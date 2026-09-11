@@ -3,6 +3,13 @@
 #
 #   bin/duck-vz-shim/build.sh                # build + ad-hoc sign
 #   INSTALL=~/bin bin/duck-vz-shim/build.sh  # …and copy onto PATH
+#   CODESIGN_IDENTITY="Developer ID Application: … (TEAMID)" bin/duck-vz-shim/build.sh
+#                                            # …signed with the same identity
+#                                            # ICE_CODESIGN_IDENTITY names for
+#                                            # the app bundle (app/README.md
+#                                            # "Release build"). Ad-hoc `-` by
+#                                            # default, which is all a local
+#                                            # build needs.
 #
 # swiftc DIRECTLY, not swift-package: the shim is one dependency-free file,
 # and SPM breaks outright on a Command Line Tools install whose llbuild is
@@ -12,8 +19,15 @@
 # The codesign step is NOT optional: Virtualization.framework refuses any
 # binary without the com.apple.security.virtualization entitlement, and the
 # node's boot probe checks for it (sandbox.rs probe_vz) so the failure lands
-# at boot with this script named — not per-run inside the framework.
+# at boot with this script named — not per-run inside the framework. The
+# ENTITLEMENT is what the framework reads, so it is passed whatever the
+# identity is; only who vouched for the binary changes.
 set -euo pipefail
+
+# `-` is the ad-hoc identity: it carries the entitlement and satisfies the
+# framework on this machine, and it is what a shim that never leaves this
+# machine needs.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -52,8 +66,8 @@ if ! try_build ""; then
   fi
 fi
 
-codesign --force --sign - --entitlements "$HERE/vz.entitlements" "$BIN"
-echo "signed: $BIN"
+codesign --force --sign "$CODESIGN_IDENTITY" --entitlements "$HERE/vz.entitlements" "$BIN"
+echo "signed: $BIN ($CODESIGN_IDENTITY)"
 
 if [[ -n "${INSTALL:-}" ]]; then
   install -m 0755 "$BIN" "$INSTALL/duck-vz-shim"

@@ -263,7 +263,7 @@ impl Driver {
                 self.write_through_if_applied(state, peer, addr);
             }
             Err(reason) => {
-                self.fail_peer(state, peer, &format!("rendezvous fallback: {reason}"));
+                self.fail_rendezvous_fallback(state, peer, &reason);
             }
         }
     }

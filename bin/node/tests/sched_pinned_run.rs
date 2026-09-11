@@ -65,13 +65,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame};
+use common::{
+    Cluster, SandboxStage, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 
-use airlock::attest::{self, Measurement};
+// The attested-gateway helpers below (an in-process testkit-minted TEE quote,
+// really verified) are the opt-in `verify` feature; the delegated-grant test
+// uses only the self-host lender (`airlock::client`/`airlock::seal`, no quote).
 use airlock::client::Gateway as AirlockClient;
-use airlock::server::{self, AttestMode, GatewayConfig};
-use airlock::wire::{CredentialKind as WireCredentialKind, CredentialPayload};
+#[cfg(feature = "verify")]
+use airlock::{
+    attest::{self, Measurement},
+    server::{self, AttestMode, GatewayConfig},
+    wire::{CredentialKind as WireCredentialKind, CredentialPayload},
+};
 
 use gateway::{
     CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS,
@@ -84,10 +92,13 @@ use saga::{SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+// only `run_output_has` (the attested test's ws subscribe) needs these.
+#[cfg(feature = "verify")]
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+#[cfg(feature = "verify")]
 use tokio_tungstenite::tungstenite::Message;
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -106,12 +117,14 @@ const TAG: &str = "sched-claude";
 // mock Anthropic upstream + testkit airlock gateway (mirrors airlock_gateway_e2e)
 // ===========================================================================
 
+#[cfg(feature = "verify")]
 fn measurement_hex() -> String {
     "11".repeat(attest::MRTD_LEN)
 }
 
 /// ONE test enclave (measures `0x11`x48). Its minted SNP chain is verified
 /// through the REAL `airlock::verify` path, but only under its own roots.
+#[cfg(feature = "verify")]
 fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
     static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
         std::sync::OnceLock::new();
@@ -171,6 +184,7 @@ async fn bind_and_serve(app: Router) -> String {
 
 /// Boot the mock upstream and the testkit airlock gateway pointed at it.
 /// Returns `(gateway_base_url, gateway_loopback_port, upstream_counters)`.
+#[cfg(feature = "verify")]
 async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
     let counters = Arc::new(MockUpstream::default());
     let upstream = bind_and_serve(
@@ -209,6 +223,7 @@ async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
 /// Verify the gateway quote and seal a credential under `name` (the mock mints
 /// access tokens from this refresh seed). Returns the attested seal key — the
 /// on-chain anchor the resolver pins.
+#[cfg(feature = "verify")]
 async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
     let gw = AirlockClient::local(gw_base.to_string());
     let (quote, _vendor) = gw.fetch_quote().await.unwrap();
@@ -460,7 +475,7 @@ fn user_sid(user: &ed25519::PrivateKey, id: &str) -> String {
 
 /// Submit a bare `SagaMsg::Trigger` through node `idx` as a frame `submitter`
 /// signed (its USER key stamps the origin — the shape `agent sched` sends),
-/// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
+/// pinned to `target`, whose run envelope carries `CRED_NAME`. No demands — the
 /// smallest reliable execution shape (the cpu/mem → VM size dimension is not
 /// exercised here).
 fn submit_sched(
@@ -487,7 +502,9 @@ fn submit_sched(
         reply_payload: Vec::new(),
         deadline: None,
         max_attempts,
-        lease_views: None,
+        // VM startup and broker setup need the same renewable lease as model
+        // runs; Saga's short-worker default can expire before the first renewal.
+        lease_views: Some(runs::RUN_LEASE_VIEWS),
         capability: Some(TAG.into()),
         demands: BTreeMap::new(),
         pinned_assignee: Some(target.to_vec()),
@@ -527,6 +544,7 @@ fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Durati
 /// `secret` is the node's own 0600 service-link token: `run-output:` carries
 /// provider stdout, so it is a workspace-gated topic and an un-tokened subscribe
 /// is refused.
+#[cfg(feature = "verify")]
 async fn run_output_has(port: u16, id: &str, marker: &str, secret: &str, budget: Duration) -> bool {
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
         .await
@@ -581,14 +599,14 @@ async fn run_output_has(port: u16, id: &str, marker: &str, secret: &str, budget:
 /// therefore lives on the mock upstream, which is host-side.
 struct ScriptProvider {
     spec_dir: PathBuf,
-    bin: PathBuf,
+    executors: PathBuf,
 }
 
 /// the broker leg's executor, as a shell one-liner.
 ///
 /// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
 /// executes inside a microVM that mounts nothing from the host — an executor a
-/// node lends has to already be in the guest rootfs. A host script reaches the
+/// node lends has to already be in the executor image. A host script reaches the
 /// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
 ///
 /// Absolute guest paths, not bare names: the guest inherits only the run's env,
@@ -628,8 +646,7 @@ impl ScriptProvider {
         let dir = root.join("provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        // resolved by basename to /opt/duck/bin/sh inside the guest
-        let bin = PathBuf::from("/bin/sh");
+        let executors = common::script_executor_dir(&dir);
 
         // the refusal leg never runs, so its body only needs to be valid.
         let body = if broker {
@@ -658,8 +675,7 @@ impl ScriptProvider {
                  tag = \"{TAG}\"\n\
                  description = \"sched e2e script executor\"\n\
                  [detect]\n\
-                 bin = \"{TAG}-nonexistent-cli\"\n\
-                 env = \"DUCKTAPE_TEST_SCHED_BIN\"\n\
+                 bin = \"sh\"\n\
                  [invoke]\n\
                  args = {args}\n\
                  prompt = \"stdin\"\n\
@@ -671,39 +687,27 @@ impl ScriptProvider {
             ),
         )
         .expect("write provider spec");
-        Self { spec_dir, bin }
+        Self {
+            spec_dir,
+            executors,
+        }
     }
 
-    /// the env that makes a node provide the tag: the operator spec dir plus the
-    /// detect override that points at the guest's shell.
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (
-                "DUCKTAPE_TEST_SCHED_BIN".into(),
-                self.bin.display().to_string(),
-            ),
-        ]
+    /// what a node's workspace holds to provide the tag: the spec dir plus the
+    /// executor directory containing the shell mounted into the guest.
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
-}
-
-/// hide the embedded claude/codex executor specs so a dev box with a real
-/// `claude`/`codex` on PATH runs identically to CI.
-fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
 }
 
 // ===========================================================================
 // the tests
 // ===========================================================================
 
+#[cfg(feature = "verify")]
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some()
@@ -728,7 +732,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
     cluster.compute_grant = Some(vec![]);
-    cluster.env[0] = [provider.env(), hide_builtins(fixtures.path(), "node0")].concat();
+    cluster.sandbox[0] = Some(provider.sandbox());
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", CONVERGE);
     cluster.wait_marker(0, "converged root_hash=", CONVERGE);
@@ -777,6 +781,8 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
         "airlock",
         "--port",
         &gw_port.to_string(),
+        "--account",
+        &owner_account.to_string(),
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
@@ -899,18 +905,24 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     cluster.compute_grant = Some(vec![]);
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, CRED_NAME, "rt-delegated");
-    cluster.env[0] = [
-        hide_builtins(fixtures.path(), "node0"),
-        vec![
-            ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
-            (
-                "DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(),
-                format!("{upstream}/oauth/token"),
-            ),
-        ],
-    ]
-    .concat();
-    cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
+    let owner_key_file = owner_storage.join("owner.key");
+    let (_, owner) = keystore::userkey::mint_user_key(&owner_key_file, "scheduled-lender-password")
+        .expect("mint the lender operator's encrypted wallet");
+    // no executor or spec on the credential owner: only the other node may
+    // discover the scheduled-run provider.
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.env[0] = vec![
+        (
+            "DUCKTAPE_USER_KEY".into(),
+            owner_key_file.display().to_string(),
+        ),
+        ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
+        (
+            "DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(),
+            format!("{upstream}/oauth/token"),
+        ),
+    ];
+    cluster.sandbox[1] = Some(provider.sandbox());
 
     for index in 0..2 {
         cluster.spawn(index);
@@ -924,19 +936,19 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // the EXECUTOR's compute daemon is what runs the workload and dials the
     // lender; the owner's is incidental to this proof.
     cluster.wait_compute_marker(1, "compute daemon serving", CONVERGE);
-    // the lender starts only once its node's http surface is up: it opens the
-    // store (minting seal.key) and registers its loopback port as the route.
-    cluster.spawn_service(0, "airlock");
-    cluster.wait_service_marker(0, "airlock", "airlock daemon serving", CONVERGE);
 
-    // two USERS: the owner founds account 1 through node 0, the executor's
-    // user account 2 through node 1. The nodes themselves are on no account.
-    let owner = ed25519::PrivateKey::from_seed(42);
+    // Admit the actual lender wallet before its daemon resolves the route
+    // account. The executor's user and both node identities remain distinct.
     let executor = ed25519::PrivateKey::from_seed(43);
     let owner_node = Cluster::identity(0);
     let executor_node = Cluster::identity(1);
     let owner_account = create_account(&cluster, 0, &owner, "owner");
     let executor_account = create_account(&cluster, 1, &executor, "executor");
+
+    // the lender starts only once its node's http surface is up: it opens the
+    // store (minting seal.key) and registers its loopback port as the route.
+    cluster.spawn_service(0, "airlock");
+    cluster.wait_service_marker(0, "airlock", "airlock daemon serving", CONVERGE);
 
     submit_frame(
         &cluster,

@@ -1,39 +1,28 @@
 use super::{
-    AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, Msg, Origin, RunsModule, RunsMsg,
-    SiblingReadBudget, TaggingMsg, TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg,
-    dispatch_id_for, envelope, jobs_encode_msg, reject_run_separator, run_id_for,
-    tagging_encode_msg,
+    Ctx, DispatchMsg, Error, JobsMsg, ModelStatus, Msg, Origin, RunsModule, RunsMsg,
+    SiblingReadBudget, canonical_origin, decode_msg, dispatch_encode_msg, dispatch_id_for,
+    envelope, jobs_encode_msg, reject_run_separator, run_id_for,
 };
 
 impl RunsModule {
     // ---- admin ops + explicit runs (any other origin) --------------------------------
 
-    async fn controlled_dispatch_id(
+    /// the dispatch id of a run still in flight; `None` for a run that already
+    /// settled (its control op is a no-op), an error for a run never staged.
+    async fn pending_dispatch_id(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
-        action: &str,
     ) -> Result<Option<String>, Error> {
-        let submitter = canonical_origin(&ctx.env().origin);
         let dispatch_id = dispatch_id_for(run_id);
-        let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
-            return match self.turn_taken(ctx, &dispatch_id).await {
-                Ok(true) => Ok(None),
-                Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
-                Err(reason) => Err(Error::Module(reason)),
-            };
-        };
-        let owner = self
-            .agent_record(ctx, &entry.agent_id)
-            .await
-            .map_err(Error::Module)?
-            .map(|a| a.owner);
-        if submitter != entry.requester && Some(&submitter) != owner.as_ref() {
-            return Err(Error::Module(format!(
-                "only the run creator or the agent owner may {action} a run"
-            )));
+        if self.pending_entry(&dispatch_id).is_some() {
+            return Ok(Some(dispatch_id));
         }
-        Ok(Some(dispatch_id))
+        match self.turn_taken(ctx, &dispatch_id).await {
+            Ok(true) => Ok(None),
+            Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
+            Err(reason) => Err(Error::Module(reason)),
+        }
     }
 
     pub(super) async fn on_admin(
@@ -43,52 +32,55 @@ impl RunsModule {
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            RunsMsg::WatchChannel { channel_id, policy } => {
-                Self::admin_origin(&ctx.env().origin)?;
-                Self::validate_non_empty("channel_id", &channel_id)?;
-                reject_run_separator("channel_id", &channel_id)?;
-                if let TurnPolicy::Assigned(assignee) = &policy
-                    && self
-                        .agent_record(&*ctx, assignee)
-                        .await
-                        .map_err(Error::Module)?
-                        .is_none()
-                {
-                    return Err(Error::Module(format!(
-                        "assigned agent is not registered: {assignee}"
-                    )));
-                }
-                // the watch and the plane subscription are ONE atomic unit
-                // (P2): if the tagging plane rejects the subscription (bad
-                // container, subscriber cap), the whole block aborts and the
-                // staged watch vanishes with it.
-                self.pending_watches
-                    .insert(channel_id.clone(), Some(policy));
-                ctx.emit_msg(Msg {
-                    target: self.tagging.clone(),
-                    payload: tagging_encode_msg(&TaggingMsg::Subscribe {
-                        source: self.chat.clone(),
-                        container: channel_id,
-                    }),
-                });
-                Ok(())
+            RunsMsg::RequestModuleUpdate {
+                request_id,
+                run_id,
+                source,
+                update,
+            } => {
+                self.request_module_update(ctx, request_id, run_id, source, update)
+                    .await
             }
-            RunsMsg::UnwatchChannel { channel_id } => {
-                Self::admin_origin(&ctx.env().origin)?;
-                if self.watch(&channel_id).is_none() {
-                    // idempotent: unwatching an unwatched channel stages (and
-                    // emits) nothing.
-                    return Ok(());
-                }
-                self.pending_watches.insert(channel_id.clone(), None);
-                ctx.emit_msg(Msg {
-                    target: self.tagging.clone(),
-                    payload: tagging_encode_msg(&TaggingMsg::Unsubscribe {
-                        source: self.chat.clone(),
-                        container: channel_id,
-                    }),
-                });
-                Ok(())
+            RunsMsg::MarkModuleArtifactStaged { sequence } => {
+                self.mark_module_artifact_staged(ctx, sequence).await
+            }
+            RunsMsg::ReconcileModuleUpdate { sequence } => {
+                self.reconcile_module_update(ctx, sequence).await
+            }
+            RunsMsg::RefuseModuleUpdate { sequence, reason } => {
+                self.refuse_module_update(ctx, sequence, reason).await
+            }
+            RunsMsg::ConfigureModel { operation } => self.configure_model(ctx, operation).await,
+            RunsMsg::RequestJobRun { agent_id, job_id } => {
+                self.request_job_run(ctx, agent_id, job_id).await
+            }
+            RunsMsg::RequestAttributedRun {
+                agent_id,
+                change_seq,
+            } => {
+                self.request_attributed_run(ctx, agent_id, change_seq, budget)
+                    .await
+            }
+            RunsMsg::ClaimActionRequest {
+                request_id,
+                target_step,
+            } => {
+                self.claim_action_request(ctx, request_id, target_step)
+                    .await
+            }
+            RunsMsg::CompleteActionRequest {
+                request_id,
+                call,
+                result,
+            } => {
+                self.complete_action_request(ctx, request_id, call, result)
+                    .await
+            }
+            RunsMsg::RejectActionRequest { request_id, reason } => {
+                self.reject_action_request(ctx, request_id, reason).await
+            }
+            RunsMsg::PublishActionRequest { request_id } => {
+                self.publish_action_request(ctx, request_id).await
             }
             RunsMsg::EnableJobWorker { enabled } => {
                 Self::admin_origin(&ctx.env().origin)?;
@@ -123,8 +115,9 @@ impl RunsModule {
                             "run requests require a non-empty submitter id".into(),
                         ));
                     }
-                    other => canonical_origin(other),
+                    other => canonical_origin(other)?,
                 };
+                reject_run_separator("channel_id", &channel_id)?;
                 // the requester's per-run skills, confined to the library by
                 // construction (names, not paths) — see `library_skills`.
                 let extra = envelope::library_skills(&skills).map_err(Error::Module)?;
@@ -135,7 +128,70 @@ impl RunsModule {
                 else {
                     return Err(Error::Module(format!("unknown agent: {agent_id}")));
                 };
-                reject_run_separator("channel_id", &channel_id)?;
+                let program_is_requesting_its_model =
+                    ctx.env().origin == Origin::Program(agent.account);
+                if !program_is_requesting_its_model {
+                    let item = self
+                        .staged_next_action_item
+                        .unwrap_or(self.next_action_item);
+                    let next = item
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Module("run request counter exhausted".into()))?;
+                    let actor = match &ctx.env().origin {
+                        Origin::Program(account) => super::Actor::Account(*account),
+                        Origin::External(key) => {
+                            let bytes = ctx
+                                .query(
+                                    "identity",
+                                    &identity::encode_query(&identity::IdentityQuery::OfKey {
+                                        key: key.clone(),
+                                    }),
+                                )
+                                .await?;
+                            match identity::decode_reply(&bytes).map_err(Error::Module)? {
+                                identity::IdentityReply::Account(Some(account)) => {
+                                    super::Actor::Account(account.number)
+                                }
+                                identity::IdentityReply::Account(None) => {
+                                    super::Actor::Key(key.clone())
+                                }
+                                _ => {
+                                    return Err(Error::Module(
+                                        "unexpected requesting identity reply".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Origin::Module(module) => super::Actor::Module(module.clone()),
+                        Origin::System => super::Actor::System,
+                    };
+                    ctx.emit_msg(Msg {
+                        target: self.attribution.clone(),
+                        payload: attribution::encode_msg(&attribution::AttributionMsg::Attribute {
+                            object: attribution::ObjectRef {
+                                kind: "run_request".into(),
+                                object: item.to_string(),
+                            },
+                            revision: 1,
+                            actor,
+                            relations: vec![attribution::Relation {
+                                recipient: agent.account,
+                                reason: attribution::Reason::Defined("model_run".into()),
+                                detail: sdk::wire::encode(&super::engagement::RunRequest::Manual {
+                                    requester,
+                                    agent_id,
+                                    channel_id,
+                                    anchor_seq,
+                                    demands,
+                                    skills,
+                                }),
+                            }],
+                            transfers: Vec::new(),
+                        }),
+                    });
+                    self.staged_next_action_item = Some(next);
+                    return Ok(());
+                }
                 let run_id = run_id_for(&channel_id, anchor_seq, &agent_id);
                 if self
                     .turn_taken(&*ctx, &dispatch_id_for(&run_id))
@@ -144,7 +200,7 @@ impl RunsModule {
                 {
                     return Ok(());
                 }
-                if agent.status != AgentStatus::Active {
+                if agent.status != ModelStatus::Active {
                     return Err(Error::Module(format!("agent is paused: {agent_id}")));
                 }
                 // unlike the engagement intake, an explicit request REJECTS
@@ -168,10 +224,7 @@ impl RunsModule {
                 Ok(())
             }
             RunsMsg::CancelRun { run_id } => {
-                let Some(dispatch_id) = self
-                    .controlled_dispatch_id(&*ctx, &run_id, "cancel")
-                    .await?
-                else {
+                let Some(dispatch_id) = self.pending_dispatch_id(&*ctx, &run_id).await? else {
                     return Ok(());
                 };
                 // cancel through the dispatch plane; the entry stays pending
@@ -185,10 +238,7 @@ impl RunsModule {
                 Ok(())
             }
             RunsMsg::ReassignRun { run_id, attempt } => {
-                let Some(dispatch_id) = self
-                    .controlled_dispatch_id(&*ctx, &run_id, "reassign")
-                    .await?
-                else {
+                let Some(dispatch_id) = self.pending_dispatch_id(&*ctx, &run_id).await? else {
                     return Ok(());
                 };
                 ctx.emit_msg(Msg {
@@ -207,15 +257,23 @@ impl RunsModule {
             // "non-empty submitter" has.
             RunsMsg::OpenAgentSession {
                 run_id,
+                attempt,
                 session_key,
-            } => self.open_agent_session(ctx, run_id, session_key).await,
-            RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
-            RunsMsg::DelegateRun {
+            } => {
+                self.open_agent_session(ctx, run_id, attempt, session_key)
+                    .await
+            }
+            RunsMsg::AgentAction {
+                run_id,
+                request_id,
+                action,
+            } => self.agent_action(ctx, run_id, request_id, action).await,
+            RunsMsg::ExecuteDelegation {
                 run_id,
                 request_id,
                 request,
             } => {
-                self.delegate_run(ctx, run_id, request_id, request, budget)
+                self.execute_delegation(ctx, run_id, request_id, request, budget)
                     .await
             }
         }

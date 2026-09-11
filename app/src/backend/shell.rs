@@ -60,58 +60,6 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     format!("{left} · {right}")
 }
 
-/// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
-/// runs in flight, not `AgentStatus::Active`: Active is the registration
-/// default and would report every registered agent as busy forever.
-pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let working = rows.iter().filter(|row| row.live).count();
-    let registered = plural(count_i64(rows.len()), "agent", "agents");
-    format!("{registered} · {working} working")
-}
-
-/// `12 open · 3 settled` — the Approvals title's machine subtitle.
-pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let open = rows.iter().filter(|row| row.open).count();
-    format!("{open} open · {} settled", rows.len() - open)
-}
-
-/// `N pending` — the header count, open proposals only.
-pub fn pending_label(rows: &[ProposalRow]) -> String {
-    format!("{} pending", rows.iter().filter(|row| row.open).count())
-}
-
-/// The settled half of the register — the RECENTLY FINALIZED column.
-pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
-    rows.iter().filter(|row| !row.open).cloned().collect()
-}
-
-/// One seat per REQUIRED signature, filled for each approval already in —
-/// the quorum dots. Capped so a large threshold does not overflow the card.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct QuorumSeat {
-    pub filled: bool,
-}
-
-pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
-    let seats = required.clamp(0, 12) as usize;
-    (0..seats)
-        .map(|seat| QuorumSeat {
-            filled: (seat as i64) < approvals,
-        })
-        .collect()
-}
-
-/// `3 / 4` — the tally, one mono run.
-pub fn tally_label(approvals: i64, required: i64) -> String {
-    format!("{approvals} / {required}")
-}
-
 /// `tally_label` for two readings that are ALREADY rendered — the consensus
 /// trio off `/v1/status` is optional per field, so each arrives as its own
 /// `optional_number` string (`—` when the node reports nothing). Joining the
@@ -121,56 +69,12 @@ pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
-pub fn tally_tone(approvals: i64, required: i64) -> String {
-    match approvals >= required.saturating_sub(1) {
-        true => "near".into(),
-        false => "far".into(),
-    }
-}
-
-/// `3 approvals · 1 more for quorum`, or `quorum met`.
-pub fn tally_note(approvals: i64, required: i64) -> String {
-    let remaining = required.saturating_sub(approvals);
-    if remaining <= 0 {
-        return "quorum met".into();
-    }
-    let have = plural(approvals, "approval", "approvals");
-    format!("{have} · {remaining} more for quorum")
-}
-
-/// The approve button leans forward at the last vote: `Approve →`.
-pub fn approve_label(approvals: i64, required: i64) -> String {
-    match approvals + 1 >= required {
-        true => "Approve →".into(),
-        false => "Approve".into(),
-    }
-}
-
-/// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: &str) -> String {
-    let access = matches!(
-        action,
-        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
-    );
-    match access {
-        true => "access".into(),
-        false => "neutral".into(),
-    }
-}
-
-/// How many proposals are still open — the count the rail pins to Approvals.
-pub fn open_proposals(rows: &[ProposalRow]) -> i64 {
-    rows.iter().filter(|row| row.open).count() as i64
-}
-
 /// The rail's navigation: nine collaboration surfaces plus the node operator
 /// surface, with the active pane flagged. `settings` is not here because the
 /// rail pins it to its own footer beside the account avatar.
 pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         (crate::ShellTab::Chat, "Chat", "nav-chat"),
-        (crate::ShellTab::Shell, "Shell", "code-slash"),
         (crate::ShellTab::Pages, "Pages", "nav-pages"),
         (crate::ShellTab::Forge, "Forge", "nav-forge"),
         (crate::ShellTab::Agents, "Agents", "nav-agents"),
@@ -228,71 +132,25 @@ pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
     }
 }
 
-/// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
-/// only writer). Read per call, not cached: the launch window switches
-/// networks in-process, so no registry reading may outlive a boot.
-fn demo_registry() -> Option<serde_json::Value> {
-    let path = ducktape_home()?.join("registry.json");
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
-fn registry_active_entry() -> Option<serde_json::Value> {
-    let registry = demo_registry()?;
-    let active = registry.get("active")?.as_str()?;
-    registry
-        .get("workspaces")?
-        .as_array()?
-        .iter()
-        .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))
-        .cloned()
-}
-
-/// The registry's `active` workspace id — the launch list's preselection
-/// hint on a demo-seeded machine.
-pub(crate) fn registry_active_workspace() -> Option<String> {
-    demo_registry()?.get("active")?.as_str().map(str::to_string)
-}
-
-/// The active workspace's name, from the CLI's registry. The app and
-/// the CLI name the same workspace, so the titlebar says `demo`, not an IP.
-fn active_workspace_name() -> Option<String> {
-    let workspace = registry_active_entry()?;
-    workspace
-        .get("name")
-        .or_else(|| workspace.get("id"))
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
-}
-
-/// The active workspace's http endpoint, from the same registry the titlebar
-/// name comes from. This is what makes a bare `make dev` connect: with no
-/// `DUCKTAPE_NODE` and an empty endpoint field the app fell back to a
-/// hardcoded port while the seeded node listened wherever `node init` picked
-/// its ports — so every first boot opened on "Could not connect" over a
-/// perfectly healthy node the registry knew the address of.
-pub(crate) fn registered_endpoint() -> Option<String> {
-    let workspace = registry_active_entry()?;
-    let http = workspace.get("ports")?.get("http")?.as_u64()?;
-    Some(format!("http://127.0.0.1:{http}"))
-}
-
-/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key
-/// uses, because it IS that resolution: [`ducktape_home::root`].
+/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the directory that holds every
+/// workspace on this device and nothing else: [`ducktape_home::root`], the
+/// same resolution the node lists its workspaces through.
 pub(crate) fn ducktape_home() -> Option<PathBuf> {
     ducktape_home::root().ok()
 }
 
-/// Every registered workspace as `(chain id, directory)` — the CLI's own
-/// registry walk (`workspace_config::list_workspaces`), so membership and the
-/// id agree with what `node init`/`node join` wrote and what `-n` resolves.
-pub(crate) fn registered_workspaces() -> Vec<(String, PathBuf)> {
-    let Ok(root) = workspace_config::workspaces_root() else {
+/// Every workspace under the ducktape home as `(chain id, directory)` — the
+/// CLI's own directory walk (`workspace_config::list_workspaces`), read per
+/// call, so membership and the id agree with what `node init`/`node join`
+/// wrote and what `-n` resolves.
+pub(crate) fn workspaces() -> Vec<(String, PathBuf)> {
+    let Some(root) = ducktape_home() else {
         return Vec::new();
     };
-    registered_workspaces_in(&root)
+    workspaces_in(&root)
 }
 
-pub(crate) fn registered_workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
     workspace_config::list_workspaces_in(root)
         .unwrap_or_default()
         .into_iter()
@@ -306,26 +164,24 @@ pub(crate) fn workspace_endpoint(dir: &Path) -> Option<String> {
     workspace_config::http_base_in(dir).ok()
 }
 
-/// The registered workspace this app is pointed at, matched on the endpoint it
-/// is actually connected to.
-pub(crate) fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
-    let endpoint = canonical_endpoint(rpc.to_string());
-    registered_workspaces()
-        .into_iter()
-        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
+/// The endpoint an EMPTY `rpc` means: the one workspace under the home, when
+/// the home holds exactly one — the rung the CLI's `-n` falls to as well.
+/// Two workspaces are a pick the launch window makes, never a default.
+pub(crate) fn lone_workspace_endpoint() -> Option<String> {
+    let listed = workspaces();
+    let [(_, dir)] = listed.as_slice() else {
+        return None;
+    };
+    workspace_endpoint(dir)
 }
 
-/// Workspaces this device has been told to forget — device-local, never wire
-/// state. The directories stay on disk; the console simply stops offering them.
-pub(crate) fn forgotten_workspaces() -> Vec<String> {
-    read_prefs()["forgotten_workspaces"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|id| id.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+/// The workspace on this device that serves an endpoint, matched on the
+/// endpoint the app is actually connected to. `None` is a remote.
+pub(crate) fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
+    let endpoint = canonical_endpoint(rpc.to_string());
+    workspaces()
+        .into_iter()
+        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
 }
 
 /// What a join hands back: the network's id, where it materialized, and the
@@ -404,7 +260,7 @@ fn workspace_rpc(selector: &str) -> Result<String, String> {
     let matches_selector = |chain_id: &str, dir: &Path| {
         chain_id == selector || dir.file_name().is_some_and(|name| name == selector)
     };
-    registered_workspaces()
+    workspaces()
         .into_iter()
         .find(|(chain_id, dir)| matches_selector(chain_id, dir))
         .and_then(|(_, dir)| workspace_endpoint(&dir))
@@ -438,7 +294,7 @@ pub fn provision_progress(
         step: usize,
         attempts: u32,
     }
-    let found = registered_workspaces()
+    let found = workspaces()
         .into_iter()
         .find(|(chain_id, dir)| *chain_id == workspace || dir.display().to_string() == workspace);
     let (chain_id, dir) = match found {
@@ -464,7 +320,7 @@ pub fn provision_progress(
                     Some((
                         registered_step(
                             1,
-                            &format!("Workspace registered · {home}"),
+                            &format!("Workspace on disk · {home}"),
                             state.dir.is_some(),
                         ),
                         state,
@@ -573,48 +429,22 @@ pub(crate) fn workspace_identity(dir: &Path) -> Option<String> {
     Some(short_label(key))
 }
 
-/// Forget this workspace on THIS DEVICE: it stops being offered by the shell
-/// and its view prefs are dropped. The directory, the identity and the chain
-/// are untouched — this is not a leave-the-network op.
-pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
-    let Some((chain_id, _)) = workspace_at(&rpc) else {
-        return Err(app_error(
-            "this endpoint is not one of this device's registered workspaces".into(),
-        ));
-    };
-    let mut prefs = read_prefs();
-    let mut forgotten = forgotten_workspaces();
-    if !forgotten.contains(&chain_id) {
-        forgotten.push(chain_id);
-    }
-    prefs["forgotten_workspaces"] = serde_json::json!(forgotten);
-    if let Some(tabs) = prefs["doc_tabs"].as_object_mut() {
-        tabs.remove(&canonical_endpoint(rpc));
-    }
-    Ok(write_prefs(&prefs))
-}
-
-/// The titlebar's chain label: the workspace serving the CONNECTED endpoint
-/// (the launch window may have picked any known network, so the registry's
-/// `active` cannot answer), then the demo registry's name, then the bound
-/// account, then the endpoint's host, then the product name.
-pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
-    let connected = workspace_at(rpc.as_ref()).map(|(chain_id, _)| {
-        let named = chain_id.split('#').next().unwrap_or_default();
-        match named.is_empty() {
-            true => chain_id,
-            false => named.to_string(),
-        }
-    });
-    if let Some(workspace) = connected {
-        return workspace;
-    }
-    if let Some(workspace) = active_workspace_name() {
-        return workspace;
-    }
-    let named = account_name.as_ref().trim();
+/// The titlebar's network label: the NAME PART of the connected node's chain
+/// id (`name#hash`), the one fact every member of a network shares. Until the
+/// node has said which chain it serves, the endpoint's host stands in, and
+/// with no endpoint the product name does.
+///
+/// Nothing device-local feeds this: the ducktape home only knows the
+/// workspaces this machine holds, and an account name is one person's,
+/// not the network's.
+pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
+    let chain_id = chain_id.as_ref().trim();
+    let named = chain_id.split('#').next().unwrap_or_default();
     if !named.is_empty() {
         return named.to_string();
+    }
+    if !chain_id.is_empty() {
+        return chain_id.to_string();
     }
     let host = rpc
         .as_ref()
@@ -844,17 +674,6 @@ pub fn current_wall_seconds() -> i64 {
     now_seconds()
 }
 
-/// A serde-tagged enum's variant name, whether it rode as a bare string
-/// (unit variant) or as a single-key object (payload variant).
-pub(crate) fn tagged_name(value: &serde_json::Value) -> String {
-    value.as_str().map(str::to_string).unwrap_or_else(|| {
-        value
-            .as_object()
-            .and_then(|tagged| tagged.keys().next().cloned())
-            .unwrap_or_default()
-    })
-}
-
 /// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
 pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
     value
@@ -866,11 +685,6 @@ pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// A module payload in its wire form — `sdk::wire` is serde_json bytes.
-pub(crate) fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
-    serde_json::to_vec(payload).unwrap_or_default()
 }
 
 /// The first grapheme of a display name, upper-cased, for an avatar plate.
@@ -889,14 +703,16 @@ pub fn initial_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The local user's inbox queue, when a key exists.
-///
-/// An inbox member IS an origin's actor string (`sdk::Origin::actor_string`),
-/// and the module now refuses a MarkRead/Clear naming any queue but the
-/// submitter's own — so this is not a display handle, it is the identity the
-/// signed frame will carry. It must be derived, never spelled.
-pub(crate) async fn local_member() -> Option<String> {
-    local_user_key()
-        .await
-        .map(|key| sdk::Origin::External(key).actor_string())
+/// The account controlled by the actual local signer, read at the write edge.
+pub(crate) async fn local_account(rpc: &RpcClient) -> Result<Option<u64>, String> {
+    let Some(key) = local_user_key().await else {
+        return Ok(None);
+    };
+    let reply: identity::IdentityReply = rpc
+        .query("identity", &identity::IdentityQuery::OfKey { key })
+        .await?;
+    let identity::IdentityReply::Account(account) = reply else {
+        return Err("the identity module returned the wrong reply".to_string());
+    };
+    Ok(account.map(|account| account.number))
 }

@@ -1,6 +1,6 @@
 //! the capability spec: a TOML file describing one executor capability.
 //!
-//! everything capability-host used to hardcode in Rust — which binary to
+//! everything the provider used to hardcode in Rust — which binary to
 //! probe, the argv to invoke it, how to parse its output — is data in a spec
 //! file. the built-in executors are embedded spec FILES (globbed by build.rs
 //! — no Rust source names an executor) parsed by this exact module, so an
@@ -36,8 +36,8 @@
 //! a spec is EXECUTING CODE by proxy. specs are operator-trusted configuration
 //! — the same trust class as a shell profile or systemd unit. they load from
 //! exactly two places, both local and operator-controlled: the specs embedded
-//! in this crate at compile time, and `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `<ducktape home>/capabilities`, so `$DUCKTAPE_HOME` moves it). specs are
+//! in this crate at compile time, and the workspace's own `capabilities/`
+//! directory, handed to `discover` by the daemon serving it. specs are
 //! NEVER fetched from the network, and nothing consensus-side may ever read
 //! one (host-local files are non-deterministic input; the consensus capability
 //! module sees only the announced TAGS, never the specs behind them).
@@ -145,6 +145,35 @@ pub struct CapabilitySpec {
     /// makes it eligible for [`crate::interactive`]. the broker/config-home
     /// isolation is shared with the headless path — only the argv differs.
     pub interactive: Option<InteractiveSpec>,
+    /// optional `[source]` — the vendor release channel this executor's Linux
+    /// build comes from, which is what makes it installable by `ducktape
+    /// agent install` (see [`ReleaseSource`]). absent = the operator puts the
+    /// binary in the executors directory themselves.
+    pub source: Option<ReleaseSource>,
+}
+
+/// Where an executor's releases come from: the vendor channel `agent install`
+/// resolves the LATEST release from at install time. No version and no hash
+/// is ever written down ahead of time — the channel names the release and the
+/// vendor publishes the checksum for it, so what gets installed is whatever
+/// is current the moment the operator approves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// Anthropic's release feed: `<base>/latest` names the version,
+    /// `<base>/<version>/manifest.json` carries a sha256 per platform, and
+    /// `<base>/<version>/<platform>/<detect.bin>` is the executable itself.
+    /// A single-binary feed, so the spec declares no companions.
+    ClaudeReleases { base: String },
+    /// A GitHub release: `releases/latest` names the tag, `asset` (with
+    /// `{arch}` filled in as the Rust triple's arch) is a gzipped tar the
+    /// release publishes a `sums` file beside, and `members` are the archive
+    /// paths of `detect.bin` and its companions, in any order.
+    GithubRelease {
+        repo: String,
+        asset: String,
+        sums: String,
+        members: Vec<String>,
+    },
 }
 
 /// the argv for an interactive, pty-backed TUI session. deliberately its own
@@ -267,6 +296,10 @@ struct RawSpec {
     /// (see [`inject_tool_args`]).
     #[serde(default)]
     tools: Option<RawTools>,
+    /// optional `[source]` — the vendor release channel, validated in
+    /// [`parse_source`].
+    #[serde(default)]
+    source: Option<RawSource>,
     /// optional `[[variants]]` — finer tags expanded at load time, validated
     /// in [`crate::variants`].
     #[serde(default)]
@@ -282,6 +315,97 @@ struct RawIsolation {
     config_home_env: Option<String>,
     #[serde(default)]
     broker: Option<String>,
+}
+
+/// the on-disk `[source]` shape: `kind` picks the channel and the rest of the
+/// table is that kind's fields. a field from the other kind is an unknown
+/// field and fails loud like everywhere else in the format.
+#[derive(Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum RawSource {
+    #[serde(rename = "claude-releases")]
+    ClaudeReleases { base: String },
+    #[serde(rename = "github-release")]
+    GithubRelease {
+        repo: String,
+        asset: String,
+        sums: String,
+        members: Vec<String>,
+    },
+}
+
+/// validate `[source]` against `[detect]`: the channel must deliver exactly
+/// the files discovery will look for — the binary and every companion, no
+/// more and no fewer — or the install verb would write a set the guest cannot
+/// run, or leave a declared companion missing.
+fn parse_source(
+    raw: Option<RawSource>,
+    bin: &str,
+    companions: &[String],
+    origin: &str,
+) -> Result<Option<ReleaseSource>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        RawSource::ClaudeReleases { base } => {
+            if !base.starts_with("https://") {
+                return Err(format!("{origin}: source.base must be an https url"));
+            }
+            if !companions.is_empty() {
+                return Err(format!(
+                    "{origin}: a claude-releases source delivers one binary, but \
+                     detect.companions declares {companions:?}"
+                ));
+            }
+            Ok(Some(ReleaseSource::ClaudeReleases {
+                base: base.trim_end_matches('/').to_string(),
+            }))
+        }
+        RawSource::GithubRelease {
+            repo,
+            asset,
+            sums,
+            members,
+        } => {
+            let is_owner_slash_name = matches!(
+                repo.split('/').collect::<Vec<_>>().as_slice(),
+                [owner, name] if !owner.is_empty() && !name.is_empty()
+            );
+            if !is_owner_slash_name {
+                return Err(format!("{origin}: source.repo {repo:?} is not owner/name"));
+            }
+            if !asset.contains("{arch}") {
+                return Err(format!(
+                    "{origin}: source.asset {asset:?} names no {{arch}} placeholder"
+                ));
+            }
+            if sums.is_empty() {
+                return Err(format!("{origin}: source.sums must be non-empty"));
+            }
+            let delivered: std::collections::BTreeSet<&str> = members
+                .iter()
+                .map(|m| m.rsplit('/').next().unwrap_or(m.as_str()))
+                .collect();
+            let declared: std::collections::BTreeSet<&str> = std::iter::once(bin)
+                .chain(companions.iter().map(String::as_str))
+                .collect();
+            let delivers_exactly_the_declared_files =
+                delivered == declared && delivered.len() == members.len();
+            if !delivers_exactly_the_declared_files {
+                return Err(format!(
+                    "{origin}: source.members {members:?} must deliver exactly detect.bin \
+                     and detect.companions {declared:?}"
+                ));
+            }
+            Ok(Some(ReleaseSource::GithubRelease {
+                repo,
+                asset,
+                sums,
+                members,
+            }))
+        }
+    }
 }
 
 /// an env var name the child will actually see: `[A-Z_][A-Z0-9_]*`. a spec that
@@ -596,6 +720,7 @@ impl CapabilitySpec {
         // AFTER isolation: `config-home:` is only meaningful when the spec asked
         // for a fresh config home, so the check needs the parsed block.
         let context = parse_context(raw.context, &isolation, origin)?;
+        let source = parse_source(raw.source, &raw.detect.bin, &raw.detect.companions, origin)?;
         Ok((
             Self {
                 tag,
@@ -613,6 +738,7 @@ impl CapabilitySpec {
                     args: i.args,
                     restricted_args: i.restricted_args,
                 }),
+                source,
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -740,9 +866,109 @@ format = "text"
         // executor names.
         let specs = builtin_specs();
         assert!(!specs.is_empty(), "the crate ships built-in specs");
-        let tags: std::collections::BTreeSet<&str> =
-            specs.iter().map(|s| s.tag.as_str()).collect();
+        let tags: std::collections::BTreeSet<&str> = specs.iter().map(|s| s.tag.as_str()).collect();
         assert_eq!(tags.len(), specs.len(), "embedded tags are unique");
+    }
+
+    /// `[source]` is validated against `[detect]`: a GitHub release must
+    /// deliver exactly the binary and its companions, a single-binary feed
+    /// cannot carry companions, and a field from the other kind — or a kind
+    /// this build does not know — fails loud like any unknown field.
+    #[test]
+    fn a_source_delivers_exactly_what_detect_declares() {
+        let github = spec_toml("pkg").replacen(
+            "bin = \"pkg-cli\"",
+            "bin = \"pkg-cli\"\ncompanions = [\"pkg-helper\"]",
+            1,
+        ) + r#"
+[source]
+kind = "github-release"
+repo = "vendor/pkg"
+asset = "pkg-{arch}-unknown-linux-musl.tar.gz"
+sums = "pkg_SHA256SUMS"
+members = ["bin/pkg-helper", "bin/pkg-cli"]
+"#;
+        let spec = CapabilitySpec::parse(&github, "t").unwrap();
+        assert_eq!(
+            spec.source,
+            Some(ReleaseSource::GithubRelease {
+                repo: "vendor/pkg".into(),
+                asset: "pkg-{arch}-unknown-linux-musl.tar.gz".into(),
+                sums: "pkg_SHA256SUMS".into(),
+                members: vec!["bin/pkg-helper".into(), "bin/pkg-cli".into()],
+            })
+        );
+
+        let feed = spec_toml("solo")
+            + r#"
+[source]
+kind = "claude-releases"
+base = "https://releases.example/feed/"
+"#;
+        let spec = CapabilitySpec::parse(&feed, "t").unwrap();
+        assert_eq!(
+            spec.source,
+            Some(ReleaseSource::ClaudeReleases {
+                base: "https://releases.example/feed".into()
+            })
+        );
+        assert_eq!(
+            CapabilitySpec::parse(&spec_toml("none"), "t")
+                .unwrap()
+                .source,
+            None
+        );
+
+        let refused = [
+            (
+                "members missing the companion",
+                github.replacen("\"bin/pkg-helper\", ", "", 1),
+                "must deliver exactly",
+            ),
+            (
+                "members naming an extra file",
+                github.replacen("\"bin/pkg-cli\"]", "\"bin/pkg-cli\", \"bin/extra\"]", 1),
+                "must deliver exactly",
+            ),
+            (
+                "an asset with no arch placeholder",
+                github.replacen("{arch}", "x86_64", 1),
+                "{arch} placeholder",
+            ),
+            (
+                "a repo that is not owner/name",
+                github.replacen("vendor/pkg", "pkg", 1),
+                "owner/name",
+            ),
+            (
+                "a feed field on a github source",
+                github.replacen("sums = ", "base = \"https://x\"\nsums = ", 1),
+                "unknown field",
+            ),
+            (
+                "a kind this build does not know",
+                github.replacen("github-release", "ftp-mirror", 1),
+                "unknown variant",
+            ),
+            (
+                "a feed with companions",
+                feed.replacen(
+                    "bin = \"solo-cli\"",
+                    "bin = \"solo-cli\"\ncompanions = [\"solo-helper\"]",
+                    1,
+                ),
+                "delivers one binary",
+            ),
+            (
+                "a feed off https",
+                feed.replacen("https://", "http://", 1),
+                "https url",
+            ),
+        ];
+        for (case, toml, expected) in refused {
+            let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
+            assert!(err.contains(expected), "{case}: {err}");
+        }
     }
 
     #[test]
@@ -797,7 +1023,11 @@ format = "text"
             (r#"tag = "ok""#, r#"tag = "OK""#, "invalid characters"),
             (r#"tag = "ok""#, r#"tag = """#, "non-empty"),
             (r#"prompt = "stdin""#, r#"prompt = "argv""#, "not supported"),
-            (r#"format = "text""#, r#"format = "yaml""#, "not a known parser"),
+            (
+                r#"format = "text""#,
+                r#"format = "yaml""#,
+                "not a known parser",
+            ),
         ] {
             let broken = base.replace(needle, replacement);
             let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
@@ -805,14 +1035,27 @@ format = "text"
         }
 
         let long_tag = spec_toml(&"x".repeat(65));
-        assert!(CapabilitySpec::parse(&long_tag, "t").unwrap_err().contains("64 bytes"));
+        assert!(
+            CapabilitySpec::parse(&long_tag, "t")
+                .unwrap_err()
+                .contains("64 bytes")
+        );
 
-        let bad_timeout = base.replace(r#"prompt = "stdin""#, "prompt = \"stdin\"\ntimeout_secs = 0");
-        assert!(CapabilitySpec::parse(&bad_timeout, "t").unwrap_err().contains("timeout_secs"));
+        let bad_timeout = base.replace(
+            r#"prompt = "stdin""#,
+            "prompt = \"stdin\"\ntimeout_secs = 0",
+        );
+        assert!(
+            CapabilitySpec::parse(&bad_timeout, "t")
+                .unwrap_err()
+                .contains("timeout_secs")
+        );
 
         // the hard ceiling rides the same table: absent = 36, out of range = refused.
         assert_eq!(
-            CapabilitySpec::parse(&base, "t").unwrap().hard_timeout_factor,
+            CapabilitySpec::parse(&base, "t")
+                .unwrap()
+                .hard_timeout_factor,
             36,
             "absent hard_timeout_factor defaults"
         );
@@ -820,14 +1063,22 @@ format = "text"
             r#"prompt = "stdin""#,
             "prompt = \"stdin\"\nhard_timeout_factor = 12",
         );
-        assert_eq!(CapabilitySpec::parse(&tuned, "t").unwrap().hard_timeout_factor, 12);
+        assert_eq!(
+            CapabilitySpec::parse(&tuned, "t")
+                .unwrap()
+                .hard_timeout_factor,
+            12
+        );
         for bad in ["0", "1001"] {
             let broken = base.replace(
                 r#"prompt = "stdin""#,
                 &format!("prompt = \"stdin\"\nhard_timeout_factor = {bad}"),
             );
             let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
-            assert!(err.contains("hard_timeout_factor"), "wanted the field named in {err:?}");
+            assert!(
+                err.contains("hard_timeout_factor"),
+                "wanted the field named in {err:?}"
+            );
         }
     }
 
@@ -907,7 +1158,10 @@ format = "text"
             spec_toml("ok")
         );
         let spec = CapabilitySpec::parse(&valid, "t").unwrap();
-        assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(
+            spec.isolation.config_home_env.as_deref(),
+            Some("CODEX_HOME")
+        );
         assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
 
         // the Anthropic broker is a distinct closed-set member (Claude Code).

@@ -1,16 +1,20 @@
 state
   pages:[PageItem] = []
-  doc_tabs:[str] = []
   blocks:[PageBlock] = []
   active_page = ""
   active_page_title = ""
   active_page_parent = ""
   page_draft = ""
   page_create_open = false
+  // Moves once per draft the app hands BACK to the pages view (a recovered
+  // comment taken up, a refused post or create returned): the view keeps
+  // its own fields and adopts `page_draft`/`block_comment_draft` only then.
+  pages_seed_rev:i64 = 0
   pending_page = ""
 
   block_comments_open = false
   block_comments_target = ""
+  inline_comment_target = ""
   block_comments_generation:i64 = 0
   block_comment_threads:[PageCommentThread] = []
   block_comment_rows:[PageCommentThreadRow] = []
@@ -28,7 +32,8 @@ state
 
   // The document is one editor buffer. Drift from the last saved text is the
   // dirty signal; `buffer_page` names what that buffer actually contains.
-  page_editor:editor = ""
+  page_text = ""
+  page_cursor_line:i64 = 0
   page_saved_text = ""
   buffer_page = ""
   commented_block_hits:[str] = []

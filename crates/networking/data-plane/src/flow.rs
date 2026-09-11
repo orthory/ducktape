@@ -33,13 +33,14 @@ impl FlowId {
     }
 }
 
-/// Policy for one datagram flow. The queue bound is the flow's whole
-/// receive-side budget: overflow drops the OLDEST queued datagram (late
-/// real-time data is dead data) and only ever this flow's — one hot flow
-/// cannot spill into another's queue.
+/// Policy for one datagram flow. The queue bound is a receive-side budget
+/// PER SENDING PEER: overflow drops that sender's OLDEST queued datagram
+/// (late real-time data is dead data), never a quieter peer's and never
+/// another flow's — one hot sender cannot spill into either.
 #[derive(Clone, Copy, Debug)]
 pub struct DatagramPolicy {
-    /// Max datagrams queued for the consumer before drop-oldest kicks in.
+    /// Max datagrams queued per sender before drop-oldest kicks in. The
+    /// flow's ceiling is this times the peers admission lets in.
     pub max_queued: usize,
 }
 

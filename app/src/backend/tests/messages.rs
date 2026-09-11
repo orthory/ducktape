@@ -32,12 +32,25 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         channel(&dm_channel_id(a.clone(), b.clone())),
         channel("general"),
     ];
-    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), a.clone(), Vec::new());
+    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].channel.id, "general");
+    // AND AN EMPTY `channel_id` CLAIMS NOTHING. A peer row whose load resolved
+    // no account number of ours carries none, and it must not swallow every
+    // channel whose id happens to be empty — but the DM does NOT fall back
+    // into the room list either: a derived two-party id is never a CHANNELS
+    // row, whoever's it is (`another_members_dm_is_not_a_channel_of_mine`).
+    let unresolved = vec![DmPeer {
+        channel_id: String::new(),
+        ..peers[0].clone()
+    }];
+    let without_the_directory = chat_sidebar_rooms(listing, unresolved, Vec::new());
     assert_eq!(
-        chat_sidebar_rooms(listing, peers, String::new(), Vec::new()).len(),
-        2
+        without_the_directory
+            .iter()
+            .map(|row| row.channel.id.as_str())
+            .collect::<Vec<_>>(),
+        ["general"]
     );
 
     // the id the app mints is the id chat will accept from a USER author:
@@ -59,6 +72,7 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
         key: "beef".into(),
         label: "b".into(),
     }];
+    let names = seed_names(NameDirectory::empty());
     assert_eq!(post_gate(false, false, Vec::new(), "cafe".into()), "");
     assert_eq!(
         post_gate(true, false, members.clone(), "beef".into()),
@@ -68,7 +82,47 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
         post_gate(false, true, members.clone(), "cafe".into()),
         "members_only"
     );
-    assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    assert_eq!(post_gate(false, true, members.clone(), "beef".into()), "");
+
+    // A seat is the ACCOUNT's: the viewer's passkey holds the seat, and her
+    // device key is bound to the same account, so the device may post too.
+    names.seat(NameDirectory::new(BTreeMap::from([
+        (
+            "beef".to_string(),
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
+        ),
+        (
+            "b00f".to_string(),
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
+        ),
+        (
+            "cafe".to_string(),
+            BoundAccount {
+                number: 8,
+                name: "c".into(),
+            },
+        ),
+    ])));
+    assert_eq!(
+        post_gate(false, true, members.clone(), "b00f".into()),
+        "members_only",
+        "a sibling key does not inherit a historical key seat"
+    );
+    let members = vec![ChatMember {
+        key: "acct:7".into(),
+        label: "b".into(),
+    }];
+    assert_eq!(post_gate(false, true, members.clone(), "b00f".into()), "");
+    assert_eq!(
+        post_gate(false, true, members, "cafe".into()),
+        "members_only"
+    );
 }
 
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
@@ -96,21 +150,27 @@ fn a_search_hit_names_its_room_exactly_once() {
         "the room comes first, then the sequence"
     );
 
-    const SEARCH: &str = include_str!("../search.rs");
-    let message_arm = SEARCH
+    // The Explorer reads the same index row in its own crate, and composes
+    // that meta exactly ONCE — the room, then the sequence. Composing the
+    // channel on top of a meta that already carried it is what printed it
+    // twice.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let message_arm = EXPLORER
         .split("kind: \"message\".into(),")
         .nth(1)
         .expect("the message hit arm")
-        .split("});")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        message_arm.contains("meta: hit.meta,"),
-        "the Explorer carries the meta through"
+        message_arm.contains(r#""{} · #{}""#),
+        "the room comes first, then the sequence"
     );
-    assert!(
-        !message_arm.contains("hit.channel_id, hit.meta"),
-        "composing the channel again is what printed it twice"
+    assert_eq!(
+        message_arm.matches("channel_id").count(),
+        2,
+        "the channel names the row's meta and its target, and nothing else: \
+         {message_arm}"
     );
 }
 
@@ -143,7 +203,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 
 /// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
 /// wire author through `author_display`, so an Explorer hit arrives holding
-/// "you", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
+/// "alice", "user 48cedb0d…" or "quackbot". The Explorer then ran `author_name`
 /// over that a SECOND time; none of those strings carries a `user:`/`agent:`
 /// prefix to split, so every one fell through to the `_` arm and every message
 /// hit in workspace search was attributed to "system".
@@ -153,7 +213,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 #[test]
 fn a_search_hits_author_is_not_reformatted_into_system() {
     // What `search_chat` hands the Explorer, for each kind of author.
-    for displayed in ["you", "user 48cedb0d…", "@quackbot", "chat"] {
+    for displayed in ["alice", "user 48cedb0d…", "quackbot", "chat"] {
         assert_eq!(
             author_name(displayed),
             "system",
@@ -163,27 +223,52 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
     }
 
     // And the first pass is the one that is correct.
-    assert_eq!(author_display("user:48cedb0d131f", None), "user 48cedb0d…");
-    assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
+    assert_eq!(
+        author_display("user:48cedb0d131f", &NameDirectory::default()),
+        "user 48cedb0d…"
+    );
+    let program = identity::AccountView {
+        number: 7,
+        name: "quackbot".into(),
+        control: identity::Control::Program {
+            controller: 1,
+            executor: "agent".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        },
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    };
+    assert_eq!(
+        author_display("acct:7", &NameDirectory::from_accounts(&[program])),
+        "quackbot"
+    );
 
-    // The call site itself, pinned: the message arm must carry the author
-    // through, never re-format it. Without this the assertions above hold
-    // while the Explorer goes on printing "system".
-    const SEARCH: &str = include_str!("../search.rs");
-    let message_arm = SEARCH
+    // ONE FORMATTING PASS, AT THE SOURCE. `author_display` above is the app's
+    // pass over a RENDERED handle; running it a second time over its own
+    // output found no `user:`/`agent:` prefix to split and fell through to
+    // "system", which is how every Explorer message hit lost its author. The
+    // Explorer reads the index row in its own crate now, so its `author` is
+    // the raw handle and `author_name` is that single pass — pinned here so a
+    // second one cannot come back.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let message_arm = EXPLORER
         .split("kind: \"message\".into(),")
         .nth(1)
         .expect("the message hit arm")
-        .split("});")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        message_arm.contains("title: hit.author,"),
-        "the message hit carries the display name it was handed"
+        message_arm.contains("title: author_name(hit[\"author\"]"),
+        "the message hit names its author off the index row's own handle"
     );
-    assert!(
-        !message_arm.contains("author_name("),
-        "re-formatting it is what produced `system`"
+    assert_eq!(
+        message_arm.matches("author_name(").count(),
+        1,
+        "formatting the author twice is what produced `system`: {message_arm}"
     );
 }
 
@@ -235,6 +320,7 @@ fn concurrent_optimistic_messages_settle_independently() {
         seq,
         author: "You".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: paragraph_blocks(body),
         pending: false,
@@ -303,6 +389,7 @@ fn message_groups_collapse_consecutive_authors() {
         seq,
         author: author.into(),
         meta: format!("#{seq}"),
+        edit_body: "body".into(),
         body: "body".into(),
         blocks: paragraph_blocks("body"),
         pending: false,
@@ -341,6 +428,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         seq,
         author: "alice".into(),
         meta: format!("#{seq}"),
+        edit_body: "body".into(),
         body: "body".into(),
         blocks: paragraph_blocks("body"),
         pending: false,
@@ -357,9 +445,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         reactions: Vec::new(),
         render_rev: 0,
     };
-    // oldest loaded root is seq 3 -> older history exists.
     let loaded = vec![msg(3), msg(4), msg(5)];
-    assert!(history_has_older(loaded.clone()));
     assert_eq!(oldest_message_seq(loaded.clone()), 3);
     // prepend an older page whose last item (seq 3) duplicates the current head.
     let merged = prepend_history(loaded, vec![msg(1), msg(2), msg(3)]);
@@ -367,17 +453,17 @@ fn history_pagination_prepends_older_and_flags_more() {
         merged.iter().map(|message| message.seq).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5]
     );
-    // now the oldest loaded root is seq 1 -> no more history to page.
-    assert!(!history_has_older(merged));
+    assert_eq!(oldest_message_seq(merged), 1);
 }
 
 /// The composer's grammar loop, closed over a real node: the SAME parser
-/// the rich composer previews (`parse_message_with_members`) builds the
+/// the rich composer previews (`parse_message`) builds the
 /// committed blocks, and the spans read back off the node still carry the
 /// marks. If the preview grammar and the renderer grammar ever drift, one
 /// of the two ends of this test moves.
 #[tokio::test(flavor = "current_thread")]
 async fn composer_markdown_round_trips_rich_spans() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -412,9 +498,8 @@ async fn composer_markdown_round_trips_rich_spans() {
         chat::encode_msg(&ChatMsg::PostMessage {
             channel_id: "general".into(),
             message_id: "styled-1".into(),
-            blocks: parse_message_with_members("say **hi** to _all_", &[]),
+            blocks: ::chat::client::parse_message("say **hi** to _all_"),
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -436,6 +521,7 @@ async fn composer_markdown_round_trips_rich_spans() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn timeline_pages_past_thread_only_traffic() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -472,7 +558,6 @@ async fn timeline_pages_past_thread_only_traffic() {
             message_id: "root".into(),
             blocks: vec![chat::Block::paragraph("root stays visible")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -487,7 +572,6 @@ async fn timeline_pages_past_thread_only_traffic() {
                 message_id: format!("reply-{index}"),
                 blocks: vec![chat::Block::paragraph(format!("reply {index}"))],
                 thread: Some(1),
-                as_agent: None,
             }),
         )
         .await;
@@ -511,13 +595,32 @@ async fn timeline_pages_past_thread_only_traffic() {
     assert_eq!(last.messages[0].body, "reply 256");
     assert_eq!(last.next_reply_seq, 0);
     assert!(!last.has_more);
-    let sparse = load_thread(origin, "general".into(), 1, 258, 10)
+    let early = load_chat_hit(origin.clone(), "general".into(), 3, 3, 10)
         .await
         .unwrap();
-    assert_eq!(sparse.target_seq, 258);
-    assert_eq!(sparse.next_reply_seq, 0);
-    assert_eq!(sparse.messages.len(), 2);
-    assert_eq!(sparse.messages[1].body, "reply 256");
+    assert_eq!(early.thread_target_seq, 3);
+    assert_eq!(early.thread_messages.len(), 257);
+    assert_eq!(early.thread_messages[1].body, "reply 0");
+    assert_eq!(early.thread_messages[256].body, "reply 255");
+    assert!(early.thread_has_more);
+    assert_eq!(
+        thread_page_cursor(&early.thread_messages, early.thread_has_more),
+        257
+    );
+    let boundary = load_thread(origin.clone(), "general".into(), 1, 257, 11)
+        .await
+        .unwrap();
+    assert_eq!(boundary.messages.len(), 258);
+    assert_eq!(boundary.messages[257].body, "reply 256");
+    assert!(!boundary.has_more);
+    let late = load_thread(origin, "general".into(), 1, 258, 12)
+        .await
+        .unwrap();
+    assert_eq!(late.target_seq, 258);
+    assert_eq!(late.next_reply_seq, 0);
+    assert_eq!(late.messages.len(), 258);
+    assert_eq!(late.messages[1].body, "reply 0");
+    assert_eq!(late.messages[257].body, "reply 256");
     sim.shutdown();
 }
 
@@ -592,6 +695,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         seq: if pending { -1 } else { seq },
         author: "u".into(),
         meta: String::new(),
+        edit_body: String::new(),
         body: String::new(),
         blocks: Vec::new(),
         pending,
@@ -632,7 +736,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
 
     // Every prepared row carries its own unread scalar. Both sections resolve
     // it once when source state moves, never from a list-taking view call.
-    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), String::new(), reads.clone());
+    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), reads.clone());
     assert!(!rooms[0].unread);
     assert!(rooms[1].unread);
     let dm = DmPeer {
@@ -644,29 +748,13 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     };
     let dms = chat_sidebar_dms(channels.clone(), vec![dm], reads.clone());
     assert!(dms[0].unread);
-    assert!(
-        !chat_sidebar_rooms(
-            vec![channel("random", 30)],
-            Vec::new(),
-            String::new(),
-            reads.clone(),
-        )[0]
-        .unread
-    );
+    assert!(!chat_sidebar_rooms(vec![channel("random", 30)], Vec::new(), reads.clone())[0].unread);
 
     // initial_channel_reads: seed absent channels to head, preserve existing.
     let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-    assert!(
-        !chat_sidebar_rooms(
-            vec![channel("general", 100)],
-            Vec::new(),
-            String::new(),
-            seeded,
-        )[0]
-        .unread
-    );
+    assert!(!chat_sidebar_rooms(vec![channel("general", 100)], Vec::new(), seeded)[0].unread);
 
     // first_unread_seq: first message past the boundary; pending (seq -1)
     // never anchors it; 0 when caught up.
@@ -779,6 +867,18 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
         load_channel_facts.contains("ChatViewQuery::Channel {"),
         "the channel row reads the index view arm"
     );
+    // AND NEITHER DOES THE DIRECTORY IT NAMES THE ROSTER WITH. The filling
+    // read (`read_accounts`, behind `refresh_names`) is an identity
+    // `/v1/query`, so reaching for it here would put the very round trip this
+    // test bans back inside the fold — one indirection further away, where the
+    // `.query(` sweep below cannot see it. The reader handed in carries the
+    // directory as last read.
+    for body in [load_channel_row, load_channel_facts] {
+        assert!(
+            !body.contains("read_accounts(") && !body.contains("refresh_names("),
+            "the fold's channel read takes the directory it already has"
+        );
+    }
     for body in [load_channel_row, load_channel_facts] {
         assert!(
             !body.contains(".query("),
@@ -851,4 +951,252 @@ fn timeline_pages_are_one_root_view_call_without_a_message_walk() {
     assert!(!LOAD.contains("walk_roots_back"));
     assert!(!LOAD.contains("ChatViewQuery::MessagesLatest"));
     assert!(!LOAD.contains("ChatViewQuery::MessagesRange"));
+}
+
+/// A NAME REGISTERED ON A NETWORK IS THE NAME ITS MESSAGES CARRY.
+///
+/// A chat row stamps `user:{hex}` and nothing else — a key is what signed the
+/// frame — while the name that key registered lives in the identity module. The
+/// two were never joined: a freshly joined resident read a DM whose every
+/// message was attributed to `user bf431c5d…`, with the same account rendered
+/// "orthory" in the DIRECT list one pane to the left.
+///
+/// The directory is built from the identity roster `read_accounts` pages,
+/// and EVERY key of an account answers to that account's name — a person with a
+/// laptop and a phone signs with two keys and is one name in the timeline.
+#[test]
+fn every_key_of_an_account_renders_as_that_accounts_name() {
+    let key = |byte: u8| identity::KeyView {
+        scheme: identity::KeyScheme::Ed25519,
+        pubkey: vec![byte; 32],
+        label: None,
+        added_at: 0,
+    };
+    let account = |number: u64, name: &str, keys: Vec<identity::KeyView>| identity::AccountView {
+        number,
+        name: name.into(),
+        control: identity::Control::Keys,
+        keys,
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    };
+    let names = directory_of(&[
+        account(1, "eddy", vec![key(0x56)]),
+        // two devices, one person
+        account(2, "orthory", vec![key(0x03), key(0xbf)]),
+    ]);
+
+    let handle = |byte: u8| format!("user:{}", hex_encode(&[byte; 32]));
+    assert_eq!(author_display(&handle(0xbf), &names), "orthory");
+    assert_eq!(
+        author_display(&handle(0x03), &names),
+        "orthory",
+        "the second device is the same person, not a second one"
+    );
+    assert_eq!(author_display(&handle(0x56), &names), "eddy");
+    // A key on no account is still honestly its short hex; nothing is invented.
+    assert_eq!(
+        author_display(&handle(0x11), &names),
+        format!("user {}", short_label(&hex_encode(&[0x11u8; 32])))
+    );
+    // And a cold directory (a resident whose identity module cannot answer yet)
+    // degrades to exactly that, for everyone.
+    assert!(directory_of(&[]).is_empty());
+}
+
+// ============================================================================
+// THE COPY RANGE. Every decision the two handler bodies apply is here, so this
+// is where the feature is actually pinned: which rows a range covers, what
+// comes out of it, and where a press leaves it.
+// ============================================================================
+
+fn message(seq: i64, author: &str, body: &str) -> ChatMessage {
+    ChatMessage {
+        id: format!("m{seq}"),
+        view_key: seq,
+        seq,
+        author: author.into(),
+        meta: String::new(),
+        edit_body: body.into(),
+        body: body.into(),
+        blocks: Vec::new(),
+        pending: false,
+        rev: 0,
+        edited: false,
+        deleted: false,
+        reply_count: 0,
+        thread_seq: 0,
+        show_author: true,
+        initial: author[..1].to_uppercase(),
+        avatar_kind: "person".into(),
+        height: 0,
+        time: 0,
+        reactions: Vec::new(),
+        render_rev: 0,
+    }
+}
+
+fn room() -> Vec<ChatMessage> {
+    vec![
+        message(1, "ana", "first"),
+        message(2, "bo", "second"),
+        message(3, "ana", "third"),
+        message(4, "bo", "fourth"),
+    ]
+}
+
+/// A RANGE IS ITS TWO ENDS, IN EITHER ORDER. Dragging up a channel is as
+/// ordinary as dragging down it, and the reader's anchor is as often the newest
+/// row as the oldest — so `anchor` is not required to be the smaller seq.
+#[test]
+fn a_copy_range_covers_its_ends_whichever_way_round_they_are() {
+    let rows = room();
+    assert_eq!(copy_range_count(&rows, 2, 3), 2, "downwards");
+    assert_eq!(copy_range_count(&rows, 3, 2), 2, "and upwards");
+    assert_eq!(copy_range_count(&rows, 2, 2), 1, "one message is a range");
+    assert_eq!(copy_range_count(&rows, 0, 0), 0, "and none is not");
+    // An end that is no longer on screen is not an end. A range whose anchor
+    // was deleted or paged out covers nothing rather than silently widening to
+    // whatever is left.
+    assert_eq!(copy_range_count(&rows, 9, 9), 0, "an end nobody holds");
+}
+
+/// WHAT COMES OUT IS WHAT YOU COULD READ. Oldest first regardless of which end
+/// was clicked, one entry per message, blank-line separated so a multi-line
+/// body survives the paste.
+#[test]
+fn the_copied_text_reads_in_timeline_order() {
+    let rows = room();
+    assert_eq!(
+        copy_range_text(&rows, 3, 1),
+        "ana: first\n\nbo: second\n\nana: third",
+        "clicked bottom-up, pasted top-down"
+    );
+    assert_eq!(copy_range_text(&rows, 2, 2), "bo: second");
+}
+
+/// A TOMBSTONE IS NOT A LINE. A deleted row inside the range contributes
+/// nothing — there is no body to lift, and a placeholder would be a line the
+/// reader never wrote. The count follows the text, so the toast cannot claim
+/// more than reached the clipboard.
+#[test]
+fn a_deleted_row_inside_the_range_contributes_nothing() {
+    let mut rows = room();
+    rows[1].deleted = true;
+    rows[1].body = String::new();
+    assert_eq!(copy_range_text(&rows, 1, 3), "ana: first\n\nana: third");
+    assert_eq!(copy_range_toast(&rows, 1, 1), "Message copied");
+}
+
+/// A SHIFT-PRESS STARTS A RANGE OR MOVES ITS FAR END. The handler refuses a
+/// plain press before this runs, so every press here is a ⇧-press.
+#[test]
+fn a_shift_press_starts_a_range_and_the_next_one_widens_it() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let started = copy_range_after_press(0, Nowhere, 2, Timeline);
+    assert_eq!(
+        (started.anchor, started.head),
+        (2, 2),
+        "the first ⇧-press is a range of one"
+    );
+
+    let widened = copy_range_after_press(2, Timeline, 5, Timeline);
+    assert_eq!(
+        (widened.anchor, widened.head),
+        (2, 5),
+        "the next ⇧-press moves the far end"
+    );
+
+    // a ⇧-press in the other list starts over there: a range never spans both
+    let elsewhere = copy_range_after_press(2, Timeline, 7, Thread);
+    assert_eq!(
+        (elsewhere.anchor, elsewhere.head, elsewhere.surface),
+        (7, 7, Thread)
+    );
+
+    let nowhere = copy_range_after_press(2, Timeline, 0, Timeline);
+    assert_eq!(
+        (nowhere.anchor, nowhere.head, nowhere.surface),
+        (0, 0, Nowhere)
+    );
+}
+
+/// A ROW LIGHTS UP ONLY FOR A RANGE DRAWN WHERE IT LIVES. A reply and a
+/// timeline row draw their seqs from the SAME channel sequence, so without the
+/// surface a reply would tint inside a range whose copy never included it.
+#[test]
+fn the_surface_keeps_a_reply_out_of_the_streams_range() {
+    use crate::CopySurface::{Thread, Timeline};
+    assert!(seq_in_copy_range(3, 2, 5, Timeline, Timeline));
+    assert!(
+        !seq_in_copy_range(3, 2, 5, Timeline, Thread),
+        "a reply in the rail"
+    );
+    assert!(
+        !seq_in_copy_range(6, 2, 5, Timeline, Timeline),
+        "past the end"
+    );
+    assert!(
+        !seq_in_copy_range(3, 0, 0, Timeline, Timeline),
+        "no range at all"
+    );
+}
+
+/// THE PLATE IS ONE ANSWER, AND IT IS ORDERED. The row you are ON outranks a
+/// row that merely sits in a range; a deleted row wears neither, because a
+/// tint would say there is something there to lift.
+#[test]
+fn the_row_plate_ranks_selection_over_range_and_skips_a_tombstone() {
+    use crate::RowPlate::{Plain, Ranged, Selected};
+    assert_eq!(message_plate(false, false, false), Plain);
+    assert_eq!(message_plate(false, false, true), Ranged);
+    assert_eq!(message_plate(false, true, true), Selected);
+    assert_eq!(
+        message_plate(true, true, true),
+        Plain,
+        "a tombstone tints for nothing"
+    );
+}
+
+/// THE CHORD LIFTS THE ROWS THE BAR COUNTED. The surface picks the list, so
+/// ⌘C in a rail-drawn range never reaches into the stream behind it.
+#[test]
+fn the_surface_picks_the_list_the_copy_reads() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let timeline = room();
+    let thread = vec![message(7, "cy", "a reply")];
+    assert_eq!(copy_range_rows(&timeline, &thread, Timeline).len(), 4);
+    assert_eq!(copy_range_rows(&timeline, &thread, Thread).len(), 1);
+    assert!(copy_range_rows(&timeline, &thread, Nowhere).is_empty());
+}
+
+/// A PENDING ROW IS NOT AN END OF ANYTHING. A message still in flight carries a
+/// negative seq, and a range with one at either end covers no rows: the bar
+/// holding the only Clear button would vanish while the ⌘C route, armed on the
+/// anchor, stayed armed with nothing able to disarm it. Pressing one ends the
+/// range instead of opening an unclearable one.
+#[test]
+fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
+    use crate::CopySurface::{Nowhere, Timeline};
+    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline);
+    assert_eq!(
+        (cleared.anchor, cleared.head),
+        (0, 0),
+        "a pending row cannot begin a range"
+    );
+    assert_eq!(cleared.surface, Nowhere);
+
+    let dropped = copy_range_after_press(2, Timeline, -3, Timeline);
+    assert_eq!(
+        (dropped.anchor, dropped.head),
+        (0, 0),
+        "and ⇧-clicking one drops the range it would otherwise have widened"
+    );
+    assert_eq!(dropped.surface, Nowhere);
+    assert_eq!(
+        copy_range_count(&room(), dropped.anchor, dropped.head),
+        0,
+        "which is the count the bar was already showing"
+    );
 }

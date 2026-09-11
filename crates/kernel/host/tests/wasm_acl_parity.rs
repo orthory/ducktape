@@ -39,7 +39,12 @@ fn wasm_acl(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 
 async fn native_host(context: &deterministic::Context) -> Host {
     let store = acl_store(context, "native_acl").await;
-    Host::genesis(vec![Box::new(Acl::new("acl", Box::new(store)))]).expect("genesis")
+    Host::genesis(vec![Box::new(Acl::new(
+        "acl",
+        Box::new(store),
+        "governance",
+    ))])
+    .expect("genesis")
 }
 
 async fn wasm_host_(context: &deterministic::Context) -> Host {

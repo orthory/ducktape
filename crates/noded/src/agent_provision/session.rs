@@ -1,5 +1,5 @@
-//! The per-run agent session signer. One fresh ed25519 keypair is bound to the
-//! run in consensus, but its private half stays in this host process.
+//! The agent session signer. Each execution attempt binds a fresh ed25519
+//! public key in consensus; its private half stays in this host process.
 //!
 //! why a key at all: an agent's mid-run writes have to be attributable, and the
 //! frameless `/v1/submit` lane cannot carry attribution — its `origin` is a
@@ -12,25 +12,25 @@
 //! the BIND is self-authorizing: `RunsMsg::OpenAgentSession` is submitted through
 //! the node's ORDINARY submit lane, whose op is framed with the node's own key —
 //! and that node is the run's committed lease-holder, because it is the node
-//! executing the run. `runs` checks exactly that. no owner is at a keyboard to
-//! sign anything (an issue-mention run has nobody), and none is needed: the
-//! owner's grant is already committed as `AgentRecord { owner, allowed_actions,
-//! caps }`. the session adds proof of ORIGIN, not authority.
+//! executing the run. `runs` checks the holder and attempt against the live
+//! saga; retries fence old keys and retain the run's action counter. The
+//! model's record is already committed; opening the session requires no
+//! additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
-//! accepts `AgentAction` and `DelegateRun` for exactly this run, signs them, and
-//! dies with the provisioned workspace. A shell can therefore exercise the
-//! committed agent grant but can never recover a general-purpose frame signer.
+//! accepts `RunsMsg::AgentAction` for exactly this run, signs it, waits for the
+//! committed receipt, and dies with the provisioned workspace. A shell can
+//! therefore act as the run but can never recover a general-purpose frame
+//! signer.
 //!
-//! a failed open is NOT a failed run (W-degrade): the run proceeds with no
-//! session vars set, which is precisely the pre-session behaviour — a read-only
-//! tool plane. loudly, in the `[oracle]` voice, so a node that is somehow not the
-//! assignee is visible rather than mysterious.
+//! A refused bind fails provisioning. An agent run never starts with a
+//! silently disabled write plane.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use compute_service::WorkspaceSpec;
 use futures::channel::oneshot;
+use futures::{SinkExt as _, StreamExt as _};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -45,16 +45,17 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = agent::MAX_ACTIONS_BYTES + agent::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize = runs::MAX_ACTIONS_BYTES + runs::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 
 /// An opened, host-owned signer and its narrow child-facing endpoint.
 pub(super) struct RunSession {
-    pub(super) run_id: String,
     pub(super) action_url: String,
     pub(super) action_token: String,
+    #[cfg(test)]
+    local_addr: std::net::SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -82,72 +83,43 @@ struct ActionRequest {
     message: runs::RunsMsg,
 }
 
-/// mint a session keypair for `spec` and bind its public half to the run.
-///
-/// `None` — no session, no env vars — when the run has no agent (a workspace
-/// nobody acts for), when the envelope named no consensus run id (a pre-field
-/// composer: there is no run to bind TO), or when the bind did not commit.
-/// never an `Err`: a session is an ADDITIVE capability, and refusing to
-/// provision a workspace because the tool plane could not be opened would fail
-/// runs that used to work.
-pub(super) async fn open(node: &NodeLink, spec: &WorkspaceSpec) -> Option<RunSession> {
-    let agent = spec.agent_id.as_ref()?;
-    // the CONSENSUS id or nothing. `spec.run_id` is `{saga_id}:{attempt}` — a
-    // host-local dir key that names no run in `runs`, so binding on it would
-    // open a session against a run that does not exist. an absent id is a
-    // pre-field envelope: degrade to the read-only plane, loudly, exactly as a
-    // refused bind does.
-    let Some(run_id) = spec.consensus_run_id.clone() else {
-        tracing::warn!(
-            target: "ducktape::agent",
-            event = "agent_session_unavailable",
-            run_id = spec.run_id.as_str(),
-            agent_id = agent.as_str(),
-            reason = "missing_consensus_run_id",
-            "agent session unavailable"
-        );
-        return None;
+/// Generate a host-private key and bind its public half to this execution.
+/// An attributed run must open its session before the provider starts.
+pub(super) async fn open(
+    node: &NodeLink,
+    spec: &WorkspaceSpec,
+) -> Result<Option<RunSession>, String> {
+    let Some(agent) = &spec.agent else {
+        return Ok(None);
     };
-    // mint from OS randomness, with the same ed25519 types `node::encode_frame`
-    // signs with — no second crypto stack, no hand-rolled key. every 32-byte
-    // string is a valid seed (the scheme clamps), so the decode cannot fail;
-    // this mirrors the node's own `load_or_generate_identity`.
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
     let payload = runs::encode_msg(&runs::RunsMsg::OpenAgentSession {
-        run_id: run_id.clone(),
+        run_id: agent.run_id.clone(),
+        attempt: agent.attempt,
         session_key: key.public_key().as_ref().to_vec(),
     });
-    match submit(node, payload).await {
-        Ok(()) => match start_action_server(node.clone(), key, run_id.clone()).await {
-            Ok(session) => Some(session),
-            Err(detail) => {
-                tracing::warn!(
-                    target: "ducktape::agent",
-                    event = "agent_session_unavailable",
-                    run_id = run_id.as_str(),
-                    agent_id = agent.as_str(),
-                    reason = "signer_endpoint_failed",
-                    detail = detail.as_str(),
-                    "agent session unavailable"
-                );
-                None
-            }
-        },
-        Err(detail) => {
+    submit(node, payload).await.map_err(|error| {
+        tracing::warn!(
+            target: "ducktape::agent", event = "agent_session_unavailable",
+            run_id = agent.run_id.as_str(), agent_id = agent.agent_id.as_str(),
+            attempt = agent.attempt, reason = "bind_rejected", detail = %error,
+            "agent session unavailable"
+        );
+        format!("open agent session: {error}")
+    })?;
+    start_action_server(node.clone(), key, agent.run_id.clone())
+        .await
+        .inspect_err(|error| {
             tracing::warn!(
-                target: "ducktape::agent",
-                event = "agent_session_unavailable",
-                run_id = run_id.as_str(),
-                agent_id = agent.as_str(),
-                reason = "bind_rejected",
-                detail = detail.as_str(),
+                target: "ducktape::agent", event = "agent_session_unavailable",
+                run_id = agent.run_id.as_str(), agent_id = agent.agent_id.as_str(),
+                attempt = agent.attempt, reason = "signer_endpoint_failed", detail = %error,
                 "agent session unavailable"
             );
-            None
-        }
-    }
+        })
+        .map(Some)
 }
 
 async fn start_action_server(
@@ -155,11 +127,11 @@ async fn start_action_server(
     signer: ed25519::PrivateKey,
     run_id: String,
 ) -> Result<RunSession, String> {
-    // Bind the host interfaces so a child in a private netns can reach the
-    // same run-scoped endpoint through its gateway. Direct children still
-    // receive a 127.0.0.1 URL; the 256-bit token and closed message/run scope
-    // are the boundary, not an ambient network listener.
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    // A child reaches this signer over a vsock tunnel that terminates on a
+    // socket the host process owns, so it dials `127.0.0.1:<port>` exactly
+    // as a local child would — the signer never has to bind past loopback
+    // to be reachable.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("bind scoped action signer: {error}"))?;
     let address = listener
@@ -188,9 +160,10 @@ async fn start_action_server(
             .await;
     });
     Ok(RunSession {
-        run_id,
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
+        #[cfg(test)]
+        local_addr: address,
         shutdown: Some(shutdown),
         task,
     })
@@ -201,17 +174,18 @@ async fn run_action(
     headers: HeaderMap,
     Json(request): Json<ActionRequest>,
 ) -> Response<Body> {
+    // The listener is loopback-only, but the token is still the boundary
+    // between every local process: compare it in constant time like every
+    // other secret in this crate, never with a short-circuiting `==`.
     let authorized = headers
         .get(ACTION_HEADER)
         .and_then(|value| value.to_str().ok())
-        == Some(state.token.as_str());
+        .is_some_and(|presented| crate::services::token_matches(presented, &state.token));
     if !authorized {
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
     let names_bound_run = match &request.message {
-        runs::RunsMsg::AgentAction { run_id, .. } | runs::RunsMsg::DelegateRun { run_id, .. } => {
-            run_id == &state.run_id
-        }
+        runs::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
         _ => false,
     };
     if !names_bound_run {
@@ -220,20 +194,161 @@ async fn run_action(
             "message is outside this run's action scope",
         );
     }
-    let msg = sdk::Msg {
-        target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&request.message),
-    };
-    // The frame lane is ordered by (origin, seq). Axum may serve requests
-    // concurrently even though normal MCP clients are serial, so keep frames
-    // from overtaking each other at the actor boundary.
-    let mut next_seq = state.seq.lock().await;
-    let frame = node::encode_frame(&state.signer, *next_seq, &msg);
-    *next_seq += 1;
-    match state.node.submit_frame(frame).await {
-        Ok(()) => action_response(StatusCode::OK, "ok"),
+    match submit_action(&state, request.message).await {
+        Ok(receipt) => action_json(StatusCode::OK, receipt),
         Err(error) => action_response(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+type ActionEvents =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The subscribe reply is a barrier: the node has registered its block receiver
+/// before this returns. Empty topics still receive the committed tip on every block.
+async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
+    let base = node.base();
+    let ws_base = match base.strip_prefix("http://") {
+        Some(rest) => format!("ws://{rest}"),
+        None => match base.strip_prefix("https://") {
+            Some(rest) => format!("wss://{rest}"),
+            None => return Err("action node URL has no HTTP scheme".into()),
+        },
+    };
+    let (mut events, _) = tokio_tungstenite::connect_async(format!("{ws_base}/v1/ws"))
+        .await
+        .map_err(|error| format!("connect action receipt events: {error}"))?;
+    let subscription =
+        serde_json::json!({"op": "subscribe", "topics": [], "resume": {}}).to_string();
+    events
+        .send(tokio_tungstenite::tungstenite::Message::Text(subscription))
+        .await
+        .map_err(|error| format!("subscribe action receipt events: {error}"))?;
+    while let Some(frame) = events.next().await {
+        let frame = frame.map_err(|error| format!("action receipt event stream: {error}"))?;
+        let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("decode action receipt event: {error}"))?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("subscribed") => return Ok(events),
+            Some("error") => return Err(format!("action receipt subscription refused: {value}")),
+            _ => {}
+        }
+    }
+    Err("action receipt event stream closed before subscription".into())
+}
+
+/// The committed outcome of one proposal: `None` while the program has not
+/// finished it, the receipt when the target applied it, its reason when it
+/// was refused anywhere along the way.
+async fn action_result(
+    node: &NodeLink,
+    request_id: &str,
+) -> Result<Option<Result<runs::ActionRequestView, String>>, String> {
+    let bytes = node
+        .query(
+            RUNS_MODULE,
+            &runs::encode_query(&runs::RunsQuery::ActionRequest {
+                request_id: request_id.into(),
+            }),
+        )
+        .await?;
+    let runs::RunsReply::ActionRequest(request) = runs::decode_reply(&bytes)? else {
+        return Err("unexpected action request reply".into());
+    };
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    match &request.status {
+        runs::ActionStatus::AwaitingProgram | runs::ActionStatus::Claimed { .. } => Ok(None),
+        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+        runs::ActionStatus::Completed { outcome, .. } => match outcome {
+            dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),
+            dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason.clone()))),
+            dispatch::CallOutcomeSummary::Refused(reason) => {
+                Ok(Some(Err(format!("program action refused: {reason:?}"))))
+            }
+            dispatch::CallOutcomeSummary::Unrepresentable { .. } => Ok(Some(Err(
+                "program action outcome could not be represented".into(),
+            ))),
+        },
+    }
+}
+
+async fn await_action_result(
+    node: &NodeLink,
+    request_id: &str,
+    mut events: ActionEvents,
+) -> Result<runs::ActionRequestView, String> {
+    if let Some(result) = action_result(node, request_id).await? {
+        return result;
+    }
+    let mut observed_height = None;
+    while let Some(frame) = events.next().await {
+        let frame = frame.map_err(|error| format!("action receipt event stream: {error}"))?;
+        let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("decode action receipt event: {error}"))?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("heartbeat") => {}
+            Some("error") => return Err(format!("action receipt stream refused: {value}")),
+            _ => continue,
+        }
+        let Some(height) = value.get("height").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if observed_height == Some(height) {
+            continue;
+        }
+        observed_height = Some(height);
+        if let Some(result) = action_result(node, request_id).await? {
+            return result;
+        }
+    }
+    Err("node disconnected before the program action completed".into())
+}
+
+/// Sign and submit one action, then wait for its committed receipt. The
+/// receipt id is derived from the run and the caller's request_id exactly as
+/// runs derives it, so a replayed request_id resolves to the same receipt; the
+/// response names it `receipt_id` beside the receipt itself.
+async fn submit_action(
+    state: &ActionState,
+    message: runs::RunsMsg,
+) -> Result<serde_json::Value, String> {
+    let runs::RunsMsg::AgentAction {
+        run_id, request_id, ..
+    } = &message
+    else {
+        return Err("message is outside the run action scope".into());
+    };
+    let receipt_id = runs::action_request_id(run_id, request_id);
+    // Serialize admission and completion so a later action cannot overtake one
+    // whose actual target write is still pending.
+    let mut next_seq = state.seq.lock().await;
+    let events = action_events(&state.node).await?;
+    let msg = sdk::Msg {
+        target: RUNS_MODULE.into(),
+        payload: runs::encode_msg(&message),
+    };
+    let frame = node::encode_frame(&state.signer, *next_seq, &msg);
+    *next_seq = next_seq
+        .checked_add(1)
+        .ok_or_else(|| "action signer sequence exhausted".to_string())?;
+    state.node.submit_frame(frame).await?;
+    let receipt = await_action_result(&state.node, &receipt_id, events).await?;
+    Ok(serde_json::json!({"receipt_id": receipt_id, "receipt": receipt}))
+}
+
+fn action_json(status: StatusCode, value: serde_json::Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(value.to_string()))
+        .expect("static scoped action response")
 }
 
 fn action_response(status: StatusCode, message: &str) -> Response<Body> {
@@ -255,4 +370,19 @@ async fn submit(node: &NodeLink, payload: Vec<u8>) -> Result<(), String> {
     // a module rejection rides through verbatim — "not the run's assignee" is
     // the one worth reading in a log.
     node.submit(RUNS_MODULE, &payload).await.map(|_height| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn action_server_binds_loopback_only() {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let session =
+            start_action_server(NodeLink::new("http://127.0.0.1:0"), signer, "run-1".into())
+                .await
+                .expect("bind scoped action signer");
+        assert!(session.local_addr.ip().is_loopback());
+    }
 }

@@ -2,9 +2,11 @@ ui_lang::include_app!("src/ui/app.ice");
 
 mod backend;
 mod call;
-mod video;
+mod composer_surface;
 mod editor;
+mod module_view;
 mod pages;
+mod video;
 
 fn main() -> iced::Result {
     install_log();
@@ -12,7 +14,13 @@ fn main() -> iced::Result {
     // sockets and the node it hosts hit that as a bare EMFILE. raised AFTER
     // install_log so the outcome lands in app.log like everything else.
     match node::resource_limits::raise_open_file_limit() {
-        Ok(soft_limit) => tracing::info!(target: "ducktape::app", soft_limit, "open-file limit"),
+        Ok(limit) => tracing::info!(
+            target: "ducktape::app",
+            soft_limit = limit.soft,
+            hard_limit = limit.hard,
+            raised = limit.raised,
+            "open-file limit"
+        ),
         Err(err) => tracing::warn!(
             target: "ducktape::app",
             reason = "open_file_limit_unraised",
@@ -20,6 +28,9 @@ fn main() -> iced::Result {
             "open-file limit left at the inherited default"
         ),
     }
+    // the desktop's own views are there before the window is: a tab's
+    // first draw never finds a load on its way
+    module_view::booted().joined();
     Ducktape::run()
 }
 
@@ -44,9 +55,9 @@ fn install_log() {
     let filter = EnvFilter::builder()
         .parse(format!("info,{env}"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let file = backend::duck_home()
+    let file = backend::app_log_path()
         .ok()
-        .and_then(|home| node::log_file::open_rotating(&home.join("app.log")).ok());
+        .and_then(|path| node::log_file::open_rotating(&path).ok());
     let file_layer = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -68,12 +79,17 @@ fn install_panic_hook() {
             .location()
             .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()))
             .unwrap_or_default();
+        // The location alone names a line inside a library (a container's
+        // unwrap); the backtrace names the widget of ours under it, which
+        // is what a member needs to find without a debugger attached.
+        let backtrace = std::backtrace::Backtrace::force_capture();
         tracing::error!(
             target: "ducktape::app",
             event = "app_panic",
             thread = std::thread::current().name().unwrap_or("?"),
             payload = info.payload_as_str().unwrap_or("non-string panic payload"),
             location,
+            backtrace = %backtrace,
             "panicked at: {info}"
         );
         default(info);

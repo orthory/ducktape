@@ -10,33 +10,32 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use serde::Deserialize;
 
-/// Linux process CPU time across every thread, in nanoseconds.
-#[cfg(target_os = "linux")]
+/// This process's CPU time across every thread, user and system, in
+/// nanoseconds — the kernel's own accounting, asked the POSIX way
+/// (`getrusage`) so the reading is the same call on every host.
 pub fn process_cpu_ns() -> Option<u64> {
-    let mut total = 0u64;
-    let mut found = false;
-    for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path().join("schedstat")) else {
-            continue;
-        };
-        let Some(runtime) = text
-            .split_whitespace()
-            .next()
-            .and_then(|raw| raw.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        total = total.saturating_add(runtime);
-        found = true;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` writes one `rusage` into the pointer it is handed,
+    // and `RUSAGE_SELF` is always a valid subject.
+    let filled = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0;
+    if !filled {
+        return None;
     }
-    found.then_some(total)
+    // SAFETY: the call returned 0, so the struct is filled.
+    let usage = unsafe { usage.assume_init() };
+    timeval_ns(usage.ru_utime)?.checked_add(timeval_ns(usage.ru_stime)?)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn process_cpu_ns() -> Option<u64> {
-    None
+fn timeval_ns(time: libc::timeval) -> Option<u64> {
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let microseconds = u64::try_from(time.tv_usec).ok()?;
+    seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(microseconds.checked_mul(1_000)?)
 }
 
+/// This process's resident set, in bytes. The kernel keeps it where the host
+/// keeps process facts: `/proc` on Linux, the task info call on macOS.
 #[cfg(target_os = "linux")]
 pub fn process_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -50,9 +49,28 @@ pub fn process_rss_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn process_rss_bytes() -> Option<u64> {
-    None
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    let pid = i32::try_from(std::process::id()).ok()?;
+    // SAFETY: `proc_pidinfo` writes at most `size` bytes into the buffer it
+    // is handed, which is exactly one `proc_taskinfo`.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: the call wrote the whole struct.
+    let info = unsafe { info.assume_init() };
+    Some(info.pti_resident_size)
 }
 
 /// The one field of `network.toml` the coordinator cares about: the genesis
@@ -153,4 +171,28 @@ fn hex_bytes(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod readings {
+    use super::*;
+
+    /// Both readings answer on this host, and CPU time only grows: a process
+    /// that just did work has spent more of it than before.
+    #[test]
+    fn the_process_readings_answer_and_cpu_time_only_grows() {
+        let before = process_cpu_ns().expect("cpu time reads on this host");
+        let mut spent = 0u64;
+        for step in 0..2_000_000u64 {
+            spent = spent.wrapping_mul(31).wrapping_add(step);
+        }
+        assert_ne!(spent, 1, "the loop ran");
+        let after = process_cpu_ns().expect("cpu time reads on this host");
+        assert!(
+            after >= before,
+            "cpu time went backwards: {before} → {after}"
+        );
+        let rss = process_rss_bytes().expect("resident size reads on this host");
+        assert!(rss > 0, "a running process is resident");
+    }
 }

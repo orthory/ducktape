@@ -1,11 +1,10 @@
 use super::{
     AgentSession, BTreeMap, DelegationState, DelegationStatus, Digest, Error,
-    MAX_ACTIONS_PER_SESSION, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_PER_RUN,
-    PendingState, RUN_KEY_SEPARATOR, RunAuthority, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot,
-    TurnPolicy, delegation_id_for, dispatch_id_for,
+    MAX_ACTIONS_PER_SESSION, MAX_DELEGATIONS_PER_RUN, MAX_REQUEST_ID_BYTES, PendingState,
+    RUN_KEY_SEPARATOR, RunOrigin, SESSION_KEY_LEN, Sha256, StateRoot, WireSink, delegation_id_for,
+    dispatch_id_for,
 };
 use sdk::codec;
-use serde::de::DeserializeOwned;
 
 // ---- canonical encoding -------------------------------------------------------
 // u64-le counts, sorted keys, every field in declaration order: u64-le length
@@ -19,62 +18,62 @@ fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
     codec::push_opt_str(out, opt.as_deref());
 }
 
-fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
-    match opt {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            codec::push_bytes(
-                out,
-                &serde_json::to_vec(value).expect("committed state serializes"),
-            );
-        }
-    }
+/// the committed sink, as a length-prefixed JSON blob — same shape as the
+/// wire (`WireSink` is `runs`' own contract, not a wider committed-state one),
+/// but always present here (never optional): every pending entry commits a
+/// sink at dispatch, `Chain` included.
+fn put_sink(out: &mut Vec<u8>, sink: &WireSink) {
+    codec::push_bytes(
+        out,
+        &serde_json::to_vec(sink).expect("committed sink serializes"),
+    );
 }
 
-fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
+fn take_sink(cur: &mut codec::Cursor) -> Result<WireSink, String> {
+    serde_json::from_slice(&take_lp_bytes(cur)?)
+        .map_err(|error| format!("snapshot sink failed to decode: {error}"))
+}
+
+fn put_origin(out: &mut Vec<u8>, origin: &RunOrigin) {
     match origin {
-        SagaOrigin::External(key) => {
+        RunOrigin::External(key) => {
             out.push(0);
             codec::push_bytes(out, key);
         }
-        SagaOrigin::Module(module) => {
+        RunOrigin::Module(module) => {
             out.push(1);
             codec::push_bytes(out, module.as_bytes());
         }
-        SagaOrigin::System => out.push(2),
+        RunOrigin::System => out.push(2),
+        RunOrigin::Program(account) => {
+            out.push(3);
+            out.extend_from_slice(&account.to_le_bytes());
+        }
     }
 }
 
 pub(super) fn encode_committed(
-    watches: &BTreeMap<String, TurnPolicy>,
+    action_requests: &crate::receipts::Records,
+    next_action_item: u64,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
     delegations: &BTreeMap<String, DelegationState>,
+    models: &BTreeMap<String, crate::ModelRecord>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
-    out.extend_from_slice(&(watches.len() as u64).to_le_bytes());
-    for (channel, policy) in watches {
-        codec::push_bytes(&mut out, channel.as_bytes());
-        match policy {
-            TurnPolicy::Mention => out.push(0),
-            TurnPolicy::All => out.push(1),
-            TurnPolicy::Assigned(agent_id) => {
-                out.push(2);
-                codec::push_bytes(&mut out, agent_id.as_bytes());
-            }
-            TurnPolicy::RoundRobin => out.push(3),
-        }
-    }
+    codec::push_bytes(&mut out, &sdk::wire::encode(action_requests));
+    out.extend_from_slice(&next_action_item.to_le_bytes());
 
     out.extend_from_slice(&(pending.len() as u64).to_le_bytes());
     for (dispatch_id, p) in pending {
         codec::push_bytes(&mut out, dispatch_id.as_bytes());
+        out.extend_from_slice(&p.account.to_le_bytes());
+        out.extend_from_slice(&p.generation.to_le_bytes());
+        codec::push_bytes(&mut out, &sdk::wire::encode(&p.cause));
         codec::push_bytes(&mut out, p.run_id.as_bytes());
         codec::push_bytes(&mut out, p.agent_id.as_bytes());
         codec::push_bytes(&mut out, p.workspace_agent_id.as_bytes());
-        put_opt_json(&mut out, &p.authority);
         put_opt_string(&mut out, &p.delegation_id);
         codec::push_bytes(&mut out, p.channel_id.as_bytes());
         out.extend_from_slice(&p.anchor_seq.to_le_bytes());
@@ -82,6 +81,7 @@ pub(super) fn encode_committed(
         put_opt_string(&mut out, &p.job_id);
         out.extend_from_slice(&p.job_claim_height.to_le_bytes());
         put_origin(&mut out, &p.requester);
+        put_sink(&mut out, &p.sink);
         out.extend_from_slice(&p.created_at.to_le_bytes());
     }
 
@@ -94,6 +94,8 @@ pub(super) fn encode_committed(
         codec::push_bytes(&mut out, run_id.as_bytes());
         codec::push_bytes(&mut out, s.agent_id.as_bytes());
         codec::push_bytes(&mut out, &s.session_key);
+        codec::push_bytes(&mut out, &s.lease.holder);
+        out.extend_from_slice(&u64::from(s.lease.attempt).to_le_bytes());
         out.extend_from_slice(&s.opened_at.to_le_bytes());
         out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
     }
@@ -107,6 +109,7 @@ pub(super) fn encode_committed(
         );
     }
 
+    codec::push_bytes(&mut out, &sdk::wire::encode(models));
     out
 }
 
@@ -114,12 +117,24 @@ pub(super) fn encode_committed(
 /// and `install()` so the verification a snapshot must pass is definitionally
 /// the same algorithm the live module answers with.
 pub(super) fn committed_root(
-    watches: &BTreeMap<String, TurnPolicy>,
+    action_requests: &crate::receipts::Records,
+    next_action_item: u64,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
     delegations: &BTreeMap<String, DelegationState>,
+    models: &BTreeMap<String, crate::ModelRecord>,
 ) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(watches, pending, sessions, delegations)).into())
+    StateRoot(
+        Sha256::digest(encode_committed(
+            action_requests,
+            next_action_item,
+            pending,
+            sessions,
+            delegations,
+            models,
+        ))
+        .into(),
+    )
 }
 
 // ---- canonical decoding (UNTRUSTED input) ---------------------------------
@@ -163,21 +178,12 @@ fn take_opt_string(cur: &mut codec::Cursor) -> Result<Option<String>, String> {
     }
 }
 
-fn take_opt_json<T: DeserializeOwned>(cur: &mut codec::Cursor) -> Result<Option<T>, String> {
-    match take_byte(cur, "snapshot opt tag")? {
-        0 => Ok(None),
-        1 => serde_json::from_slice(&take_lp_bytes(cur)?)
-            .map(Some)
-            .map_err(|error| format!("snapshot json value failed to decode: {error}")),
-        tag => Err(format!("snapshot has unknown option tag {tag}")),
-    }
-}
-
-fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, String> {
+fn take_origin(cur: &mut codec::Cursor) -> Result<RunOrigin, String> {
     match take_byte(cur, "snapshot origin discriminant")? {
-        0 => Ok(SagaOrigin::External(take_lp_bytes(cur)?)),
-        1 => Ok(SagaOrigin::Module(take_lp_string(cur)?)),
-        2 => Ok(SagaOrigin::System),
+        0 => Ok(RunOrigin::External(take_lp_bytes(cur)?)),
+        1 => Ok(RunOrigin::Module(take_lp_string(cur)?)),
+        2 => Ok(RunOrigin::System),
+        3 => Ok(RunOrigin::Program(take_u64(cur)?)),
         d => Err(format!("snapshot has unknown origin discriminant {d}")),
     }
 }
@@ -229,9 +235,6 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     if contains_run_separator(&p.workspace_agent_id) {
         return Err("snapshot workspace agent id contains reserved unit separator".into());
     }
-    if p.delegation_id.is_some() && p.authority.is_none() {
-        return Err("snapshot delegated run has an edge without scoped authority".into());
-    }
     match &p.job_id {
         Some(job_id) => {
             if contains_run_separator(job_id) {
@@ -269,7 +272,7 @@ fn validate_decoded_delegations(
             return Err("snapshot delegation id does not match its caller request".into());
         }
         if view.request_id.is_empty()
-            || view.request_id.len() > MAX_DELEGATION_REQUEST_ID_BYTES
+            || view.request_id.len() > MAX_REQUEST_ID_BYTES
             || contains_run_separator(&view.request_id)
         {
             return Err("snapshot delegation request id is invalid".into());
@@ -323,6 +326,9 @@ fn validate_decoded_session(
     if s.session_key.len() != SESSION_KEY_LEN {
         return Err("snapshot session key is not a 32-byte ed25519 key".into());
     }
+    if s.lease.holder.is_empty() {
+        return Err("snapshot session names no lease holder".into());
+    }
     if contains_run_separator(&s.agent_id) {
         return Err("snapshot session agent_id contains reserved unit separator".into());
     }
@@ -339,48 +345,37 @@ fn validate_decoded_session(
 }
 
 type Committed = (
-    BTreeMap<String, TurnPolicy>,
+    crate::receipts::Records,
+    u64,
     BTreeMap<String, PendingState>,
     BTreeMap<String, AgentSession>,
     BTreeMap<String, DelegationState>,
+    BTreeMap<String, crate::ModelRecord>,
 );
 
 pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
-    // per-entry minimum sizes: a watch costs its id prefix and a policy
-    // discriminant; a pending entry its three length prefixes, anchor, two
-    // option tags, claim height, origin discriminant, and created_at; a session
-    // its three length prefixes, opened_at, and the action counter.
-    const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
-    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
+    // Each pending entry includes identity generation, causal provenance,
+    // model/workspace coordinates, requester and the committed sink. The
+    // minimum excludes variable bodies, which each decoder checks below.
+    const MIN_PENDING_BYTES: u64 =
+        8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 8;
+    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8 + 8 + 8;
     const MIN_DELEGATION_BYTES: u64 = 8 + 8;
 
     let mut cur = codec::Cursor::new(bytes);
-    let mut watches: BTreeMap<String, TurnPolicy> = BTreeMap::new();
-    let count = take_count(&mut cur, MIN_WATCH_BYTES, "watch")?;
-    for _ in 0..count {
-        let channel = take_lp_string(&mut cur)?;
-        if contains_run_separator(&channel) {
-            return Err("snapshot channel_id contains reserved unit separator".into());
-        }
-        let policy = match take_byte(&mut cur, "snapshot turn policy")? {
-            0 => TurnPolicy::Mention,
-            1 => TurnPolicy::All,
-            2 => TurnPolicy::Assigned(take_lp_string(&mut cur)?),
-            3 => TurnPolicy::RoundRobin,
-            d => return Err(format!("snapshot has unknown turn policy {d}")),
-        };
-        insert_ascending(&mut watches, channel, policy)?;
-    }
+    let action_requests = sdk::wire::decode(&take_lp_bytes(&mut cur)?)?;
+    let next_action_item = take_u64(&mut cur)?;
 
     let mut pending: BTreeMap<String, PendingState> = BTreeMap::new();
     let count = take_count(&mut cur, MIN_PENDING_BYTES, "pending")?;
     for _ in 0..count {
         let dispatch_id = take_lp_string(&mut cur)?;
+        let account = take_u64(&mut cur)?;
+        let generation = take_u64(&mut cur)?;
+        let cause = sdk::wire::decode(&take_lp_bytes(&mut cur)?)?;
         let run_id = take_lp_string(&mut cur)?;
         let agent_id = take_lp_string(&mut cur)?;
         let workspace_agent_id = take_lp_string(&mut cur)?;
-        let authority = take_opt_json::<RunAuthority>(&mut cur)?;
         let delegation_id = take_opt_string(&mut cur)?;
         let channel_id = take_lp_string(&mut cur)?;
         let anchor_seq = take_u64(&mut cur)?;
@@ -388,12 +383,15 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let job_id = take_opt_string(&mut cur)?;
         let job_claim_height = take_u64(&mut cur)?;
         let requester = take_origin(&mut cur)?;
+        let sink = take_sink(&mut cur)?;
         let created_at = take_u64(&mut cur)?;
         let entry = PendingState {
+            account,
+            generation,
+            cause,
             run_id,
             agent_id,
             workspace_agent_id,
-            authority,
             delegation_id,
             channel_id,
             anchor_seq,
@@ -401,6 +399,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             job_id,
             job_claim_height,
             requester,
+            sink,
             created_at,
         };
         validate_decoded_pending(&dispatch_id, &entry)?;
@@ -413,6 +412,9 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let run_id = take_lp_string(&mut cur)?;
         let agent_id = take_lp_string(&mut cur)?;
         let session_key = take_lp_bytes(&mut cur)?;
+        let holder = take_lp_bytes(&mut cur)?;
+        let attempt = u32::try_from(take_u64(&mut cur)?)
+            .map_err(|_| "snapshot session attempt exceeds u32".to_string())?;
         let opened_at = take_u64(&mut cur)?;
         let actions = u32::try_from(take_u64(&mut cur)?)
             .map_err(|_| "snapshot session action count exceeds u32".to_string())?;
@@ -420,6 +422,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             run_id: run_id.clone(),
             agent_id,
             session_key,
+            lease: crate::ExecutionLease { holder, attempt },
             opened_at,
             actions,
         };
@@ -437,8 +440,22 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
     }
     validate_decoded_delegations(&pending, &delegations)?;
 
+    let models: BTreeMap<String, crate::ModelRecord> =
+        sdk::wire::decode(&take_lp_bytes(&mut cur)?)?;
+    for (id, record) in &models {
+        if id != &record.agent_id || record.account == 0 {
+            return Err("invalid model record".into());
+        }
+    }
     if cur.remaining() != 0 {
         return Err("snapshot has trailing bytes".into());
     }
-    Ok((watches, pending, sessions, delegations))
+    Ok((
+        action_requests,
+        next_action_item,
+        pending,
+        sessions,
+        delegations,
+        models,
+    ))
 }

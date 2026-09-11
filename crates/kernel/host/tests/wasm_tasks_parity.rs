@@ -31,14 +31,42 @@ const TASKS_WASM: &[u8] = include_bytes!("fixtures/tasks.component.wasm");
 
 async fn native_host(context: &deterministic::Context, label: &'static str) -> Host {
     let store = QmdbStore::init(context.child(label), "tasks").await;
-    Host::genesis(vec![Box::new(Tasks::new("tasks", Box::new(store)))]).expect("genesis")
+    Host::genesis(vec![
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(Tasks::new(
+            "tasks",
+            "identity",
+            "attribution",
+            Box::new(store),
+        )),
+    ])
+    .expect("genesis")
 }
 
 async fn wasm_host_(context: &deterministic::Context, label: &'static str) -> Host {
     let store = QmdbStore::init(context.child(label), "tasks").await;
-    Host::genesis(vec![Box::new(
-        WasmModule::with_store("tasks", TASKS_WASM, Box::new(store)).expect("load component"),
-    )])
+    Host::genesis(vec![
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(
+            WasmModule::with_store("tasks", TASKS_WASM, Box::new(store)).expect("load component"),
+        ),
+    ])
     .expect("genesis")
 }
 
@@ -68,6 +96,7 @@ fn create(task_id: &str, title: &str) -> TaskMsg {
     TaskMsg::CreateTask {
         task_id: task_id.into(),
         title: title.into(),
+        owner: None,
     }
 }
 
@@ -190,6 +219,16 @@ async fn same_ops_inner(context: &deterministic::Context) {
             op_job(&JobsMsg::Claim {
                 job_id: "build".into(),
                 lease_views: 100,
+            }),
+        ),
+        (
+            3,
+            ext(&bob),
+            op_job(&JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "build".into(),
+                comment_id: "progress".into(),
+                text: "Build underway".into(),
             }),
         ),
         (
@@ -699,6 +738,8 @@ fn sync_handle_matches_native() {
     deterministic::Runner::default().start(|context| async move {
         let native = Tasks::new(
             "tasks",
+            "identity",
+            "attribution",
             Box::new(QmdbStore::init(context.child("handle_native"), "tasks").await),
         );
         let wasm = WasmModule::with_store(

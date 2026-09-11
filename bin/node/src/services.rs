@@ -15,11 +15,12 @@
 //! runtime already lives in its own sibling (`gateway-routes.json`,
 //! `invite-fronts.json`, `coord.cap`), and this follows that precedent.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::cli_args::WorkspaceArgs;
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
@@ -696,14 +697,32 @@ fn render_enable_summary(plan: &EnablePlan) -> String {
 /// the operator already consented to most of this, and what deserves their
 /// attention is the tag that was not there before. Rendered from the two
 /// records, so it says exactly what the file is about to become.
+///
+/// Covers BOTH persisted fields a re-mint can widen (`capabilities` AND
+/// `scopes` — see `remint_grant`/`mint_grant`, which persist `offered.scopes`
+/// verbatim): "unchanged" is said only when neither set moved, never when
+/// capabilities alone happen to match while scopes grew. A widened scope is
+/// rendered in the same `+`/`-`/` ` list as a capability, tagged so the two
+/// halves cannot be mistaken for each other.
 fn render_reconsent_diff(plan: &EnablePlan) -> String {
     let Some(previous) = &plan.previous else {
         return String::new();
     };
-    let had: std::collections::BTreeSet<&str> =
-        previous.capabilities.iter().map(String::as_str).collect();
-    let has: std::collections::BTreeSet<&str> =
-        plan.grant.capabilities.iter().map(String::as_str).collect();
+    let tagged = |prefix: &'static str, tags: &[String]| -> Vec<String> {
+        tags.iter().map(|t| format!("{prefix}:{t}")).collect()
+    };
+    let had_tags = [
+        tagged("cap", &previous.capabilities),
+        tagged("scope", &previous.scopes),
+    ]
+    .concat();
+    let has_tags = [
+        tagged("cap", &plan.grant.capabilities),
+        tagged("scope", &plan.grant.scopes),
+    ]
+    .concat();
+    let had: std::collections::BTreeSet<&str> = had_tags.iter().map(String::as_str).collect();
+    let has: std::collections::BTreeSet<&str> = has_tags.iter().map(String::as_str).collect();
     let mut out = format!(
         "\n  {} is already enabled as {}\n",
         paint(BOLD, &plan.kind),
@@ -772,77 +791,6 @@ pub(crate) enum ServiceCmd {
     Disable(KindArgs),
     /// per-service state, instance id, offered tags and requested scopes
     Status(ReadArgs),
-}
-
-/// which workspace's `services.toml` a verb reads or edits: an explicit
-/// `--workspace` wins, else `-n/--network` resolves through the registry.
-#[derive(Debug, clap::Args)]
-pub(crate) struct WorkspaceArgs {
-    /// this node's config file (`ducktape node run --config`'s twin)
-    #[arg(long, value_name = "FILE")]
-    config: Option<PathBuf>,
-    /// explicit workspace dir (wins over -n)
-    #[arg(long, value_name = "DIR")]
-    workspace: Option<PathBuf>,
-    /// a registered workspace's chain id (`ducktape node list`)
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
-    network: Option<String>,
-}
-
-impl WorkspaceArgs {
-    /// the node config this service's node is described by.
-    ///
-    /// `--config` exists because a workspace dir does not always CONTAIN its
-    /// config: the dev shape's workspace is its `storage_dir`, named BY a
-    /// config that lives elsewhere. `ducktape node run --config` has always
-    /// taken the file directly; a daemon serving that node needs the same.
-    fn config_file(&self) -> Result<PathBuf, String> {
-        match &self.config {
-            Some(file) => Ok(file.clone()),
-            None => Ok(self.dir()?.join("node.toml")),
-        }
-    }
-
-    /// where this node's `services.toml` lives — the config's own answer, so
-    /// the CLI and the node can never disagree about which file carries the
-    /// grant.
-    fn dir(&self) -> Result<PathBuf, String> {
-        if let Some(file) = &self.config {
-            // the keyless read: every `service` verb — `run` included — answers
-            // "which workspace?" without ever opening the node's identity.
-            return Ok(config::resolve_service(file)?.workspace);
-        }
-        if let Some(dir) = &self.workspace {
-            return Ok(dir.clone());
-        }
-        if let Some(needle) = &self.network {
-            let (dir, _http) = config::resolve_network(needle)?;
-            return Ok(dir);
-        }
-        // the bottom rung `node run` and `node status` already stand on: with
-        // exactly one workspace registered there is nothing to disambiguate,
-        // and demanding a selector here made `service list` the only read verb
-        // on the box that refused to answer a machine with one network on it.
-        let mut workspaces = config::list_workspaces()?;
-        match workspaces.len() {
-            // `list_workspaces` yields the node.toml PATH, not the directory —
-            // this verb family wants the workspace that CONTAINS it.
-            1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
-            0 => Err(
-                "no workspace: found one with `ducktape node init --name <name>` \
-                      or `ducktape node join <invite>`"
-                    .into(),
-            ),
-            _ => Err(format!(
-                "several workspaces are registered — pick one with -n:\n{}",
-                workspaces
-                    .iter()
-                    .map(|(chain_id, _)| format!("  {chain_id}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )),
-        }
-    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -942,8 +890,8 @@ struct Catalog {
 /// The services signaling to the workspace's own node. A node that is not
 /// running is NOT an error here: nothing signaling is exactly what `list` must
 /// render, and the grants still come off disk.
-fn catalog_now(workspace: &Path) -> Catalog {
-    match read_catalog(workspace) {
+fn catalog_now(base: &str) -> Catalog {
+    match read_catalog(base) {
         Ok(catalog) => catalog,
         // A node that is not running is the ordinary case — `list` must still
         // render the grants — so it stays quiet. Anything else (a 404, a 500,
@@ -961,10 +909,9 @@ fn catalog_now(workspace: &Path) -> Catalog {
     }
 }
 
-fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailure> {
+fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
     use crate::node_http::ReadFailure;
-    let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
-    let body = crate::node_http::get_json(&base, "/v1/services")?;
+    let body = crate::node_http::get_json(base, "/v1/services")?;
     let signaling = body
         .get("signaling")
         .ok_or_else(|| ReadFailure::Rejected("/v1/services carries no `signaling` field".into()))?;
@@ -979,7 +926,11 @@ fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailu
 fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
-    let catalog = catalog_now(&workspace);
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
+    let catalog = match service.http_listen.as_deref() {
+        Some(listen) => catalog_now(&config::http_base_of(listen)),
+        None => Catalog::default(),
+    };
     let all = rows(&catalog.signaling, &grants.grants);
     Ok((only_kind(all, args.kind.as_deref())?, catalog.node_build))
 }
@@ -1115,12 +1066,16 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
+    let listen = service
+        .http_listen
+        .as_deref()
+        .ok_or("this node serves no http surface")?;
     plan_enable_from(
         workspace,
         kind,
         service,
         node_id,
-        catalog_now(workspace).signaling,
+        catalog_now(&config::http_base_of(listen)).signaling,
     )
 }
 
@@ -1286,7 +1241,7 @@ pub(crate) fn commit_enable(
     // can produce, and this is a subset of it.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &catalog_now(workspace).signaling,
+        &catalog_now(base).signaling,
         &plan.capacity,
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
@@ -1650,7 +1605,13 @@ fn discover_executors(
     backend
         .probe()
         .map_err(|error| format!("sandbox: {error}"))?;
-    let providers = provider_host::discover(node_key, None, backend, kind)?;
+    let providers = provider_host::discover(
+        node_key,
+        &workspace_config::capability_dir(&service.workspace),
+        None,
+        backend,
+        kind,
+    )?;
     Ok(providers.capabilities())
 }
 
@@ -2097,7 +2058,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     // which `Services::validate` prevents on load.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &catalog_now(&workspace).signaling,
+        &catalog_now(&base).signaling,
         &service.sandbox_capacity,
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
@@ -2139,6 +2100,31 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn enable_reads_the_resolved_node_without_a_workspace_config() {
+        use std::io::{Read, Write};
+        let (dir, mut service) = planning_workspace(&[]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        service.http_listen = Some(listener.local_addr().unwrap().to_string());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(
+                std::str::from_utf8(&request[..count])
+                    .unwrap()
+                    .starts_with("GET /v1/services ")
+            );
+            let body = serde_json::json!({"signaling": [hello_offering("compute", &["claude"])], "build": "test"}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        assert!(!dir.path().join("node.toml").exists());
+        let plan = plan_enable(dir.path(), "compute", &service, [1; 32]).unwrap();
+        assert_eq!(plan.grant.capabilities, ["claude"]);
+        server.join().unwrap();
+    }
 
     /// A daemon used to compute its hello ONCE and re-send it verbatim until
     /// the process was restarted, so `ducktape agent install`/uninstall on a
@@ -2546,15 +2532,15 @@ mod tests {
         let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
         assert!(screen.contains("already enabled as"), "{screen}");
         assert!(
-            screen.contains("+ codex  (new)"),
+            screen.contains("+ cap:codex  (new)"),
             "the added tag is marked: {screen}"
         );
         assert!(
-            screen.contains("- aider  (no longer installed)"),
+            screen.contains("- cap:aider  (no longer installed)"),
             "the tag that went away is marked, and says why: {screen}"
         );
         assert!(
-            screen.contains("  claude\n"),
+            screen.contains("  cap:claude\n"),
             "an unchanged tag rides along unmarked: {screen}"
         );
     }
@@ -2575,6 +2561,44 @@ mod tests {
         let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
         assert!(screen.contains("unchanged"), "{screen}");
         assert!(!screen.contains("CHANGED"), "{screen}");
+    }
+
+    /// A widened GRANT SCOPE must render as a change even when capabilities
+    /// happen to match exactly — the ruling this pins is that the diff covers
+    /// every persisted field (`ServiceGrant::capabilities` AND `::scopes`),
+    /// never capabilities alone, so a daemon that widens what it asks for is
+    /// never re-consented under "unchanged".
+    #[test]
+    fn a_widened_scope_renders_as_a_change_even_when_capabilities_match() {
+        let (dir, service) = planning_workspace(&[]);
+        let mut services = Services::default();
+        services.grants.push(ServiceGrant {
+            kind: "compute".into(),
+            instance: "aa".repeat(32),
+            nonce: "bb".repeat(16),
+            granted_unix: 1,
+            capabilities: vec!["claude".into()],
+            scopes: vec!["cred:read".into()],
+        });
+        save(dir.path(), &services).expect("write grants");
+
+        let offered = noded::services::Signaling {
+            kind: "compute".into(),
+            version: "1".into(),
+            build: "b".into(),
+            capabilities: vec!["claude".into()],
+            scopes: vec!["cred:read".into(), "cred:write".into()],
+            needs: Vec::new(),
+        };
+        let plan = plan_enable_from(dir.path(), "compute", &service, NODE_A, vec![offered])
+            .expect("re-consent plans");
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(!screen.contains("unchanged"), "{screen}");
+        assert!(screen.contains("CHANGED"), "{screen}");
+        assert!(
+            screen.contains("+ scope:cred:write  (new)"),
+            "the widened scope is named: {screen}"
+        );
     }
 
     /// A file the registry would refuse must not LOAD, which means it fails the

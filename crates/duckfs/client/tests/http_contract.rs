@@ -189,6 +189,29 @@ fn commit_posts_snake_case_and_parses_camelcase_block() {
 }
 
 #[test]
+fn unpin_posts_the_name_in_a_json_body_no_url_normalization_can_touch() {
+    // a path segment goes through `url` normalization before it leaves this
+    // process — `.`/`..` collapse into dot-segments, `/` splits into an extra
+    // segment. a JSON body is opaque to all of that, so every legal pin name
+    // (see `pin_apply`: non-empty + a byte cap, no charset restriction)
+    // round-trips unchanged.
+    for name in [".", "..", "a/b", "café-🦆"] {
+        let stub = Stub::new(|_method, _path, _body| (200, serde_json::json!({ "height": 9 })));
+        let node = HttpNode::new(stub.url());
+
+        node.unpin(name).unwrap_or_else(|e| panic!("unpin {name:?} ok: {e:?}"));
+
+        let reqs = stub.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/v1/files/unpin");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("unpin body json");
+        assert_eq!(sent["name"], name);
+    }
+}
+
+#[test]
 fn a_400_error_envelope_surfaces_as_rejected_verbatim() {
     let stub = Stub::new(|_method, _path, _body| {
         (

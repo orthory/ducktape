@@ -325,6 +325,20 @@ impl NodeApi for HttpNode {
         self.post("/v1/files/pin", "application/json", bytes)?;
         Ok(())
     }
+
+    fn unpin(&self, name: &str) -> Result<(), ApiError> {
+        // the name rides a signed JSON body (symmetric with `pin`), never a
+        // path segment: a pin name has no charset restriction (`.` and `..`
+        // are legal), and `reqwest`'s `url` crate normalizes a `%2E`/`%2E%2E`
+        // path segment as a dot-segment before the request leaves this
+        // process, so a path-shaped request could reach a different route or
+        // fail signature verification. a JSON body is opaque to URL
+        // normalization, and it is exactly the bytes `self.post` signs.
+        let body = serde_json::json!({ "name": name });
+        let bytes = serde_json::to_vec(&body).map_err(|e| ApiError::Transport(e.to_string()))?;
+        self.post("/v1/files/unpin", "application/json", bytes)?;
+        Ok(())
+    }
 }
 
 /// the POST /v1/files/commit body — snake_case, matching `CommitBody` in

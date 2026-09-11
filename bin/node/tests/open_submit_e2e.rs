@@ -110,7 +110,6 @@ fn a_fresh_key_submits_through_a_resident_with_no_standing_ceremony() {
                 message_id: "open-door-m1".into(),
                 blocks: vec![chat::Block::paragraph("no ceremony needed")],
                 thread: None,
-                as_agent: None,
             }),
         },
     );
@@ -131,7 +130,7 @@ fn a_fresh_key_submits_through_a_resident_with_no_standing_ceremony() {
         CONVERGE,
         || {
             let m = message(&cluster, 0, "open-door-m1")?;
-            (m.head.author == chat::AuthorRef::User(user_key.clone())).then_some(())
+            (m.head.author == chat::Party::Key(user_key.clone())).then_some(())
         },
     );
 
@@ -147,7 +146,6 @@ fn a_fresh_key_submits_through_a_resident_with_no_standing_ceremony() {
                 message_id: "open-door-m2".into(),
                 blocks: vec![chat::Block::paragraph("pre-tamper")],
                 thread: None,
-                as_agent: None,
             }),
         },
     );

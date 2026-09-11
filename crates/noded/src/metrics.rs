@@ -131,6 +131,7 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
     match origin {
         sdk::Origin::External(_) => "external",
         sdk::Origin::Module(_) => "module",
+        sdk::Origin::Program(_) => "program",
         sdk::Origin::System => "system",
     }
 }
@@ -350,6 +351,14 @@ impl NodeMetrics {
                 })
                 .inc_by(count as u64);
         }
+    }
+
+    /// the latest committed local block height — the same gauge
+    /// `ducktape_block_height` exposes, for a node-local task that must
+    /// compare committed state against the height it holds (the netstack
+    /// governance reconciler's activation floor).
+    pub fn block_height(&self) -> u64 {
+        u64::try_from(self.block_height.get()).unwrap_or(0)
     }
 
     /// follow the committed height WITHOUT recording a block apply — the

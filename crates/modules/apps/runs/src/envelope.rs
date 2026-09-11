@@ -26,8 +26,8 @@
 
 use std::collections::BTreeSet;
 
-use agent::{AgentRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
-use chat::{AuthorRef, Block, MessageView};
+use crate::{LoadMode, MAX_SKILLS_PER_AGENT, ModelRecord, SKILL_LIBRARY_PREFIX, SkillRef};
+use chat::{Block, MessageView, Party};
 use files::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
 
@@ -51,10 +51,10 @@ pub(crate) const DEFAULT_PROMPT: &str =
     "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
 
 /// the strict output contract riding every composed payload — exactly the
-/// [`agent::AgentResponse`] wire shape.
+/// [`crate::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Each action is a catalog envelope {"operation":"<name>","target":{...},"input":{...}} — the same shape the live ducktape_action tool takes, without request_id. ducktape_actions lists every operation with its target and input schema and the lanes it admits. reply_blocks are your reply to the run's source and Ducktape posts them; the reply operation is live only, for progress posted mid-run through ducktape_action, and is refused in the final response. An action with an explicit destination names its target, e.g. {"operation":"tasks.create","input":{"title":"..."}} or {"operation":"chat.post_message","target":{"channel_id":"general","thread":12},"input":{"content":[{"type":"text","text":"..."}]}}. modules.update is final-response only: {"operation":"modules.update","input":{"module_id":"hello","artifact":"hello.module","code_hash":"<lowercase SHA-256>","after":50}}. The artifact path is relative to your forge checkout; Ducktape binds it to the host-pushed output commit. The file contains the prebuilt canonical ModuleArtifact (component and optional mapper); code_hash is SHA-256 of that file. It requires a changed forge output; the program queues it and each validator stages the pinned artifact and votes; query runs ModuleUpdate for activation. forge.open_pr is final-response only: {"operation":"forge.open_pr","target":{"repo":"app"},"input":{"source_branch":"agent/x","target_branch":"dev","title":"...","body":"..."}} opens a pull request from a branch you pushed to that forge repository; Ducktape appends the run's breadcrumb to the body and reports an open PR that already sources the branch instead of opening a second one. agent.call is live only: call peers through ducktape_action mid-run and read their results with ducktape_query; at most 8 calls are live at once across the whole recursive tree, and completed calls release their slot. submit carries any module's own message verbatim as your program account, in either lane: {"operation":"submit","target":{"module":"forge"},"input":{"merge_pr":{...}}}; the module decides on its own rules and its verdict is the receipt's outcome. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -90,30 +90,20 @@ struct RunEnvelope<'a> {
     context: Option<String>,
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
-    /// whether this agent's committed `duckfs_read` caps cover the global skill
-    /// library (`agent::SKILL_LIBRARY_PREFIX`). the HOST cannot work this out —
-    /// it has no registry to ask — so the composer states it, and the assembler
-    /// emits the library paragraph only when it is true.
-    ///
-    /// a fact ABOUT the caps, never a widening of them: the answer comes from
-    /// `AgentRecord::library_readable`, which is `permits(DuckfsRead(..))` — the
-    /// same call the MCP tool plane gates the real read on. so the document can
-    /// only advertise a door that will actually open.
-    library_readable: bool,
     result_contract: ResultContractEnvelope,
 }
 
 /// the portable workspace source — WHERE the run's rw workspace is checked out
-/// from, tagged by kind. carries NO `mount_path` (D7): the envelope states
+/// from, tagged by kind. The envelope carries no `mount_path`: it states
 /// committed source coordinates only, and the host wrapper picks the per-run
 /// writable cwd — never a consensus-supplied host path.
 #[derive(Serialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WorkspaceSource {
-    /// a duckfs subtree checkout — exactly the flat era's two fields.
+    /// A duckfs subtree checkout.
     Duckfs {
         source_prefix: String,
-        /// the W2 consensus pin of the duckfs head. ALWAYS emitted (null when
+        /// The consensus pin of the duckfs head. Always emitted (null when
         /// the files head is unresolved) so the envelope states its pin
         /// decision.
         source_snapshot: Option<String>,
@@ -138,10 +128,6 @@ pub(crate) enum WorkspaceSource {
         /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
         /// surface and an audit/M2 signal.
         branch_born: bool,
-        /// the compose-height verdict from the agent's committed
-        /// `forge_push` cap for this repo. the host may act on this fact but
-        /// cannot widen it.
-        forge_push: bool,
     },
 }
 
@@ -156,8 +142,8 @@ struct ResultContractEnvelope {
     sink: WireSink,
 }
 
-/// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
-/// run, mirroring [`agent::SkillRef`]. a tracking skill's snapshot is resolved
+/// A skill reference: a duckfs read-only source subtree the host mounts for the
+/// run, mirroring [`crate::SkillRef`]. a tracking skill's snapshot is resolved
 /// to the committed head at compose time (see `RunsModule::portable_inputs`).
 ///
 /// `always` is the curated [`LoadMode`], flattened to the bool the host needs:
@@ -187,14 +173,14 @@ pub(crate) struct PortableInputs {
 }
 
 /// the duckfs subtree a portable run's rw workspace is checked out from.
-fn workspace_source_prefix(agent: &AgentRecord) -> String {
+fn workspace_source_prefix(agent: &ModelRecord) -> String {
     format!("/shared/agent-workspaces/{}", agent.agent_id)
 }
 
 /// the duckfs workspace source for `agent`, pinned at `source_snapshot` — the
 /// non-forge composer lane's workspace.
 pub(crate) fn duckfs_workspace(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     source_snapshot: Option<String>,
 ) -> WorkspaceSource {
     WorkspaceSource::Duckfs {
@@ -218,7 +204,7 @@ pub(crate) fn duckfs_workspace(
 /// only what the agent lacks. curation ORDER is the order the host inlines the
 /// `always` bodies in, so the persona always assembles first.
 pub(crate) fn resolve_skills(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     extra: &[SkillRef],
     head: &Option<String>,
 ) -> Vec<SkillEnvelope> {
@@ -240,13 +226,13 @@ pub(crate) fn resolve_skills(
 /// to the shared library by CONSTRUCTION (`/shared/skills/<name>`).
 ///
 /// this is the one place a run gains skills it was not curated with, and the
-/// ro-mount that materializes them runs on the node's duckfs authority with no
-/// read-cap gate — so a requester must never get to name a raw path. taking
-/// NAMES, not refs, means a requester can only ever point at a library entry:
-/// the name is canonicalized as the last segment of the library prefix, so a
-/// `/` or `..` in it fails to resolve to a single entry and is refused. no
-/// pinned snapshot, no `always` — a requester offers a library skill on demand;
-/// only an owner's own record inlines a persona.
+/// ro-mount that materializes them runs on the node's duckfs authority — so a
+/// requester must never get to name a raw path. taking NAMES, not refs, means a
+/// requester can only ever point at a library entry: the name is canonicalized
+/// as the last segment of the library prefix, so a `/` or `..` in it fails to
+/// resolve to a single entry and is refused. no pinned snapshot, no `always` —
+/// a requester offers a library skill on demand; only an owner's own record
+/// inlines a persona.
 pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> {
     // the SAME ceiling the agent record's own curation carries — the resolved
     // set is bounded there, and an unbounded request would otherwise commit a
@@ -292,7 +278,7 @@ pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> 
 /// to key the dispatch, and one id minted in two places is exactly the drift
 /// this field exists to close.
 fn envelope(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     conversation: String,
     portable: PortableInputs,
@@ -308,7 +294,6 @@ fn envelope(
         context: portable.context,
         workspace: portable.workspace,
         skills: portable.skills,
-        library_readable: agent.library_readable(),
         result_contract: ResultContractEnvelope {
             ducktape_runner_result: RUNNER_RESULT_MARKER,
             sink: portable.sink,
@@ -321,8 +306,8 @@ fn envelope(
 /// window ending at the anchor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_payload(
-    module_id: &str,
-    agent: &AgentRecord,
+    _module_id: &str,
+    agent: &ModelRecord,
     run_id: &str,
     transcript: &[MessageView],
     portable: PortableInputs,
@@ -330,7 +315,7 @@ pub(crate) fn render_payload(
     envelope(
         agent,
         run_id,
-        render_conversation(module_id, &agent.agent_id, transcript),
+        render_conversation(agent.account, transcript),
         portable,
     )
 }
@@ -338,7 +323,7 @@ pub(crate) fn render_payload(
 /// compose a job run's payload: same envelope, no thread key, and the
 /// conversation is the job's coordinates plus its FULL submitted spec.
 pub(crate) fn render_job_payload(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     job_id: &str,
     spec: &str,
@@ -348,7 +333,7 @@ pub(crate) fn render_job_payload(
         agent,
         run_id,
         format!(
-            "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
+            "Job {job_id} — replies are delivered to this job discussion; use ducktape_action with operation reply for live updates.\n\nJob spec:\n{spec}"
         ),
         portable,
     )
@@ -358,7 +343,7 @@ pub(crate) fn render_job_payload(
 /// context, while the conversation keeps the triggering comment and stable
 /// thread/ordinal coordinates explicit.
 pub(crate) fn render_page_comment_payload(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     thread_id: &str,
     ordinal: u64,
@@ -376,20 +361,42 @@ pub(crate) fn render_page_comment_payload(
     )
 }
 
+/// Compose an inline mention of a page or block. A reply opens a comment
+/// thread on that exact source; it does not edit the source author's content.
+pub(crate) fn render_page_block_payload(
+    agent: &ModelRecord,
+    run_id: &str,
+    block: &pages::Block,
+    portable: PortableInputs,
+) -> String {
+    let author = match &block.author {
+        pages::Party::Key(key) => format!("user:{}", crate::hex(key)),
+        pages::Party::Account(account) => format!("account:{account}"),
+        pages::Party::Module(module) => format!("module:{module}"),
+        pages::Party::System => "system".into(),
+    };
+    envelope(
+        agent,
+        run_id,
+        format!(
+            "Pages inline mention on block {}, in page {}. Reply in a new comment thread on this block.\n\n{author}: {}",
+            block.id, block.page, block.text
+        ),
+        portable,
+    )
+}
+
 /// the transcript block, rendered exactly as the flat-payload era did — the
 /// host feeds it to the model verbatim, so the wording is part of the
 /// committed prompt input.
-fn render_conversation(module_id: &str, agent_id: &str, transcript: &[MessageView]) -> String {
+fn render_conversation(account: u64, transcript: &[MessageView]) -> String {
     if transcript.is_empty() {
         return "No transcript was embedded for this run. Answer the user helpfully.".into();
     }
     let mut out = String::from("Conversation so far:\n");
     for message in transcript {
         let speaker = match &message.head.author {
-            AuthorRef::Agent {
-                module,
-                agent_id: author,
-            } if module == module_id && author == agent_id => "you",
+            Party::Account(author) if *author == account => "you",
             _ => "them",
         };
         out.push_str(&format!("[{speaker}] {}\n", render_message(message)));
@@ -413,12 +420,12 @@ fn render_message(message: &MessageView) -> String {
     )
 }
 
-fn render_author(author: &AuthorRef) -> String {
+fn render_author(author: &Party) -> String {
     match author {
-        AuthorRef::User(bytes) => format!("user:{}", hex(bytes)),
-        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        AuthorRef::Module(module) => format!("module:{module}"),
-        AuthorRef::System => "system".into(),
+        Party::Key(bytes) => format!("user:{}", hex(bytes)),
+        Party::Account(account) => format!("account:{account}"),
+        Party::Module(module) => format!("module:{module}"),
+        Party::System => "system".into(),
     }
 }
 
@@ -443,36 +450,35 @@ fn render_block(block: &Block) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::AgentStatus;
+    use crate::ModelStatus;
     use chat::MessageHead;
-    use saga::SagaOrigin;
+    use sdk::Origin as RunOrigin;
     use serde_json::Value;
 
     /// an agent defined by its curated skills — there is no prompt to give it.
-    fn agent_with_skills(skills: Vec<agent::SkillRef>) -> AgentRecord {
-        AgentRecord {
+    fn agent_with_skills(skills: Vec<crate::SkillRef>) -> ModelRecord {
+        ModelRecord {
+            account: 2,
             agent_id: "bot".into(),
-            owner: SagaOrigin::External(vec![9; 32]),
+            owner: RunOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
-            allowed_actions: vec![],
-            status: AgentStatus::Active,
-            role: agent::AgentRole::General,
+            status: ModelStatus::Active,
+            role: crate::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
-            caps: agent::ResourceCaps::default(),
             skills,
         }
     }
 
-    fn bot() -> AgentRecord {
+    fn bot() -> ModelRecord {
         agent_with_skills(Vec::new())
     }
 
     /// a curated skill ref, as the registry commits it.
-    fn skill_ref(name: &str, load: LoadMode) -> agent::SkillRef {
-        agent::SkillRef {
+    fn skill_ref(name: &str, load: LoadMode) -> crate::SkillRef {
+        crate::SkillRef {
             name: name.into(),
             source_prefix: format!("/shared/skills/{name}"),
             source_snapshot: Some("bb".repeat(32)),
@@ -480,16 +486,29 @@ mod tests {
         }
     }
 
-    fn message(seq: u64, author: AuthorRef, text: &str) -> MessageView {
+    fn message(seq: u64, author: Party, text: &str) -> MessageView {
         MessageView {
             channel_id: "general".into(),
             seq,
             head: MessageHead {
                 message_id: format!("m{seq}"),
+                content_origin: match &author {
+                    chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                    chat::Party::Account(account) => sdk::Origin::Program(*account),
+                    chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                    chat::Party::System => sdk::Origin::System,
+                },
+                origin: match &author {
+                    chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                    chat::Party::Account(account) => sdk::Origin::Program(*account),
+                    chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                    chat::Party::System => sdk::Origin::System,
+                },
                 author,
                 blocks: vec![Block::paragraph(text)],
                 created_at: 0,
                 rev: 0,
+                revision: 1,
                 edited_at: None,
                 base_rev: None,
                 deleted: false,
@@ -538,10 +557,21 @@ mod tests {
         }
     }
 
+    /// the contract tells the model the live-call bound as a number, and that
+    /// number is the one the session lane enforces — the two never drift.
+    #[test]
+    fn the_contract_states_the_live_call_bound_the_session_lane_enforces() {
+        let stated = format!(
+            "at most {} calls are live at once",
+            crate::model::MAX_DELEGATIONS_PER_RUN
+        );
+        assert!(STRICT_OUTPUT_INSTRUCTION.contains(&stated), "{stated}");
+    }
+
     #[test]
     fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let payload = render_payload("runs", &agent, &run_id("general", 1), &transcript, plain());
         let v = parse(&payload);
 
@@ -614,54 +644,6 @@ mod tests {
         );
     }
 
-    /// the library grant the host assembles on is READ OFF THE CAPS, never
-    /// assumed: an agent whose `duckfs_read` covers the library prefix composes
-    /// `library_readable: true` and is told the library exists; one without the
-    /// grant composes `false` and is never pointed at a door the MCP tool plane
-    /// would refuse it (the caps ARE that refusal — same `permits` call).
-    #[test]
-    fn the_envelope_states_the_agents_library_read_grant() {
-        let compose = |caps: agent::ResourceCaps| {
-            let mut agent = agent_with_skills(Vec::new());
-            agent.caps = caps;
-            let payload = render_payload(
-                "runs",
-                &agent,
-                &run_id("general", 1),
-                &[],
-                PortableInputs {
-                    workspace: duckfs_workspace(&agent, None),
-                    skills: Vec::new(),
-                    sink: WireSink::Chain,
-                    context: None,
-                },
-            );
-            parse(&payload)["library_readable"].clone()
-        };
-
-        assert_eq!(
-            compose(agent::ResourceCaps::default()),
-            Value::Bool(false),
-            "the empty default grants nothing, so the agent hears nothing about the library"
-        );
-        assert_eq!(
-            compose(agent::ResourceCaps {
-                duckfs_read: vec![agent::SKILL_LIBRARY_PREFIX.into()],
-                ..Default::default()
-            }),
-            Value::Bool(true),
-            "the grant the app pre-fills is the grant the assembler acts on"
-        );
-        assert_eq!(
-            compose(agent::ResourceCaps {
-                duckfs_read: vec!["/shared/agent-workspaces/bot".into()],
-                ..Default::default()
-            }),
-            Value::Bool(false),
-            "an unrelated read grant is not a library grant"
-        );
-    }
-
     /// the per-run union: the agent's own skills lead, and `extra` appends only
     /// the names the agent does not already carry — a task supplements a
     /// persona, never rewrites it, and order is the `always`-inline order.
@@ -713,18 +695,18 @@ mod tests {
         // and the count is capped in consensus — the same ceiling the agent
         // record carries — so a huge request cannot commit a giant payload or
         // force a checkout per name for a doomed run.
-        let too_many: Vec<String> = (0..=agent::MAX_SKILLS_PER_AGENT)
+        let too_many: Vec<String> = (0..=crate::MAX_SKILLS_PER_AGENT)
             .map(|i| format!("s{i}"))
             .collect();
         assert!(library_skills(&too_many).is_err());
-        assert!(library_skills(&too_many[..agent::MAX_SKILLS_PER_AGENT]).is_ok());
+        assert!(library_skills(&too_many[..crate::MAX_SKILLS_PER_AGENT]).is_ok());
     }
 
     /// a tracking skill (no pin) still resolves to the committed head, and its
     /// load mode is untouched by that resolution.
     #[test]
     fn a_tracking_skill_resolves_to_the_head_and_keeps_its_load_mode() {
-        let agent = agent_with_skills(vec![agent::SkillRef {
+        let agent = agent_with_skills(vec![crate::SkillRef {
             name: "persona".into(),
             source_prefix: "/shared/skills/persona".into(),
             source_snapshot: None,
@@ -774,10 +756,8 @@ mod tests {
         assert_eq!(v["run_id"], page);
     }
 
-    /// an agent with no always-skill has no persona to assemble — the generic
-    /// `instructions` are the floor under it. this fallback was UNREACHABLE
-    /// before (the old composer dropped `instructions` whenever a prompt pin was
-    /// set); now it is reached by a state you can see.
+    /// A model with no always-skill uses the generic `instructions` as its
+    /// context; on-demand skills do not replace that fallback.
     #[test]
     fn a_soulless_agent_falls_back_to_the_generic_instructions() {
         let agent = agent_with_skills(vec![skill_ref("release", LoadMode::OnDemand)]);
@@ -819,7 +799,7 @@ mod tests {
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(
             v["conversation"],
-            "Job job-1 — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\nsummarize this work item"
+            "Job job-1 — replies are delivered to this job discussion; use ducktape_action with operation reply for live updates.\n\nJob spec:\nsummarize this work item"
         );
     }
 
@@ -827,15 +807,8 @@ mod tests {
     fn envelope_bytes_are_deterministic() {
         let agent = bot();
         let transcript = vec![
-            message(1, AuthorRef::User(vec![1; 32]), "hello \"quoted\"\nline"),
-            message(
-                2,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "bot".into(),
-                },
-                "earlier reply",
-            ),
+            message(1, Party::Key(vec![1; 32]), "hello \"quoted\"\nline"),
+            message(2, Party::Account(2), "earlier reply"),
         ];
         let a = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
         let b = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
@@ -876,23 +849,9 @@ mod tests {
     fn the_agents_own_messages_render_as_you() {
         let agent = bot();
         let transcript = vec![
-            message(1, AuthorRef::User(vec![1; 32]), "question"),
-            message(
-                2,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "bot".into(),
-                },
-                "my own reply",
-            ),
-            message(
-                3,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "other".into(),
-                },
-                "someone else",
-            ),
+            message(1, Party::Key(vec![1; 32]), "question"),
+            message(2, Party::Account(2), "my own reply"),
+            message(3, Party::Account(3), "someone else"),
         ];
         let payload = render_payload("runs", &agent, &run_id("general", 3), &transcript, plain());
         let conversation = parse(&payload)["conversation"]
@@ -900,8 +859,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(conversation.contains("[them] user:"));
-        assert!(conversation.contains("[you] agent:runs/bot @2: my own reply"));
-        assert!(conversation.contains("[them] agent:runs/other @3: someone else"));
+        assert!(conversation.contains("[you] account:2 @2: my own reply"));
+        assert!(conversation.contains("[them] account:3 @3: someone else"));
     }
 
     // ---- the portable plan ---------------------------------------------------
@@ -909,7 +868,7 @@ mod tests {
     #[test]
     fn the_envelope_carries_source_coords_and_skills_but_no_mount_path() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let skills = vec![SkillEnvelope {
             name: "release".into(),
             source_prefix: "/shared/skills/release".into(),
@@ -944,10 +903,10 @@ mod tests {
             "/shared/agent-workspaces/bot"
         );
         assert_eq!(v["workspace"]["source_snapshot"], "aa".repeat(32));
-        // D7: the envelope carries SOURCE coords only — never a host mount path.
+        // The envelope carries source coordinates, never a host mount path.
         assert!(
             v["workspace"].get("mount_path").is_none(),
-            "the workspace must NOT carry a mount_path (D7): {}",
+            "the workspace must not carry a mount_path: {}",
             v["workspace"]
         );
         assert!(
@@ -996,7 +955,7 @@ mod tests {
     #[test]
     fn the_envelope_composes_no_runtime_text() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let payload = render_payload(
             "runs",
             &agent,
@@ -1024,7 +983,7 @@ mod tests {
     #[test]
     fn a_forge_run_composes_tagged_source_item_context_and_requested_pr_sink() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let commit = "ab".repeat(20);
         let inputs = PortableInputs {
             workspace: WorkspaceSource::Forge {
@@ -1033,7 +992,6 @@ mod tests {
                 commit: commit.clone(),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {
@@ -1068,7 +1026,7 @@ mod tests {
         assert_eq!(v["workspace"]["branch_born"], false);
         assert!(
             payload.contains(&format!(
-                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false,"forge_push":false}}"#
+                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
             )),
             "the forge workspace field order is part of the committed bytes: {payload}"
         );
@@ -1089,7 +1047,7 @@ mod tests {
     #[test]
     fn forge_envelope_bytes_are_deterministic() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "go")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "go")];
         let inputs = || PortableInputs {
             workspace: WorkspaceSource::Forge {
                 repo: "app".into(),
@@ -1097,7 +1055,6 @@ mod tests {
                 commit: "cd".repeat(20),
                 branch: "feature/x".into(),
                 branch_born: true,
-                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {

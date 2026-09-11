@@ -77,7 +77,7 @@ impl Driver {
     }
 
     /// Retry the by-identity rendezvous fallback for any MEMBER peer that
-    /// is still endpoint-less and still missing a punched override — the
+    /// is still endpoint-less and that NO layer can dial — the
     /// handshake-time attempt can lose the race against the peer's own
     /// coordinator registration (both sides often boot together). Each
     /// resolution that lands writes its own override through to the live
@@ -89,7 +89,11 @@ impl Driver {
             .iter()
             .copied()
             .filter(|peer| {
-                let unresolved = !state.overrides.contains_key(peer);
+                // dialable through ANY layer — a resolved override, or the
+                // invite layer's observed address grafted onto the
+                // endpoint-less record — means there is nothing to punch
+                // for: the interface can already initiate.
+                let undialable = self.dial_endpoint(state, *peer).is_none();
                 // the peer's CURRENT life decides whether it is
                 // endpoint-less: a post-lock re-advertisement supersedes
                 // the record the view locked.
@@ -100,7 +104,7 @@ impl Driver {
                     .or_else(|| state.view().and_then(|view| view.record(*peer)));
                 let endpoint_less =
                     record.is_some_and(|record| record.wireguard_endpoint.is_none());
-                unresolved && endpoint_less
+                undialable && endpoint_less
             })
             .collect();
         for peer in retry_targets {
@@ -108,9 +112,8 @@ impl Driver {
         }
     }
 
-    /// The standby's half of the sweep: rendezvous any member whose
-    /// EFFECTIVE pre-warm entry (the pre-warm layer merged over the restored
-    /// base, `sync_prewarm`'s own layering) is endpoint-less. After a reboot
+    /// The standby's half of the sweep: rendezvous any member it holds an
+    /// entry for and [`Driver::dial_endpoint`] cannot dial. After a reboot
     /// that is every fully-NATed member: the restore reinstalls them
     /// endpoint-less from the persisted mesh, and their live records cannot
     /// arrive to replace them — plane gossip rides the very tunnels the
@@ -126,11 +129,17 @@ impl Driver {
             .iter()
             .copied()
             .filter(|peer| {
-                let effective = state
-                    .prewarm_peers
-                    .get(peer)
-                    .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(peer)));
-                effective.is_some_and(|config| config.endpoint.is_none())
+                let known = state.prewarm_peers.contains_key(peer)
+                    || self
+                        .base_peers
+                        .as_ref()
+                        .is_some_and(|base| base.contains_key(peer));
+                // an endpoint-less pre-warm entry is NOT undialable on its
+                // own: the invite layer grafts its observed address onto
+                // exactly that entry on every push, and a fresh resident's
+                // first tunnel is carrying traffic on it.
+                let undialable = self.dial_endpoint(state, *peer).is_none();
+                known && undialable
             })
             .collect();
         for peer in targets {

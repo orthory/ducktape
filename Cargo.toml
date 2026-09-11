@@ -11,8 +11,11 @@
 #                      consensus (BFT orderer), statesync, recovery, indexer,
 #                      blobstore (node-local receipt-lane byte store — like
 #                      indexer, never in any root), wasm-host (runs a
-#                      ducktape:module component as a native sdk::Module),
-#                      module-guest (that world's WIT definition)
+#                      ducktape:module component as a native sdk::Module)
+#   crates/module-sdk/ — the module SDK, the one crate a wasm module pins by
+#                      git revision: the ducktape:module WIT world, the
+#                      bindings + adapter every port shares, `sdk` re-exported,
+#                      and the wasm32 patch crates (stubs/) a guest graph needs
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
 #                      reachability decision core, its ducktape:netstack
@@ -28,8 +31,8 @@
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (acl,
-#                      kv, valset, governance, identity, lifecycle, saga,
-#                      capability, dispatch, tagging, gateway — which absorbed
+#                      kv, valset, governance, identity, modules, saga,
+#                      capability, dispatch, attribution, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
 #   crates/modules/apps/   — application modules, the product features (forge,
@@ -55,13 +58,12 @@
 #                      than under the one module that happens to wrap it
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
-#   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
-#                      ducktape:module world binding every port shares), the
-#                      wasm32 dep stubs, and the kernel-fixture test guests
-#                      (hello, hello-replacement, sibling, object). every module
-#                      carries its OWN port (src/guest.rs behind the `guest`
-#                      feature) and bin/guest-builder synthesizes the
-#                      packaging — no per-module crate lives here
+#   crates/guests/   — the kernel-fixture test guests ONLY (hello,
+#                      hello-replacement, noop, sibling, object), standalone
+#                      workspaces over the raw WIT world. every module carries
+#                      its OWN port (src/guest.rs behind the `guest` feature)
+#                      and bin/guest-builder builds it out of this repository
+#                      at a revision — no per-module crate lives here
 #   crates/examples/ — reference modules: directory (the first wasm port; a test
 #                      tenant, in no genesis set), greeter (the types-only
 #                      composition example)
@@ -100,6 +102,8 @@ members = [
     # two lines up, and the reason it left crates/modules/system/.
     "crates/kernel/blobstore",
     "crates/kernel/wasm-host",
+    "crates/kernel/module-artifact",
+    "crates/kernel/node-work",
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
@@ -115,11 +119,11 @@ members = [
     "crates/modules/system/valset",
     "crates/modules/system/governance",
     "crates/modules/system/identity",
-    "crates/modules/system/lifecycle",
+    "crates/modules/system/modules",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/dispatch",
-    "crates/modules/system/tagging",
+    "crates/modules/system/attribution",
     "crates/modules/system/gateway",
     # airlock — the two-party execution/auth contract. NOT a consensus module
     # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
@@ -155,8 +159,6 @@ members = [
     "crates/duckfs/disk",
     "crates/duckfs/client",
     "crates/rpc-client",
-    # desktop-only font assets and the product typography contract
-    "crates/design",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
@@ -167,6 +169,7 @@ members = [
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
+    "crates/modules/apps/collaboration",
     # services — off-chain host-side executors
     "crates/services/agent",
     "crates/services/airlock",
@@ -195,7 +198,9 @@ members = [
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-exclude = ["crates/labs", "crates/guests/guest-adapter"]
+# The shared design crate belongs to the views workspace so Cargo gives
+# its guest dependency a checkout-independent package identity.
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design"]
 
 [workspace.package]
 edition = "2024"
@@ -233,22 +238,27 @@ rand = "0.8"
 opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
-commonware-storage = "2026.5.0"
-commonware-runtime = "2026.5.0"
-commonware-cryptography = "2026.5.0"
-commonware-codec = "2026.5.0"
+commonware-storage = "2026.9.0"
+commonware-runtime = "2026.9.0"
+commonware-cryptography = "2026.9.0"
+commonware-codec = "2026.9.0"
 # the simplex BFT stack — used by the `consensus` crate (the real orderer);
 # pinned here so every commonware crate stays on the one version.
-commonware-consensus = "2026.5.0"
-commonware-resolver = "2026.5.0"
-commonware-p2p = "2026.5.0"
-commonware-parallel = "2026.5.0"
-commonware-utils = "2026.5.0"
-commonware-actor = "2026.5.0"
+commonware-consensus = "2026.9.0"
+commonware-resolver = "2026.9.0"
+commonware-p2p = "2026.9.0"
+commonware-parallel = "2026.9.0"
+commonware-utils = "2026.9.0"
+commonware-actor = "2026.9.0"
 # the userspace overlay backend (overlay-net/userspace): the BoringTun noise
 # core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
 # the wire by construction.
 defguard_boringtun = "0.6.5"
+# tests only: forging a WireGuard mac1 the way boringtun's rate limiter
+# computes it (blake2s keyed by HASH(LABEL_MAC1 || responder public)). the
+# helpers are `pub(crate)` in boringtun, and this is the same blake2 build its
+# own handshake code links.
+blake2 = "0.10"
 # the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
 # at the node's overlay ULA, entirely in-process. `medium-ip` because the
 # tunnel carries raw IP (WireGuard has no link layer), `async` for the
@@ -294,10 +304,10 @@ zeroize = "1"
 fluent31 = { git = "https://github.com/orthory/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
 # fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
 # only the index-guest crate's `guest` feature pulls it, and only guest-builder's
-# synthesized wasm32 workspaces ever enable that feature. It is compiled INTO
+# synthesized wasm32 shells ever enable that feature. It is compiled INTO
 # every committed index guest, so moving this rev moves their bytes: rebuild
 # each `index.wasm` (`guest-builder --index`, the Makefile's INDEX_MODULES)
-# and run `make wasm-index-check` in the same change.
+# and run `make wasm-rebuild-check` in the same change.
 fluent-guest = { git = "https://github.com/orthory/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
 # borsh — the deterministic op-row envelope on the derived tier's fold feed
 # (host encodes, index guests decode; one byte layout, no map ordering games).
@@ -315,6 +325,9 @@ wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+# the module SDK a guest port compiles against. wasm-only: every module's
+# `guest` feature turns it on, and only guest-builder's shell workspace does.
+ducktape-module-sdk = { path = "crates/module-sdk" }
 keyscheme = { path = "crates/kernel/keyscheme" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
@@ -332,6 +345,8 @@ blobstore = { path = "crates/kernel/blobstore" }
 # feature sharing its name with a non-optional dependency key.
 index_guest = { path = "crates/kernel/index-guest", package = "index-guest" }
 wasm-host = { path = "crates/kernel/wasm-host" }
+module-artifact = { path = "crates/kernel/module-artifact" }
+node-work = { path = "crates/kernel/node-work" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
@@ -340,14 +355,14 @@ acl = { path = "crates/modules/system/acl" }
 valset = { path = "crates/modules/system/valset" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
-lifecycle = { path = "crates/modules/system/lifecycle" }
+modules = { path = "crates/modules/system/modules" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 dispatch = { path = "crates/modules/system/dispatch" }
-tagging = { path = "crates/modules/system/tagging" }
+attribution = { path = "crates/modules/system/attribution" }
 gateway = { path = "crates/modules/system/gateway" }
 forge = { path = "crates/modules/apps/forge" }
-design = { path = "crates/design" }
+design = { path = "crates/views/support/design" }
 pages = { path = "crates/modules/apps/pages" }
 chat = { path = "crates/modules/apps/chat" }
 agent = { path = "crates/modules/apps/agent" }
@@ -356,6 +371,7 @@ tasks = { path = "crates/modules/apps/tasks" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
+collaboration = { path = "crates/modules/apps/collaboration" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
@@ -404,12 +420,15 @@ overlay-net = { path = "crates/networking/overlay-net" }
 
 # overlay-net's wrapper context implements commonware-runtime's `Clock` and
 # rng bounds, whose supertraits live in these crates — pinned to the exact
-# versions commonware-runtime 2026.5.0 depends on (a different semver-major
-# would be a different trait).
+# versions commonware-runtime 2026.9.0 depends on (a different semver-major
+# would be a different trait). airlock pins its own rand_core 0.6 for the
+# dalek curves, which have not moved.
 governor = "0.10.2"
-rand_core = "0.6.4"
+rand_core = "0.10.1"
 
 [patch.crates-io]
+# A caret move replaces its selection, including clearing the previous anchor.
+iced_graphics = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "00fccc604d5b2fb37a1d64eb47184419ba83de86" }
 # `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
 # its uninhabited extern-static type is future-incompatible with Rust. Keep the
 # API/ABI identical and patch only that declaration locally.

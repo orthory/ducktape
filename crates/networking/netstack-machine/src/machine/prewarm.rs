@@ -324,7 +324,7 @@ impl Driver {
         let addr = match outcome {
             Ok(addr) => addr,
             Err(reason) => {
-                self.fail_peer(state, peer, &format!("rendezvous fallback: {reason}"));
+                self.fail_rendezvous_fallback(state, peer, &reason);
                 return;
             }
         };

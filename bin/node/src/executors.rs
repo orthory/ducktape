@@ -6,36 +6,49 @@
 //! `PATH` worked for as long as nobody built an image on a Mac — where the
 //! vendor's installer produces a Mach-O binary the guest cannot exec at all.
 //!
-//! So the binary is acquired deliberately, into `~/.ducktape/executors`, and
-//! the node derives the guest's copy from whatever is there
-//! (`sandbox_host::executor_image`). This verb owns that directory, the pinned
-//! versions, and the one approved way to fill it.
+//! So the binary is acquired deliberately, into the WORKSPACE's `executors/`
+//! directory — per network, like every other file a node runs with: two
+//! networks on one machine lend two independent sets, and a throwaway network
+//! takes its CLIs with it when it goes — and the node derives the guest's copy
+//! from whatever is there (`sandbox_host::executor_image`). This verb owns that
+//! directory and the one approved way to fill it.
 //!
-//! TWO RULES IT EXISTS TO KEEP:
+//! THREE RULES IT EXISTS TO KEEP:
 //!
 //! 1. NOTHING IS FETCHED WITHOUT THE OPERATOR ASKING FOR IT. Bare
 //!    `agent install` shows what is missing and what installing it would
 //!    download — the checklist IS the approval, and unchecking everything is a
 //!    complete answer. Nothing else in the tree fetches an executable.
-//! 2. WHAT IS FETCHED IS VERIFIED AGAINST A VALUE IN THIS FILE. A checksum
-//!    published beside an artifact proves only that the download was not
-//!    corrupted in flight — it comes from the same place the artifact does.
-//!    The expected hash lives here, where changing it is a reviewed diff.
+//! 2. WHAT IS INSTALLED IS THE VENDOR'S LATEST, VERIFIED AGAINST THE VENDOR'S
+//!    CHECKSUM FOR IT. Each executor's capability spec names its release
+//!    channel (`[source]`); this verb asks the channel what is current, reads
+//!    the checksum the vendor publishes for that release, and refuses bytes
+//!    that do not match it. No version and no hash lives in this tree: a pin
+//!    written down anywhere is stale the day after it is written.
+//! 3. WHAT WAS INSTALLED IS WRITTEN DOWN. A receipt beside the directory
+//!    (`<workspace>/executors.toml`) records, per provider, the release this
+//!    verb installed and the sha256 of the bytes it wrote. That is what lets a
+//!    newer vendor release show up as `BUMP` on the next `agent install`
+//!    instead of a silent `ok` over old bytes, and what keeps the operator's
+//!    own build from ever being offered for replacement unasked.
 //!
-//! WHY THE HASH MATTERS MORE THAN USUAL: this executable runs inside the
+//! WHY THE CHECKSUM MATTERS MORE THAN USUAL: this executable runs inside the
 //! sandbox that holds the operator's provider credential. The sandbox is what
 //! protects the HOST from the CLI; it is not what protects the CREDENTIAL from
 //! it.
 //!
 //! The operator does not have to use this verb at all — dropping their own
-//! Linux build into the directory is equally valid, and the image builder's
-//! ELF check stays for exactly that case. This is a convenience with a
-//! receipt, not a gate.
+//! Linux build into the directory is equally valid (it reports as `own`), and
+//! the image builder's ELF check stays for exactly that case. This is a
+//! convenience with a receipt, not a gate.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+use provider_host::{CapabilitySpec, ReleaseSource, SpecSet};
 use sha2::{Digest as _, Sha256};
 
 use crate::cred_cli::ProviderArg;
@@ -43,17 +56,13 @@ use crate::cred_cli::ProviderArg;
 type InstallResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Every provider that has a guest CLI. Adding one here is what makes it
-/// offerable; the download metadata below is what makes it installable.
+/// offerable; its capability spec's `[source]` is what makes it installable.
 const ALL: [ProviderArg; 2] = [ProviderArg::Claude, ProviderArg::Codex];
-
-// ---- the pins ---------------------------------------------------------------
-// A bump is a reviewed diff: new version, new hashes, both arches.
-const CODEX_RELEASE: &str = "rust-v0.150.1";
-const CLAUDE_VERSION: &str = "2.1.231";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InstallArgs {
-    /// which CLIs to install (omitted = a checklist of what is missing)
+    /// which CLIs to install (omitted = a checklist of what is missing or
+    /// behind the vendor's latest release)
     #[arg(value_name = "NAME")]
     providers: Vec<ProviderArg>,
 }
@@ -71,11 +80,12 @@ impl GuestArch {
         match std::env::consts::ARCH {
             "aarch64" => Ok(Self::Aarch64),
             "x86_64" => Ok(Self::X86_64),
-            other => Err(format!("no pinned agent CLIs for guest arch {other}")),
+            other => Err(format!("no agent CLIs are published for guest arch {other}")),
         }
     }
 
-    /// the arch as the vendors' asset names spell it.
+    /// the arch as a Rust target triple spells it — what a `{arch}` in a
+    /// GitHub release's asset name stands for.
     fn rust_triple_arch(self) -> &'static str {
         match self {
             Self::Aarch64 => "aarch64",
@@ -83,6 +93,7 @@ impl GuestArch {
         }
     }
 
+    /// the arch as Anthropic's release feed spells its Linux platforms.
     fn claude_platform(self) -> &'static str {
         match self {
             Self::Aarch64 => "linux-arm64",
@@ -91,28 +102,34 @@ impl GuestArch {
     }
 }
 
+// ---- the vendors -------------------------------------------------------------
+
 /// What the artifact IS, which is what decides how it is unpacked.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Payload {
     /// the download is the executable itself, installed under this name.
-    Binary(&'static str),
+    Binary(String),
     /// members to lift out of a gzipped tar, by their path inside the archive.
-    TarGz(&'static [&'static str]),
+    TarGz(Vec<String>),
 }
 
-/// One vendor download — everything the operator is being asked to approve.
-struct Download {
-    version: &'static str,
+/// One vendor release, resolved: the channel's latest, and everything the
+/// operator is being asked to approve — where the bytes come from and the
+/// checksum the vendor published for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Release {
+    version: String,
     url: String,
-    sha256: &'static str,
+    sha256: String,
     payload: Payload,
 }
 
-impl Download {
-    /// the file names this download installs into the executors directory.
-    fn files(&self) -> Vec<&'static str> {
+impl Release {
+    /// the file names this release installs into the executors directory.
+    fn files(&self) -> Vec<&str> {
         match &self.payload {
-            Payload::Binary(name) => vec![name],
-            Payload::TarGz(members) => members.iter().copied().map(base_name).collect(),
+            Payload::Binary(name) => vec![name.as_str()],
+            Payload::TarGz(members) => members.iter().map(|m| base_name(m)).collect(),
         }
     }
 }
@@ -122,94 +139,285 @@ fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-impl ProviderArg {
-    /// The pinned Linux build of this provider's CLI for `arch`.
-    fn download(self, arch: GuestArch) -> Download {
-        match self {
-            // `codex-package-<triple>` carries `bin/codex` AND the
-            // `bin/codex-code-mode-host` companion codex requires, in ONE
-            // artifact the release publishes a sha256 for. The bare
-            // `codex-<triple>` asset ships neither.
-            Self::Codex => Download {
-                version: CODEX_RELEASE.trim_start_matches("rust-v"),
-                url: format!(
-                    "https://github.com/openai/codex/releases/download/{CODEX_RELEASE}/codex-package-{}-unknown-linux-musl.tar.gz",
-                    arch.rust_triple_arch()
-                ),
-                sha256: match arch {
-                    GuestArch::Aarch64 => {
-                        "1ecac3f87823efb98153233b076ea3d6e34a7a8cebe43c5285dc5f79e1514639"
-                    }
-                    GuestArch::X86_64 => {
-                        "00aba704f029f6dc0d948be407a756e0c97cc840132fd691353b2c6b0a505b17"
-                    }
-                },
-                payload: Payload::TarGz(&["bin/codex", "bin/codex-code-mode-host"]),
-            },
-            // glibc, not musl: the guest base is a full Ubuntu userland.
-            Self::Claude => Download {
-                version: CLAUDE_VERSION,
-                url: format!(
-                    "https://downloads.claude.ai/claude-code-releases/{CLAUDE_VERSION}/{}/claude",
-                    arch.claude_platform()
-                ),
-                sha256: match arch {
-                    GuestArch::Aarch64 => {
-                        "4ee7c484b11dece6521aa2173a19ea913428c1c78599186d62559d2d2aef4e32"
-                    }
-                    GuestArch::X86_64 => {
-                        "47a01daebf794f6c86c13d1875ad6e5be0627029ad8600731161f24018ecde5b"
-                    }
-                },
-                payload: Payload::Binary("claude"),
-            },
+/// The vendors' side of the verb: one HTTP client, and the two release
+/// channels the spec format knows how to read.
+struct Vendors {
+    http: reqwest::blocking::Client,
+}
+
+impl Vendors {
+    fn new() -> Result<Self, String> {
+        // no read timeout: the artifacts are hundreds of megabytes, and
+        // reqwest's blocking default (30s) would abort every one of them.
+        let http = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        Ok(Self { http })
+    }
+
+    fn get(&self, url: &str) -> Result<reqwest::blocking::Response, String> {
+        self.http
+            .get(url)
+            .send()
+            .map_err(|e| format!("fetch {url}: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("fetch {url}: {e}"))
+    }
+
+    fn text(&self, url: &str) -> Result<String, String> {
+        self.get(url)?
+            .text()
+            .map_err(|e| format!("read {url}: {e}"))
+    }
+
+    /// What is current on `spec`'s release channel for `arch`.
+    fn latest(&self, spec: &CapabilitySpec, arch: GuestArch) -> Result<Release, String> {
+        let Some(source) = &spec.source else {
+            return Err(format!(
+                "{}: its capability spec names no [source] to install it from",
+                spec.tag
+            ));
+        };
+        match source {
+            ReleaseSource::ClaudeReleases { base } => self.latest_on_feed(base, &spec.bin, arch),
+            ReleaseSource::GithubRelease {
+                repo,
+                asset,
+                sums,
+                members,
+            } => self.latest_github_release(repo, asset, sums, members, arch),
         }
     }
+
+    /// Anthropic's feed: `latest` names the version, the version's manifest
+    /// carries a checksum per platform, and the binary sits under the
+    /// platform.
+    fn latest_on_feed(&self, base: &str, bin: &str, arch: GuestArch) -> Result<Release, String> {
+        let version = self.text(&format!("{base}/latest"))?.trim().to_string();
+        if version.is_empty() {
+            return Err(format!("{base}/latest named no version"));
+        }
+        let manifest = self.text(&format!("{base}/{version}/manifest.json"))?;
+        let platform = arch.claude_platform();
+        let sha256 = manifest_checksum(&manifest, platform)
+            .map_err(|e| format!("{base}/{version}/manifest.json: {e}"))?;
+        Ok(Release {
+            url: format!("{base}/{version}/{platform}/{bin}"),
+            version,
+            sha256,
+            payload: Payload::Binary(bin.to_string()),
+        })
+    }
+
+    /// A GitHub release: `releases/latest` REDIRECTS to the latest tag's page,
+    /// so the tag is read off the landing url — no API call, no rate limit —
+    /// and the tag's download route serves the asset and its sums file.
+    fn latest_github_release(
+        &self,
+        repo: &str,
+        asset: &str,
+        sums: &str,
+        members: &[String],
+        arch: GuestArch,
+    ) -> Result<Release, String> {
+        let landing = self.get(&format!("https://github.com/{repo}/releases/latest"))?;
+        let tag = release_tag(landing.url().path())?;
+        let asset = asset.replace("{arch}", arch.rust_triple_arch());
+        let downloads = format!("https://github.com/{repo}/releases/download/{tag}");
+        let sums_text = self.text(&format!("{downloads}/{sums}"))?;
+        let sha256 =
+            sums_checksum(&sums_text, &asset).map_err(|e| format!("{downloads}/{sums}: {e}"))?;
+        Ok(Release {
+            version: tag,
+            url: format!("{downloads}/{asset}"),
+            sha256,
+            payload: Payload::TarGz(members.to_vec()),
+        })
+    }
 }
 
-/// Staging for a download in flight, BESIDE the executors directory rather than
-/// inside it: the guest's copy is an image built from that directory's whole
-/// contents, so a half-written 200 MB `.part` left there by an interrupted
+/// `platforms.<platform>.checksum` out of a release manifest.
+fn manifest_checksum(manifest: &str, platform: &str) -> Result<String, String> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest).map_err(|e| format!("not a manifest: {e}"))?;
+    let Some(checksum) = manifest["platforms"][platform]["checksum"].as_str() else {
+        return Err(format!("no checksum published for platform {platform}"));
+    };
+    if !is_sha256_hex(checksum) {
+        return Err(format!("the checksum for {platform} is not a sha256: {checksum:?}"));
+    }
+    Ok(checksum.to_string())
+}
+
+/// `asset`'s line out of a sha256 sums file: `<hex>  <name>` per line, the
+/// `*` a binary-mode `sha256sum` prefixes to the name allowed.
+fn sums_checksum(sums: &str, asset: &str) -> Result<String, String> {
+    for line in sums.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hex), Some(name)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if name.trim_start_matches('*') != asset {
+            continue;
+        }
+        if !is_sha256_hex(hex) {
+            return Err(format!("the checksum for {asset} is not a sha256: {hex:?}"));
+        }
+        return Ok(hex.to_string());
+    }
+    Err(format!("no checksum published for {asset}"))
+}
+
+/// The tag off the url `releases/latest` landed on: `…/releases/tag/<tag>`.
+fn release_tag(landing_path: &str) -> Result<String, String> {
+    let Some((_, tag)) = landing_path.rsplit_once("/releases/tag/") else {
+        return Err(format!(
+            "releases/latest did not land on a release tag: {landing_path}"
+        ));
+    };
+    if tag.is_empty() || tag.contains('/') {
+        return Err(format!("not a release tag: {tag:?}"));
+    }
+    Ok(tag.to_string())
+}
+
+fn is_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// ---- where the bytes go ------------------------------------------------------
+
+/// The download cache: OUTSIDE every workspace, because a workspace is
+/// disposable and a download is not — a `make dev` lap founds a fresh
+/// workspace and would otherwise fetch the same quarter-gigabyte again — and
+/// under the platform's cache dir rather than the ducktape home, which holds
+/// workspaces and nothing else. Keyed by provider and version, so a newer
+/// release never collides with the file an older one left; every hit is
+/// re-verified against the vendor's checksum before it is used.
+fn download_cache() -> Result<PathBuf, String> {
+    let root = cache_root(
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        cfg!(target_os = "macos"),
+    )?;
+    Ok(root.join("downloads"))
+}
+
+/// The platform's cache dir for ducktape: `$XDG_CACHE_HOME/ducktape`, else
+/// `~/.cache/ducktape` on Linux and `~/Library/Caches/ducktape` on macOS.
+fn cache_root(
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+    macos: bool,
+) -> Result<PathBuf, String> {
+    if let Some(xdg) = xdg_cache_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("ducktape"));
+    }
+    let Some(home) = home.filter(|value| !value.is_empty()) else {
+        return Err("neither XDG_CACHE_HOME nor HOME is set; nowhere to cache downloads".into());
+    };
+    let platform_cache = if macos { "Library/Caches" } else { ".cache" };
+    Ok(PathBuf::from(home).join(platform_cache).join("ducktape"))
+}
+
+/// Staging for an archive being unpacked, BESIDE the executors directory
+/// rather than inside it: the guest's copy is an image built from that
+/// directory's whole contents, so an extraction left there by an interrupted
 /// install would be baked into it.
-fn download_dir(executors: &Path) -> PathBuf {
-    executors.with_extension("download")
+fn staging_dir(executors: &Path) -> PathBuf {
+    executors.with_extension("staging")
 }
 
-pub(crate) fn run(args: InstallArgs) -> InstallResult {
-    let arch = GuestArch::host()?;
-    let dir = workspace_config::executor_dir()?;
-    print_status(&dir, arch);
+// ---- the receipts -----------------------------------------------------------
 
-    // Named providers are the operator's explicit ask — already the approval a
-    // checklist would collect, so it is not collected twice.
-    if !args.providers.is_empty() {
-        return install_all(&args.providers, &dir, arch);
-    }
-
-    let missing: Vec<ProviderArg> = ALL
-        .into_iter()
-        .filter(|p| !is_installed(*p, &dir, arch))
-        .collect();
-    if missing.is_empty() {
-        println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
-        return Ok(());
-    }
-    let chosen = choose(&missing, arch)?;
-    if chosen.is_empty() {
-        return Ok(());
-    }
-    install_all(&chosen, &dir, arch)
+/// What this verb installed, per provider — `<workspace>/executors.toml`,
+/// beside the directory it describes for the same reason the staging dir is:
+/// the directory's whole contents become the guest image.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Receipts {
+    #[serde(flatten)]
+    providers: BTreeMap<String, Receipt>,
 }
 
-/// Every file a provider's download installs is present and executable.
-/// A partial install reports as missing rather than as present: codex without
-/// its Code Mode companion is a codex that dies at startup inside the guest.
-fn is_installed(provider: ProviderArg, dir: &Path, arch: GuestArch) -> bool {
-    provider
-        .download(arch)
-        .files()
-        .iter()
-        .all(|f| is_executable(&dir.join(f)))
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Receipt {
+    /// the vendor release the download carried
+    version: String,
+    /// sha256 of the installed primary binary (`<executors>/<provider>`) —
+    /// the bytes this verb wrote, so a file the operator has since replaced
+    /// reads as their own build rather than as this receipt's
+    sha256: String,
+}
+
+impl Receipts {
+    fn path(executors: &Path) -> PathBuf {
+        executors.with_extension("toml")
+    }
+
+    fn load(executors: &Path) -> Result<Self, String> {
+        let path = Self::path(executors);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
+        };
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    fn save(&self, executors: &Path) -> Result<(), String> {
+        let path = Self::path(executors);
+        let text = toml::to_string(self).map_err(|e| format!("encode {}: {e}", path.display()))?;
+        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// What the directory holds for one provider, measured against the vendor's
+/// latest release and the receipts.
+#[derive(Debug, PartialEq, Eq)]
+enum Installed {
+    /// no complete, executable set of the provider's files
+    Missing,
+    /// installed by this verb, at the vendor's latest
+    Current { sha256: String },
+    /// installed by this verb at an earlier release: the bump the checklist
+    /// offers
+    Behind { installed: String },
+    /// executable bytes this verb did not write, or wrote and the operator has
+    /// since replaced — their own Linux build. Never offered; replaced only by
+    /// naming it (`agent install <name>`).
+    Foreign { sha256: String },
+}
+
+impl Installed {
+    /// what the checklist proposes: absent, or behind the vendor's latest.
+    fn is_offered(&self) -> bool {
+        matches!(self, Self::Missing | Self::Behind { .. })
+    }
+}
+
+fn installed(provider: ProviderArg, latest: &Release, dir: &Path, receipts: &Receipts) -> Installed {
+    // A partial install reports as missing rather than as present: codex
+    // without its Code Mode companion is a codex that dies at startup inside
+    // the guest.
+    let every_file_executable = latest.files().iter().all(|f| is_executable(&dir.join(f)));
+    if !every_file_executable {
+        return Installed::Missing;
+    }
+    let sha256 = sha256_file(&dir.join(provider.token())).unwrap_or_else(|_| "?".into());
+    let Some(receipt) = receipts.providers.get(provider.token()) else {
+        return Installed::Foreign { sha256 };
+    };
+    let bytes_are_the_receipts = sha256 == receipt.sha256;
+    if !bytes_are_the_receipts {
+        return Installed::Foreign { sha256 };
+    }
+    if receipt.version == latest.version {
+        return Installed::Current { sha256 };
+    }
+    Installed::Behind {
+        installed: receipt.version.clone(),
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -219,54 +427,122 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// What is here, and — for what is not — exactly what installing it would
-/// download. This IS the proposal the checklist below then asks approval for,
-/// so it names the vendor url and the sha256 this build expects, in full.
-fn print_status(dir: &Path, arch: GuestArch) {
+/// One provider's row in the survey: what the vendor has, and what the
+/// directory holds against it.
+struct Surveyed {
+    provider: ProviderArg,
+    latest: Release,
+    state: Installed,
+}
+
+pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
+    let arch = GuestArch::host()?;
+    let dir = workspace_config::executor_dir(workspace);
+    let receipts = Receipts::load(&dir)?;
+    // the workspace's specs, the way the compute daemon loads them: an
+    // operator override of a built-in spec changes where its build comes from
+    // for this verb too.
+    let capability_dir = workspace_config::capability_dir(workspace);
+    let specs = SpecSet::load(capability_dir.is_dir().then_some(capability_dir.as_path()))?;
+    let vendors = Vendors::new()?;
+    let survey = ALL
+        .into_iter()
+        .map(|provider| {
+            let Some(spec) = specs.get(provider.token()) else {
+                return Err(format!("no capability spec for {}", provider.token()));
+            };
+            let latest = vendors.latest(spec, arch)?;
+            let state = installed(provider, &latest, &dir, &receipts);
+            Ok(Surveyed {
+                provider,
+                latest,
+                state,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    print_status(&dir, arch, &survey);
+
+    // Named providers are the operator's explicit ask — already the approval a
+    // checklist would collect, so it is not collected twice.
+    let chosen: Vec<&Surveyed> = if args.providers.is_empty() {
+        let offered: Vec<&Surveyed> = survey.iter().filter(|row| row.state.is_offered()).collect();
+        if offered.is_empty() {
+            println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
+            return Ok(());
+        }
+        choose(&offered)?
+    } else {
+        survey
+            .iter()
+            .filter(|row| args.providers.contains(&row.provider))
+            .collect()
+    };
+    if chosen.is_empty() {
+        return Ok(());
+    }
+    install_all(&vendors, &chosen, &dir)
+}
+
+/// What is here, and — for what is not, or is behind the vendor — exactly what
+/// installing it would download. This IS the proposal the checklist below then
+/// asks approval for, so it names the vendor url and the checksum the vendor
+/// published, in full.
+fn print_status(dir: &Path, arch: GuestArch, survey: &[Surveyed]) {
     println!(
         "guest executors ({}, guest arch {})",
         dir.display(),
         arch.rust_triple_arch()
     );
-    for provider in ALL {
-        let name = provider.token();
-        let download = provider.download(arch);
-        if !is_installed(provider, dir, arch) {
-            println!("  MISS    {name:<8} {}", download.version);
-            println!("          {}", download.url);
-            println!("          sha256 {}", download.sha256);
-            continue;
+    for row in survey {
+        let name = row.provider.token();
+        let latest = &row.latest;
+        match &row.state {
+            Installed::Missing => {
+                println!("  MISS    {name:<8} {} (latest)", latest.version);
+                println!("          {}", latest.url);
+                println!("          sha256 {}", latest.sha256);
+            }
+            Installed::Behind { installed } => {
+                println!("  BUMP    {name:<8} {installed} -> {} (latest)", latest.version);
+                println!("          {}", latest.url);
+                println!("          sha256 {}", latest.sha256);
+            }
+            // the hash of what is actually installed, so the image's contents
+            // stay attributable to a download without unpacking the image.
+            Installed::Current { sha256 } => println!(
+                "  ok      {name:<8} {} (latest) sha256:{}…",
+                latest.version,
+                &sha256[..16.min(sha256.len())]
+            ),
+            Installed::Foreign { sha256 } => println!(
+                "  own     {name:<8} sha256:{}… (not installed by this verb; \
+                 `ducktape agent install {name}` replaces it)",
+                &sha256[..16.min(sha256.len())]
+            ),
         }
-        // the hash of what is actually installed, so the image's contents stay
-        // attributable to a download without unpacking the image.
-        let installed = sha256_file(&dir.join(name)).unwrap_or_else(|_| "?".into());
-        println!(
-            "  ok      {name:<8} sha256:{}…",
-            &installed[..16.min(installed.len())]
-        );
     }
 }
 
 /// The checklist — the approval step for the downloads [`print_status`] just
 /// proposed. Off a terminal there is nobody to approve, so it prints the
 /// commands and installs nothing.
-fn choose(missing: &[ProviderArg], arch: GuestArch) -> Result<Vec<ProviderArg>, String> {
+fn choose<'a>(offered: &[&'a Surveyed]) -> Result<Vec<&'a Surveyed>, String> {
     if !std::io::stdin().is_terminal() {
         println!("\nnot a terminal — install what you want with:");
-        for provider in missing {
-            println!("  ducktape agent install {}", provider.token());
+        for row in offered {
+            println!("  ducktape agent install {}", row.provider.token());
         }
         return Ok(Vec::new());
     }
 
     println!();
-    let items: Vec<String> = missing
+    let items: Vec<String> = offered
         .iter()
-        .map(|p| format!("{:<8} {}", p.token(), p.download(arch).version))
+        .map(|row| format!("{:<8} {}", row.provider.token(), row.latest.version))
         .collect();
     let picked = dialoguer::MultiSelect::new()
         .with_prompt(
-            "agent CLIs to install into this host's guest image (space toggles, enter confirms)",
+            "agent CLIs to install into this workspace's guest image (space toggles, enter confirms)",
         )
         .items(&items)
         .interact_opt()
@@ -274,13 +550,21 @@ fn choose(missing: &[ProviderArg], arch: GuestArch) -> Result<Vec<ProviderArg>, 
     let Some(picked) = picked else {
         return Ok(Vec::new());
     };
-    Ok(picked.into_iter().map(|i| missing[i]).collect())
+    Ok(picked.into_iter().map(|i| offered[i]).collect())
 }
 
-fn install_all(providers: &[ProviderArg], dir: &Path, arch: GuestArch) -> InstallResult {
+fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallResult {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    for provider in providers {
-        install_one(*provider, dir, arch)?;
+    let cache = download_cache()?;
+    let mut receipts = Receipts::load(dir)?;
+    for row in chosen {
+        let receipt = install_one(vendors, row.provider, &row.latest, dir, &cache)?;
+        receipts
+            .providers
+            .insert(row.provider.token().to_string(), receipt);
+        // saved per install, so a second download failing does not lose the
+        // first one's receipt.
+        receipts.save(dir)?;
     }
     // Nothing else to do: the node derives the guest's copy from this directory
     // and rebuilds it whenever the directory has moved on, so the next run
@@ -288,30 +572,32 @@ fn install_all(providers: &[ProviderArg], dir: &Path, arch: GuestArch) -> Instal
     Ok(())
 }
 
-fn install_one(provider: ProviderArg, dir: &Path, arch: GuestArch) -> InstallResult {
-    let download = provider.download(arch);
-    println!(
-        "\n{} {} <- {}",
-        provider.token(),
-        download.version,
-        download.url
-    );
+fn install_one(
+    vendors: &Vendors,
+    provider: ProviderArg,
+    latest: &Release,
+    dir: &Path,
+    cache: &Path,
+) -> Result<Receipt, Box<dyn std::error::Error>> {
+    println!("\n{} {} <- {}", provider.token(), latest.version, latest.url);
 
-    let work = download_dir(dir);
-    std::fs::create_dir_all(&work).map_err(|e| format!("create {}: {e}", work.display()))?;
-    let artifact = work.join(base_name(&download.url));
-    fetch(&download.url, &artifact, download.sha256)?;
+    let shelf = cache.join(provider.token()).join(&latest.version);
+    std::fs::create_dir_all(&shelf).map_err(|e| format!("create {}: {e}", shelf.display()))?;
+    let artifact = shelf.join(base_name(&latest.url));
+    fetch(vendors, &latest.url, &artifact, &latest.sha256)?;
     println!("  sha256 ok");
 
-    match &download.payload {
+    match &latest.payload {
         Payload::Binary(name) => install_file(&artifact, &dir.join(name))?,
         Payload::TarGz(members) => unpack_into(&artifact, members, dir)?,
     }
-    // the artifact is the image's input, not its store: what was verified now
-    // lives in the executors directory, and 200+ MB of tarball does not.
-    let _ = std::fs::remove_file(&artifact);
-    println!("  installed {} -> {}", provider.token(), dir.display());
-    Ok(())
+    for file in latest.files() {
+        println!("  installed {}", dir.join(file).display());
+    }
+    Ok(Receipt {
+        version: latest.version.clone(),
+        sha256: sha256_file(&dir.join(provider.token()))?,
+    })
 }
 
 /// Download to `dest` unless it is already there, then verify — a cached file
@@ -319,9 +605,9 @@ fn install_one(provider: ProviderArg, dir: &Path, arch: GuestArch) -> InstallRes
 /// entry cannot survive into an image. A mismatch deletes the file and stops:
 /// there is no "carry on without it" for an executable that runs beside a
 /// credential.
-fn fetch(url: &str, dest: &Path, want: &str) -> Result<(), String> {
+fn fetch(vendors: &Vendors, url: &str, dest: &Path, want: &str) -> Result<(), String> {
     if !dest.exists() {
-        download_to(url, dest)?;
+        download_to(vendors, url, dest)?;
     }
     let got = sha256_file(dest)?;
     if got != want {
@@ -336,20 +622,9 @@ fn fetch(url: &str, dest: &Path, want: &str) -> Result<(), String> {
 
 /// Stream to `<dest>.part` and rename on success: an interrupted download must
 /// never be picked up as a cache hit on the next run.
-fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+fn download_to(vendors: &Vendors, url: &str, dest: &Path) -> Result<(), String> {
     let part = dest.with_extension("part");
-    // no read timeout: these artifacts are hundreds of megabytes, and reqwest's
-    // blocking default (30s) would abort every one of them.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(None)
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("fetch {url}: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("fetch {url}: {e}"))?;
+    let mut response = vendors.get(url)?;
     let response_length = response.content_length();
     // The meter draws nothing off a terminal, so say the size once instead: it
     // is the part that tells a long download from a wedged one, and it is the
@@ -463,8 +738,8 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 /// `tar` rather than a crate: it is on every macOS and Linux host, both
 /// flavours extract named members the same way, and a tar reader is a parser
 /// this verb does not need to own.
-fn unpack_into(archive: &Path, members: &[&str], dir: &Path) -> Result<(), String> {
-    let unpack = download_dir(dir).join("unpack");
+fn unpack_into(archive: &Path, members: &[String], dir: &Path) -> Result<(), String> {
+    let unpack = staging_dir(dir);
     let _ = std::fs::remove_dir_all(&unpack);
     std::fs::create_dir_all(&unpack).map_err(|e| format!("create {}: {e}", unpack.display()))?;
     let status = std::process::Command::new("tar")
@@ -495,6 +770,30 @@ fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dt-exec-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// a stand-in executable: any file with the exec bit reads as installed,
+    /// and a small one keeps the hashing out of the test's clock.
+    fn stand_in(dir: &Path, name: &str) {
+        let src = dir.join(format!("{name}.src"));
+        std::fs::write(&src, name).unwrap();
+        install_file(&src, &dir.join(name)).unwrap();
+    }
+
+    fn release(version: &str, files: &[&str]) -> Release {
+        Release {
+            version: version.into(),
+            url: format!("https://vendor.example/{version}/artifact"),
+            sha256: "0".repeat(64),
+            payload: Payload::TarGz(files.iter().map(|f| format!("bin/{f}")).collect()),
+        }
+    }
 
     /// The meter's only real arithmetic is the fill, and it has to hold at both
     /// ends and on a server that sends no `Content-Length` — the bar is drawn
@@ -530,62 +829,176 @@ mod tests {
         assert_eq!(meter(7 * mib, Some(0)), "  7.0 MiB");
     }
 
-    /// Every pin is a full sha256 and every url is the vendor's, on both
-    /// arches — the two things a bump can get wrong without failing to compile.
+    /// The three readers of what a vendor publishes, on the shapes the vendors
+    /// actually serve: a manifest's per-platform checksum, a sums file's line
+    /// for one asset (binary-mode `*` prefix included), and the tag off the
+    /// page `releases/latest` lands on. Each refuses a checksum that is not a
+    /// sha256 rather than passing it on to be "verified" against.
     #[test]
-    fn every_pin_is_a_full_hash_from_a_vendor_url() {
-        for arch in [GuestArch::Aarch64, GuestArch::X86_64] {
-            for provider in ALL {
-                let download = provider.download(arch);
-                assert_eq!(download.sha256.len(), 64, "{:?} {arch:?}", provider.token());
-                assert!(
-                    download.sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                    "{} {arch:?} sha is not hex",
-                    provider.token()
-                );
-                assert!(
-                    download.url.starts_with("https://"),
-                    "{} {arch:?} url is not https",
-                    provider.token()
-                );
-                assert!(!download.files().is_empty());
-            }
-        }
+    fn the_vendor_readers_take_what_is_published_and_nothing_else() {
+        let sha = "26d020351e8112f4006790f3cfce43b4c9df0c1bb1d0e542364d64151b81d5ba";
+        let manifest = format!(
+            r#"{{"version":"2.1.263","platforms":{{"linux-x64":{{"binary":"claude","checksum":"{sha}","size":1}},"darwin-arm64":{{"checksum":"short"}}}}}}"#
+        );
+        assert_eq!(manifest_checksum(&manifest, "linux-x64").unwrap(), sha);
+        assert!(
+            manifest_checksum(&manifest, "linux-arm64")
+                .unwrap_err()
+                .contains("no checksum published for platform linux-arm64")
+        );
+        assert!(
+            manifest_checksum(&manifest, "darwin-arm64")
+                .unwrap_err()
+                .contains("not a sha256")
+        );
+        assert!(manifest_checksum("{", "linux-x64").unwrap_err().contains("not a manifest"));
+
+        let sums = format!(
+            "{}  codex-package-aarch64-apple-darwin.tar.gz\n\
+             {sha} *codex-package-x86_64-unknown-linux-musl.tar.gz\n\
+             nonsense\n\
+             short  codex-package-aarch64-unknown-linux-musl.tar.gz\n",
+            "1".repeat(64)
+        );
+        assert_eq!(
+            sums_checksum(&sums, "codex-package-x86_64-unknown-linux-musl.tar.gz").unwrap(),
+            sha
+        );
+        assert!(
+            sums_checksum(&sums, "codex-package-aarch64-unknown-linux-musl.tar.gz")
+                .unwrap_err()
+                .contains("not a sha256")
+        );
+        assert!(
+            sums_checksum(&sums, "codex-x86_64-unknown-linux-musl.tar.gz")
+                .unwrap_err()
+                .contains("no checksum published for codex-x86_64")
+        );
+
+        assert_eq!(
+            release_tag("/openai/codex/releases/tag/rust-v0.153.4").unwrap(),
+            "rust-v0.153.4"
+        );
+        assert!(release_tag("/openai/codex/releases").is_err());
+        assert!(release_tag("/openai/codex/releases/tag/").is_err());
+    }
+
+    /// The cache is the platform's, never a workspace's: `$XDG_CACHE_HOME`
+    /// when set and non-empty, else the OS convention under `$HOME`.
+    #[test]
+    fn the_download_cache_is_the_platforms_cache_dir() {
+        let root = |xdg: Option<&str>, home: Option<&str>, macos: bool| {
+            cache_root(xdg.map(OsString::from), home.map(OsString::from), macos)
+        };
+        assert_eq!(
+            root(Some("/var/cache/op"), Some("/home/op"), false).unwrap(),
+            PathBuf::from("/var/cache/op/ducktape")
+        );
+        assert_eq!(
+            root(Some(""), Some("/home/op"), false).unwrap(),
+            PathBuf::from("/home/op/.cache/ducktape")
+        );
+        assert_eq!(
+            root(None, Some("/Users/op"), true).unwrap(),
+            PathBuf::from("/Users/op/Library/Caches/ducktape")
+        );
+        assert!(root(None, None, false).is_err());
     }
 
     /// codex is useless in the guest without its Code Mode companion, so a
-    /// directory holding only `codex` must report as missing, not installed.
+    /// directory holding only `codex` must report as missing, not installed —
+    /// and a complete set nobody wrote a receipt for is the operator's own.
     #[test]
     fn a_partial_install_reports_as_missing() {
-        let dir = std::env::temp_dir().join(format!("dt-exec-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let arch = GuestArch::Aarch64;
+        let dir = scratch("partial");
+        let latest = release("rust-v1.0.0", &["codex", "codex-code-mode-host"]);
+        let receipts = Receipts::default();
 
-        install_file(&std::env::current_exe().unwrap(), &dir.join("codex")).unwrap();
-        assert!(!is_installed(ProviderArg::Codex, &dir, arch));
-        install_file(
-            &std::env::current_exe().unwrap(),
-            &dir.join("codex-code-mode-host"),
-        )
-        .unwrap();
-        assert!(is_installed(ProviderArg::Codex, &dir, arch));
+        stand_in(&dir, "codex");
+        assert_eq!(
+            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            Installed::Missing
+        );
+        stand_in(&dir, "codex-code-mode-host");
+        assert!(matches!(
+            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            Installed::Foreign { .. }
+        ));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The receipt is what tells current from behind from the operator's own
+    /// build: the same bytes read as `ok` under a receipt at the vendor's
+    /// latest, as `BUMP` under an older one, and as `own` under a receipt
+    /// whose hash the file no longer matches — the operator replaced it, and a
+    /// checklist that offered to replace THAT back would be doing the one
+    /// thing this verb exists not to do.
+    #[test]
+    fn a_receipt_tells_current_from_behind_from_the_operators_own_build() {
+        let workspace = scratch("receipts");
+        let dir = workspace_config::executor_dir(&workspace);
+        std::fs::create_dir_all(&dir).unwrap();
+        let latest = release("2.1.263", &["claude"]);
+        stand_in(&dir, "claude");
+        let sha256 = sha256_file(&dir.join("claude")).unwrap();
+
+        let mut receipts = Receipts::default();
+        receipts.providers.insert(
+            "claude".into(),
+            Receipt {
+                version: "2.1.263".into(),
+                sha256: sha256.clone(),
+            },
+        );
+        assert_eq!(
+            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            Installed::Current {
+                sha256: sha256.clone()
+            }
+        );
+
+        receipts.providers.get_mut("claude").unwrap().version = "2.1.231".into();
+        assert_eq!(
+            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            Installed::Behind {
+                installed: "2.1.231".into()
+            }
+        );
+        assert!(installed(ProviderArg::Claude, &latest, &dir, &receipts).is_offered());
+
+        receipts.providers.get_mut("claude").unwrap().sha256 = "0".repeat(64);
+        let own = installed(ProviderArg::Claude, &latest, &dir, &receipts);
+        assert_eq!(own, Installed::Foreign { sha256 });
+        assert!(!own.is_offered());
+
+        // the receipts round-trip through the file beside the directory.
+        receipts.save(&dir).unwrap();
+        assert_eq!(Receipts::path(&dir), workspace.join("executors.toml"));
+        let reloaded = Receipts::load(&dir).unwrap();
+        assert_eq!(reloaded.providers, receipts.providers);
+        // and an absent file is simply no receipts.
+        assert!(
+            Receipts::load(&scratch("no-receipts").join("executors"))
+                .unwrap()
+                .providers
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+    }
+
     /// The verify gate: an unexpected hash deletes the file and refuses. This
-    /// is the whole point of the pins, so it is checked without a network — a
-    /// present `dest` skips the download.
+    /// is the whole point of the vendor's checksum, so it is checked without a
+    /// network — a present `dest` skips the download.
     #[test]
     fn a_mismatched_download_is_deleted_and_refused() {
-        let dir = std::env::temp_dir().join(format!("dt-exec-fetch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("fetch");
         let dest = dir.join("artifact");
-        std::fs::write(&dest, b"not what the pin says").unwrap();
+        std::fs::write(&dest, b"not what the vendor published").unwrap();
+        let vendors = Vendors::new().unwrap();
 
-        let err = fetch("https://example.invalid/x", &dest, &"0".repeat(64)).unwrap_err();
+        let err = fetch(&vendors, "https://example.invalid/x", &dest, &"0".repeat(64)).unwrap_err();
         assert!(
             err.contains("refusing to install an unverified executable"),
             "{err}"
@@ -595,6 +1008,7 @@ mod tests {
         // and the matching case installs: sha256("") is the empty-file hash.
         std::fs::write(&dest, b"").unwrap();
         fetch(
+            &vendors,
             "https://example.invalid/x",
             &dest,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -603,5 +1017,33 @@ mod tests {
         assert!(dest.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both built-in channels answer, live: the feed names a version and a
+    /// checksum for each Linux platform, and the GitHub release names a tag
+    /// and a checksum for each arch's asset. The one test that talks to the
+    /// vendors, so it runs on request:
+    ///
+    ///   cargo test -p node-bin --bin ducktape -- --ignored executors::tests::the_vendors
+    #[test]
+    #[ignore = "live: resolves the latest release from each vendor over the network"]
+    fn the_vendors_publish_a_latest_release_for_both_guest_arches() {
+        let specs = SpecSet::load(None).unwrap();
+        let vendors = Vendors::new().unwrap();
+        for provider in ALL {
+            for arch in [GuestArch::Aarch64, GuestArch::X86_64] {
+                let latest = vendors
+                    .latest(specs.get(provider.token()).unwrap(), arch)
+                    .unwrap();
+                assert!(!latest.version.is_empty(), "{} {arch:?}", provider.token());
+                assert!(latest.url.starts_with("https://"), "{}", latest.url);
+                assert!(is_sha256_hex(&latest.sha256), "{} {arch:?}", provider.token());
+                assert!(
+                    latest.files().contains(&provider.token()),
+                    "the release delivers the binary named for its provider"
+                );
+                eprintln!("{} {arch:?}: {} {}", provider.token(), latest.version, latest.url);
+            }
+        }
     }
 }

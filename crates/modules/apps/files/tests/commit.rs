@@ -429,24 +429,35 @@ fn case6_rm_mv_mkdir_symlink() {
 fn case7_authority() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
-    // ext:bob writing under alice's home → reject (home is owner-gated).
-    let alice_owner = format!("ext:{}", to_hex(b"alice"));
-    let alice_home = format!("/home/{alice_owner}/secret");
-    let err = commit(
+    // ext:bob writing under alice's home lands: a home's label is attribution.
+    let alice_label = format!("ext:{}", to_hex(b"alice"));
+    let alice_home = format!("/home/{alice_label}/note");
+    commit(
         &mut f,
         ext(b"bob"),
         1,
         None,
         vec![put_inline(&alice_home, b"x")],
     )
-    .expect_err("bob cannot write alice's home");
+    .expect("bob writes under alice's home");
+    commit_block(&mut f);
+    assert!(stat(&f, &alice_home, None).is_some());
+    // ext:bob writing outside /home and /shared → reject.
+    let err = commit(
+        &mut f,
+        ext(b"bob"),
+        2,
+        None,
+        vec![put_inline("/etc/passwd", b"x")],
+    )
+    .expect_err("bob cannot write outside the namespaces");
     assert!(matches!(err, sdk::Error::Module(_)));
     abort_block(&mut f);
     // system writes anywhere (bypasses /home + /shared authority).
     commit(
         &mut f,
         sdk::Origin::System,
-        2,
+        3,
         None,
         vec![put_inline("/genesis/seed", b"s")],
     )
@@ -578,8 +589,8 @@ fn case12_watch_fan_out_emits_notification() {
     .expect("commit");
     commit_block(&mut f);
     let head = f.committed_head_for_test().expect("head");
-    assert_eq!(ctx.msgs().len(), 1, "exactly one watch hit");
-    let msg = &ctx.msgs()[0];
+    assert_eq!(watch_msgs(&ctx).len(), 1, "exactly one watch hit");
+    let msg = &watch_msgs(&ctx)[0];
     assert_eq!(
         msg.target, "indexer",
         "notification targets the watching module"
@@ -607,7 +618,7 @@ fn case12_watch_outside_prefix_does_not_notify() {
     .expect("commit");
     commit_block(&mut f);
     assert!(
-        ctx.msgs().is_empty(),
+        watch_msgs(&ctx).is_empty(),
         "a path outside the prefix emits nothing"
     );
 }

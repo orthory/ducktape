@@ -21,6 +21,23 @@ use super::*;
 /// Pinned as a SET, for the reason the node streams below are: a `contains` is
 /// equally satisfied by a second, unfiltered subscription sitting beside the
 /// right one.
+///
+/// THE FOURTH ONE IS THE COMMAND CHORDS, AND IT IS ARMED, NOT STANDING. ⌘Q and ⌘W have to
+/// reach the launch window too, so it cannot hide behind the `connected ||
+/// palette_open` gate the first line uses — and a fourth standing subscription
+/// is exactly the second rebuild per character this test exists to refuse. It
+/// pays nothing instead because `cmd_held` gates it: the modifier stream (which
+/// fires only when a modifier moves) arms the press route, so the route does
+/// not exist while anyone is typing. Dropping `when cmd_held` is the regression
+/// — the app would still quit on ⌘Q, and every keystroke would pay for it.
+///
+/// THE FIFTH IS THE CHAT'S ⌘C, armed by its own copy range AND by the chat tab.
+/// It is a separate route and not an arm on the chord dispatch for exactly the
+/// reason above: the chord's route is armed by ⌘ alone and therefore exists on
+/// every screen, while this one exists only once the reader has actually
+/// selected something — and only where the selection is, so a range left
+/// standing in chat cannot tax a keystroke typed in Pages, Forge or the
+/// console.
 #[test]
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
@@ -35,14 +52,44 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
             "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
             "keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, \
              palette_open, bell_open, channel_create_open, thread_message_action, \
-             message_action, channel_settings_open, page_delete_armed, \
-             fs_delete_target, forge_repo_menu)) -> global_key_pressed _",
-            "keyboard press status=ignored -> content_scroll_key _",
+             message_action, channel_settings_open, page_delete_armed)) -> \
+             global_key_pressed _",
+            "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
+            "keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == \
+             ShellTab.chat) -> copy_chord_pressed _",
         ],
         "a `keyboard press` without `status=` bills every captured key a whole \
          extra view rebuild; the captured half is Escape-only (ducktape-ui#602) \
-         and stays gated on an open layer"
+         and stays gated on an open layer; the command chords' route keeps its \
+         `when cmd_held` arming, without which it becomes a fourth STANDING \
+         subscription and every keystroke pays for ⌘Q and ⌘W; and the chat's \
+         ⌘C route keeps both terms of its arming, which is why it is not an \
+         arm on the chord dispatch — a reader with nothing selected, or \
+         reading another tab, has no copy route at all, while the chord's own \
+         route, armed by ⌘ alone, runs on every screen"
     );
+}
+
+/// THE ROOM CHECK, RE-READ AT DELIVERY. A submit rides one async hop before
+/// `composer_submitted` takes it, and the reader can change rooms — or
+/// networks — in between; the scope it was written in rides the intent, so
+/// a body for a room no longer on screen is refused and restored into THAT
+/// room's box, never posted into the one she moved to.
+#[test]
+fn a_submit_for_a_room_the_reader_has_left_goes_back_to_that_room() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "general".into();
+    let left = backend::composer_scope("http://node", "ops");
+    let task = app.__update(__DucktapeMessage::ChatViewEvent(composer_intent(
+        &left, "message", "for ops",
+    )));
+    pump(&mut app, task);
+    assert!(app.messages.is_empty(), "never posted into general");
+    assert_eq!(composer_stash(&left), "for ops");
+    assert!(composer_stash(&composer_scope(&app)).is_empty());
 }
 
 #[test]
@@ -55,16 +102,16 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     // instance — the same route a real keystroke takes through the rich
     // composer — so this pins the instance's whole cycle: it collects the
     // keystrokes, clears itself on submit, and only then hands the body up.
-    let composer = composer_scope(&mut app);
-    type_into(&mut app, &composer, ComposerKind::Message, "first");
-    assert_eq!(composer_text(&app, &composer), "first");
+    let composer = composer_scope(&app);
+    type_into(&composer, "first");
+    assert_eq!(composer_text(&composer), "first");
 
     submit_composer(&mut app, &composer, ComposerKind::Message, false);
     let first_id = app.messages[0].id.clone();
     let first_view_key = app.messages[0].view_key;
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(
-        composer_text(&app, &composer).is_empty(),
+        composer_text(&composer).is_empty(),
         "the instance clears itself before it emits"
     );
     assert_eq!(app.messages.len(), 1);
@@ -77,7 +124,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages.iter().all(|message| message.pending));
 
-    type_into(&mut app, &composer, ComposerKind::Message, "third");
+    type_into(&composer, "third");
     // the submit receipt itself never touches the list…
     let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
         operation_id: first_id.clone(),
@@ -93,7 +140,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general", second,
     )));
-    assert_eq!(composer_text(&app, &composer), "third");
+    assert_eq!(composer_text(&composer), "third");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(!app.messages[0].pending);
     assert_eq!(app.messages[0].seq, 1);
@@ -145,7 +192,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         [second_view_key, first_view_key]
     );
 
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat.contains("keyed message in messages by=message.view_key"));
     assert!(!chat.contains("keyed message in messages by=message.seq"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
@@ -173,7 +220,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
 #[test]
 fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
     const HANDLERS: &str = include_str!("../ui/handlers/chat.ice");
-    const SCREEN: &str = include_str!("../ui/screens/chat.ice");
+    const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
 
     // The rail's plate is drawn under `if active_thread_seq > 0` and
     // `open_thread_for` refuses an empty channel, so its re-read may name
@@ -218,13 +265,19 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
             })
             .collect()
     };
-    // The mount's `blocked=` and the arm's `let refused =`, in mount order.
+    // The seat's `blocked` argument — the fifth of `chat_composer(scope,
+    // kind, compact, hint, blocked, …)` — and the arm's verdict, in seat order.
     let shown: Vec<Vec<String>> = SCREEN
         .lines()
         .map(str::trim)
-        .filter_map(|line| line.strip_prefix("blocked=("))
-        .filter_map(|line| line.strip_suffix(')'))
-        .map(terms)
+        .filter_map(|line| line.strip_prefix("extern chat_composer("))
+        .filter_map(|arguments| {
+            let arguments = split_top(arguments);
+            match arguments[1] {
+                "\"message\"" | "\"reply\"" => Some(terms(arguments[4])),
+                _ => None,
+            }
+        })
         .collect();
     // The re-read is a VERDICT now, computed once from the same four inputs
     // the mount's gate wears — so the lint reads its arguments rather than a
@@ -256,7 +309,7 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
     assert_eq!(
         shown.len(),
         2,
-        "two composers are mounted, each with its own gate"
+        "the message and reply composers each have a delivery gate"
     );
     assert_eq!(
         refused.len(),
@@ -289,13 +342,8 @@ fn a_resync_never_eats_the_message_being_typed() {
     app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.hydration_generation = 4;
-    let composer = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &composer,
-        ComposerKind::Message,
-        "half a paragraph, mid-word",
-    );
+    let composer = composer_scope(&app);
+    type_into(&composer, "half a paragraph, mid-word");
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         4,
@@ -306,7 +354,7 @@ fn a_resync_never_eats_the_message_being_typed() {
     )));
 
     assert_eq!(
-        composer_text(&app, &composer),
+        composer_text(&composer),
         "half a paragraph, mid-word",
         "a resync must never eat keystrokes either"
     );
@@ -326,21 +374,17 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.connected_rpc = "http://node-a".into();
-    let composer = composer_scope(&mut app);
-    type_into(&mut app, &composer, ComposerKind::Message, "next message");
+    let composer = composer_scope(&app);
+    type_into(&composer, "next message");
     // The stash is seeded the only way anything writes it now: the `unsent`
-    // message the app's failure slices publish, addressed to this instance.
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
-        composer.clone(),
-        "unsent message".into(),
-        false,
-    ));
+    // hand-back the app's failure arms make, addressed to this document.
+    composer_surface::unsent(&composer, "unsent message", false);
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
 
     assert_eq!(app.connected_rpc, "http://node-a");
-    assert_eq!(composer_text(&app, &composer), "next message");
-    assert_eq!(composer_stash(&app, &composer), "unsent message");
+    assert_eq!(composer_text(&composer), "next message");
+    assert_eq!(composer_stash(&composer), "unsent message");
 }
 
 /// SURVIVING THE RECONNECT IS NOT THE SAME AS SURVIVING IT IN THE RIGHT ROOM.
@@ -360,15 +404,10 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     app.connected_rpc = "http://node".into();
     app.active_channel = "private-ops".into();
     app.active_thread_seq = 3;
-    let ops = composer_scope(&mut app);
-    let ops_rail = reply_composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &ops,
-        ComposerKind::Message,
-        "the incident started at",
-    );
-    type_into(&mut app, &ops_rail, ComposerKind::Reply, "half a reply");
+    let ops = composer_scope(&app);
+    let ops_rail = reply_composer_scope(&app);
+    type_into(&ops, "the incident started at");
+    type_into(&ops_rail, "half a reply");
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
 
@@ -381,10 +420,10 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
         app.active_channel, "general",
         "the connect picks the landing"
     );
-    let general = composer_scope(&mut app);
+    let general = composer_scope(&app);
     assert_ne!(general, ops, "a different room is a different instance");
     assert!(
-        composer_text(&app, &general).is_empty(),
+        composer_text(&general).is_empty(),
         "#general's composer is #general's — the note she was writing next door \
          is not armed to send here"
     );
@@ -392,14 +431,14 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     app.mutation_phase = MutationPhase::Idle;
     let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
-        composer_text(&app, &ops),
+        composer_text(&ops),
         "the incident started at",
         "it is waiting in the room she was writing it in"
     );
 
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(3));
     assert_eq!(
-        composer_text(&app, &ops_rail),
+        composer_text(&ops_rail),
         "half a reply",
         "and the rail the reconnect closed kept its reply too"
     );
@@ -422,13 +461,8 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "private-ops".into();
-    let ops = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &ops,
-        ComposerKind::Message,
-        "the incident started at",
-    );
+    let ops = composer_scope(&app);
+    type_into(&ops, "the incident started at");
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
     let mut landed = workspace("general");
@@ -441,7 +475,7 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     // is a slice addressed to `#general`, the room it is carrying her OUT of,
     // and it carries the inline edit's text: nothing is being edited here, so
     // there is no body for it to hand anyone.
-    let general = composer_scope(&mut app);
+    let general = composer_scope(&app);
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "dm-with-alice",
@@ -451,18 +485,18 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     )));
 
     assert_eq!(app.active_channel, "dm-with-alice");
-    let dm = composer_scope(&mut app);
+    let dm = composer_scope(&app);
     assert!(
-        composer_text(&app, &dm).is_empty() && composer_stash(&app, &dm).is_empty(),
+        composer_text(&dm).is_empty() && composer_stash(&dm).is_empty(),
         "the room she left keeps its own words in its own instance, and is \
          never offered to the room she is in — neither in its box nor on its plate"
     );
     assert!(
-        composer_stash(&app, &general).is_empty(),
+        composer_stash(&general).is_empty(),
         "and the room the resync carried her out of was handed nothing either"
     );
     assert_eq!(
-        composer_text(&app, &ops),
+        composer_text(&ops),
         "the incident started at",
         "they are still waiting in #private-ops, where she typed them"
     );
@@ -511,12 +545,16 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
+        // Each reason is its own network: the composer documents are keyed
+        // by endpoint and room and outlive an app, so two fixtures on one
+        // thread must not share a plate.
+        app.connected_rpc = format!("http://{reason}");
         app.active_channel = "general".into();
         app.active_channel_archived = archived;
         app.active_channel_members_only = members_only;
         // Empty roster: she is not seated, which is what `members_only` refuses.
         app.channel_members = Vec::new();
-        app.settings_user_key = "me".into();
+        app.settings_user_key = "ab".repeat(32);
         // The gate the composers re-ask is the MIRROR every handler that moves
         // one of those four inputs writes — so the fixture writes it the same
         // way, through `post_gate` itself, and the two reasons are still real.
@@ -528,30 +566,30 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         );
         assert_eq!(app.post_refusal, reason);
 
-        let stream = composer_scope(&mut app);
-        submit_refused(&mut app, &stream, ComposerKind::Message, "into the void");
+        let stream = composer_scope(&app);
+        submit(&mut app, ComposerKind::Message, "into the void");
         assert!(
             app.messages.is_empty(),
             "the main composer must refuse a {reason} channel at apply time"
         );
         // The words are still hers — #general's own plate holds what
         // #general's box let go of.
-        assert_eq!(composer_stash(&app, &stream), "into the void");
+        assert_eq!(composer_stash(&stream), "into the void");
 
         app.active_thread_seq = 7;
-        let rail = reply_composer_scope(&mut app);
-        submit_refused(&mut app, &rail, ComposerKind::Reply, "into the void");
+        let rail = reply_composer_scope(&app);
+        submit(&mut app, ComposerKind::Reply, "into the void");
         assert!(
             app.thread_messages.is_empty(),
             "the reply composer must refuse a {reason} channel at apply time"
         );
-        assert_eq!(composer_stash(&app, &rail), "into the void");
+        assert_eq!(composer_stash(&rail), "into the void");
         // AND ONLY THAT THREAD'S. The rail's refusal is sliced to the root it
         // was written under, so it cannot reach the room's stream composer —
         // a plate that took both would read `"into the void\ninto the void"`,
         // which is what `remember_failed_draft` does with a second stash.
         assert_eq!(
-            composer_stash(&app, &stream),
+            composer_stash(&stream),
             "into the void",
             "the stream plate holds only what the stream itself refused"
         );
@@ -566,10 +604,10 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     app.active_channel = "general".into();
     app.active_channel_members_only = true;
     app.channel_members = vec![backend::ChatMember {
-        key: "me".into(),
+        key: "ab".repeat(32),
         label: "me".into(),
     }];
-    app.settings_user_key = "me".into();
+    app.settings_user_key = "ab".repeat(32);
     app.post_refusal = backend::post_gate(
         false,
         true,
@@ -613,7 +651,7 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
 /// in `rooms.rs` pins that no handler can reach a composer to mark it.
 #[test]
 fn the_keyboard_subscription_no_longer_marks_a_composer() {
-    const HANDLERS: [(&str, &str); 11] = [
+    const HANDLERS: [(&str, &str); 10] = [
         ("chat", include_str!("../ui/handlers/chat.ice")),
         ("files", include_str!("../ui/handlers/files.ice")),
         ("forge", include_str!("../ui/handlers/forge.ice")),
@@ -624,11 +662,10 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
         ("overlays", include_str!("../ui/handlers/overlays.ice")),
         ("pages", include_str!("../ui/handlers/pages.ice")),
         ("roster", include_str!("../ui/handlers/roster.ice")),
-        ("shell", include_str!("../ui/handlers/shell.ice")),
     ];
 
     // `app.ice` is the real registry; the list above is a hand copy of it, and
-    // a twelfth handler file would otherwise ship unscanned.
+    // an eleventh handler file would otherwise ship unscanned.
     for line in include_str!("../ui/app.ice").lines() {
         let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
             continue;
@@ -665,22 +702,22 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
     app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
-    let stream = composer_scope(&mut app);
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &stream, ComposerKind::Message, "channel draft");
-    type_into(&mut app, &rail, ComposerKind::Reply, "reply draft");
+    let stream = composer_scope(&app);
+    let rail = reply_composer_scope(&app);
+    type_into(&stream, "channel draft");
+    type_into(&rail, "reply draft");
 
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyB,
     )));
 
     assert_eq!(
-        composer_text(&app, &stream),
+        composer_text(&stream),
         "channel draft",
         "the subscription cannot reach the channel composer"
     );
     assert_eq!(
-        composer_text(&app, &rail),
+        composer_text(&rail),
         "reply draft",
         "nor the rail's — the chord is claimed at the widget or not at all"
     );
@@ -711,14 +748,10 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     let guard = body
         .find("  return if empty(escape_key)")
         .expect("the inert-press guard");
-    // The composer marks left this handler with the descent — the widget
-    // claims its own chord (ducktape-ui#711) — so the page buffer's undo/redo
-    // is the one take the subscription still performs.
-    let take = "page_editor = page_history_key(";
-    let at = body.find(take).expect(take);
+    assert!(guard > 0);
     assert!(
-        guard < at,
-        "`{take}…` takes the editor, so it must sit BELOW the inert-press guard"
+        !body.contains("page_history_key("),
+        "Pages owns undo in its guest binding"
     );
 
     fn plain(code: iced::keyboard::key::Code, key: iced::keyboard::Key) -> __IceKeyPress {
@@ -744,8 +777,8 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     app.loading = false;
     app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
-    let composer = composer_scope(&mut app);
-    type_into(&mut app, &composer, ComposerKind::Message, "draft");
+    let composer = composer_scope(&app);
+    type_into(&composer, "draft");
 
     // Inert: a bare letter opens nothing.
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(plain(
@@ -760,7 +793,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
         iced::keyboard::key::Code::KeyB,
     )));
     assert_eq!(
-        composer_text(&app, &composer),
+        composer_text(&composer),
         "draft",
         "the subscription no longer marks a composer"
     );
@@ -781,17 +814,15 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
 
     // The pages chord is the third take, so it is driven too.
     app.shell_tab = ShellTab::Pages;
-    app.page_editor = iced::widget::text_editor::Content::with_text("one");
-    crate::pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    app.page_text = ("one").to_string();
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
     assert_eq!(
-        app.page_editor.text(),
-        "",
-        "Cmd+Z on the pages tab still reaches the buffer"
+        app.page_text.clone(),
+        "one",
+        "the global handler cannot mutate the guest-owned undo buffer"
     );
-    crate::pages::history::reset();
 }
 
 /// A FAILED SEND HANDS THE WORDS BACK THROUGH THE PLATE, not silently into
@@ -810,8 +841,8 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     // THROUGH THE INSTANCE, which is the real path and the reason the stash
     // can reach it: a composer that has never been typed into holds no state
     // yet, and a slice delivers to instances that do.
-    let composer = composer_scope(&mut app);
-    type_into(&mut app, &composer, ComposerKind::Message, "retry me");
+    let composer = composer_scope(&app);
+    type_into(&composer, "retry me");
     submit_composer(&mut app, &composer, ComposerKind::Message, false);
     let operation_id = app.messages[0].id.clone();
     let task = app.__update(__DucktapeMessage::MessageSendFailed(
@@ -826,7 +857,7 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     ));
     pump(&mut app, task);
 
-    assert_eq!(composer_stash(&app, &composer), "retry me");
+    assert_eq!(composer_stash(&composer), "retry me");
     assert!(app.messages.is_empty());
     assert_eq!(app.error, "rejected");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
@@ -840,8 +871,8 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
     app.active_channel = "general".into();
     submit(&mut app, ComposerKind::Message, "first");
     let operation_id = app.messages[0].id.clone();
-    let composer = composer_scope(&mut app);
-    type_into(&mut app, &composer, ComposerKind::Message, "second");
+    let composer = composer_scope(&app);
+    type_into(&composer, "second");
     let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
@@ -855,34 +886,34 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
     pump(&mut app, task);
 
     assert_eq!(
-        composer_text(&app, &composer),
+        composer_text(&composer),
         "second",
         "the words she is writing now are untouched"
     );
-    assert_eq!(composer_stash(&app, &composer), "first");
+    assert_eq!(composer_stash(&composer), "first");
 
     // AND RESTORE REFUSES OVER A NON-EMPTY BOX — the instance's own guard,
     // which is why the plate's Restore is disabled while she is typing. The
     // stash is not passed in any more: the instance restores from the words it
     // is already holding, so there is no route by which another room's plate
     // could be armed to post here.
-    restore_composer(&mut app, &composer, false);
+    restore_composer(&composer, false);
     assert_eq!(
-        composer_text(&app, &composer),
+        composer_text(&composer),
         "second",
         "restoring over a draft in progress would overwrite it"
     );
     assert_eq!(
-        composer_stash(&app, &composer),
+        composer_stash(&composer),
         "first",
         "so the stash still holds"
     );
 
-    seed_composer(&mut app, &composer, ComposerKind::Message, "");
-    restore_composer(&mut app, &composer, false);
-    assert_eq!(composer_text(&app, &composer), "first");
+    seed_composer(&composer, "");
+    restore_composer(&composer, false);
+    assert_eq!(composer_text(&composer), "first");
     assert!(
-        composer_stash(&app, &composer).is_empty(),
+        composer_stash(&composer).is_empty(),
         "and the instance clears its own plate the moment the words are back"
     );
 }
@@ -909,26 +940,16 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     app.active_channel = "general".into();
     // Through #general's own box, so the room she leaves has an instance to
     // hand the words back to.
-    let general = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &general,
-        ComposerKind::Message,
-        "the deploy is at 4pm",
-    );
+    let general = composer_scope(&app);
+    type_into(&general, "the deploy is at 4pm");
     submit_composer(&mut app, &general, ComposerKind::Message, false);
     let operation_id = app.messages[0].id.clone();
 
     // She switches rooms while the write is in flight, and starts a new message
     // there. `choose_channel` blanks the timeline; the pending row is gone.
     let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
-    let random = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &random,
-        ComposerKind::Message,
-        "different thought",
-    );
+    let random = composer_scope(&app);
+    type_into(&random, "different thought");
 
     let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
@@ -944,17 +965,17 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 
     assert_eq!(app.error, "rejected", "the refusal must be said out loud");
     assert_eq!(
-        composer_stash(&app, &general),
+        composer_stash(&general),
         "the deploy is at 4pm",
         "and the body she typed must be recoverable in the room it was for"
     );
     assert!(
-        composer_stash(&app, &random).is_empty(),
+        composer_stash(&random).is_empty(),
         "#random raises no plate about #general's send — the offer would have \
          armed those words to post in a room she never wrote them for"
     );
     assert_eq!(
-        composer_text(&app, &random),
+        composer_text(&random),
         "different thought",
         "and the box she is typing in is untouched either way"
     );
@@ -972,8 +993,8 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     // Through the rail's own box, for the reason #general's half is: a sighted
     // instance holds no state until a message reaches it, and a slice delivers
     // only to instances that do.
-    let rail_composer = reply_composer_scope(&mut rail);
-    type_into(&mut rail, &rail_composer, ComposerKind::Reply, "on it");
+    let rail_composer = reply_composer_scope(&rail);
+    type_into(&rail_composer, "on it");
     submit_composer(&mut rail, &rail_composer, ComposerKind::Reply, false);
     let reply_id = rail.thread_messages[0].id.clone();
     let _ = rail.__update(__DucktapeMessage::CloseThread);
@@ -991,7 +1012,7 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 
     assert_eq!(rail.error, "reply rejected");
     assert_eq!(
-        composer_stash(&rail, &rail_composer),
+        composer_stash(&rail_composer),
         "on it",
         "a closed rail is not a reason to throw the reply away — it is waiting \
          in thread 7, which is the only place it can be posted from"
@@ -1001,10 +1022,10 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 /// A PENDING ROW HAS NO SEQ, SO IT CANNOT ANSWER FOR THE TOP OF THE TIMELINE.
 ///
 /// `optimistic_message` mints a descending negative seq, which sorts ahead of
-/// every real message. Sorting it numerically into a prepended page put an in-flight send
-/// at the top of months-old scrollback, and then `history_has_older` read
-/// `-1 > 1` and hid "Load older" outright — the pending send locked the reader
-/// out of her own history until it settled.
+/// every real message. Sorting it numerically into a prepended page put an
+/// in-flight send at the top of months-old scrollback, and `oldest_message_seq`
+/// then handed the loader that `-1` as its cursor — the pending send locked the
+/// reader out of her own history until it settled.
 #[test]
 fn a_pending_send_survives_a_history_page_without_poisoning_it() {
     let (mut app, _) = Ducktape::__boot();
@@ -1054,7 +1075,7 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
     app.active_channel = "general".into();
     submit(&mut app, ComposerKind::Message, "committed once");
     let operation_id = app.messages[0].id.clone();
-    let composer = composer_scope(&mut app);
+    let composer = composer_scope(&app);
     let _ = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "read failed after commit".into(),
@@ -1066,17 +1087,13 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
         },
     ));
 
-    // The offer the handler slices out, delivered by hand — the committed arm
-    // goes on to launch the recovery resync, so pumping the whole task would
+    // The hand-back the failure arm makes, made by hand — the committed arm
+    // goes on to launch the recovery resync, so running the whole task would
     // put a real request on a node this test does not have. A committed body
-    // is not unsent, and the INSTANCE is what says so: `unsent` refuses it.
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
-        composer.clone(),
-        "committed once".into(),
-        true,
-    ));
+    // is not unsent, and the DOCUMENT is what says so: `unsent` refuses it.
+    composer_surface::unsent(&composer, "committed once", true);
     assert!(
-        composer_stash(&app, &composer).is_empty(),
+        composer_stash(&composer).is_empty(),
         "a COMMITTED body is not unsent — the plate must not offer it back"
     );
     assert_eq!(app.messages.len(), 1);
@@ -1186,37 +1203,28 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
     app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "private-ops".into();
     app.channels = vec![room("private-ops", 10), room("general", 20)];
-    let ops = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &ops,
-        ComposerKind::Message,
-        "the incident started at",
-    );
+    let ops = composer_scope(&app);
+    type_into(&ops, "the incident started at");
 
     let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
-    let general = composer_scope(&mut app);
+    let general = composer_scope(&app);
     assert_ne!(general, ops, "a different room is a different instance");
     assert!(
-        composer_text(&app, &general).is_empty(),
+        composer_text(&general).is_empty(),
         "#general's composer is #general's — nothing from next door is armed to \
          send here"
     );
 
-    type_into(&mut app, &general, ComposerKind::Message, "ok");
+    type_into(&general, "ok");
     let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
-        composer_text(&app, &ops),
+        composer_text(&ops),
         "the incident started at",
         "and the sentence she was writing is waiting where she left it"
     );
 
     let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
-    assert_eq!(
-        composer_text(&app, &general),
-        "ok",
-        "both rooms keep their own"
-    );
+    assert_eq!(composer_text(&general), "ok", "both rooms keep their own");
 
     // A SENT DRAFT DOES NOT COME BACK: the instance clears itself when it
     // emits, and an empty instance is what a return to the room shows.
@@ -1224,13 +1232,13 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
     app.loading = false;
     submit_composer(&mut app, &general, ComposerKind::Message, false);
     assert!(
-        composer_text(&app, &general).is_empty(),
+        composer_text(&general).is_empty(),
         "the send emptied the box"
     );
     let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
     let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
     assert!(
-        composer_text(&app, &general).is_empty(),
+        composer_text(&general).is_empty(),
         "a message she already sent must not be handed back as a draft"
     );
 }
@@ -1251,13 +1259,8 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
     app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "private-ops".into();
     app.channels = vec![room("private-ops", 10)];
-    let ops = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &ops,
-        ComposerKind::Message,
-        "the incident started at",
-    );
+    let ops = composer_scope(&app);
+    type_into(&ops, "the incident started at");
 
     let mut created = chat_data("new-channel", Vec::new());
     created.generation = app.chat_generation;
@@ -1268,16 +1271,16 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
         app.active_channel, "new-channel",
         "the create lands her in it"
     );
-    let created_room = composer_scope(&mut app);
+    let created_room = composer_scope(&app);
     assert!(
-        composer_text(&app, &created_room).is_empty(),
+        composer_text(&created_room).is_empty(),
         "and the new channel's composer is the new channel's — nothing from the \
          room she left is armed to send here"
     );
 
     let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
-        composer_text(&app, &ops),
+        composer_text(&ops),
         "the incident started at",
         "the sentence is waiting in the room she was writing it in"
     );

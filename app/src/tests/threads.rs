@@ -10,8 +10,8 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     app.active_thread_seq = 9;
     app.thread_target_seq = 10;
     app.thread_messages = vec![message(9, "thread root", false)];
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "unsent reply");
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "unsent reply");
 
     // the root's delete arrives as a delta: both lists tombstone the row
     // in place; the open thread stays open showing the tombstone (the
@@ -31,7 +31,7 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     assert!(app.thread_messages[0].deleted);
     assert_eq!(app.thread_messages[0].body, "Message deleted");
     assert_eq!(app.active_thread_seq, 9, "the panel stays open");
-    assert_eq!(composer_text(&app, &rail), "unsent reply");
+    assert_eq!(composer_text(&rail), "unsent reply");
 }
 
 #[test]
@@ -80,8 +80,8 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
 /// a11y keys apiece. The two are not alternatives, and the stream carries both.
 #[test]
 fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
-    assert!(chat.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    assert!(chat.contains("scroll #thread-stream dir=vertical w=fill h=fill anchor-y=end auto=(thread_target_seq <= 0)"));
     assert!(chat.contains(
         "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
     ));
@@ -89,7 +89,7 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // compiler-owned revision of `thread_messages` itself, so a writer that
     // forgets to bump anything can no longer leave stale pixels behind.
     assert!(chat.contains(
-        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
+        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_thread_messages"
     ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target
@@ -98,7 +98,12 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // The KEYED form is pinned too:
     // dropping `by (seq, render_rev)` silently reverts every visible reply to
     // a full row clone + hash per frame — the #1058 residue this collects.
-    assert!(chat.contains("lazy thread_message as cached_reply"));
+    // The copy range joins the per-reply key for the same reason it joins the
+    // stream's: a cached reply has to notice the range's ends moving or it
+    // keeps a stale plate while its neighbours tint.
+    assert!(chat.contains(
+        "lazy thread_message, copy_anchor_seq, copy_head_seq, copy_surface as cached_reply"
+    ));
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
@@ -109,7 +114,9 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
 
 #[test]
 fn thread_messages_mirror_the_main_action_system() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     let card = components
         .split_once("component ThreadMessageCard")
         .unwrap()
@@ -137,10 +144,15 @@ fn thread_messages_mirror_the_main_action_system() {
     // Confirmation is the pending dot disappearing, so the card needs no
     // timer or animation prop. (`card` starts right after the component name,
     // so the signature is its head.)
-    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool)"));
+    // `in_range` is the fourth reading, and it is a reading and not a second
+    // selection: a reply inside the copy range wears the lighter plate, while
+    // `selected` still means the deep-link target and nothing else.
+    assert!(
+        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)")
+    );
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
-    let chat_screen_rail = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat_screen_rail = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat_screen_rail.contains("menu_open=(thread_message.seq == thread_selected_seq)"));
     // No open-thread action from inside a thread you are already reading. The
     // shared contents still declare the event (their reply pill emits it) so
@@ -148,7 +160,7 @@ fn thread_messages_mirror_the_main_action_system() {
     // reply carries no replies, so the pill never renders here.
     assert!(!card.contains("label=\"Open thread\""));
 
-    let chat_screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let thread = chat_screen
         .split_once("if active_thread_seq > 0 && !channel_settings_open")
         .unwrap()
@@ -211,14 +223,14 @@ fn thread_messages_mirror_the_main_action_system() {
     }
     // Thread edit/delete target the thread selection, never the main one.
     let edit = handlers
-        .split_once("on edit_thread_message_submit\n")
+        .split_once("on edit_thread_message_submit(text, scope, seq, rev)\n")
         .unwrap()
         .1
         .split_once("\non ")
         .unwrap()
         .0;
     assert!(edit.contains(
-        "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members)"
+        "edit_message(connected_rpc, password, active_channel, seq, rev, trim(thread_edit_draft))"
     ));
     let delete = handlers
         .split_once("on delete_thread_message_submit\n")
@@ -277,18 +289,18 @@ fn opening_another_thread_invalidates_the_pending_thread() {
     app.active_thread_seq = 1;
     app.thread_messages =
         backend::optimistic_message(Vec::new(), "old thread".into(), "pending-old".into());
-    let thread_one = reply_composer_scope(&mut app);
-    type_into(&mut app, &thread_one, ComposerKind::Reply, "old reply");
+    let thread_one = reply_composer_scope(&app);
+    type_into(&thread_one, "old reply");
 
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
     assert_eq!(app.thread_generation, 5);
     assert!(app.thread_loading);
     assert_eq!(app.active_thread_seq, 2);
     assert!(app.thread_messages.is_empty());
-    let thread_two = reply_composer_scope(&mut app);
-    assert!(composer_text(&app, &thread_two).is_empty());
+    let thread_two = reply_composer_scope(&app);
+    assert!(composer_text(&thread_two).is_empty());
     assert_eq!(
-        composer_text(&app, &thread_one),
+        composer_text(&thread_one),
         "old reply",
         "the rail that opened is thread 2's own composer instance; thread 1's \
          words are not thrown away, they wait under thread 1's key"
@@ -313,7 +325,7 @@ fn opening_another_thread_invalidates_the_pending_thread() {
 /// in — so three sentences into a reply, a click meant to check something next
 /// door destroyed them: no banner, no Restore, nothing.
 ///
-/// Each rail owns a retained `ChatComposer` instance now (ducktape-ui#697),
+/// Each rail owns a retained composer document now (ducktape-ui#697),
 /// keyed by room AND root, so there is no shared buffer left for a rail open to
 /// blank: the words stay in the one composer they can be posted from. The PLATE
 /// is keyed the same way (ducktape-ui#698); it used to be one channel-scoped
@@ -333,26 +345,21 @@ fn opening_another_thread_leaves_the_reply_in_the_thread_it_belongs_to() {
     app.loading = false;
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
-    let thread_one = reply_composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &thread_one,
-        ComposerKind::Reply,
-        "three sentences in and",
-    );
+    let thread_one = reply_composer_scope(&app);
+    type_into(&thread_one, "three sentences in and");
 
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
     assert_eq!(
         app.active_thread_seq, 2,
         "the rail she clicked is the one open"
     );
-    let thread_two = reply_composer_scope(&mut app);
+    let thread_two = reply_composer_scope(&app);
     assert!(
-        composer_text(&app, &thread_two).is_empty(),
+        composer_text(&thread_two).is_empty(),
         "a rail that just opened has an untouched composer"
     );
     assert!(
-        composer_stash(&app, &thread_two).is_empty(),
+        composer_stash(&thread_two).is_empty(),
         "and no plate over it either — a channel-scoped stash would have \
          offered thread 1's words to every other thread in #general"
     );
@@ -360,18 +367,13 @@ fn opening_another_thread_leaves_the_reply_in_the_thread_it_belongs_to() {
     // Back to the thread they belong to, and they are waiting there — the same
     // instance under the same key, never emptied by anything in between.
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(1));
-    assert_eq!(reply_composer_scope(&mut app), thread_one);
-    assert_eq!(composer_text(&app, &thread_one), "three sentences in and");
+    assert_eq!(reply_composer_scope(&app), thread_one);
+    assert_eq!(composer_text(&thread_one), "three sentences in and");
 
     // A ROOM SWITCH CARRIES THE RAIL AWAY AND HANDS IT BACK on the way in. The
     // text is CHANGED first, so this arm reads the instance as the picker left
     // it rather than what the entry `open_thread_for` above found.
-    seed_composer(
-        &mut app,
-        &thread_one,
-        ComposerKind::Reply,
-        "and then the pager went off",
-    );
+    seed_composer(&thread_one, "and then the pager went off");
     app.channels = vec![room("general", 10), room("random", 20)];
     app.mutation_phase = MutationPhase::Idle;
     let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
@@ -379,7 +381,7 @@ fn opening_another_thread_leaves_the_reply_in_the_thread_it_belongs_to() {
     let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(1));
     assert_eq!(
-        composer_text(&app, &thread_one),
+        composer_text(&thread_one),
         "and then the pager went off",
         "the reply belongs to #general's thread 1 and is still there"
     );
@@ -390,7 +392,7 @@ fn opening_another_thread_leaves_the_reply_in_the_thread_it_belongs_to() {
     let _ = app.__update(__DucktapeMessage::CloseThread);
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(1));
     assert_eq!(
-        composer_text(&app, &thread_one),
+        composer_text(&thread_one),
         "and then the pager went off",
         "Close hides the rail, it does not empty the composer behind it"
     );
@@ -417,13 +419,8 @@ fn a_resync_that_closes_the_rail_leaves_the_reply_it_closes_over() {
     app.active_channel = "general".into();
     app.hydration_generation = 4;
     app.active_thread_seq = 7;
-    let rail = reply_composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &rail,
-        ComposerKind::Reply,
-        "three sentences in and",
-    );
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "three sentences in and");
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         4,
@@ -437,7 +434,7 @@ fn a_resync_that_closes_the_rail_leaves_the_reply_it_closes_over() {
         "a deleted root closes the rail under the caret"
     );
     assert_eq!(
-        composer_text(&app, &rail),
+        composer_text(&rail),
         "three sentences in and",
         "and the words are still in the composer of the thread they were written in"
     );
@@ -446,8 +443,8 @@ fn a_resync_that_closes_the_rail_leaves_the_reply_it_closes_over() {
     // back — through the ordinary rail open, no banner and no Restore needed.
     // The reopened rail IS the instance she left, not a refilled copy of it.
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(7));
-    assert_eq!(reply_composer_scope(&mut app), rail);
-    assert_eq!(composer_text(&app, &rail), "three sentences in and");
+    assert_eq!(reply_composer_scope(&app), rail);
+    assert_eq!(composer_text(&rail), "three sentences in and");
 }
 
 /// AND ARRIVING IN A THREAD BY THE SEARCH ROUTE OPENS THE SAME COMPOSER.
@@ -470,14 +467,14 @@ fn a_search_hit_that_seats_a_thread_opens_that_threads_own_composer() {
     app.loading = false;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
-    let seven = reply_composer_scope(&mut app);
-    type_into(&mut app, &seven, ComposerKind::Reply, "half an answer");
+    let seven = reply_composer_scope(&app);
+    type_into(&seven, "half an answer");
 
     // Clicking another thread swaps the instance under the rail — the route
     // this one has to arrive back from.
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(9));
-    let nine = reply_composer_scope(&mut app);
-    assert!(composer_text(&app, &nine).is_empty());
+    let nine = reply_composer_scope(&app);
+    assert!(composer_text(&nine).is_empty());
 
     let mut hit = chat_data("general", vec![message(7, "the root", false)]);
     hit.generation = app.chat_generation;
@@ -485,9 +482,9 @@ fn a_search_hit_that_seats_a_thread_opens_that_threads_own_composer() {
     let _ = app.__update(__DucktapeMessage::ChatHitLoaded(hit));
 
     assert_eq!(app.active_thread_seq, 7, "the hit seated its thread");
-    assert_eq!(reply_composer_scope(&mut app), seven);
+    assert_eq!(reply_composer_scope(&app), seven);
     assert_eq!(
-        composer_text(&app, &seven),
+        composer_text(&seven),
         "half an answer",
         "and the rail it opened is the rail she left words in"
     );
@@ -501,6 +498,7 @@ fn thread_pagination_preserves_multiple_pending_replies() {
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: backend::paragraph_blocks(body),
         pending: false,
@@ -598,8 +596,8 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
     app.thread_target_seq = 9;
     app.thread_next_reply_seq = 5;
     app.thread_has_more = true;
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "typing");
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "typing");
     app.thread_messages = backend::optimistic_message(
         backend::optimistic_message(Vec::new(), "pending first".into(), "pending-first".into()),
         "pending second".into(),
@@ -622,7 +620,7 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
             messages: Vec::new(),
         },
     ));
-    assert_eq!(composer_text(&app, &rail), "typing");
+    assert_eq!(composer_text(&rail), "typing");
     assert_eq!(app.thread_target_seq, 9);
     assert_eq!(app.thread_next_reply_seq, 5);
     assert!(app.thread_has_more);
@@ -660,35 +658,22 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
 ///
 /// BOTH DOORS ARE INSIDE THE COMPOSER NOW (ducktape-ui#697/#711), and that —
 /// not a wider app-side discriminant — is what ended the bug class. The marks
-/// row is mounted ONCE, in `ChatComposer`, and its `mark` handler can only
-/// reach that instance's own `body`; the chord is claimed at the widget that
-/// HAS the caret and arrives as a `ComposerEvent::Mark` on the same instance.
-/// Two seats can no longer collapse onto one editor because neither route names
-/// an editor at all — the retired app state that could is swept by
+/// row is painted ONCE, by the `chat_composer` host surface, and its mark can
+/// only reach that surface's own document; the chord is claimed at the widget
+/// that HAS the caret and arrives as a `ComposerEvent::Mark` on the same
+/// document. Two seats can no longer collapse onto one editor because neither
+/// route names an editor at all — the retired app state that could is swept by
 /// `the_composers_are_out_of_reach_of_every_handler`.
 ///
 /// Both doors stay pinned because they are still separate mechanisms: the
-/// toolbar goes through the component's own handler, the chord through
+/// toolbar goes through the surface's own `Mark`, the chord through
 /// `apply_composer_event`.
 #[test]
 fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
-    // THE MOUNT. One marks row, inside the composer, routed to the local
-    // handler — no app event in the path to aim at the wrong editor.
-    let components = inlined(include_str!("../ui/components/chat.ice"));
-    let chat_composer = components.split_once("component ChatComposer").unwrap().1;
-    assert!(chat_composer.contains("mark -> mark(_, blocked)"));
-
     // A caret selection, through the same seam a real drag arrives on.
-    let select_all = |app: &mut Ducktape, scope: &str, kind: ComposerKind| {
-        let message = Ducktape::__ice_test_message_chat_composer_composer_event(
-            scope.to_owned(),
-            editor::ComposerEvent::Apply(editor::RichAction::Edit(
-                iced::widget::text_editor::Action::SelectAll,
-            )),
-            false,
-            kind,
-        );
-        let _ = app.__update(message);
+    let select_all = |scope: &str| edit(scope, iced::widget::text_editor::Action::SelectAll);
+    let mark = |scope: &str, interaction: Interaction| {
+        let _ = composer::interact(scope, "reply", false, false, interaction);
     };
 
     let (mut app, _) = Ducktape::__boot();
@@ -696,21 +681,17 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     app.loading = false;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
-    let stream = composer_scope(&mut app);
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &stream, ComposerKind::Message, "channel draft");
-    type_into(&mut app, &rail, ComposerKind::Reply, "reply draft");
+    let stream = composer_scope(&app);
+    let rail = reply_composer_scope(&app);
+    type_into(&stream, "channel draft");
+    type_into(&rail, "reply draft");
 
     // THE TOOLBAR half: the rail's Bold wraps the REPLY and nothing else.
-    select_all(&mut app, &rail, ComposerKind::Reply);
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_mark(
-        rail.clone(),
-        "bold".into(),
-        false,
-    ));
-    assert_eq!(composer_text(&app, &rail), "**reply draft**");
+    select_all(&rail);
+    mark(&rail, Interaction::Mark("bold"));
+    assert_eq!(composer_text(&rail), "**reply draft**");
     assert_eq!(
-        composer_text(&app, &stream),
+        composer_text(&stream),
         "channel draft",
         "the stream draft is not the reply's"
     );
@@ -718,17 +699,15 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     // THE CHORD half, caret in the reply: the widget claimed Cmd+B and handed
     // it to its OWN instance as a mark. Nothing consults a focus discriminant,
     // because the press never leaves the composer it was pressed in.
-    seed_composer(&mut app, &rail, ComposerKind::Reply, "reply draft");
-    select_all(&mut app, &rail, ComposerKind::Reply);
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_composer_event(
-        rail.clone(),
-        editor::ComposerEvent::Mark("bold".into()),
-        false,
-        ComposerKind::Reply,
-    ));
-    assert_eq!(composer_text(&app, &rail), "**reply draft**");
+    seed_composer(&rail, "reply draft");
+    select_all(&rail);
+    mark(
+        &rail,
+        Interaction::Editor(editor::ComposerEvent::Mark("bold".into())),
+    );
+    assert_eq!(composer_text(&rail), "**reply draft**");
     assert_eq!(
-        composer_text(&app, &stream),
+        composer_text(&stream),
         "channel draft",
         "Cmd+B in a reply is not a channel edit"
     );
@@ -736,16 +715,14 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     // AND IT IS NOT A BLANKET REDIRECT: the same chord pressed in the stream's
     // composer marks the stream's draft, rail open or not. Without this arm the
     // asserts above would pass against a route hard-wired to the reply.
-    let reply_before = composer_text(&app, &rail);
-    select_all(&mut app, &stream, ComposerKind::Message);
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_composer_event(
-        stream.clone(),
-        editor::ComposerEvent::Mark("bold".into()),
-        false,
-        ComposerKind::Message,
-    ));
-    assert_eq!(composer_text(&app, &stream), "**channel draft**");
-    assert_eq!(composer_text(&app, &rail), reply_before);
+    let reply_before = composer_text(&rail);
+    select_all(&stream);
+    mark(
+        &stream,
+        Interaction::Editor(editor::ComposerEvent::Mark("bold".into())),
+    );
+    assert_eq!(composer_text(&stream), "**channel draft**");
+    assert_eq!(composer_text(&rail), reply_before);
 }
 
 #[test]
@@ -821,12 +798,12 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     app.loading = false;
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
-    let rail = reply_composer_scope(&mut app);
+    let rail = reply_composer_scope(&app);
     submit(&mut app, ComposerKind::Reply, "first");
     let first_id = app.thread_messages[0].id.clone();
     submit(&mut app, ComposerKind::Reply, "second");
     let second_id = app.thread_messages[1].id.clone();
-    type_into(&mut app, &rail, ComposerKind::Reply, "newer draft");
+    type_into(&rail, "newer draft");
 
     let task = app.__update(__DucktapeMessage::ThreadReplySendFailed(
         backend::OptimisticMutationError {
@@ -841,8 +818,8 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     // The stash rides a slice keyed to `(room, thread)`, so the words only
     // reach this rail's own plate once the publication is delivered.
     pump(&mut app, task);
-    assert_eq!(composer_text(&app, &rail), "newer draft");
-    assert_eq!(composer_stash(&app, &rail), "first");
+    assert_eq!(composer_text(&rail), "newer draft");
+    assert_eq!(composer_stash(&rail), "first");
     assert_eq!(app.thread_messages.len(), 1);
     assert_eq!(app.thread_messages[0].id, second_id);
     assert!(app.thread_messages[0].pending);
@@ -852,10 +829,10 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     // RESTORE REFUSES OVER A LIVE DRAFT, and the guard is the instance's own
     // (`restore` returns on a non-empty body) — the words she is typing now are
     // never overwritten by a banner about an older send.
-    restore_composer(&mut app, &rail, false);
-    assert_eq!(composer_text(&app, &rail), "newer draft");
+    restore_composer(&rail, false);
+    assert_eq!(composer_text(&rail), "newer draft");
     assert_eq!(
-        composer_stash(&app, &rail),
+        composer_stash(&rail),
         "first",
         "a refused restore leaves the plate armed"
     );
@@ -863,10 +840,10 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     // Empty the box and it hands them back. One instance does the whole move:
     // it writes the words it was holding and clears its own plate, so nothing
     // outside it can hand the stash to a composer it was never written in.
-    seed_composer(&mut app, &rail, ComposerKind::Reply, "");
-    restore_composer(&mut app, &rail, false);
-    assert_eq!(composer_text(&app, &rail), "first");
-    assert!(composer_stash(&app, &rail).is_empty());
+    seed_composer(&rail, "");
+    restore_composer(&rail, false);
+    assert_eq!(composer_text(&rail), "first");
+    assert!(composer_stash(&rail).is_empty());
 }
 
 #[test]
@@ -877,7 +854,7 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
-    let rail = reply_composer_scope(&mut app);
+    let rail = reply_composer_scope(&app);
     submit(&mut app, ComposerKind::Reply, "committed");
     let operation_id = app.thread_messages[0].id.clone();
     let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
@@ -892,17 +869,13 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
     ));
     assert_eq!(app.thread_messages.len(), 1);
     assert!(app.thread_messages[0].pending);
-    // The offer the handler slices out, delivered by hand — the committed arm
-    // goes on to launch the recovery resync, so pumping the whole task would
+    // The hand-back the failure arm makes, made by hand — the committed arm
+    // goes on to launch the recovery resync, so running the whole task would
     // put a real request on a node this test does not have. The rail's own
     // `unsent` is what refuses a committed body.
-    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
-        rail.clone(),
-        "committed".into(),
-        true,
-    ));
+    composer_surface::unsent(&rail, "committed", true);
     assert!(
-        composer_stash(&app, &rail).is_empty(),
+        composer_stash(&rail).is_empty(),
         "a committed body is on the node, so no banner offers it back"
     );
     assert_eq!(app.mutation_phase, MutationPhase::Idle);

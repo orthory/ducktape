@@ -16,6 +16,9 @@ version.workspace = true
 # names every speaker (the plane's WireGuard identity binding).
 data-plane = { workspace = true }
 opus-rs = { workspace = true }
+# one random per-session media epoch: the field that tells a receiver a peer
+# restarted their stream rather than replaying an old one.
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 # `ducktape::voice`: a peer's speaker lane opening — once per peer per

@@ -66,13 +66,24 @@ impl StagedStore {
         self.store.get(&store_key(key)).await
     }
 
+    /// Warm a known frontier before reading its records. Overlay entries already
+    /// have their answers; the backing may fetch the remaining keys together.
+    pub async fn prefetch(&self, keys: &[Vec<u8>]) -> Result<(), Error> {
+        let digests: Vec<_> = keys
+            .iter()
+            .filter(|key| !self.pending.contains_key(key.as_slice()))
+            .map(|key| store_key(key))
+            .collect();
+        self.store.prefetch(&digests).await
+    }
+
     /// read `key` from COMMITTED state only, bypassing the overlay — the
     /// boundary-decider read: a kernel coordinator whose activation decides
-    /// over the frozen end-of-(H-1) state (lifecycle's `Advance`, dispatch's
+    /// over the frozen end-of-(H-1) state (the modules registry's `Advance`, dispatch's
     /// committed-only query lane) must not see writes staged earlier in the
     /// same block. everything else reads [`get`](StagedStore::get).
     pub async fn get_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.store.get(&store_key(key)).await
+        self.store.get_committed(&store_key(key)).await
     }
 
     /// stage `key -> value` (upsert) for this block WITHOUT committing. visible
@@ -86,6 +97,22 @@ impl StagedStore {
     /// from the store (and the root) at [`commit`](StagedStore::commit).
     pub fn delete(&mut self, key: Vec<u8>) {
         self.pending.insert(key, None);
+    }
+
+    /// Save the overlay before an operation that may need to undo its writes.
+    /// Restoring this snapshot preserves writes accepted earlier in the block.
+    pub fn checkpoint(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        self.pending.clone()
+    }
+
+    /// Restore a checkpoint without changing committed state.
+    pub fn restore(&mut self, checkpoint: BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
+        self.pending = checkpoint;
+    }
+
+    /// Pending upserts and deletes, ordered by their logical keys.
+    pub fn staged_writes(&self) -> &BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        &self.pending
     }
 
     /// whether the overlay holds no staged writes — a [`commit`] would be a

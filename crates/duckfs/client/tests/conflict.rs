@@ -158,7 +158,7 @@ impl NodeApi for ScriptedNode {
             id: "REBASED".into(),
             parent: None,
             root_tree: String::new(),
-            author: String::new(),
+            author: duckfs_core::Actor::System,
             height: self.height,
             consensus_time: 0,
             message: String::new(),
@@ -202,6 +202,9 @@ impl NodeApi for ScriptedNode {
         Err(ApiError::Transport("unused".into()))
     }
     fn pin(&self, _snapshot: &str, _name: &str) -> Result<(), ApiError> {
+        Err(ApiError::Transport("unused".into()))
+    }
+    fn unpin(&self, _name: &str) -> Result<(), ApiError> {
         Err(ApiError::Transport("unused".into()))
     }
 }

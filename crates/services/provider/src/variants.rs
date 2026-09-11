@@ -98,6 +98,9 @@ pub(crate) fn expand(
             // interactive TUI eligibility is a property of the CLI, not the
             // model pin, so variants inherit the parent's argv whole.
             interactive: base.interactive.clone(),
+            // WHERE the CLI's build comes from is a property of the CLI too;
+            // a variant runs the same executable.
+            source: base.source.clone(),
         });
     }
     Ok(specs)
@@ -352,9 +355,18 @@ args = ["run", "--model", "m1"]
                 "--allowedTools",
                 "mcp__ducktape",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--permission-mode",
-                "acceptEdits"
+                "acceptEdits",
+                "--allowedTools",
+                "Bash",
+                "Read",
+                "Edit",
+                "Write",
+                "Glob",
+                "Grep",
+                "mcp__ducktape"
             ],
         );
 
@@ -392,9 +404,18 @@ args = ["run", "--model", "m1"]
                 "--allowedTools",
                 "mcp__ducktape",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--permission-mode",
                 "acceptEdits",
+                "--allowedTools",
+                "Bash",
+                "Read",
+                "Edit",
+                "Write",
+                "Glob",
+                "Grep",
+                "mcp__ducktape",
                 "--model",
                 "opus",
                 "--effort",
@@ -429,7 +450,10 @@ args = ["run", "--model", "m1"]
                 "{}: codex authenticates through the host broker",
                 spec.tag
             );
-            assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+            assert_eq!(
+                spec.isolation.config_home_env.as_deref(),
+                Some("CODEX_HOME")
+            );
         }
         for spec in specs.iter().filter(|s| s.tag.starts_with("claude")) {
             assert_eq!(

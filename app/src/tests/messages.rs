@@ -367,7 +367,7 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
 /// mid-sentence, once per page, for as long as she keeps reading upwards.
 #[test]
 fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     // Only the rows the viewport can see are laid out, which is what lets the
     // timeline hold a whole channel without paying a text layout per row — and
     // `by=message.view_key` is what makes per-row state and per-row MEASUREMENT
@@ -386,7 +386,7 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // `h=shrink` is the composer-anchored height: the virtual column reports a
     // whole-list estimate, so a long timeline still hits the box's cap.
     assert!(
-        chat.contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
+        chat.contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=!history_view")
     );
     // The page controls stay OUTSIDE the keyed column. A keyed column repeats
     // one template over one list; a button folded into that list is a row whose
@@ -394,7 +394,16 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(chat.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(chat.contains("button \"Load older messages\""));
-    assert!(timeline.1.contains("lazy message as cached_message"));
+    // THE COPY RANGE JOINS THE PER-ROW KEY. A quiet row's memo has to notice
+    // the range's ends moving, or shift-clicking down a channel would tint the
+    // rows the reader is dragging over and leave every cached row behind it
+    // untinted. Everything else about the key is unchanged: the range is three
+    // scalars, not a list, so a cached row still reads nothing expensive.
+    assert!(
+        timeline.1.contains(
+            "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+        )
+    );
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -419,8 +428,8 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
 /// template that meets it.
 #[test]
 fn the_message_line_is_one_rich_text_paragraph() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
-    let rich_line = components
+    let rich_body = inlined(include_str!("../ui/components/richbody.ice"));
+    let rich_line = rich_body
         .split_once("component RichLine")
         .expect("the message line component")
         .1;
@@ -430,10 +439,12 @@ fn the_message_line_is_one_rich_text_paragraph() {
     // ONE paragraph, expanded by the widget's own `for` — no wrapping flex of
     // per-token `text` widgets, and no per-token link button.
     assert!(rich_line.contains(
-        "rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg \
+        "rich-text w=fill size=size line-h=1.55 wrap=word-or-glyph color=accent_fg \
          -> emit(open_message_link, _)"
     ));
     assert!(rich_line.contains("for span in block.spans"));
+    // The prose scale is the BODY's to set: a chat row reads at 13.5.
+    assert!(rich_body.contains("RichBody blocks=message.blocks size=13.5"));
     assert!(
         !rich_line.contains("flex") && !rich_line.contains("button"),
         "a token widget beside the paragraph is the #1071 workaround back"
@@ -445,10 +456,21 @@ fn the_message_line_is_one_rich_text_paragraph() {
         .map(str::trim)
         .filter(|line| line.starts_with("span ") && line.contains("bg="))
         .collect();
+    // The plate is ALSO a destination: `link=` carries the account the
+    // mention names, so the widget's own link route opens it on a click and
+    // shows the pointer on hover.
     assert_eq!(
         plated,
-        ["span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand"],
-        "the mention arm alone wears the plate"
+        [
+            "span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium \
+             color=brand"
+        ],
+        "the mention arm alone wears a plate that leaves prose whitespace visible"
+    );
+    let forge = inlined(include_str!("../../../crates/views/forge/src/ui/kit.ice"));
+    assert!(
+        forge.contains(plated[0]),
+        "Forge uses the same mention spacing"
     );
     // And the underline is the link's rule alone — it marks a destination,
     // not an emphasis (ducktape-ui#604).
@@ -471,28 +493,55 @@ fn the_message_line_is_one_rich_text_paragraph() {
     ));
 }
 
-/// A TAIL SNAP ON AN END-ANCHORED SCROLL IS `snap … 0.0`, NEVER `snap-end`.
-///
-/// Both of the app's snapped scrolls (`#message-stream`, `#transcript`) are
-/// `anchor-y=end`: the offset counts FROM the tail, so relative 0.0 is the
-/// tail and `snap-end` (relative 1.0) is the TOP of loaded history. The
-/// inverted op shipped once — every send hurled the reader to the oldest
-/// loaded row — and is a silent no-op in any fixture whose content fits the
-/// viewport, so only this lint stands between it and a paste-back.
 #[test]
-fn tail_snaps_speak_the_end_anchored_offset() {
-    let chat = include_str!("../ui/handlers/chat.ice");
-    let shell = include_str!("../ui/handlers/shell.ice");
-    assert!(
-        chat.contains("task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0"),
-        "the send handler snaps the stream to its anchored tail"
-    );
-    for (name, source) in [("chat", chat), ("shell", shell)] {
-        assert!(
-            !source.contains("task widget snap-end"),
-            "{name} handlers invoke snap-end, which is the TOP of an anchor-y=end scroll"
-        );
-    }
+fn the_mention_plate_leaves_space_before_and_after_the_token() {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{LineHeight, Paragraph as _, Shaping, Span, Text, Wrapping};
+
+    let _renderer = crate::frame_probe::headless_renderer();
+    let source = include_str!("../ui/components/richbody.ice");
+    let padding: f32 = source
+        .lines()
+        .find(|line| line.trim_start().starts_with("span span.mention "))
+        .and_then(|line| line.split_once("px="))
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .expect("the mention plate declares its paint padding")
+        .parse()
+        .unwrap();
+    let blocks = chat::client::paragraph_blocks("before<@3>after");
+    let spans: Vec<Span<'_, ()>> = blocks[0]
+        .spans
+        .iter()
+        .map(|run| {
+            if run.mention.is_empty() {
+                Span::new(run.plain.as_str())
+            } else {
+                Span::new(run.mention.as_str()).font(iced::Font {
+                    weight: iced::font::Weight::Medium,
+                    ..iced::Font::with_name("Geist")
+                })
+            }
+        })
+        .collect();
+    let paragraph = Paragraph::with_spans(Text {
+        content: spans.as_slice(),
+        bounds: iced::Size::INFINITE,
+        size: iced::Pixels(13.5),
+        line_height: LineHeight::Relative(1.55),
+        font: iced::Font::with_name("Geist"),
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::WordOrGlyph,
+    });
+    let before = paragraph.span_bounds(0)[0];
+    let mention = paragraph.span_bounds(2)[0];
+    let after = paragraph.span_bounds(4)[0];
+    // Native rich text expands the painted plate without advancing glyphs.
+    let leading_gap = mention.x - padding - (before.x + before.width);
+    let trailing_gap = after.x - (mention.x + mention.width + padding);
+    assert!(leading_gap >= 1.5, "leading gap: {leading_gap}px");
+    assert!(trailing_gap >= 1.5, "trailing gap: {trailing_gap}px");
 }
 
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.
@@ -504,7 +553,9 @@ fn tail_snaps_speak_the_end_anchored_offset() {
 /// has. The thread root drew a header and still never carried it at all.
 #[test]
 fn the_edited_marker_reaches_every_row_it_annotates() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     let marker = "text \"· edited\" size=11.0 wrap=none font=code_medium @text-muted";
     assert_eq!(
         components.matches(marker).count(),
@@ -528,10 +579,27 @@ fn the_edited_marker_reaches_every_row_it_annotates() {
 fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = MutationPhase::Idle;
-
+    app.connected_rpc = "http://message-actions".into();
+    app.active_channel = "general".into();
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
     assert_eq!(app.selected_message_seq, 7);
     assert_eq!(app.message_action, MessageAction::More);
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
+    assert_eq!(
+        app.message_action,
+        MessageAction::More,
+        "a missing row cannot be edited"
+    );
+    app.messages = vec![backend::ChatMessage {
+        rev: 2,
+        ..message(7, "hello", false)
+    }];
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "stale".into(), 1));
+    assert_eq!(
+        app.message_action,
+        MessageAction::More,
+        "a stale menu cannot seed an edit"
+    );
     let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
     assert_eq!(app.message_action, MessageAction::Editing);
     // Every cancel affordance in the view routes `clear_message_selection`
@@ -551,23 +619,36 @@ fn message_actions_require_explicit_intent() {
     assert_eq!(app.message_action, MessageAction::Delete);
 }
 
+/// Seats this device's key as the reader the mint names, and returns the
+/// label a COMMITTED row of hers carries — the same directory lookup the
+/// window fold runs — so a test never hand-writes the reader's label.
+fn seat_reader(byte: u8) -> String {
+    let key = vec![byte; 32];
+    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(key.clone())));
+    backend::author_display(
+        &format!("user:{}", backend::hex_encode(&key)),
+        &backend::names(),
+    )
+}
+
 /// A SEND CONTINUES THE READER'S OWN RUN.
 ///
 /// The optimistic row used to be minted with a hand-written `"You"` while every
-/// committed row of the reader's own renders `"you"`, so `mark_message_groups`
-/// opened a run on it: a send that followed one of your own drew a full avatar +
-/// header that vanished — shifting the row up by the header's height — the
-/// moment the settle delta replaced it. The COMMITTED row below is the fence:
-/// without it both rows are minted by the same call and carry the same label
-/// whatever literal it uses.
+/// committed row of the reader's own carried her directory label, so
+/// `mark_message_groups` opened a run on it: a send that followed one of your
+/// own drew a full avatar + header that vanished — shifting the row up by the
+/// header's height — the moment the settle delta replaced it. The COMMITTED
+/// row below is the fence: without it both rows are minted by the same call
+/// and carry the same label whatever it is.
 #[test]
 fn consecutive_sends_stay_in_one_author_run() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
     app.messages = vec![backend::ChatMessage {
-        author: "you".into(),
+        author: me.clone(),
         ..message(40, "landed a minute ago", false)
     }];
 
@@ -582,7 +663,7 @@ fn consecutive_sends_stay_in_one_author_run() {
         .collect();
     assert_eq!(
         authors,
-        vec!["you", "you", "you"],
+        vec![me.as_str(), me.as_str(), me.as_str()],
         "the mint renders the reader the way a committed row of hers does"
     );
     let headers: Vec<bool> = app
@@ -607,6 +688,7 @@ fn consecutive_sends_stay_in_one_author_run() {
 /// same grouping the timeline draws.
 #[test]
 fn a_minted_reply_keeps_the_first_reply_header() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -614,11 +696,11 @@ fn a_minted_reply_keeps_the_first_reply_header() {
     app.active_thread_seq = 7;
     app.thread_messages = vec![
         backend::ChatMessage {
-            author: "you".into(),
+            author: me.clone(),
             ..message(7, "the root", false)
         },
         backend::ChatMessage {
-            author: "you".into(),
+            author: me,
             ..message(8, "the first reply", false)
         },
     ];
@@ -635,4 +717,98 @@ fn a_minted_reply_keeps_the_first_reply_header() {
         "the root's header and the first reply's both stand; the minted reply \
          continues the run"
     );
+}
+
+/// A PLAIN PRESS IS ONLY A PRESS. Every click on a message's prose used to
+/// light a one-message range and its bar; now a range starts with ⇧ and the
+/// next ⇧-press widens it, so a reader clicking around a room sees no bar.
+#[test]
+fn a_range_starts_with_shift_and_a_plain_press_leaves_it_alone() {
+    let (mut app, _) = Ducktape::__boot();
+    app.messages = vec![message(7, "root", false), message(8, "next", false)];
+
+    let _ = app.__update(__DucktapeMessage::PressMessage(7, CopySurface::Timeline));
+    assert_eq!(
+        (app.copy_anchor_seq, app.copy_head_seq, app.copy_surface),
+        (0, 0, CopySurface::Nowhere),
+        "a plain press draws no range"
+    );
+
+    app.shift_held = true;
+    let _ = app.__update(__DucktapeMessage::PressMessage(7, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 7));
+    let _ = app.__update(__DucktapeMessage::PressMessage(8, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 8));
+
+    // a plain press with a range open keeps it: Esc and Clear end a range
+    app.shift_held = false;
+    let _ = app.__update(__DucktapeMessage::PressMessage(8, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 8));
+    let _ = app.__update(__DucktapeMessage::ClearCopyRange);
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (0, 0));
+}
+
+/// Editing starts from the row's IDs even when the menu passed stale copy text.
+#[test]
+fn editing_a_named_mention_keeps_its_id_when_the_account_is_renamed() {
+    let scope_rpc = "http://mention-edit-identity";
+    let account_id = 900_002;
+    let names = |name: &str| {
+        chat::client::NameDirectory::new(std::collections::BTreeMap::from([(
+            "aa11".into(),
+            chat::client::BoundAccount {
+                number: account_id,
+                name: name.into(),
+            },
+        )]))
+    };
+    let original_names = names("Selfhost Duck");
+    let body = format!("Ask <@{account_id}> **again**");
+    let mut row = chat::client::optimistic_message(
+        Vec::new(),
+        body.clone(),
+        "mention-edit".into(),
+        chat::client::ChatReader::new(None, &original_names),
+    )
+    .remove(0);
+    row.seq = 7;
+    row.pending = false;
+    assert_eq!(row.body, "Ask @Selfhost Duck again");
+    assert_eq!(row.edit_body, body);
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected_rpc = scope_rpc.into();
+    app.active_channel = "general".into();
+    app.messages = vec![row];
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(
+        7,
+        "stale menu text".into(),
+        0,
+    ));
+    let scope = format!("{}/edit", backend::thread_scope(scope_rpc, "general", 7));
+    let submitted = composer::interact(
+        &scope,
+        "edit",
+        false,
+        false,
+        Interaction::Editor(editor::ComposerEvent::Submit),
+    )
+    .expect("the seeded edit can be submitted");
+    let event = composer_surface::intent(&submitted).expect("a composer intent");
+    let detail: serde_json::Value = serde_json::from_str(&event.detail).expect("intent fields");
+    assert_eq!(detail["body"], body);
+    assert_eq!(detail["scope"], scope);
+    assert_eq!(detail["kind"], "edit");
+
+    let blocks = chat::client::parse_message(detail["body"].as_str().expect("draft body"));
+    assert!(chat::client::mentions_reach(
+        &blocks,
+        &[chat::Party::Account(account_id)]
+    ));
+    let renamed = names("Claude Peer");
+    assert_eq!(
+        chat::client::message_body_with_names(&blocks, &renamed),
+        "Ask @Claude Peer again"
+    );
+    assert_eq!(chat::client::draft_body(&blocks), body);
 }

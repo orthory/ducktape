@@ -16,7 +16,7 @@ mod args;
 mod read_cmds;
 mod work_cmds;
 
-use self::args::NodeAddr;
+use self::args::{nfc_path, NodeAddr};
 
 /// the `ducktape fs` verb tree. usage errors (a missing positional, a bad
 /// numeric flag, an unknown verb) are clap's job at the top-level parse — it
@@ -42,11 +42,14 @@ pub(crate) enum FsCmd {
     Commit(CommitArgs),
     /// pin a snapshot so gc keeps it
     Pin(PinArgs),
+    /// release a pin (the owner or `system` only)
+    Unpin(UnpinArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct LsArgs {
     /// the directory path to list
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -64,6 +67,7 @@ pub(crate) struct LsArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct CatArgs {
     /// the file path to stream
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -75,6 +79,7 @@ pub(crate) struct CatArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct StatArgs {
     /// the entry path to describe
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -105,7 +110,7 @@ pub(crate) struct DiffArgs {
     /// the target snapshot
     pub to: String,
     /// restrict the diff to leaves under this path prefix
-    #[arg(long, value_name = "PREFIX")]
+    #[arg(long, value_name = "PREFIX", value_parser = nfc_path)]
     pub prefix: Option<String>,
     /// emit one JSON array line instead of tab-separated rows
     #[arg(long)]
@@ -117,6 +122,7 @@ pub(crate) struct DiffArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct CheckoutArgs {
     /// the subtree prefix to materialize
+    #[arg(value_parser = nfc_path)]
     pub prefix: String,
     /// the directory to materialize into
     pub dir: String,
@@ -133,7 +139,7 @@ pub(crate) struct StatusArgs {
     pub dir: Option<String>,
     /// report only changes at or under this path (repeatable). a path is
     /// relative to the checkout, or an absolute duckfs path
-    #[arg(long = "path", value_name = "PATH")]
+    #[arg(long = "path", value_name = "PATH", value_parser = nfc_path)]
     pub paths: Vec<String>,
 }
 
@@ -151,7 +157,7 @@ pub(crate) struct CommitArgs {
     /// a FLAG, not a positional: `commit` already takes the checkout dir
     /// positionally, and `ducktape fs commit src/` reading as "the checkout is
     /// src/" is the kind of ambiguity that eats a commit
-    #[arg(long = "path", value_name = "PATH")]
+    #[arg(long = "path", value_name = "PATH", value_parser = nfc_path)]
     pub paths: Vec<String>,
     /// fail on a conflict instead of auto-rebasing onto the current head
     #[arg(long)]
@@ -161,6 +167,10 @@ pub(crate) struct CommitArgs {
     /// the user key that signs the write (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<std::path::PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -174,6 +184,25 @@ pub(crate) struct PinArgs {
     /// the user key that signs the write (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<std::path::PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct UnpinArgs {
+    /// the pin name to release
+    pub name: String,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+    /// the user key that signs the write (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<std::path::PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 /// `main` installs a subscriber only for `node run`, so a one-shot verb would
@@ -206,6 +235,7 @@ pub(crate) fn run(cmd: FsCmd) -> u8 {
         FsCmd::Status(a) => work_cmds::status(a),
         FsCmd::Commit(a) => work_cmds::commit(a),
         FsCmd::Pin(a) => work_cmds::pin(a),
+        FsCmd::Unpin(a) => work_cmds::unpin(a),
     };
     match outcome {
         Ok(()) => 0,

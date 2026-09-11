@@ -2,9 +2,8 @@
 # Everything a Mac needs BEFORE it can run the compute plane (airlock +
 # provider runs under the vz sandbox), checked in one pass.
 #
-#   ops/macos-preflight.sh                       # report; guest images expected in ~/.ducktape/guest
+#   ops/macos-preflight.sh                       # report
 #   ops/macos-preflight.sh --prompt              # …and offer to run the install steps (tty only)
-#   GUEST_DIR=/elsewhere ops/macos-preflight.sh
 #
 # Reports EVERY missing prerequisite with the exact command that installs it,
 # instead of the boot probe's one-refusal-at-a-time loop — the probe's job is
@@ -12,11 +11,13 @@
 # done in one sitting. With --prompt (what `make dev` passes) the runnable
 # steps are offered as a single "install now?" question; what cannot be run
 # for the operator (Homebrew itself, rustup itself, a non-VM Mac) is only
-# ever printed. Exit 0 = the node's sandbox probe will pass.
+# ever printed. Exit 0 = the host half of the node's sandbox probe will pass;
+# the guest images are a WORKSPACE's own (`<workspace>/guest`, built by
+# `OUT=<workspace>/guest ops/build-guest-rootfs.sh` — `make dev` builds the
+# demo's), so no image is checked here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-GUEST_DIR="${GUEST_DIR:-${DUCKTAPE_HOME:-$HOME/.ducktape}/guest}"
 
 # brew lives outside a non-login shell's PATH (ssh commands, make, cron), so
 # look for it at the standard prefixes rather than reporting a Homebrew that
@@ -37,10 +38,15 @@ miss() {
   MISSING=1
   [[ $# -ge 3 && -n "$3" ]] && FIX_CMDS+=("$3")
 }
+# note <what> <fix-text> — the same shape as miss(), for a section that is NOT
+# a sandbox prerequisite. Nothing here can fail the run: this script's exit
+# code answers "will the node's sandbox probe pass", and `make dev` gates on
+# it, so a dev Mac with no Developer ID must still exit 0.
+note() { printf '  n/a   %s\n        fix: %s\n' "$1" "$2"; }
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "this preflight is for macOS; on Linux the probe wants firecracker + kvm" >&2; exit 1; }
 
-echo "duck macOS preflight (guest dir: $GUEST_DIR)"
+echo "duck macOS preflight"
 
 # ---- the machine ------------------------------------------------------------
 if [[ "$(sysctl -n kern.hv_support 2>/dev/null)" == "1" ]]; then
@@ -120,19 +126,44 @@ else
   miss "duck-vz-shim on PATH (the macOS VMM)" "INSTALL=<dir-on-PATH> bin/duck-vz-shim/build.sh" "$SHIM_INSTALL_CMD"
 fi
 
-# ---- the guest artifacts ----------------------------------------------------
-if [[ -f "$GUEST_DIR/vmlinux" && -f "$GUEST_DIR/rootfs.ext4" ]]; then
-  ok "guest images ($GUEST_DIR)"
+# ---- release signing (informational) ----------------------------------------
+# Not a prerequisite for running anything locally: `make app` ad-hoc signs, and
+# an ad-hoc bundle runs on the machine that built it. It is a prerequisite for
+# a bundle that leaves this Mac, and the two halves fail far apart (Gatekeeper
+# on someone else's machine, or a notarytool rejection after the upload), so
+# both are reported here. The recipe is app/README.md "Release build".
+echo
+echo "release signing (only for a bundle that leaves this Mac):"
+DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' || true)"
+if [[ -n "$DEVELOPER_ID" ]]; then
+  # one line per identity, quoted name only — that string is what
+  # ICE_CODESIGN_IDENTITY takes.
+  while IFS= read -r line; do
+    ok "codesigning identity: ${line#*\"}"
+  done <<< "$(printf '%s\n' "$DEVELOPER_ID" | sed 's/"$//')"
 else
-  miss "guest kernel + rootfs" "OUT=\"$GUEST_DIR\" ops/build-guest-rootfs.sh" \
-    "OUT=\"$GUEST_DIR\" bash \"$HERE/ops/build-guest-rootfs.sh\""
+  note "no \"Developer ID Application\" identity in the keychain" \
+    "enroll in the Apple Developer Program, then download the certificate; without one \`make app\` signs ad-hoc"
+fi
+
+if [[ -n "${ICE_NOTARY_KEY:-}" && -n "${ICE_NOTARY_KEY_ID:-}" && -n "${ICE_NOTARY_ISSUER:-}" ]]; then
+  if [[ -f "$ICE_NOTARY_KEY" ]]; then
+    ok "notary credentials (ICE_NOTARY_KEY exists, KEY_ID and ISSUER set)"
+  else
+    note "ICE_NOTARY_KEY points at no file ($ICE_NOTARY_KEY)" \
+      "point it at the App Store Connect API key .p8, stored outside this repo"
+  fi
+else
+  note "notary credentials not exported" \
+    "export ICE_NOTARY_KEY=<path to .p8> ICE_NOTARY_KEY_ID=<id> ICE_NOTARY_ISSUER=<uuid>; all three or none"
 fi
 
 echo
 if [[ "$MISSING" == 0 ]]; then
-  echo "ready: the sandbox probe will pass. Smoke it with:"
+  echo "ready: the host half of the sandbox probe will pass. Build a workspace's"
+  echo "guest (OUT=<workspace>/guest ops/build-guest-rootfs.sh) and smoke it with:"
   echo "  cargo run -p sandbox-host --example vm_smoke -- \\"
-  echo "      --kernel \"$GUEST_DIR/vmlinux\" --rootfs \"$GUEST_DIR/rootfs.ext4\""
+  echo "      --kernel <workspace>/guest/vmlinux --rootfs <workspace>/guest/rootfs.ext4"
   exit 0
 fi
 
@@ -155,7 +186,7 @@ if [[ "$PROMPT" == 1 && -t 0 && "$runnable" -gt 0 ]]; then
         bash -c "$cmd" || { echo "install step failed — fix the error above and re-run" >&2; exit 1; }
       done
       echo
-      exec env GUEST_DIR="$GUEST_DIR" bash "$0"
+      exec bash "$0"
       ;;
   esac
 fi

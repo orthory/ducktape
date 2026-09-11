@@ -3,19 +3,22 @@
 // exactly as they did when this mod lived inline in main.rs.
 use super::*;
 
+mod bell;
+mod canary;
 mod connection;
 mod design;
 mod font_fallback;
-mod forge;
 mod huddle_live;
 mod messages;
 mod page_autosave_gate;
 mod pages;
 mod rooms;
 mod sends;
+mod settings;
 mod shell;
 mod stream;
 mod threads;
+mod window_lifecycle;
 
 /// EVERY SCREEN BODY, as one string. These are the slot bodies that used to
 /// sit inline in `view.ice`; the sweeps below read the console's authored
@@ -142,6 +145,7 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: backend::paragraph_blocks(body),
         pending: false,
@@ -160,114 +164,74 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     }
 }
 
-/// THE COMPOSERS ARE COMPONENT INSTANCES NOW (ducktape-ui#697), so a harness
-/// reaches them the way any harness does: render once to materialize the
-/// instances, then read and drive them through the generated test seam
-/// (ducktape-ui#696 layer 1). The scope is the rendered instance path; the
-/// two composers are told apart by the id segment their mount declares.
-fn materialize_composers(app: &mut Ducktape) {
-    let window = app.console_win.unwrap_or_else(iced::window::Id::unique);
-    app.console_win = Some(window);
-    app.shell_tab = ShellTab::Chat;
-    let _ = app.__view(window);
-    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
-    for message in boots {
-        let _ = app.__update(message);
-    }
+/// THE COMPOSERS ARE HOST SURFACES NOW: the Chat tab is a module-owned view
+/// and the words never cross the wire, so each composer's document lives in
+/// `composer_surface`, keyed by the scope the view spells for its slot —
+/// which is the scope the app's own `composer_scope` / `thread_scope` spell.
+/// A harness reaches one the way the painted composer does: an interaction
+/// on that scope's document, then the intent a submit publishes, delivered
+/// to the app as the chat view's event.
+use crate::composer_surface::testing::{self as composer, Interaction};
+
+/// The stream composer of the room the app is in.
+fn composer_scope(app: &Ducktape) -> String {
+    backend::composer_scope(&app.connected_rpc, &app.active_channel)
 }
 
-/// The instance whose scope names BOTH the mount and this key. Retained
-/// storage keeps every instance the app has ever rendered, which is the whole
-/// promise — so a scope lookup has to say which room it means, exactly as the
-/// mount does.
-fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String> {
-    // THIS APP'S OWN WINDOW, and no other's. The sighting side-channel a
-    // freshly rendered instance is found through is a THREAD-local, so a
-    // sibling test that rendered the same room on the same test thread has a
-    // scope with the same mount and the same key — differing only in the
-    // window the render was for. Reading that one back finds no state and the
-    // assertion fails in a full run while passing alone.
-    let window = format!("/{:?}/", app.console_win?);
-    app.__ice_test_scopes_chat_composer()
-        .into_iter()
-        .find(|scope| scope.contains(&window) && scope.contains(mount) && scope.contains(key))
-}
-
-/// The stream composer of the room the app is in, materializing it if needed.
-fn composer_scope(app: &mut Ducktape) -> String {
-    materialize_composers(app);
-    let key = backend::composer_scope(&app.connected_rpc, &app.active_channel);
-    composer_scope_named(app, "/composer(", &key)
-        .unwrap_or_else(|| panic!("the composer for `{}` materialized", app.active_channel))
-}
-
-/// The rail composer of the thread the app is in, materializing it if needed.
-fn reply_composer_scope(app: &mut Ducktape) -> String {
-    materialize_composers(app);
-    let key = backend::thread_scope(
+/// The rail composer of the thread the app is in.
+fn reply_composer_scope(app: &Ducktape) -> String {
+    backend::thread_scope(
         &app.connected_rpc,
         &app.active_channel,
         app.active_thread_seq,
-    );
-    composer_scope_named(app, "/reply_composer(", &key).unwrap_or_else(|| {
-        panic!(
-            "the reply composer for thread {} materialized",
-            app.active_thread_seq
-        )
-    })
+    )
 }
 
-/// Types `text` into one composer instance, one character at a time — the
-/// same route a real keystroke takes through the rich composer.
-fn type_into(app: &mut Ducktape, scope: &str, kind: ComposerKind, text: &str) {
+/// One editor action on a scope's document — the same route a real
+/// keystroke takes through the rich composer.
+fn edit(scope: &str, action: iced::widget::text_editor::Action) {
+    let event = editor::ComposerEvent::Apply(editor::RichAction::Edit(action));
+    let _ = composer::interact(scope, "message", false, false, Interaction::Editor(event));
+}
+
+/// Types `text` into one composer, one character at a time.
+fn type_into(scope: &str, text: &str) {
     for character in text.chars() {
-        let message = Ducktape::__ice_test_message_chat_composer_composer_event(
-            scope.to_owned(),
-            editor::ComposerEvent::Apply(editor::RichAction::Edit(
-                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(
-                    character,
-                )),
+        edit(
+            scope,
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(
+                character,
             )),
-            false,
-            kind,
         );
-        let task = app.__update(message);
-        pump(app, task);
     }
 }
 
-/// Replaces one composer instance's whole content.
-fn seed_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, text: &str) {
-    let clear = Ducktape::__ice_test_message_chat_composer_composer_event(
-        scope.to_owned(),
-        editor::ComposerEvent::Apply(editor::RichAction::Edit(
-            iced::widget::text_editor::Action::SelectAll,
-        )),
-        false,
-        kind,
+/// Replaces one composer's whole content.
+fn seed_composer(scope: &str, text: &str) {
+    edit(scope, iced::widget::text_editor::Action::SelectAll);
+    edit(
+        scope,
+        iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Delete),
     );
-    let _ = app.__update(clear);
-    let cut = Ducktape::__ice_test_message_chat_composer_composer_event(
-        scope.to_owned(),
-        editor::ComposerEvent::Apply(editor::RichAction::Edit(
-            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Delete),
-        )),
-        false,
-        kind,
-    );
-    let _ = app.__update(cut);
-    type_into(app, scope, kind, text);
+    type_into(scope, text);
 }
 
-/// Submits one composer instance, the way plain Enter and the Send button do.
+/// Submits one composer, the way plain Enter and the Send button do: the
+/// surface clears itself and publishes the `composer` intent, which reaches
+/// the app as the chat view's event and is dispatched to `composer_submitted`.
 fn submit_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, blocked: bool) {
-    let message = Ducktape::__ice_test_message_chat_composer_composer_event(
-        scope.to_owned(),
-        editor::composer_submit_event(),
+    let submitted = composer::interact(
+        scope,
+        &backend::composer_op_prefix(kind),
         blocked,
-        kind,
+        false,
+        Interaction::Editor(editor::ComposerEvent::Submit),
     );
-    let task = app.__update(message);
+    let Some(value) = submitted else {
+        return;
+    };
+    let event = composer_surface::intent(&value).expect("a submit is the composer intent");
+    let task = app.__update(__DucktapeMessage::ChatViewEvent(event));
     pump(app, task);
 }
 
@@ -309,70 +273,58 @@ fn pump(app: &mut Ducktape, task: iced::Task<__DucktapeMessage>) {
 /// the send lane's receipts and failures are keyed by.
 fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
     let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
+    let scope = match kind {
+        ComposerKind::Message => composer_scope(app),
+        ComposerKind::Reply => reply_composer_scope(app),
+        ComposerKind::Edit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.selected_message_seq),
+        ComposerKind::ThreadEdit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.thread_selected_seq),
+    };
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         kind,
         body.to_owned(),
         id.clone(),
+        scope,
     ));
     id
 }
 
-/// THE SUBMIT THE GATE TURNS BACK. A refusal is not a discard: the refusing
-/// arm hands the body to that room's own composer with a slice, and a slice is
-/// a published message — so this one pumps, where `submit` above deliberately
-/// does not. Only the refused arm is safe to pump: the admitted arm's task IS
-/// the send request, and running it here would answer with the failure a unit
-/// test's absent node returns.
-fn submit_refused(app: &mut Ducktape, scope: &str, kind: ComposerKind, body: &str) {
-    // The instance has to EXIST for the refusal to reach it — a composer that
-    // has never been typed into holds no state yet, and a slice delivers to
-    // instances that do. Typing and clearing is what a real submit did.
-    seed_composer(app, scope, kind, body);
-    seed_composer(app, scope, kind, "");
-    let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
-    let task = app.__update(__DucktapeMessage::ComposerSubmitted(
-        kind,
-        body.to_owned(),
-        id,
-    ));
-    pump(app, task);
+/// A `composer` intent as the host surface publishes it for `scope` — the
+/// way a submit reaches the app when the box it was written in may no
+/// longer be the one on screen.
+fn composer_intent(scope: &str, kind: &str, body: &str) -> module_view::ModuleViewEvent {
+    module_view::ModuleViewEvent {
+        kind: "composer".into(),
+        detail: serde_json::json!({
+            "scope": scope,
+            "kind": kind,
+            "body": body,
+            "id": backend::fresh_operation_id(kind.to_owned()),
+        })
+        .to_string(),
+    }
 }
 
-/// One composer instance's draft, as the reader sees it.
-fn composer_text(app: &Ducktape, scope: &str) -> String {
-    app.__ice_test_state_chat_composer(scope)
-        .map(|state| state.body.trim().to_owned())
-        .unwrap_or_default()
+/// One composer's draft, as the reader sees it.
+fn composer_text(scope: &str) -> String {
+    composer::text(scope).trim().to_owned()
 }
 
-/// THE WORDS ONE COMPOSER INSTANCE'S PLATE IS HOLDING. The failed-send stash
-/// used to be two app fields, so the plate a refused send raised followed the
-/// reader into whatever room she moved to; it is the instance's own state now
-/// (ducktape-ui#698), which is why reading it takes a scope.
-fn composer_stash(app: &Ducktape, scope: &str) -> String {
-    app.__ice_test_state_chat_composer(scope)
-        .map(|state| state.failed)
-        .unwrap_or_default()
+/// THE WORDS ONE COMPOSER'S PLATE IS HOLDING. The stash is the scope's
+/// document's own, which is why reading it takes a scope.
+fn composer_stash(scope: &str) -> String {
+    composer::failed(scope)
 }
 
-/// Clicks one composer instance's Restore, the way the plate's button does.
-/// The instance writes its own body and clears its own stash under its own
+/// Clicks one composer's Restore, the way the plate's button does. The
+/// surface writes its own body and clears its own stash under its own
 /// guards, so `blocked` is the verdict the frame drew, nothing more.
-fn restore_composer(app: &mut Ducktape, scope: &str, blocked: bool) {
-    let task = app.__update(Ducktape::__ice_test_message_chat_composer_restore(
-        scope.to_owned(),
-        blocked,
-    ));
-    pump(app, task);
-}
-
-fn compose(text: &str) -> iced::widget::text_editor::Content {
-    iced::widget::text_editor::Content::with_text(text)
+fn restore_composer(scope: &str, blocked: bool) {
+    let _ = composer::interact(scope, "message", false, blocked, Interaction::Restore);
 }
 
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
-    app.page_editor.text()
+    app.page_text.clone()
 }
 
 fn default_ice_color(name: &str) -> iced::Color {
@@ -548,15 +500,12 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the block editor's autosave clock: the stock editor's edits
-            // never pass through a handler, so a dirty buffer is the only
-            // signal there is — and the gate IS the dirty test, so the tick
-            // exists solely while unsaved text needs the node. It costs
-            // nothing at rest and dies the moment the save lands.
-            // the page document's write gate: dirty IS the condition, so the
-            // tick exists only while the buffer has drifted from the node's
-            // text — not a poll, an edit-driven flush.
-            "every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick",
+            // the page document's write clock: the guest editor's edits never
+            // pass through a handler, so the app mirror cannot know the buffer
+            // is dirty — the tick reads the canonical document while a page is
+            // open on a connected node and its handler makes the dirty/no-op
+            // call. It exists only while a page is open, and no other tick may.
+            "every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick",
         ]
     );
 }
@@ -604,12 +553,11 @@ fn reading_alpha() -> Ducktape {
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.pages = vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")];
-    app.doc_tabs = vec!["alpha".into(), "beta".into()];
     app.active_page = "alpha".into();
     app.active_page_title = "Alpha".into();
     app.active_page_parent = "Root".into();
     app.blocks = vec![page_block("alpha-1", "alpha", "alpha body")];
-    app.page_editor = compose("Alpha\nalpha body");
+    app.page_text = "Alpha\nalpha body".into();
     app.page_saved_text = "Alpha\nalpha body".into();
     app.buffer_page = "alpha".into();
     app

@@ -4,11 +4,7 @@ use super::*;
 
 #[test]
 fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
-    let (mut m, registry, run_id) = awaiting_run(&[
-        ACTION_CHAT_POST,
-        ACTION_TASKS_CREATE,
-        ACTION_TASKS_UPDATE_STATUS,
-    ]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -22,16 +18,10 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             Ok(response(
                 &["on it"],
                 vec![
-                    AgentAction::CreateTask {
-                        task_id: "t1".into(),
-                        title: "ship it".into(),
-                    },
+                    create_task("t1", "ship it"),
                     // updating a task created earlier in this SAME response
                     // is valid — tasks applies the follow-ups in order.
-                    AgentAction::UpdateTaskStatus {
-                        task_id: "t1".into(),
-                        status: "in_progress".into(),
-                    },
+                    update_task_status("t1", "in_progress"),
                 ],
             )),
         ),
@@ -50,8 +40,7 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             channel_id: "general".into(),
             message_id: reply_message_id(&run_id),
             blocks: vec![Block::paragraph("on it")],
-            thread: None,
-            as_agent: Some("bot".into()),
+            thread: Some(2),
         }],
         "the reply posts as the AGENT, under the run's message id"
     );
@@ -61,6 +50,7 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship it".into(),
+                owner: None,
             },
             TaskMsg::UpdateStatus {
                 task_id: "t1".into(),
@@ -72,20 +62,20 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
 
 #[test]
 fn a_threaded_anchor_threads_the_reply() {
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    let mut m = watched(TurnPolicy::All, &registry);
+    let registry = registry(&["bot"]);
+    let mut m = configured(&registry);
     // seq 3 is a reply to root 1; the pin records thread_root = 1.
     let mut thread_transcript = transcript(2);
     thread_transcript.push(message_in(
         "general",
         3,
-        AuthorRef::User(vec![1; 32]),
+        Party::Key(vec![1; 32]),
         "in thread",
         Some(1),
     ));
     let mut ctx = CaptureCtx::new()
         .at(3)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript("general", thread_transcript.clone());
     exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
@@ -115,74 +105,36 @@ fn a_threaded_anchor_threads_the_reply() {
 #[test]
 fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
     // normalization already absorbed shape problems (prose, fences,
-    // oversize); what remains failable is POLICY: task validity and
-    // grants. every case emits NO follow-up except the ⚠ failure reply
-    // (the agent here holds chat.post), leaves a breadcrumb, and prunes
-    // the entry — never the block.
+    // oversize); what remains failable is POLICY: task validity. every
+    // case emits NO follow-up except the ⚠ failure reply, leaves a
+    // breadcrumb, and prunes the entry — never the block.
     let cases: Vec<(&str, Vec<u8>)> = vec![
         (
             "task already exists: t0",
-            response(
-                &["ok"],
-                vec![AgentAction::CreateTask {
-                    task_id: "t0".into(),
-                    title: "dup of a committed task".into(),
-                }],
-            ),
+            response(&["ok"], vec![create_task("t0", "dup of a committed task")]),
         ),
         (
             "task already exists: fresh",
             response(
                 &["ok"],
-                vec![
-                    AgentAction::CreateTask {
-                        task_id: "fresh".into(),
-                        title: "one".into(),
-                    },
-                    AgentAction::CreateTask {
-                        task_id: "fresh".into(),
-                        title: "two".into(),
-                    },
-                ],
+                vec![create_task("fresh", "one"), create_task("fresh", "two")],
             ),
         ),
         (
             "unknown task: ghost",
-            response(
-                &["ok"],
-                vec![AgentAction::UpdateTaskStatus {
-                    task_id: "ghost".into(),
-                    status: "done".into(),
-                }],
-            ),
+            response(&["ok"], vec![update_task_status("ghost", "done")]),
         ),
         (
             "unknown task status",
-            response(
-                &["ok"],
-                vec![AgentAction::UpdateTaskStatus {
-                    task_id: "t0".into(),
-                    status: "shipped".into(),
-                }],
-            ),
+            response(&["ok"], vec![update_task_status("t0", "shipped")]),
         ),
         (
-            "non-empty task_id",
-            response(
-                &["ok"],
-                vec![AgentAction::CreateTask {
-                    task_id: String::new(),
-                    title: "x".into(),
-                }],
-            ),
+            "task_id must be non-empty",
+            response(&["ok"], vec![create_task(String::new(), "x")]),
         ),
     ];
     for (fragment, bytes) in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[
-            ACTION_CHAT_POST,
-            ACTION_TASKS_CREATE,
-            ACTION_TASKS_UPDATE_STATUS,
-        ]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -197,10 +149,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
         let posts = ctx.chat_msgs();
         assert_eq!(posts.len(), 1, "exactly one failure reply ({fragment})");
         let ChatMsg::PostMessage {
-            message_id,
-            blocks,
-            as_agent,
-            ..
+            message_id, blocks, ..
         } = &posts[0]
         else {
             panic!("expected a post");
@@ -210,7 +159,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             reply_message_id(&run_id),
             "the failure reply holds the run's one reply id ({fragment})"
         );
-        assert_eq!(*as_agent, Some("bot".into()));
+
         assert_eq!(blocks.len(), 1, "one ⚠ paragraph ({fragment})");
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("expected a paragraph");
@@ -260,7 +209,7 @@ fn a_task_id_tasks_would_reject_fails_the_run_not_the_op() {
         ),
     ];
     for (task_id, fragment) in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -273,10 +222,7 @@ fn a_task_id_tasks_would_reject_fails_the_run_not_the_op() {
                 &run_id,
                 Ok(response(
                     &["ok"],
-                    vec![AgentAction::CreateTask {
-                        task_id,
-                        title: "rejected at tasks".into(),
-                    }],
+                    vec![create_task(task_id, "rejected at tasks")],
                 )),
             ),
         )
@@ -313,7 +259,7 @@ fn a_task_id_at_the_cap_still_emits() {
     // the boundary belongs to the ACCEPTING side: tasks admits exactly
     // MAX_TASK_ID bytes, so this validator must not be one byte stricter.
     let task_id = "t".repeat(tasks::MAX_TASK_ID);
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -326,10 +272,7 @@ fn a_task_id_at_the_cap_still_emits() {
             &run_id,
             Ok(response(
                 &["on it"],
-                vec![AgentAction::CreateTask {
-                    task_id: task_id.clone(),
-                    title: "at the cap".into(),
-                }],
+                vec![create_task(task_id.clone(), "at the cap")],
             )),
         ),
     )
@@ -339,6 +282,7 @@ fn a_task_id_at_the_cap_still_emits() {
         vec![TaskMsg::CreateTask {
             task_id,
             title: "at the cap".into(),
+            owner: None,
         }]
     );
 }
@@ -357,7 +301,7 @@ fn raw_model_text_normalizes_into_a_postable_reply() {
         ),
     ];
     for bytes in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -377,19 +321,13 @@ fn oversized_actions_fail_the_run_deterministically() {
     // (a pasted-file title) must be a deterministic run failure — never an
     // oversized finalize payload the jobs board would byte-truncate into
     // invalid JSON.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
-    let huge = response(
-        &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "x".repeat(MAX_ACTIONS_BYTES),
-        }],
-    );
+    let huge = response(&[], vec![create_task("t1", "x".repeat(MAX_ACTIONS_BYTES))]);
     exec(&mut m, &mut ctx, &result_event(&run_id, Ok(huge))).unwrap();
     commit(&mut m);
     assert_eq!(
@@ -418,17 +356,14 @@ fn an_over_cap_action_set_is_refused_not_truncated() {
     // of silently losing its tail and delivering a partial action set the agent
     // never sees dropped.
     let over_cap = MAX_ACTIONS_PER_RUN + 1;
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
     let actions = (0..over_cap)
-        .map(|n| AgentAction::CreateTask {
-            task_id: format!("t{n}"),
-            title: format!("task {n}"),
-        })
+        .map(|n| create_task(format!("t{n}"), format!("task {n}")))
         .collect();
     exec(
         &mut m,
@@ -468,7 +403,7 @@ fn an_over_cap_action_set_is_refused_not_truncated() {
 
 #[test]
 fn code_blocks_survive_normalization_into_chat_blocks() {
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let raw = r#"{"reply_blocks":[{"id":"b1","kind":"paragraph","text":"hello"},{"kind":"code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"paragraph","text":"  "}],"actions":[]}"#;
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -504,7 +439,7 @@ fn a_fenced_json_reply_is_parsed_into_prose_not_dumped_as_a_code_block() {
     // ```json fence despite the contract, the bare parse fails, and the
     // whole fenced string lands in chat as a raw code block. the tolerant
     // parser must recover the real prose.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"QUACKTEST! Hello there.\"}],\"actions\":[]}\n```";
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -567,14 +502,13 @@ fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
 }
 
 #[test]
-fn a_fenced_job_response_still_yields_actions_only() {
-    // job runs drop reply_blocks; the fenced-parse path must still recover
-    // the actions inside the fence.
-    let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
-    let parsed = agent_response_from_text(raw, true);
+fn a_fenced_response_retains_reply_blocks_and_actions() {
+    // Parsing preserves both facets; delivery resolves the source.
+    let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"operation\":\"tasks.create\",\"input\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
+    let parsed = agent_response_from_text(raw);
     assert!(
-        parsed.reply_blocks.is_empty(),
-        "job runs post no chat reply"
+        parsed.reply_blocks[0].text == "noise",
+        "source routing must not discard the answer"
     );
     assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
 }
@@ -585,8 +519,8 @@ fn a_fenced_job_response_still_yields_actions_only() {
 fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
     // the agent SPEAKING (its own channel, its own message) rather than
     // ANSWERING where it was engaged — one more action in the strict lane, and
-    // one more chat post carrying `as_agent`.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    // one more proposed chat post for the program account.
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -599,11 +533,7 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
             &run_id,
             Ok(response(
                 &["done"],
-                vec![AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "progress: halfway".into(),
-                    thread: None,
-                }],
+                vec![post_message("general", "progress: halfway", None)],
             )),
         ),
     )
@@ -621,7 +551,6 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
             message_id: post_message_id(&run_id, "0"),
             blocks: vec![Block::paragraph("progress: halfway")],
             thread: None,
-            as_agent: Some("bot".into()),
         }
     );
     assert_ne!(
@@ -631,59 +560,10 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
 }
 
 #[test]
-fn post_message_without_its_own_grant_fails_the_run() {
-    // THE ESCALATION GUARD, on the settle path: `chat.post` authorizes the
-    // reply and nothing more. an agent registered before this action existed
-    // must not have been silently handed the wider power.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-    let mut ctx = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(response(
-                &["done"],
-                vec![AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "sneaking in".into(),
-                    thread: None,
-                }],
-            )),
-        ),
-    )
-    .unwrap();
-
-    // the strict lane: an ungranted action fails the RUN (never the block).
-    assert!(
-        ctx.notes()
-            .iter()
-            .any(|n| n.contains("not allowed to chat.post_message")),
-        "{:?}",
-        ctx.notes()
-    );
-    let posts = ctx.chat_msgs();
-    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
-    assert!(
-        matches!(
-            &posts[0],
-            ChatMsg::PostMessage { message_id, .. } if *message_id == reply_message_id(&run_id)
-        ),
-        "the agent's own post never existed — only the run's failure reply"
-    );
-    commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
-}
-
-#[test]
 fn a_post_message_action_decodes_and_threads() {
     // a `chat.post_message` action in the response prose threads under the
     // named root — the prose-parsed action lane (the production path).
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -691,11 +571,7 @@ fn a_post_message_action_decodes_and_threads() {
         .with_transcript("general", transcript(2));
     let prose = String::from_utf8(response_json(
         &["done"],
-        vec![AgentAction::PostMessage {
-            channel_id: "general".into(),
-            text: "threaded update".into(),
-            thread: Some(1),
-        }],
+        vec![post_message("general", "threaded update", Some(1))],
     ))
     .unwrap();
     exec(
@@ -738,10 +614,13 @@ fn dispatch_view_reads_through_testkit_on_query() {
         assert_eq!(receiver, "runs", "runs is the dispatching module");
         Ok(dispatch::encode_reply(&dispatch::DispatchReply::Dispatch(
             Some(DispatchView {
+                cause: sdk::Cause::Direct,
                 dispatch_id,
                 recipe_id: "agent/x".into(),
                 receiver,
-                status: DispatchStatus::Delivered,
+                status: DispatchStatus::Delivered {
+                    delivery: sdk::DeliveryOutcome::Applied,
+                },
                 outcome: Some(Ok(Vec::new())),
                 created_at: 0,
                 updated_at: 0,
@@ -761,7 +640,7 @@ fn dispatch_view_reads_through_testkit_on_query() {
     };
     assert_eq!(view.dispatch_id, dispatch_id);
     assert_eq!(view.receiver, "runs");
-    assert!(matches!(view.status, DispatchStatus::Delivered));
+    assert!(matches!(view.status, DispatchStatus::Delivered { .. }));
 
     // an unregistered sibling still gets the shared QueryUnsupported default.
     let err = block_on(ctx.query("saga", b"")).unwrap_err();

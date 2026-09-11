@@ -6,8 +6,8 @@
 //! engine's `AdmissionPolicy` and the channel→flow derivation; the media
 //! pipeline here knows nothing of channels.
 //!
-//! Wire surface (this module root + [`media`]): the 8-byte media header
-//! (version, flags, seq, timestamp) carried inside a data-plane datagram on
+//! Wire surface (this module root + [`media`]): the 10-byte media header
+//! (epoch, seq, timestamp) carried inside a data-plane datagram on
 //! `Service::Voice`, payload = one 20 ms Opus frame. Speakers are identified
 //! by the transport-authenticated `PeerId` — the plane's WireGuard identity
 //! binding — so there is no SSRC and no media-level identity to spoof.

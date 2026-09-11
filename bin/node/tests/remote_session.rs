@@ -30,7 +30,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, create_account, hex, sandbox_toml, skip_unless_sandboxed, submit_frame};
+use common::{
+    Cluster, SandboxStage, create_account, hex, sandbox_toml, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use gateway::{
@@ -46,10 +48,6 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// the child echo must fan all the way back to the guest topic within this
 /// bound (container cold-start + the mesh hop); a deadline, not a poll.
 const ECHO: Duration = Duration::from_secs(120);
-
-// The scripted echo provider used to name its own container image. Every node
-// now boots the same shared guest rootfs, so what a run can execute is decided
-// when that image is built (ops/build-guest-rootfs.sh), not per suite.
 
 fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<u64> {
     let bytes = cluster.query(
@@ -102,17 +100,21 @@ fn signed_set_credential(
     }
 }
 
-/// an operator capability dir whose sole provider, `echo`, runs a bare `cat` on
+/// An operator capability dir whose sole provider, `echo`, runs a bare `cat` on
 /// the pty — a scripted child that echoes stdin, no real provider or credential
-/// needed. Written to a tempdir handed to the HOST node via
-/// `DUCKTAPE_CAPABILITY_DIR`.
-fn echo_spec_dir() -> tempfile::TempDir {
-    let dir = tempfile::TempDir::new().expect("capability spec tempdir");
+/// needed. Its private executor directory carries the guest's own `cat`,
+/// mounted at `/opt/duck/bin/cat` in the host's session microVM.
+fn echo_fixture() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("echo provider tempdir");
+    let specs = dir.path().join("specs");
+    let executors = dir.path().join("executors");
+    std::fs::create_dir_all(&specs).expect("echo spec directory");
+    std::fs::create_dir_all(&executors).expect("echo executor directory");
+    common::guest_binary("/usr/bin/cat", &executors.join("cat"));
     std::fs::write(
-        dir.path().join("echo.toml"),
-        // detect.bin = cat (present on the host PATH, mounted into the sandbox);
-        // an empty [interactive] argv launches it bare — `cat` copies its pty
-        // stdin straight back to stdout.
+        specs.join("echo.toml"),
+        // An empty interactive argv launches the installed cat bare; it copies
+        // its pty stdin straight back to stdout.
         r#"spec = 1
 [capability]
 tag = "echo"
@@ -238,17 +240,18 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
 
     // the host's sole provider is the scripted `cat`; keep the dir alive for the
     // node's whole lifetime.
-    let spec_dir = echo_spec_dir();
+    let fixture = echo_fixture();
 
     // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run
     // a terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
     cluster.extra_toml = sandbox_toml();
-    cluster.env[1] = vec![(
-        "DUCKTAPE_CAPABILITY_DIR".into(),
-        spec_dir.path().display().to_string(),
-    )];
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(SandboxStage {
+        capabilities: Some(fixture.path().join("specs")),
+        executors: Some(fixture.path().join("executors")),
+    });
     for index in 0..2 {
         cluster.spawn(index);
     }

@@ -1,32 +1,30 @@
-//! who this run is, and what it may do.
+//! who this run is.
 //!
 //! the environment carries which node and agent, plus a narrow host endpoint
 //! for actions made by this run. The session private key never enters the child.
-//! it carries NOTHING about the grant: owner, `allowed_actions` and
-//! `ResourceCaps` are read back from the committed agent registry, so what this
-//! module reports is always what consensus actually holds.
+//! it carries NOTHING about the model's record: that is read back from the
+//! committed Runs model configuration, so this module reports what consensus
+//! actually holds.
 //!
-//! ## writes are gated in CONSENSUS, not here
+//! ## writes are validated in CONSENSUS, not here
 //!
-//! this binary does not decide whether a write is allowed. it asks the scoped
-//! host endpoint to sign an allowed runs message; the runs module then checks —
-//! on every validator — that the origin IS
-//! the session key bound to that run, that the run is still in flight, and that
-//! the action sits inside the agent's committed `allowed_actions` and caps. a
-//! refusal comes back as the module's own words.
+//! this binary does not decide whether a write is well-formed. it asks the
+//! scoped host endpoint to sign a runs message; the runs module then checks —
+//! on every validator — that the origin IS the session key bound to that run
+//! and that the run is still in flight, and the target module decides whether
+//! the message it carries is one it accepts. a refusal comes back as the
+//! module's own words.
 //!
 //! a frame's origin is its verified public key. The endpoint accepts only
-//! `AgentAction` and `DelegateRun` for its exact run id, so its bearer token is
-//! not a general-purpose signer even if the child reads its environment.
+//! `RunsMsg::AgentAction` for its exact run id, so its bearer token is not a
+//! general-purpose signer even if the child reads its environment.
 //!
-//! READS are still gated here, against the committed caps (`forge_read`,
-//! `duckfs_read`) — they cross no consensus op to be checked by, and `/v1/query`
-//! is ambient to any local process anyway.
+//! READS are not gated: `/v1/query` is ambient to any local process anyway,
+//! and a run reads what any member reads.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use agent::{AgentRecord, CapRequest};
+use runs::ModelRecord;
 use serde_json::json;
 
 use crate::mcp::node::{Node, NodeError, Result};
@@ -37,19 +35,15 @@ pub const ENV_WORKSPACE: &str = "DUCKTAPE_RUN_WORKSPACE";
 pub const ENV_SKILLS: &str = "DUCKTAPE_RUN_SKILLS";
 pub const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
-/// the run this session is bound to — the `run_id` every `AgentAction` names.
+/// the run this session is bound to — the `run_id` every action names.
 pub const ENV_RUN_ID: &str = "DUCKTAPE_RUN_ID";
 const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
 const ENV_PROVIDER_CONTROL_TOKEN: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 const PROVIDER_CONTROL_HEADER: &str = "x-ducktape-provider-control";
 
-/// the agent-registry module id. the node's genesis registers it under this
-/// name (`bin/noded/src/main.rs`), as it does every module the tools speak to.
-pub const TARGET_AGENT: &str = "agent";
-/// the runs module id — the target of every `AgentAction`, and the only module
-/// this binary ever WRITES to. chat, tasks and pages are written by runs, in
-/// consensus, on the agent's behalf; that indirection is what earns the write
-/// its `AuthorRef::Agent` attribution.
+/// Model configuration and run requests belong to the runs module.
+pub const TARGET_MODEL: &str = "runs";
+/// Scoped action proposals go to runs; the user program performs their writes.
 pub const TARGET_RUNS: &str = "runs";
 
 /// The narrow host signer endpoint for this live run. Its random token can ask
@@ -59,7 +53,6 @@ struct ActionControl {
     client: reqwest::blocking::Client,
     url: String,
     token: String,
-    pub run_id: String,
 }
 
 /// this run, as the tool plane sees it.
@@ -70,15 +63,15 @@ pub struct Run {
     pub agent_id: Option<String>,
     pub workspace: Option<String>,
     pub skills: Option<String>,
-    /// `None` when the node opened no session for this run (an older node, or a
-    /// run whose `OpenAgentSession` was refused). every WRITE then refuses,
-    /// loudly — there is no credential to prove the write came from this agent,
-    /// and this binary will not fall back to a lane that would file it under
-    /// somebody else's name.
+    /// the CONSENSUS run id this server is bound to, from `DUCKTAPE_RUN_ID`.
+    /// exported for every provisioned run, session or not: it is identity, not
+    /// a credential.
+    run_id: Option<String>,
+    /// Absent when this MCP server starts without a scoped action endpoint.
+    /// Writes then refuse: only a provisioned run has the credential to act
+    /// under its program account.
     action: Option<ActionControl>,
     provider_control: Option<ProviderControl>,
-    /// monotonic within the process — the tail of every minted id.
-    ids: AtomicU64,
 }
 
 impl Run {
@@ -92,56 +85,31 @@ impl Run {
             agent_id: std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty()),
             workspace: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
             skills: std::env::var(ENV_SKILLS).ok().filter(|s| !s.is_empty()),
+            run_id: std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty()),
             action: ActionControl::from_env(),
             provider_control: ProviderControl::from_env(),
-            ids: AtomicU64::new(0),
         }
     }
 
     /// the run this MCP session is bound to. The signer stays private; callers
     /// that only need an evidence id never get access to the session key.
     pub fn run_id(&self) -> Option<&str> {
-        self.action.as_ref().map(|action| action.run_id.as_str())
+        self.run_id.as_deref()
     }
 
-    /// Apply one action mid-run through this run's scoped host signer.
+    /// Propose one catalog action mid-run through this run's scoped host
+    /// signer, under the caller's idempotency key, and return its committed
+    /// receipt.
     ///
-    /// there is NO permission check here. the runs module makes it, on every
-    /// validator, against the agent's committed grant — and its refusal is what
-    /// comes back. a second gate in this process could only ever drift from the
-    /// one that actually decides.
-    pub fn act(&self, action: agent::AgentAction) -> Result<serde_json::Value> {
-        self.submit_runs(runs::RunsMsg::AgentAction {
-            run_id: self.run_id().unwrap_or_default().to_string(),
-            action,
-        })
-    }
-
-    pub fn delegate(
+    /// there is NO decoding of the envelope here. the runs module decodes it,
+    /// on every validator, against the catalog it owns — and its refusal, or
+    /// the target module's, is what comes back. a second decoder in this
+    /// process could only ever drift from the one that actually decides.
+    pub fn act(
         &self,
         request_id: String,
-        request: agent::DelegationRequest,
+        action: runs::ActionEnvelope,
     ) -> Result<serde_json::Value> {
-        self.submit_runs(runs::RunsMsg::DelegateRun {
-            run_id: self.run_id().unwrap_or_default().to_string(),
-            request_id,
-            request,
-        })
-    }
-
-    pub fn delegations(&self) -> Result<serde_json::Value> {
-        let run_id = self.run_id().ok_or_else(|| {
-            NodeError::Rejected(format!(
-                "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset)"
-            ))
-        })?;
-        self.node.query(
-            TARGET_RUNS,
-            json!({"delegations": {"caller_run_id": run_id}}),
-        )
-    }
-
-    fn submit_runs(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
         self.action
             .as_ref()
             .ok_or_else(|| {
@@ -149,7 +117,11 @@ impl Run {
                     "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset), so writing is refused"
                 ))
             })?
-            .submit(message)
+            .submit(runs::RunsMsg::AgentAction {
+                run_id: self.run_id().unwrap_or_default().to_string(),
+                request_id,
+                action,
+            })
     }
 
     /// Ask the host-local controller for more silent provider time. The model
@@ -166,77 +138,40 @@ impl Run {
         control.request(request_id, requested_secs)
     }
 
-    /// the agent's COMMITTED record. fetched per call rather than cached at
-    /// startup: an owner can pause an agent or narrow its caps mid-run, and a
-    /// cached grant would keep honouring a permission that consensus has
-    /// already taken away.
-    pub fn record(&self) -> Result<AgentRecord> {
+    /// the agent's COMMITTED record.
+    ///
+    /// fetched per call rather than cached at startup: an owner can pause or
+    /// reconfigure an agent mid-run, and a cached record would keep reporting
+    /// what consensus has already changed.
+    pub fn record(&self) -> Result<ModelRecord> {
         let agent_id = self.agent_id.as_deref().ok_or_else(|| {
             NodeError::Rejected(format!(
                 "this MCP server was started without {ENV_AGENT}, so it is not acting for any \
                  agent and cannot write"
             ))
         })?;
-        let reply = self
-            .node
-            .query(TARGET_AGENT, json!({"agent": {"agent_id": agent_id}}))?;
-        // AgentReply::Agent(Option<AgentRecord>) — snake_case externally
+        let reply = self.node.query(
+            TARGET_MODEL,
+            json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}),
+        )?;
+        // ModelReply::Agent(Option<ModelRecord>) — snake_case externally
         // tagged, so the record sits under "agent" and is null for an id the
         // registry does not hold.
-        let record = reply.get("agent").ok_or_else(|| {
-            NodeError::Transport(format!(
-                "the agent registry answered a shape this server does not understand: {reply}"
-            ))
-        })?;
+        let record = reply
+            .get("model")
+            .and_then(|model| model.get("agent"))
+            .ok_or_else(|| {
+                NodeError::Transport(format!(
+                    "the Runs model query answered a shape this server does not understand: {reply}"
+                ))
+            })?;
         if record.is_null() {
             return Err(NodeError::Rejected(format!(
-                "the agent registry holds no agent {agent_id:?}"
+                "Runs holds no model {agent_id:?}"
             )));
         }
-        serde_json::from_value(record.clone()).map_err(|e| {
-            NodeError::Transport(format!("the agent registry's record did not decode: {e}"))
-        })
-    }
-
-    /// a read-side cap probe. reads cross no consensus op that could check them,
-    /// so this is the only gate they get — and it is honest about being one: the
-    /// node's `/v1/query` is ambient to any local process. under codex's
-    /// network-less sandbox this server IS the only door and the probe is a real
-    /// boundary; under claude it is a guardrail on a surface the run could reach
-    /// anyway.
-    ///
-    /// WRITES do not come through here. they are gated in consensus — see
-    /// [`Run::act`] and this module's doc.
-    pub fn permits(&self, record: &AgentRecord, cap: &CapRequest) -> Result<()> {
-        record.permits(cap).then_some(()).ok_or_else(|| {
-            NodeError::Rejected(format!(
-                "agent {:?}'s resource caps do not cover {}",
-                record.agent_id,
-                describe(cap)
-            ))
-        })
-    }
-
-    /// a fresh id for a client-minted key (a chat message, a task, a pages
-    /// thread/comment). unique by construction within a process, and across
-    /// processes by the nanosecond stamp.
-    ///
-    /// deliberately NOT the runs module's deterministic derivation: those ids
-    /// must be identical on every replaying validator, because the op is minted
-    /// IN consensus. this op is minted host-side by one process and submitted
-    /// once, so it needs uniqueness, not reproducibility. a collision is not
-    /// silent — the module rejects a squatted id and the agent sees why.
-    // ponytail: nanos+counter, no hashing, no uuid dep. two servers minting in
-    // the same nanosecond on one node would collide; the module rejects that
-    // loudly rather than corrupting anything, and a real uuid is the upgrade if
-    // it ever actually happens.
-    pub fn mint(&self, kind: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let n = self.ids.fetch_add(1, Ordering::Relaxed);
-        format!("mcp/{kind}/{nanos:x}/{n}")
+        serde_json::from_value(record.clone())
+            .map_err(|e| NodeError::Transport(format!("the Runs model record did not decode: {e}")))
     }
 }
 
@@ -250,7 +185,9 @@ impl ActionControl {
         let token = std::env::var(ENV_ACTION_TOKEN)
             .ok()
             .filter(|value| provider_control_token_allowed(value))?;
-        let run_id = std::env::var(ENV_RUN_ID)
+        // the signer is scoped to ONE run and every message it signs names it,
+        // so a session with no run id can sign nothing.
+        std::env::var(ENV_RUN_ID)
             .ok()
             .filter(|value| !value.is_empty())?;
         let client = reqwest::blocking::Client::builder()
@@ -259,12 +196,7 @@ impl ActionControl {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("a loopback action client always builds");
-        Some(Self {
-            client,
-            url,
-            token,
-            run_id,
-        })
+        Some(Self { client, url, token })
     }
 
     fn submit(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
@@ -298,10 +230,7 @@ fn action_url_allowed(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
-        )
+        && matches!(url.host_str(), Some("127.0.0.1"))
         && url.port().is_some()
         && url.path() == "/v1/run-action"
         && url.username().is_empty()
@@ -368,10 +297,7 @@ fn provider_control_url_allowed(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
-        )
+        && matches!(url.host_str(), Some("127.0.0.1"))
         && url.port().is_some()
         && url.path() == "/v1/control/provider-idle"
         && url.username().is_empty()
@@ -396,15 +322,11 @@ mod provider_control_tests {
         assert!(provider_control_url_allowed(
             "http://127.0.0.1:41043/v1/control/provider-idle"
         ));
-        assert!(provider_control_url_allowed(
-            "http://ducktape-host:41043/v1/control/provider-idle"
-        ));
-        assert!(provider_control_url_allowed(
-            "http://host.containers.internal:41043/v1/control/provider-idle"
-        ));
         for rejected in [
             "https://127.0.0.1:41043/v1/control/provider-idle",
             "http://localhost:41043/v1/control/provider-idle",
+            "http://ducktape-host:41043/v1/control/provider-idle",
+            "http://host.containers.internal:41043/v1/control/provider-idle",
             "http://example.com:41043/v1/control/provider-idle",
             "http://127.0.0.1:41043/v1/control/provider-idle?token=leak",
             "http://127.0.0.1:41043/other",
@@ -420,37 +342,85 @@ mod provider_control_tests {
     }
 }
 
-/// a cap request in the words the agent's own grant uses, so a refusal names
-/// the field its owner would have to widen.
-fn describe(cap: &CapRequest) -> String {
-    match cap {
-        CapRequest::ForgeRead(r) => format!("reading forge repo {r:?} (caps.forge_read)"),
-        CapRequest::ForgePush(r) => format!("pushing to forge repo {r:?} (caps.forge_push)"),
-        CapRequest::DuckfsRead(p) => format!("reading duckfs path {p:?} (caps.duckfs_read)"),
-        CapRequest::DuckfsWrite(p) => format!("writing duckfs path {p:?} (caps.duckfs_write)"),
-        CapRequest::Tool(t) => format!("invoking tool {t:?} (caps.tools)"),
-        CapRequest::Secret(s) => format!("resolving secret {s:?} (caps.secrets)"),
-        CapRequest::PagesWrite(p) => format!("writing page {p:?} (caps.pages_write)"),
-        CapRequest::SpawnSubagent => "calling a peer agent (caps.subagent_budget)".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// a node that answers `/v1/query` from a canned table. one thread, `n`
+    /// requests, no framework.
+    fn fake_node(replies: Vec<serde_json::Value>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // drain enough of the request to unblock the client, then answer.
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn standing_record() -> ModelRecord {
+        runs::ModelRecord {
+            account: 2,
+            agent_id: "worker".into(),
+            owner: runs::RunOrigin::External(vec![9; 32]),
+            display_name: "Worker".into(),
+            capability: "model-1".into(),
+            status: runs::ModelStatus::Active,
+            role: runs::ModelRole::General,
+            created_at: 0,
+            updated_at: 0,
+            recipe_hash: Vec::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    fn bound_run(node: String, replies: Vec<serde_json::Value>) -> Run {
+        Run {
+            node: Node::new(Some(fake_node(replies))),
+            agent_id: Some("worker".into()),
+            workspace: None,
+            skills: None,
+            run_id: Some(node),
+            action: None,
+            provider_control: None,
+        }
+    }
+
+    #[test]
+    fn the_record_is_the_committed_standing_record_and_a_missing_one_refuses() {
+        let run = bound_run(
+            "run-1".into(),
+            vec![json!({"model": {"agent": standing_record()}})],
+        );
+        assert_eq!(
+            run.record().expect("the registry answers"),
+            standing_record()
+        );
+
+        let gone = bound_run("run-1".into(), vec![json!({"model": {"agent": null}})]);
+        assert!(matches!(gone.record(), Err(NodeError::Rejected(_))));
+    }
+
     #[test]
     fn action_endpoint_is_strictly_host_local_and_path_scoped() {
         assert!(action_url_allowed("http://127.0.0.1:41043/v1/run-action"));
-        assert!(action_url_allowed(
-            "http://ducktape-host:41043/v1/run-action"
-        ));
-        assert!(action_url_allowed(
-            "http://host.containers.internal:41043/v1/run-action"
-        ));
         for rejected in [
             "https://127.0.0.1:41043/v1/run-action",
             "http://localhost:41043/v1/run-action",
+            "http://ducktape-host:41043/v1/run-action",
+            "http://host.containers.internal:41043/v1/run-action",
             "http://127.0.0.1:41043/v1/submit/frame",
             "http://127.0.0.1:41043/v1/run-action?token=leak",
         ] {

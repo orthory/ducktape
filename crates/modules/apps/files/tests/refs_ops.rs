@@ -4,10 +4,9 @@
 //! decoding the snapshot image (`decode_refs(f.snapshot())`) — an honest codec
 //! round-trip, since the `Refs` query is not part of this task's read surface.
 //!
-//! covers the brief's list plus the two BINDING requirements from task 9's
-//! review: the origin/owner gates, the honest cap boundaries (1024 pins, 256
-//! watches), and — the controller ruling — segment-boundary watch matching at
-//! both ends (`/shared` fires for `/shared/x`, never for `/sharedsecret/x`).
+//! covers the origin rules, the honest cap boundaries (1024 pins, 256
+//! watches), and segment-boundary watch matching at both ends (`/shared`
+//! fires for `/shared/x`, never for `/sharedsecret/x`).
 //!
 //! each async call is `block_on`'d at the top level; `commit_block`/`abort_block`
 //! get their own `block_on` (nesting trips futures' LocalPool re-entry guard).
@@ -179,7 +178,8 @@ fn pin_happy_path_moves_root_and_records_owner() {
     let pin = refs.pins.get("v1").expect("pin recorded under its name");
     assert_eq!(to_hex(&pin.snapshot), head, "pin protects the seeded head");
     assert_eq!(
-        pin.owner, "system",
+        pin.owner,
+        files::Actor::System,
         "owner is the acting origin, not the payload"
     );
 }
@@ -236,53 +236,149 @@ fn pin_table_full_at_max_pins() {
     let mut f = open_files(&d);
     let head = seed_head(&mut f, 1);
     // fill the pin table honestly in ONE block: MAX_PINS distinct names, all
-    // pointing at the resolvable head (a cheap in-memory BTreeMap fill).
+    // pointing at the resolvable head (a cheap in-memory BTreeMap fill), spread
+    // across MAX_PINS / MAX_PINS_PER_OWNER owners so the per-owner cap (#1801)
+    // never trips before the global one this test targets.
+    let owners_needed = files::MAX_PINS / files::MAX_PINS_PER_OWNER;
     for i in 0..files::MAX_PINS {
-        exec(
-            &mut f,
-            sdk::Origin::System,
-            2,
-            pin_op(&head, &format!("p{i}")),
-        )
-        .expect("pin fits under the cap");
+        let owner = md(&format!("owner{}", i % owners_needed));
+        exec(&mut f, owner, 2, pin_op(&head, &format!("p{i}")))
+            .expect("pin fits under the global and per-owner caps");
     }
+    // the table is now exactly full: even a FRESH owner (nowhere near its own
+    // per-owner share) is refused by the global cap.
     let err =
-        exec(&mut f, sdk::Origin::System, 2, pin_op(&head, "overflow")).expect_err("cap reached");
+        exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow")).expect_err("cap reached");
     assert_module_err(&err, "pin table is full");
     abort_block(&mut f);
+}
+
+/// the per-owner share of the global table (#1801): the `MAX_PINS_PER_OWNER`th
+/// pin from one owner lands, the next from the SAME owner is refused with a
+/// stable reason distinct from the global cap, and a DIFFERENT owner is
+/// unaffected.
+#[test]
+fn pin_per_owner_cap_is_independent_of_other_owners() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    let head = seed_head(&mut f, 1);
+
+    for i in 0..files::MAX_PINS_PER_OWNER {
+        exec(&mut f, md("alice"), 2, pin_op(&head, &format!("a{i}")))
+            .expect("alice's pin fits under her share");
+    }
+    let err = exec(&mut f, md("alice"), 2, pin_op(&head, "one-too-many"))
+        .expect_err("alice hit her per-owner cap");
+    assert_module_err(&err, "pin quota exceeded");
+
+    // bob's share is untouched by alice filling hers.
+    exec(&mut f, md("bob"), 2, pin_op(&head, "b0")).expect("bob still pins");
+    abort_block(&mut f);
+}
+
+#[test]
+fn pin_quota_follows_the_account_share_and_exact_key_admission() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    let head = seed_head(&mut f, 1);
+    let old_key = files::Authority::External {
+        key: vec![1],
+        account: None,
+    };
+    let admitted = files::Authority::External {
+        key: vec![1],
+        account: Some(1),
+    };
+    let sibling = files::Authority::External {
+        key: vec![2],
+        account: Some(1),
+    };
+    let store = duckfs_disk::DiskStore::open(d.path().join("objects")).unwrap();
+    let mut core = files::Fs::new(store, decoded_refs(&f));
+    core.pin(&old_key, 2, head.clone(), "before-admission".into())
+        .unwrap();
+    for i in 0..files::MAX_PINS_PER_OWNER - 1 {
+        let signer = match i % 2 {
+            0 => &admitted,
+            _ => &sibling,
+        };
+        core.pin(signer, 2, head.clone(), format!("account-{i}"))
+            .unwrap();
+    }
+
+    // Admission must not erase the actual signer's earlier quota usage.
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&admitted, 2, head.clone(), "over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+
+    // The other member draws on the account's share, not on the earlier key
+    // pin's. Its one remaining account slot is shared by every account member,
+    // and any member releases the earlier key pin.
+    core.pin(&sibling, 2, head.clone(), "last-account-slot".into())
+        .unwrap();
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&sibling, 2, head.clone(), "account-over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+    core.unpin(&sibling, 2, "before-admission".into()).unwrap();
+
+    // A keyless program has its own account share and can release its own pin
+    // to regain capacity, with the same revision/rollback discipline.
+    let program = files::Authority::Program(2);
+    for i in 0..files::MAX_PINS_PER_OWNER {
+        core.pin(&program, 2, head.clone(), format!("program-{i}"))
+            .unwrap();
+    }
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&program, 2, head.clone(), "program-over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+    core.unpin(&program, 2, "program-0".into()).unwrap();
+    core.pin(&program, 2, head, "program-replacement".into())
+        .unwrap();
 }
 
 // ---- unpin ------------------------------------------------------------------
 
 #[test]
-fn unpin_owner_gate_and_absent() {
+fn any_authority_unpins_and_an_absent_pin_is_refused() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
     let head = seed_head(&mut f, 1);
 
-    // alice (a module) creates the pin, so she is its owner.
+    // alice (a module) creates the pin: its owner for attribution and the
+    // per-owner pin share, not for removal.
     exec(&mut f, md("alice"), 2, pin_op(&head, "a")).expect("alice pins");
     commit_block(&mut f);
 
-    // bob cannot remove alice's pin.
-    let err = exec(&mut f, md("bob"), 3, unpin_op("a")).expect_err("bob is not the owner");
-    assert_module_err(&err, "only the pin owner may unpin");
-    abort_block(&mut f);
+    // bob, another module, removes alice's pin.
+    exec(&mut f, md("bob"), 3, unpin_op("a")).expect("bob unpins");
+    commit_block(&mut f);
+    assert!(decoded_refs(&f).pins.is_empty(), "bob removed alice's pin");
 
-    // alice, the owner, can.
-    exec(&mut f, md("alice"), 4, unpin_op("a")).expect("alice unpins");
+    // re-pin; alice removes her own.
+    exec(&mut f, md("alice"), 4, pin_op(&head, "a")).expect("re-pin");
+    commit_block(&mut f);
+    exec(&mut f, md("alice"), 5, unpin_op("a")).expect("alice unpins");
     commit_block(&mut f);
     assert!(decoded_refs(&f).pins.is_empty(), "alice's pin removed");
 
-    // re-pin, then system (the arbitrary-authority origin) removes anyone's pin.
-    exec(&mut f, md("alice"), 5, pin_op(&head, "a")).expect("re-pin");
+    // re-pin; system removes it too.
+    exec(&mut f, md("alice"), 6, pin_op(&head, "a")).expect("re-pin");
     commit_block(&mut f);
-    exec(&mut f, sdk::Origin::System, 6, unpin_op("a")).expect("system unpins");
+    exec(&mut f, sdk::Origin::System, 7, unpin_op("a")).expect("system unpins");
     commit_block(&mut f);
     assert!(decoded_refs(&f).pins.is_empty(), "system removed the pin");
 
-    // unpin of an absent name → not found.
-    let err = exec(&mut f, sdk::Origin::System, 7, unpin_op("ghost")).expect_err("absent");
+    // unpin of an absent name → not found, whoever asks.
+    let err = exec(&mut f, md("bob"), 8, unpin_op("ghost")).expect_err("absent");
     assert_module_err(&err, "pin not found");
     abort_block(&mut f);
 }
@@ -456,7 +552,7 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     .expect("commit under a different top-level name");
     commit_block(&mut f);
     assert!(
-        ctx.msgs().is_empty(),
+        watch_msgs(&ctx).is_empty(),
         "no false-positive notification across the segment boundary"
     );
 
@@ -470,8 +566,12 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     )
     .expect("commit under the watched prefix");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "fires under the real segment prefix");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "fires under the real segment prefix"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 
 #[test]
@@ -491,8 +591,12 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /sharedsecret/x");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /sharedsecret/x"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 
     let ctx = commit(
         &mut f,
@@ -503,8 +607,12 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /shared/y too");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /shared/y too"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 
 // ---- root-movement discipline: staged-then-abort is a no-op -----------------

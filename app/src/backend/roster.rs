@@ -1,8 +1,9 @@
 use super::*;
+use identity::{AccountNumber, AccountView, IdentityQuery, IdentityReply};
 
 /// One member of the network: a validator (quorum seat), a resident
 /// (mesh + statesync standing), or a registered agent.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct MemberRow {
     pub key: String,
     pub label: String,
@@ -22,6 +23,187 @@ pub struct MemberRow {
 pub struct MembersData {
     pub generation: i64,
     pub members: Vec<MemberRow>,
+}
+
+/// The network's name directory as this process last read it: the account
+/// name bound to every user key. Every surface that names a key reads it, and
+/// every read of the identity roster ([`read_accounts`]) rewrites it whole —
+/// on each chat load, before a row renders, and on every identity op the live
+/// stream delivers.
+static NAME_DIRECTORY: std::sync::RwLock<Names> = std::sync::RwLock::new(Names {
+    generation: 0,
+    directory: NameDirectory::empty(),
+});
+
+/// The directory with the generation of the read that seated it, so a
+/// holder of a snapshot can tell when the directory has moved on without
+/// cloning it again.
+struct Names {
+    generation: u64,
+    directory: NameDirectory,
+}
+
+fn read_names() -> std::sync::RwLockReadGuard<'static, Names> {
+    NAME_DIRECTORY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seats a freshly read directory as the one every surface reads.
+fn seat_names(directory: NameDirectory) {
+    let mut names = NAME_DIRECTORY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    names.generation += 1;
+    names.directory = directory;
+}
+
+/// The directory as last read — a snapshot the caller owns, so a loader can
+/// lend it across its awaits and the update thread can read it without one.
+pub(crate) fn names() -> NameDirectory {
+    read_names().directory.clone()
+}
+
+/// The generation the directory is at: it moves on every read that seats
+/// one, so a holder of [`names_at`]'s snapshot compares generations instead
+/// of directories.
+pub(crate) fn names_generation() -> u64 {
+    read_names().generation
+}
+
+/// The directory and the generation it is at, read together.
+pub(crate) fn names_at() -> (u64, NameDirectory) {
+    let names = read_names();
+    (names.generation, names.directory.clone())
+}
+
+/// Every identity account, paged the way the module serves them: numbered
+/// from 1 with no gaps, at most `MAX_QUERY_LIMIT` per page. THE ONE read of
+/// the identity roster; the name directory is rewritten from what it returns.
+pub(crate) async fn read_accounts(client: &RpcClient) -> Result<Vec<AccountView>, String> {
+    let page_limit =
+        usize::try_from(identity::MAX_QUERY_LIMIT).expect("the identity page cap fits a usize");
+    let mut accounts: Vec<AccountView> = Vec::new();
+    let mut from: AccountNumber = 0;
+    loop {
+        let reply: IdentityReply = client
+            .query(
+                "identity",
+                &IdentityQuery::All {
+                    from,
+                    limit: identity::MAX_QUERY_LIMIT,
+                },
+            )
+            .await?;
+        let IdentityReply::Accounts(page) = reply else {
+            return Err("the identity module returned the wrong reply".to_string());
+        };
+        let page_is_last = page.len() < page_limit;
+        let Some(last) = page.last().map(|account| account.number) else {
+            break;
+        };
+        accounts.extend(page);
+        if page_is_last {
+            break;
+        }
+        from = last + 1;
+    }
+    seat_names(directory_of(&accounts));
+    Ok(accounts)
+}
+
+/// The directory an account list binds: every key of an account resolves to
+/// that account — its number and its name.
+pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
+    NameDirectory::from_accounts(accounts)
+}
+
+/// A test's directory, seated the way a roster read seats it, for as long as
+/// the guard lives. The directory is one per process, so tests that seat one
+/// take turns on it, and a guard dropped leaves it empty for the next.
+#[cfg(test)]
+pub(crate) fn seed_names(directory: NameDirectory) -> SeededNames {
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let seeded = SeededNames { _turn: turn };
+    seeded.seat(directory);
+    seeded
+}
+
+/// A test's turn on the process-wide directory.
+#[cfg(test)]
+pub(crate) struct SeededNames {
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl SeededNames {
+    /// Replace the seated directory, the turn kept.
+    pub(crate) fn seat(&self, directory: NameDirectory) {
+        seat_names(directory);
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeededNames {
+    fn drop(&mut self) {
+        self.seat(NameDirectory::empty());
+    }
+}
+
+/// Whether the account or exact key represented by `me` holds a seat.
+pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
+    let Ok(key) = hex_decode(me) else {
+        return false;
+    };
+    let names = names();
+    members.iter().any(|member| {
+        let handle = match member.key.starts_with("acct:") || member.key.starts_with("user:") {
+            true => member.key.clone(),
+            false => format!("user:{}", member.key),
+        };
+        names.owns_handle(&handle, &key)
+    })
+}
+
+/// Refresh the directory and nothing else — what a chat load does before it
+/// renders a row.
+pub(crate) async fn refresh_names(client: &RpcClient) -> Result<(), String> {
+    read_accounts(client).await.map(|_accounts| ())
+}
+
+/// What every chat renderer is handed: this device's key (the `by me` facts)
+/// and the directory (every label), owned so a loader can lend a
+/// [`ChatReader`] across its awaits.
+pub(crate) struct ReaderFacts {
+    key: Option<Vec<u8>>,
+    names: NameDirectory,
+}
+
+impl ReaderFacts {
+    pub(crate) async fn current() -> Self {
+        Self {
+            key: local_user_key().await,
+            names: names(),
+        }
+    }
+
+    /// The update thread's reading — it cannot await, so it takes the cached
+    /// key (warm by the time anyone sends) and the directory as last read.
+    pub(crate) fn cached() -> Self {
+        Self {
+            key: rpc::cached_user_key(),
+            names: names(),
+        }
+    }
+
+    pub(crate) fn reader(&self) -> ChatReader<'_> {
+        ChatReader::new(self.key.as_deref(), &self.names)
+    }
+
+    pub(crate) fn names(&self) -> &NameDirectory {
+        &self.names
+    }
 }
 
 /// Load the roster: validators, then residents, then the registered agents —
@@ -130,296 +312,3 @@ pub fn member_tier(rows: &[MemberRow]) -> String {
         .map_or_else(|| "guest".into(), |row| row.role.clone())
 }
 
-/// The All / Humans / Agents / Validators strip.
-pub fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -> Vec<MemberRow> {
-    rows.iter()
-        .filter(|row| match filter {
-            crate::MembersFilter::All => true,
-            crate::MembersFilter::Humans => !row.is_agent,
-            crate::MembersFilter::Agents => row.is_agent,
-            crate::MembersFilter::Validators => row.role == "validator",
-        })
-        .cloned()
-        .collect()
-}
-
-/// One governance proposal, rendered.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ProposalRow {
-    pub id: String,
-    pub action: String,
-    /// what the action actually does — the `GovAction` payload, rendered.
-    pub detail: String,
-    pub proposer: String,
-    pub status: String,
-    pub deadline: i64,
-    pub approvals: i64,
-    pub rejections: i64,
-    /// the frozen rule's discriminant: `threshold` | `participating_majority`.
-    /// The two bars are NOT interchangeable — a threshold counts YES power, a
-    /// participating majority counts TURNOUT and then compares yes against no.
-    pub rule: String,
-    /// how many YES votes would pass this proposal AT ITS CURRENT TALLY, in
-    /// `approvals`' own unit — the one number the dots, the `3 / 4` reading and
-    /// the note may compare `approvals` against. Under
-    /// `ParticipatingMajority{quorum}` that is `max(quorum − no, no + 1)`, which
-    /// is exactly `turnout >= quorum && yes > no` restated as a yes count.
-    pub required_yes: i64,
-    pub electorate: i64,
-    pub open: bool,
-    /// The block a settled proposal was EXECUTED at, derived from the op feed
-    /// (see [`settle_heights`]). 0 when the proposal is still open, or when it
-    /// settled further back than the op window reaches.
-    pub settled_height: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct GovernanceData {
-    pub generation: i64,
-    pub proposals: Vec<ProposalRow>,
-}
-
-/// Load the proposal register, open proposals first, newest first within.
-pub async fn load_governance(
-    rpc: String,
-    generation: i64,
-) -> Result<GovernanceData, HydrationError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc
-            .query("governance", &serde_json::json!("proposals"))
-            .await?;
-        let mut proposals: Vec<ProposalRow> = reply["proposals"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|view| {
-                let votes = view["votes"].as_array().cloned().unwrap_or_default();
-                let approvals = votes
-                    .iter()
-                    .filter(|vote| vote[1].as_bool().unwrap_or(false))
-                    .count();
-                let status = tagged_name(&view["status"]);
-                let action = tagged_name(&view["action"]);
-                let rejections = count_i64(votes.len() - approvals);
-                ProposalRow {
-                    id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
-                    open: status == "open",
-                    detail: gov_action_detail(&view["action"]),
-                    proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
-                    deadline: view["deadline"].as_i64().unwrap_or(0),
-                    approvals: count_i64(approvals),
-                    rule: tagged_name(&view["voting_rule"]),
-                    required_yes: yes_needed(&view["voting_rule"], rejections),
-                    rejections,
-                    electorate: count_i64(
-                        view["electorate"]
-                            .as_array()
-                            .map_or(0, |members| members.len()),
-                    ),
-                    settled_height: 0,
-                    action,
-                    status,
-                }
-            })
-            .collect();
-        let any_settled = proposals.iter().any(|proposal| !proposal.open);
-        if any_settled {
-            let settled = settle_heights(&rpc).await;
-            for proposal in &mut proposals {
-                proposal.settled_height = settled.get(&proposal.id).copied().unwrap_or(0);
-            }
-        }
-        proposals.sort_by(|left, right| {
-            right
-                .open
-                .cmp(&left.open)
-                .then(right.deadline.cmp(&left.deadline))
-        });
-        Ok(GovernanceData {
-            generation,
-            proposals,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// How far back the settle-height derivation reads the op feed.
-const SETTLE_SCAN_BLOCKS: usize = 400;
-
-/// Proposal id -> the height it SETTLED at.
-///
-/// `ProposalView` omits the settle height, but settling is an ordinary op:
-/// `GovMsg::Execute { proposal_id }` applied against the governance module. So
-/// the height is recoverable from the block feed every explorer row already
-/// reads — no module change, and no invented number: a proposal that settled
-/// before the window simply has no entry, and its row prints no height.
-async fn settle_heights(client: &RpcClient) -> BTreeMap<String, i64> {
-    let Ok(blocks) = client.blocks(SETTLE_SCAN_BLOCKS).await else {
-        return BTreeMap::new();
-    };
-    let mut heights = BTreeMap::new();
-    for block in &blocks {
-        let height = block["height"].as_i64().unwrap_or(0);
-        for op in block["ops"].as_array().cloned().unwrap_or_default() {
-            let governance_op = op["target"].as_str() == Some("governance");
-            let applied = op["disposition"].as_str() == Some("applied");
-            if !governance_op || !applied {
-                continue;
-            }
-            // The feed carries the payload as its json TEXT preview, so the
-            // execute variant is read back out of that text.
-            let Some(payload) = op["payload"].as_str() else {
-                continue;
-            };
-            let Ok(message) = serde_json::from_str::<serde_json::Value>(payload) else {
-                continue;
-            };
-            let Some(id) = message["execute"]["proposal_id"].as_str() else {
-                continue;
-            };
-            heights.insert(id.to_string(), height);
-        }
-    }
-    heights
-}
-
-/// The `GovAction` payload as one readable clause — what the op DOES, which
-/// the bare variant tag never says.
-pub(crate) fn gov_action_detail(action: &serde_json::Value) -> String {
-    let Some(tagged) = action.as_object() else {
-        return String::new();
-    };
-    let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
-    };
-    let key = payload.get("key").map(json_bytes).unwrap_or_default();
-    if !key.is_empty() {
-        return format!("key {}", short_label(&hex_encode(&key)));
-    }
-    if let Some(text) = payload.get("text").and_then(|text| text.as_str()) {
-        return text.to_string();
-    }
-    match variant.as_str() {
-        "update_module" => format!(
-            "{} → h {}",
-            payload["name"].as_str().unwrap_or_default(),
-            payload["activation_height"].as_i64().unwrap_or(0)
-        ),
-        "set_share_mode" => match payload["enabled"].as_bool().unwrap_or(false) {
-            true => "account shares".into(),
-            false => "one ballot per validator".into(),
-        },
-        _ => String::new(),
-    }
-}
-
-/// How many YES votes pass this proposal at its current tally.
-///
-/// `Threshold{required_yes}` is already that number. `ParticipatingMajority`
-/// is NOT: its `quorum` is a TURNOUT bar, and passing also needs `yes > no`
-/// (crates/modules/system/governance/src/lib.rs, `settle`). Reading `quorum`
-/// into a yes counter renders "quorum met" on a Signal vote that will not
-/// settle, so restate the whole rule as the yes count it implies —
-/// `yes >= quorum − no` IS `yes + no >= quorum`, and `yes >= no + 1` IS
-/// `yes > no`.
-pub(crate) fn yes_needed(rule: &serde_json::Value, rejections: i64) -> i64 {
-    let Some(tagged) = rule.as_object() else {
-        return 0;
-    };
-    let Some((variant, payload)) = tagged.iter().next() else {
-        return 0;
-    };
-    match variant.as_str() {
-        "participating_majority" => {
-            let quorum = payload["quorum"].as_i64().unwrap_or(0);
-            quorum.saturating_sub(rejections).max(rejections + 1)
-        }
-        _ => payload["required_yes"].as_i64().unwrap_or(0),
-    }
-}
-
-/// Open a membership proposal. The app could vote and settle but never OPEN
-/// one; `action` is `add_validator` | `add_resident` | `remove_validator`.
-pub async fn governance_propose(
-    rpc: String,
-    password: String,
-    action: String,
-    target_key: String,
-) -> Result<bool, AppError> {
-    async {
-        let key = public_key(&target_key, "member public key")?;
-        let action = match action.as_str() {
-            "add_validator" => governance::GovAction::AddValidator { key },
-            "add_resident" => governance::GovAction::AddResident { key },
-            "remove_validator" => governance::GovAction::RemoveValidator { key },
-            other => return Err(format!("unknown membership action `{other}`")),
-        };
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "governance",
-            governance::encode_msg(&governance::GovMsg::Propose {
-                proposal_id: fresh_id("proposal"),
-                action,
-                voting_period: GOVERNANCE_VOTING_PERIOD,
-            }),
-            password,
-        )
-        .await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}
-
-/// Cast (or change) this node's ballot.
-pub async fn governance_vote(
-    rpc: String,
-    password: String,
-    proposal_id: String,
-    approve: bool,
-) -> Result<bool, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "governance",
-            governance::encode_msg(&governance::GovMsg::Vote {
-                proposal_id,
-                approve,
-            }),
-            password,
-        )
-        .await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}
-
-/// Tally and settle a proposal past its deadline (anyone may trigger).
-pub async fn governance_execute(
-    rpc: String,
-    password: String,
-    proposal_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "governance",
-            governance::encode_msg(&governance::GovMsg::Execute { proposal_id }),
-            password,
-        )
-        .await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}

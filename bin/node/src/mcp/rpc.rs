@@ -59,10 +59,10 @@ impl Response {
     }
 
     /// a PROTOCOL error — an unknown method, an unparseable frame. a failing
-    /// TOOL is not this: a tool that refuses (a denied cap, a node that said
-    /// no) returns a normal `result` carrying `isError: true`, so the model
-    /// sees the refusal as content it can react to rather than as a transport
-    /// fault it cannot. see [`tool_failure`].
+    /// TOOL is not this: a tool that refuses (a module that said no, a node
+    /// that could not be reached) returns a normal `result` carrying
+    /// `isError: true`, so the model sees the refusal as content it can react
+    /// to rather than as a transport fault it cannot. see [`tool_failure`].
     pub fn err(id: Value, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0",
@@ -85,8 +85,8 @@ pub fn tool_result(value: &Value) -> Value {
 }
 
 /// the `tools/call` failure shape. `isError` — NOT a JSON-RPC error — so the
-/// refusal reaches the MODEL as readable content ("you were not granted
-/// chat.post") instead of surfacing to the runner as a broken tool server.
+/// refusal reaches the MODEL as readable content ("task already exists")
+/// instead of surfacing to the runner as a broken tool server.
 /// that distinction is the whole reason an agent can recover from being denied.
 pub fn tool_failure(message: impl Into<String>) -> Value {
     json!({

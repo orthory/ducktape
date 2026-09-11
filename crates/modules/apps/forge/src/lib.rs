@@ -74,21 +74,18 @@
 //! branch are protected (never deleted, fast-forward-guarded at materialize);
 //! feature branches may force-push and be deleted — the GitHub flow.
 //!
-//! ## repo ownership — the ONLY protected-branch lever there is
+//! ## protected branches — every member's to move
 //!
 //! consensus CANNOT check ref descendancy: a validator may not hold the
-//! objects, and reading them would break the determinism invariant above. so
-//! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
-//! a repo pins its owner — the Identity ACCOUNT principal the origin resolves
-//! to (see [`state::ForgeState::principal_of_origin`]; every key of one
-//! association, laptop or phone, collapses onto one account) — and only that
-//! owner may move `main`/`dev` afterwards, whether by
-//! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
-//! FEATURE branches stay open to every member.
-//!
-//! without the gate one signed op from any member CAS-moves `main` to bytes no
-//! pack closes: `materialize` then refuses forever and `snapshot()` errors on
-//! every node, so the network stops checkpointing and cannot admit joiners.
+//! objects, and reading them would break the determinism invariant above. no
+//! member owns a repo: any member births one with a push, moves `main`/`dev`
+//! by [`ForgeMsg::PushRefs`] or [`ForgeMsg::MergePr`], and force-pushes or
+//! deletes a feature branch. what a protected branch keeps is the CAS on its
+//! previous head, its refusal to be deleted, and materialize's fast-forward
+//! rule on disk: a head that is not a descendant of the installed one is
+//! never installed. a push is attributed to the ACCOUNT principal its origin
+//! resolves to (every bound key resolves to its canonical account; an unbound
+//! key stays the exact signer) — attribution is who did it, never who may.
 //!
 //! ## the default repo
 //!
@@ -106,7 +103,7 @@
 //!
 //! ## the two runtimes over one core
 //!
-//! the consensus half — the CAS gate, ownership, the tracker — is the pure
+//! the consensus half — the CAS gate, attribution, the tracker — is the pure
 //! [`state::ForgeState`], and it is the ONLY implementation of forge's
 //! accept/reject logic. two runtimes drive it:
 //!
@@ -140,9 +137,9 @@ mod git;
 pub use git::{list_branches, pack_closure_many, pack_delta};
 pub mod oid;
 pub use oid::Oid;
-pub mod pushcert;
 #[cfg(feature = "native")]
 mod module;
+pub mod pushcert;
 pub mod refs;
 pub mod state;
 #[cfg(feature = "native")]
@@ -183,10 +180,13 @@ const MAX_REPO_NAME_LEN: usize = 64;
 /// normalize + validate a repo slug DETERMINISTICALLY (same input -> same
 /// decision on every validator, so it is safe as a consensus gate): empty ->
 /// `"default"`; otherwise it must be 1..=`MAX_REPO_NAME_LEN` bytes of
-/// `[a-z0-9._-]` and never `.`/`..` (those would escape or collide with the base
-/// dir as a path segment). a valid non-empty slug returns unchanged, so the map
-/// key equals the on-disk directory name. `pub`: bin/noded's git smart-HTTP
-/// layer shares this validator — the security-relevant check has ONE home.
+/// `[a-z0-9._-]` and never start with `.` (that collides with `.`/`..` as a
+/// path segment, AND with forge's own dot-prefixed state files — `.tracker.bin`,
+/// `.pending.bin`, `.stuck.txt`, `.snapshot-cache.bin` — that live in the same
+/// base dir; a repo named after one of those bricks every node's `commit_block`
+/// forever). a valid non-empty slug returns unchanged, so the map key equals
+/// the on-disk directory name. `pub`: bin/noded's git smart-HTTP layer shares
+/// this validator — the security-relevant check has ONE home.
 pub fn norm_repo(repo: &str) -> Result<String, Error> {
     if repo.is_empty() {
         return Ok(DEFAULT_REPO.to_string());
@@ -197,9 +197,9 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
             repo.len()
         )));
     }
-    if repo == "." || repo == ".." {
+    if repo.starts_with('.') {
         return Err(Error::Module(
-            "forge: repo name may not be '.' or '..'".into(),
+            "forge: repo name may not start with '.'".into(),
         ));
     }
     if !repo

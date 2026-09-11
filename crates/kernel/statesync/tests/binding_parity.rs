@@ -45,7 +45,7 @@ use statesync::{
 
 /// a canned op-row key at `height` — the responder's stand-in row.
 fn statesync_op_key(height: u64) -> String {
-    format!("op/{height:016x}/0000")
+    format!("op/{height:016x}/00000000")
 }
 
 fn boundary() -> BoundaryId {
@@ -143,11 +143,14 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
             entries: vec![ManifestEntry {
+                code_hash: None,
                 module_id: "kv".into(),
                 root: StateRoot([3u8; 32]),
                 kind: PayloadKind::Snapshot,
                 resolver_target: None,
             }],
+            applied_frames: vec![(41, [0x5A; 32]), (42, [0x5B; 32])],
+            pending_cutover_view: Some(45),
         }),
         SyncRequest::Chunk { offset, .. } => SyncResponse::Chunk {
             total: 999,
@@ -345,6 +348,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
             simulated::Config {
                 max_size: 1024 * 1024,
                 disconnect_on_block: true,
+                max_peers_per_set: NZUsize!(32),
                 tracked_peer_sets: NZUsize!(1),
             },
             vec![server.clone(), joiner.clone()],
@@ -355,7 +359,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
         let link = Link {
             latency: Duration::from_millis(2),
             jitter: Duration::from_millis(0),
-            success_rate: 1.0,
+            success_rate: commonware_utils::probability!(1.0),
         };
         oracle
             .add_link(server.clone(), joiner.clone(), link.clone())

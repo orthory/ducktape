@@ -33,7 +33,7 @@ const FILES: &str = "files";
 
 /// GENERATED artifact — built from the module crate's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained (the same fixture the
-/// node embeds).
+/// test pins).
 const FILES_WASM: &[u8] = include_bytes!("fixtures/files.component.wasm");
 
 // ---- the two runtimes over their own tempdirs -------------------------------
@@ -47,6 +47,15 @@ fn native_host(dir: &tempfile::TempDir) -> Host {
         Box::new(Files::open(FILES, dir.path().to_path_buf()).expect("open native files")),
         Box::new(Recorder::new("recorder")),
         Box::new(QueryProbe::new()),
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "files-parity".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
     ])
     .expect("native genesis")
 }
@@ -63,6 +72,15 @@ fn wasm_host(dir: &tempfile::TempDir) -> Host {
         ),
         Box::new(Recorder::new("recorder")),
         Box::new(QueryProbe::new()),
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "files-parity".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
     ])
     .expect("wasm genesis")
 }
@@ -399,7 +417,7 @@ fn happy_path_matrix_roots_identical_block_by_block() {
         "hosts disagree on the committed head"
     );
 
-    // pin [5] then unpin the head — owner-gated; same owner threads both.
+    // pin [5] then unpin the head; the same signer threads both.
     for (height, msg) in [
         (4, pin_op(&head_hex, "release")),
         (5, {
@@ -961,7 +979,7 @@ fn reopen_preserves_equal_roots() {
     let wasm2 = wasm_host(&dir_w);
     assert_eq!(
         files_root(&native2),
-        before_n[0].1,
+        before_n.iter().find(|(id, _)| id == FILES).unwrap().1,
         "native reopen must re-adopt the committed files root"
     );
     assert_eq!(

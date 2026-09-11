@@ -113,14 +113,22 @@ struct Fanout {
     id: ModuleId,
     committed: BTreeMap<String, String>,
     pending: Vec<(String, String)>,
+    /// the modules each `Set` fans the same write out to. empty = a pure
+    /// in-memory sink that only writes itself.
+    fans_to: Vec<ModuleId>,
 }
 
 impl Fanout {
     fn new(id: &str) -> Self {
+        Self::fanning_to(id, vec!["diskish".into()])
+    }
+
+    fn fanning_to(id: &str, fans_to: Vec<ModuleId>) -> Self {
         Self {
             id: id.into(),
             committed: BTreeMap::new(),
             pending: Vec::new(),
+            fans_to,
         }
     }
 
@@ -153,7 +161,9 @@ impl Module for Fanout {
         // stage our own write AND fan out the same write to the disk substrate,
         // so ONE block touches both modules.
         self.pending.push((k.clone(), v.clone()));
-        ctx.emit_msg(set("diskish", &k, &v));
+        for target in &self.fans_to {
+            ctx.emit_msg(set(target, &k, &v));
+        }
         Ok(())
     }
 
@@ -1191,5 +1201,285 @@ fn an_undeclared_container_substrate_still_fail_stops() {
             matches!(err, recovery::Error::Torn(_)),
             "expected a torn fail-stop, got {err:?}"
         );
+    });
+}
+
+// ---- a module ADMITTED after the last checkpoint ---------------------------
+//
+// governance admits module X at height H, above the last checkpoint C, so the
+// manifest carries no root for it at all. recovery seeds such a module's replay
+// baseline from what it holds AT BOOT, on the premise that a module composed
+// after the checkpoint was composed EMPTY — true for the in-memory (map) cohort,
+// and false for a per-block-durable STORE, whose seat reopens the module's own
+// canonical durable store already at the crash tip's root. that baseline makes
+// the store look "still at its pre-root" at H, so the torn branch re-commits
+// block H into a store that already holds it — moving its op-log root and
+// fail-stopping the boot at the final recompose.
+
+/// the substrate a post-checkpoint admission is seated over at boot.
+enum Admitted {
+    /// a per-block-durable store: the seat reopens the canonical store, which
+    /// is already at the crash tip's root.
+    Store,
+    /// the in-memory cohort: the seat really is empty (the control).
+    Map,
+}
+
+/// module `newmod` is admitted at H = block 1, above the (genesis) checkpoint,
+/// and written by `driver` in every block from H to the tip. `diskish` is a
+/// pre-existing store the same blocks move, so every one of them is classed
+/// TORN at boot (the in-memory cohort rolled back, the store durable).
+///
+/// recovery must reach the sealed tip with `newmod` at its own durable root and
+/// block H NEVER re-applied to it — for both substrates.
+fn a_module_admitted_after_the_checkpoint_recovers(kind: Admitted) {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell_d: Cell = Rc::new(RefCell::new(DiskCell::default()));
+        let cell_n: Cell = Rc::new(RefCell::new(DiskCell::default()));
+        let seat = |kind: &Admitted| -> Box<dyn Module> {
+            match kind {
+                Admitted::Store => Box::new(Diskish::open("newmod", cell_n.clone())),
+                Admitted::Map => Box::new(Fanout::fanning_to("newmod", vec![])),
+            }
+        };
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        // the LIVE host carries the admitted module from the start; the
+        // CHECKPOINT below is captured from a host without it — exactly what a
+        // checkpoint taken before the admission holds.
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Fanout::fanning_to(
+                "driver",
+                vec!["diskish".into(), "newmod".into()],
+            )),
+            Box::new(Diskish::open("diskish", cell_d.clone())),
+            seat(&kind),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+
+        let pos = node.sink_mut().oplog_pos().await;
+        let before_admission = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Fanout::fanning_to(
+                "driver",
+                vec!["diskish".into(), "newmod".into()],
+            )),
+            Box::new(Diskish::open("diskish", cell_d.clone())),
+        ])
+        .expect("genesis");
+        let manifest0 =
+            Manifest::capture(&before_admission, None, 0, 0, vec![], vec![], None, pos, 1)
+                .expect("capture");
+        assert!(
+            manifest0.root("newmod").is_none(),
+            "the checkpoint predates the admission"
+        );
+        drop(before_admission);
+        node.sink_mut()
+            .write_manifest(&manifest0)
+            .await
+            .expect("write genesis manifest");
+
+        // block 0: pre-admission traffic (fanout + diskish only).
+        let signer = sk(1);
+        node.submit(&signer, 0, set("fanout", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        // blocks 1..=3: H and beyond — driver + diskish + newmod each block.
+        for (nonce, key) in [(1u64, "k1"), (2, "k2"), (3, "k3")] {
+            node.submit(&signer, nonce, set("driver", key, "v"))
+                .await
+                .expect("submit");
+            node.flush_batch().await.expect("flush");
+        }
+        assert_eq!(node.drain_delivered().await.expect("drain"), 4);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
+        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, per block");
+
+        // the crash: memory dies, both durable cells survive.
+        drop(node);
+        let durable_newmod = cell_n.borrow().counter;
+
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let mut driver = Fanout::fanning_to("driver", vec!["diskish".into(), "newmod".into()]);
+        driver.install(manifest.snapshot("driver").expect("driver snapshot"));
+        let mut host = Host::genesis(vec![
+            Box::new(fanout),
+            Box::new(driver),
+            Box::new(Diskish::reopen("diskish", cell_d.clone())),
+            // the admission's seat: Fresh over its own canonical substrate.
+            seat(&kind),
+        ])
+        .expect("genesis");
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("a module admitted after the checkpoint recovers");
+
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical to the sealed tip"
+        );
+        assert_eq!(
+            cell_n.borrow().counter,
+            durable_newmod,
+            "the admitted module's own block was never re-applied to it"
+        );
+        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, untouched");
+        for key in [b"k1", b"k2", b"k3"] {
+            assert_eq!(
+                host.query("newmod", key).await.expect("query"),
+                b"v".to_vec(),
+                "the admitted module holds every post-admission write"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_store_admitted_after_the_checkpoint_recovers() {
+    a_module_admitted_after_the_checkpoint_recovers(Admitted::Store);
+}
+
+#[test]
+fn a_map_admitted_after_the_checkpoint_recovers() {
+    a_module_admitted_after_the_checkpoint_recovers(Admitted::Map);
+}
+
+/// the SIBLING of the two above: the admitted store's OWN commits never became
+/// durable, so at boot it stands at its admission pre-root — an EMPTY cell —
+/// while the journal's seals carry its post-roots. nothing above the checkpoint
+/// records the empty root, so the forward pre-scan floors it nowhere and a
+/// height cursor (which a store does not keep) cannot claim it either.
+///
+/// that is precisely a module the composer adopted EMPTY: its baseline is what
+/// a freshly-seated substrate holds, and every sealed block from the admission
+/// on must replay into it. leaving the whole disk cohort unseeded to place a
+/// DURABLE admission by its floor takes this one down with it — floorless AND
+/// baseline-less is neither `at_pre` nor `ahead`, i.e. `Error::Torn`: a
+/// wipe-and-re-sync fail-stop for a node whose state was intact.
+#[test]
+fn a_store_admitted_after_the_checkpoint_replays_when_its_own_commit_was_lost() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell_d: Cell = Rc::new(RefCell::new(DiskCell::default()));
+        let cell_n: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Fanout::fanning_to(
+                "driver",
+                vec!["diskish".into(), "newmod".into()],
+            )),
+            Box::new(Diskish::open("diskish", cell_d.clone())),
+            Box::new(Diskish::open("newmod", cell_n.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+
+        // the checkpoint predates the admission: captured from a host without
+        // `newmod`, so the manifest holds no root for it.
+        let pos = node.sink_mut().oplog_pos().await;
+        let before_admission = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Fanout::fanning_to(
+                "driver",
+                vec!["diskish".into(), "newmod".into()],
+            )),
+            Box::new(Diskish::open("diskish", cell_d.clone())),
+        ])
+        .expect("genesis");
+        let manifest0 =
+            Manifest::capture(&before_admission, None, 0, 0, vec![], vec![], None, pos, 1)
+                .expect("capture");
+        assert!(
+            manifest0.root("newmod").is_none(),
+            "the checkpoint predates the admission"
+        );
+        drop(before_admission);
+        node.sink_mut()
+            .write_manifest(&manifest0)
+            .await
+            .expect("write genesis manifest");
+
+        // block 0: pre-admission traffic. blocks 1..=3: H and beyond, each one
+        // moving `driver` (in-memory), `diskish` (durable) and `newmod`.
+        let signer = sk(1);
+        node.submit(&signer, 0, set("fanout", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        for (nonce, key) in [(1u64, "k1"), (2, "k2"), (3, "k3")] {
+            node.submit(&signer, nonce, set("driver", key, "v"))
+                .await
+                .expect("submit");
+            node.flush_batch().await.expect("flush");
+        }
+        assert_eq!(node.drain_delivered().await.expect("drain"), 4);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
+        assert_eq!(cell_n.borrow().counter, 3, "one commit per admitted block");
+
+        // the crash: `diskish` keeps its durable cell; `newmod`'s own commits
+        // never reached disk, so its seat comes up on a cell that never moved.
+        drop(node);
+        let cell_lost: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let mut driver = Fanout::fanning_to("driver", vec!["diskish".into(), "newmod".into()]);
+        driver.install(manifest.snapshot("driver").expect("driver snapshot"));
+        let mut host = Host::genesis(vec![
+            Box::new(fanout),
+            Box::new(driver),
+            Box::new(Diskish::reopen("diskish", cell_d.clone())),
+            Box::new(Diskish::open("newmod", cell_lost.clone())),
+        ])
+        .expect("genesis");
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("an admitted store at its empty pre-root replays");
+
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical to the sealed tip"
+        );
+        assert_eq!(
+            cell_lost.borrow().counter,
+            3,
+            "each sealed block from the admission on replayed into it exactly once"
+        );
+        assert_eq!(cell_d.borrow().counter, 4, "the pre-existing store, untouched");
+        for key in [b"k1", b"k2", b"k3"] {
+            assert_eq!(
+                host.query("newmod", key).await.expect("query"),
+                b"v".to_vec(),
+                "the replayed store holds every post-admission write"
+            );
+        }
     });
 }

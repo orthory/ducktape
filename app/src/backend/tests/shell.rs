@@ -8,7 +8,6 @@ fn the_rail_seats_collaboration_and_node_operations_separately() {
         ids,
         [
             ShellTab::Chat,
-            ShellTab::Shell,
             ShellTab::Pages,
             ShellTab::Forge,
             ShellTab::Agents,
@@ -34,71 +33,6 @@ fn the_rail_seats_collaboration_and_node_operations_separately() {
             .unwrap()
             .badge,
         3
-    );
-}
-
-/// The three folds the mounted surfaces are drawn from — the crumb bar's
-/// counts, the blob gutter, and the roster the popped panel keeps.
-#[test]
-fn the_crumb_counts_split_the_listing_in_two() {
-    let entries = ["dir", "file", "file"]
-        .into_iter()
-        .enumerate()
-        .map(|(key, kind)| FsEntry {
-            key: key as i64,
-            path: format!("/shared/{kind}"),
-            name: kind.into(),
-            kind: kind.into(),
-            size: 0,
-            object: String::new(),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(fs_dir_count(&entries), 1);
-    assert_eq!(fs_file_count(&entries), 2);
-    assert_eq!(
-        fs_dir_count(&entries) + fs_file_count(&entries),
-        3,
-        "every row lands in exactly one bucket"
-    );
-    assert_eq!(fs_dir_count(&[]), 0);
-    assert_eq!(fs_file_count(&[]), 0);
-}
-
-#[test]
-fn the_selected_fs_entry_resolves_or_blanks() {
-    let selected = FsEntry {
-        key: 1,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 7,
-        object: "abc".into(),
-    };
-
-    assert_eq!(
-        fs_entry_named(vec![no_fs_entry(), selected.clone()], selected.path.clone(),),
-        selected
-    );
-    assert_eq!(
-        fs_entry_named(Vec::new(), "/shared/missing".into()),
-        no_fs_entry()
-    );
-}
-
-#[test]
-fn directory_rows_are_prepared_from_the_listing() {
-    let entry = |name: &str, kind: &str| FsEntry {
-        key: 0,
-        path: format!("/shared/{name}"),
-        name: name.into(),
-        kind: kind.into(),
-        size: 0,
-        object: String::new(),
-    };
-
-    assert_eq!(
-        fs_directories(&[entry("docs", "dir"), entry("readme", "file")]),
-        vec![entry("docs", "dir")]
     );
 }
 
@@ -212,10 +146,6 @@ fn the_roster_answers_admin_tier_and_filters() {
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
     assert_eq!(member_tier(&answered_without_this_node), "guest");
-    assert_eq!(filter_members(&rows, MembersFilter::Agents).len(), 1);
-    assert_eq!(filter_members(&rows, MembersFilter::Humans).len(), 2);
-    assert_eq!(filter_members(&rows, MembersFilter::Validators).len(), 1);
-    assert_eq!(filter_members(&rows, MembersFilter::All).len(), 3);
 }
 
 /// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
@@ -265,31 +195,146 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // `user:{hex}` — the previous fixture invented prefixed entries and
     // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
+    let my_passkey = [0xacu8; 32];
     let peer = [0xbbu8; 32];
+    // A seat taken with the person's passkey is the person's: the directory
+    // binds both keys to one account, and the roster recognises it.
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&me),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&my_passkey),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&peer),
+            BoundAccount {
+                number: 2,
+                name: "peer".into(),
+            },
+        ),
+    ]));
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
-                user: hex_encode(&me),
+                party: "acct:1".into(),
                 node: "0a0a".into(),
                 joined_at: 10,
             },
             chat::index::HuddleEntry {
-                user: hex_encode(&peer),
+                party: format!("user:{}", hex_encode(&peer)),
                 node: "0b0b".into(),
                 joined_at: 20,
             },
         ],
-        Some(&me),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
     assert!(!roster[1].is_you && !roster[1].is_agent);
+    assert_eq!(roster[0].label, "me");
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
     // The fan-out the live session polls for is this roster's NODE keys with
     // our own row removed — the hub admits and fans out by node identity, and
     // a set that carried our own key would aim this device's media at itself.
-    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
+    assert_eq!(
+        huddle_recipient_nodes(roster, None),
+        vec!["0b0b".to_string()]
+    );
+}
+
+#[test]
+fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
+    // A `node_proof` only proves ITS OWN user holds that node's key — nothing
+    // stops a stale or replayed roster row from naming a DIFFERENT user
+    // alongside THIS node's key. `is_you` alone would miss it (that row is
+    // not "mine"), and fanning media to your own node is a loopback echo.
+    let me = [0xaau8; 32];
+    let peer = [0xbbu8; 32];
+    let names = NameDirectory::new(BTreeMap::new());
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&me)),
+                node: "0a0a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&peer)),
+                node: "0a0a".into(),
+                joined_at: 20,
+            },
+        ],
+        ChatReader::new(Some(&me), &names),
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("0a0a")),
+        Vec::<String>::new(),
+        "the peer row names this device's own node — never fan media there"
+    );
+}
+
+#[test]
+fn huddle_recipient_nodes_keeps_the_readers_other_device() {
+    // Two devices of ONE account in the same huddle: the module dedups a
+    // join by PARTY, so this device's own historical `user:{hex}` row (this
+    // exact key) sits alongside the account's shared `acct:1` row a second,
+    // now-bound device joined onto — and `is_you` answers by ACCOUNT, so
+    // BOTH rows answer it true. Excluding on `is_you` alone used to drop
+    // both, and the two devices went mutually dark. The fan-out has to tell
+    // them apart by NODE, the one thing that is actually per-device, so it
+    // must exclude only THIS device's own row.
+    let laptop = [0xaau8; 32];
+    let phone = [0xadu8; 32];
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&laptop),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&phone),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+    ]));
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&laptop)),
+                node: "1a1a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                party: "acct:1".into(),
+                node: "2b2b".into(),
+                joined_at: 20,
+            },
+        ],
+        ChatReader::new(Some(&laptop), &names),
+    );
+    assert!(
+        roster.iter().all(|participant| participant.is_you),
+        "is_you answers by account: both rows are ours"
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("1a1a")),
+        vec!["2b2b".to_string()],
+        "the phone is still a recipient; only this device's own node is excluded"
+    );
 }
 
 #[test]
@@ -368,8 +413,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
                   create: bool,
                   thread_action: MessageAction,
                   action: MessageAction,
-                  drawer: bool,
-                  repo_menu: bool| {
+                  drawer: bool| {
         escape_target(
             escape.clone(),
             tab,
@@ -380,8 +424,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             action,
             drawer,
             false,
-            String::new(),
-            repo_menu,
         )
     };
 
@@ -397,8 +439,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             true,
             true,
-            "/shared/q3.md".into(),
-            true,
         ),
         ""
     );
@@ -411,7 +451,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
-            true,
             true,
         ),
         ""
@@ -427,7 +466,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             true,
-            true,
         ),
         "bell"
     );
@@ -439,7 +477,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
-            true,
             true,
         ),
         "channel_create"
@@ -453,7 +490,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             false,
-            true,
         ),
         "thread_menu"
     );
@@ -472,7 +508,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::Toolbar,
             true,
-            true,
         ),
         "channel_settings"
     );
@@ -485,12 +520,11 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Editing,
             true,
-            true,
         ),
         "message_menu"
     );
-    // THE DRAWER SITS BETWEEN THEM. The stream's menu floats over Channel
-    // details, so it wins; the repo menu lives on another tab, so it loses.
+    // THE DRAWER SITS UNDER THE STREAM'S MENU, which floats over Channel
+    // details, so it wins.
     // It had no rung at all — an `×` and no keyboard exit, while every other
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.
@@ -503,26 +537,12 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             true,
-            true,
         ),
         "channel_settings"
     );
-    assert_eq!(
-        target(
-            ShellTab::Forge,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            true,
-        ),
-        "repo_menu"
-    );
     // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
     // the Pages screen — so it is a rung, and it answers only from Pages.
-    let armed = |tab: ShellTab, page_delete: bool, fs_delete: &str| {
+    let armed = |tab: ShellTab, page_delete: bool| {
         escape_target(
             escape.clone(),
             tab,
@@ -533,14 +553,10 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             false,
             page_delete,
-            fs_delete.into(),
-            false,
         )
     };
-    assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
-    assert_eq!(armed(ShellTab::Chat, true, ""), "");
-    assert_eq!(armed(ShellTab::Files, false, "/shared/q3.md"), "fs_delete");
-    assert_eq!(armed(ShellTab::Node, false, "/shared/q3.md"), "");
+    assert_eq!(armed(ShellTab::Pages, true), "page_delete");
+    assert_eq!(armed(ShellTab::Chat, true), "");
 
     // Nothing transient open → Escape is a no-op. The pages block menus are
     // gone with the surfaces they dismissed.
@@ -553,7 +569,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             false,
-            false,
         ),
         ""
     );
@@ -562,9 +577,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 // A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
 // clears menu state (`select_shell_tab` leaves every menu flag set), so a
 // ⋯ menu opened on Chat is still SET while Pages is on screen —
-// unscoped, that stale flag ate the first Escape on every other tab, and the
-// same reading made `content_scroll_step` refuse to move a pane nothing was
-// covering. The palette, bell and create modal are mounted OUTSIDE the tab
+// unscoped, that stale flag ate the first Escape on every other tab. The
+// palette, bell and create modal are mounted OUTSIDE the tab
 // match in `components/shell.ice` and keep answering from every tab.
 #[test]
 fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
@@ -575,29 +589,20 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
 
     // One closure per reader, the sibling test's `target` shape: tab first,
     // then one argument per layer.
-    let overlay = |tab: ShellTab,
-                   thread_action: MessageAction,
-                   action: MessageAction,
-                   drawer: bool,
-                   repo_menu: bool| {
-        topmost_overlay(
-            tab,
-            false,
-            false,
-            false,
-            thread_action,
-            action,
-            drawer,
-            false,
-            "",
-            repo_menu,
-        )
-    };
-    let target = |tab: ShellTab,
-                  bell: bool,
-                  create: bool,
-                  thread_action: MessageAction,
-                  repo_menu: bool| {
+    let overlay =
+        |tab: ShellTab, thread_action: MessageAction, action: MessageAction, drawer: bool| {
+            topmost_overlay(
+                tab,
+                false,
+                false,
+                false,
+                thread_action,
+                action,
+                drawer,
+                false,
+            )
+        };
+    let target = |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction| {
         escape_target(
             escape.clone(),
             tab,
@@ -608,21 +613,12 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             false,
             false,
-            String::new(),
-            repo_menu,
         )
     };
 
     // A stale chat menu names no layer from another tab — for BOTH readers.
-    let stale_thread_menu = |tab: ShellTab| {
-        overlay(
-            tab,
-            MessageAction::More,
-            MessageAction::Toolbar,
-            false,
-            false,
-        )
-    };
+    let stale_thread_menu =
+        |tab: ShellTab| overlay(tab, MessageAction::More, MessageAction::Toolbar, false);
     assert_eq!(stale_thread_menu(ShellTab::Chat), "thread_menu");
     assert_eq!(stale_thread_menu(ShellTab::Pages), none);
     assert_eq!(stale_thread_menu(ShellTab::Explorer), none);
@@ -634,7 +630,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             MessageAction::Editing,
             false,
-            false,
         ),
         none
     );
@@ -644,97 +639,20 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             true,
-            false,
         ),
         none
-    );
-
-    // And the forge menu answers only from Forge.
-    let repo_menu = |tab: ShellTab| {
-        overlay(
-            tab,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            true,
-        )
-    };
-    assert_eq!(repo_menu(ShellTab::Forge), "repo_menu");
-    assert_eq!(repo_menu(ShellTab::Chat), none);
-
-    // THE LOAD-BEARING STACK: a stale chat flag must not SHADOW the menu that
-    // is actually on screen. Before scoping, this named "thread_menu" and the
-    // visible forge menu survived the press.
-    assert_eq!(
-        target(ShellTab::Forge, false, false, MessageAction::More, true),
-        "repo_menu"
     );
 
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
     assert_eq!(
-        target(ShellTab::Governance, true, false, MessageAction::Toolbar, false),
+        target(ShellTab::Governance, true, false, MessageAction::Toolbar),
         "bell"
     );
     assert_eq!(
-        target(ShellTab::Node, false, true, MessageAction::Toolbar, false),
+        target(ShellTab::Node, false, true, MessageAction::Toolbar),
         "channel_create"
     );
-}
-
-// THE PANE SCROLL'S THREE CONDITIONS, one assertion each, over the router
-// itself rather than over one key's pixels. #1006 shipped it with only the
-// modifier condition: it claimed the arrows (which a focused single-line
-// `text_input` leaves UNCAPTURED — `iced_widget-0.14.2/src/text_input.rs:1245`
-// falls Up/Down through to `_ => {}` — so `status=ignored` handed them here
-// while a caret sat in the field), and it never asked whether a transient
-// layer was over the pane it was about to move.
-#[test]
-fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
-    use iced::keyboard::{Key, Modifiers, key::Named};
-
-    let step = |named: Named, modifiers: Modifiers, overlay: &str| {
-        content_scroll_step(Key::Named(named), modifiers, overlay.into())
-    };
-    let free = Modifiers::empty();
-
-    // 1. THE PANE'S OWN KEYS. Page Up/Down and Home/End: iced's text widgets
-    //    capture Home/End when focused, so one only ever reaches here with
-    //    nothing focused, and no widget in this console owns a Page key.
-    assert!(step(Named::PageDown, free, "") > 0.0);
-    assert!(step(Named::PageUp, free, "") < 0.0);
-    assert!(step(Named::End, free, "") > 0.0);
-    assert!(step(Named::Home, free, "") < 0.0);
-
-    // 2. AN ARROW BELONGS TO WHATEVER HAS FOCUS. Nothing in this stack can
-    //    read widget focus, and a single-line input does not capture Up/Down,
-    //    so the pane cannot tell a caret's arrow from its own and must not
-    //    claim one — at any time, under any layer.
-    assert_eq!(step(Named::ArrowDown, free, ""), 0.0);
-    assert_eq!(step(Named::ArrowUp, free, ""), 0.0);
-
-    // 3. A TRANSIENT LAYER'S KEY IS NOT THE PANE'S. Every rung `topmost_overlay`
-    //    can name stops every scroll key, so no press moves the screen behind
-    //    an open palette or bell.
-    for overlay in [
-        "palette",
-        "bell",
-        "channel_create",
-        "thread_menu",
-        "message_menu",
-        "channel_settings",
-        "page_delete",
-        "fs_delete",
-        "repo_menu",
-    ] {
-        for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {
-            assert_eq!(step(key, free, overlay), 0.0, "{overlay} is over the pane");
-        }
-    }
-
-    // 4. A CHORD IS NOT THE PANE'S — it belongs to its own router.
-    assert_eq!(step(Named::PageDown, Modifiers::SHIFT, ""), 0.0);
-    assert_eq!(step(Named::Home, Modifiers::CTRL, ""), 0.0);
 }
 
 #[test]
@@ -755,6 +673,15 @@ fn files_base64_round_trips() {
     }
     assert_eq!(base64_encode(b"abc"), "YWJj");
     assert_eq!(base64_encode(b"ab"), "YWI=");
+    // MALFORMED IS A REFUSAL, NOT EMPTY BYTES. The handwritten decoder this
+    // replaced stopped at padding per quartet (`Zg==Zg==` read as `ff`) and
+    // read a lone `Z` as nothing; a read page that decodes to `None` fails
+    // the read upstream instead of showing an empty file.
+    for malformed in [
+        "Zg==Zg==", "Z", "Zg", "Zg=", "Zg===", "Zh==", "Y*Jj", "YWJj\n",
+    ] {
+        assert_eq!(base64_decode(malformed), None, "{malformed}");
+    }
 }
 
 #[test]
@@ -770,11 +697,9 @@ fn bell_severity_projects_the_kind_and_defaults_to_info() {
 fn bell_badge_takes_the_worst_unread_severity() {
     let item = |seq: i64, kind: &str, read: bool| BellItem {
         seq,
-        kind: kind.into(),
-        body: String::new(),
-        source: String::new(),
-        height: 0,
+        reason: kind.into(),
         read,
+        ..BellItem::default()
     };
 
     assert_eq!(
@@ -856,6 +781,7 @@ fn workspace_facts_come_from_the_crate_that_wrote_them() {
         bootstrap: vec![],
         reach: vec![],
         coordination: None,
+        block_time_ms: workspace_config::DEFAULT_BLOCK_TIME_MS,
         modules: vec![],
         genesis: String::new(),
     }
@@ -882,13 +808,12 @@ wireguard_advertised = "auto"
 primary_coordinator = "none"
 coordinator_relay = "none"
 checkpoint_blocks = 32
-block_time_ms = 1000
 "#,
     )
     .unwrap();
 
     assert_eq!(
-        registered_workspaces_in(root.path()),
+        workspaces_in(root.path()),
         vec![("mynet#a1b2c3d4".to_string(), dir.clone())]
     );
     assert_eq!(workspace_identity(&dir), Some(short_label(&founder)));
@@ -896,4 +821,46 @@ block_time_ms = 1000
         workspace_endpoint(&dir).as_deref(),
         Some("http://127.0.0.1:8844")
     );
+}
+
+#[test]
+fn membership_removal_preserves_the_exact_stored_party() {
+    let key = "ab".repeat(32);
+    assert_eq!(member_party("acct:42").unwrap(), ::chat::Party::Account(42));
+    assert_eq!(
+        member_party(&key).unwrap(),
+        ::chat::Party::Key(vec![0xab; 32])
+    );
+    assert_eq!(
+        member_party(&format!("user:{key}")).unwrap(),
+        ::chat::Party::Key(vec![0xab; 32])
+    );
+    assert!(member_party("module:chat").is_err());
+    assert!(member_party("acct:invalid").is_err());
+}
+
+#[test]
+fn bell_renders_attribution_relation_and_change_actor() {
+    let item = BellItem {
+        seq: 1,
+        change_seq: 4,
+        source: "chat/message/general:2".into(),
+        reason: "mention".into(),
+        kind: "transferred_in:7".into(),
+        actor: "account:9".into(),
+        height: 3,
+        read: false,
+    };
+    assert_eq!(bell_title(&item.reason), "Mention");
+    let context = BellPresentation {
+        seq: item.seq,
+        title: "Mention changed · Alice".into(),
+        detail: "Please review the launch checklist.".into(),
+        ..BellPresentation::default()
+    };
+    assert_eq!(
+        bell_presentation(&item, std::slice::from_ref(&context)),
+        context
+    );
+    assert_eq!(bell_worst_severity(&[item]), "info");
 }

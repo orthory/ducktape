@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape, LiveKind, MessageAction, ShellTab};
+use super::{__DucktapeMessage, Ducktape, LiveKind, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -39,12 +39,6 @@ const PAGE_ROWS: usize = 128;
 /// subject to the 256-root hot-window cap.
 const THREAD_ROWS: i64 = backend::THREAD_HOT_WINDOW_LIMIT as i64;
 const HUDDLE_ROWS: usize = 32;
-const LONG_LIST_ROWS: usize = 2_048;
-const FILE_ROWS: usize = 256;
-const DISCUSSION_ROWS: usize = 256;
-/// Settled agent answers on the shell transcript, each carrying one fenced
-/// code block — the syntect surface repeated per row.
-const ANSWER_ROWS: usize = 20;
 /// The same interaction at four timeline sizes. A fixed-size ceiling can stay
 /// green while the frame still grows linearly, so responsiveness is the slope,
 /// not the single 256-row point.
@@ -76,15 +70,6 @@ pub(crate) const FRAMES: usize = 12;
 /// broad headroom. Deleting the stream's `virtual-row=` alone takes it above
 /// 27 000, still well beyond the budget.
 const KEYSTROKE_ALLOCATION_CEILING: u64 = 15_000;
-/// ALLOCATIONS PER CLICK ON AN ANSWER'S "Show what the agent did" FOLD.
-///
-/// `steps_open` is one value for the whole transcript, so it must stay OUT
-/// of the answer memo's key: the fold is drawn beside the memo, and a click
-/// rebuilds the one fold it moved while every answer's markdown is reclaimed.
-/// 7,127 measured 2026-08-23; with `steps_open` in each row's key
-/// the same click cost 197,874 (63 ms) — one full re-parse of the transcript,
-/// growing with its length.
-const STEPS_CLICK_ALLOCATION_CEILING: u64 = 10_000;
 /// ALLOCATIONS PER `loading` FLIP UNDER A POPULATED STREAM.
 ///
 /// `loading` is the workspace hydration flag: a page load moves it while a
@@ -113,8 +98,8 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // one-change negative control measured with this deterministic fixture:
     // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
     // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
-    // externs borrowing their list and string arguments (`doc_tab_rows`,
-    // `subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
+    // externs borrowing their list and string arguments
+    // (`subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
     // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
     // externs cloning them per frame.
     ScreenProbe {
@@ -140,87 +125,6 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         size: HUDDLE_WINDOW,
         fixture: console_in_huddle,
         allocation_ceiling: 6_000,
-    },
-    // 129,731 measured 2026-08-15 for a wire-cap (1,000 entry) directory
-    // listing — the un-virtualized tree column at its honest worst case.
-    // 152,723 measured 2026-08-16 post-descent: each row's LOCAL routes now
-    // carry their captured values (rpc, repo, rev, path), ~23 allocations a
-    // row over the app-routed 129,731 — the measured price of the rows
-    // owning their own cycle.
-    ScreenProbe {
-        label: "forge tree build+layout",
-        size: WINDOW,
-        fixture: console_in_forge_tree_only,
-        allocation_ceiling: 165_000,
-    },
-    // The syntect reader on a LONG file: the descent took this fixture away
-    // until the component test seam could seed the blob through the update
-    // loop again. 2,848 measured 2026-08-21 with the Ice-side memo boundary
-    // (`lazy file_text by file_text, file_path, dark`) holding the tokenized
-    // rows across unchanged frames; 650,972 without it — the negative control
-    // this ceiling sits between, and the whole reason the fixture must have a
-    // file OPEN. An empty reader makes the number unreachable and the ceiling
-    // vacuous.
-    ScreenProbe {
-        label: "forge code build+layout",
-        size: WINDOW,
-        fixture: console_in_forge_code,
-        allocation_ceiling: 146_000,
-    },
-    // 318,811 with the discussion rows under the keyed (seq, render_rev)
-    // lazy vs 382,671 without one; 387,952 was removing discussion
-    // virtualization, and removing diff virtualization is a larger
-    // regression still.
-    ScreenProbe {
-        label: "forge PR build+layout",
-        size: WINDOW,
-        fixture: console_in_forge_pr,
-        allocation_ceiling: 325_000,
-    },
-    // Re-derived at ducktape-ui af77d53e (#668). Baseline 62,167: dev-side
-    // drift unrelated to that pin had already moved it 60,437 -> 61,019, and
-    // #668's per-row reconciliation identity adds ~3 allocations per
-    // lazy-free component row (384 rows here, +1,148) — the honest price of
-    // rows that park per-row instead of sharing one scope. The controls
-    // flipped order at this pin: removing the directory-row virtualization
-    // is now the smallest at 63,729; restoring the selected-entry scan
-    // reaches 73,453 (the per-rebuild list clone grew with the rows).
-    // Re-derived 2026-08-23 at af41cc28: 46,036 with the mount's
-    // `fs_directories(fs_entries)` and the screen's `fs_counts_summary`,
-    // `explorer_ops_at`, `markdown_path` borrowing their arguments; 51,569
-    // with them cloning — `fs_directories` alone copied every entry into the
-    // call per frame — and that clone is the control this ceiling gates.
-    // The two structural controls fell inside the noise floor at this pin
-    // and no longer gate on allocations: removing the directory-row
-    // virtualization lands at 47,478 and restoring the selected-entry scan
-    // at 46,553 (it moves layout time, 3.5 ms -> 3.9 ms, not the count).
-    ScreenProbe {
-        label: "files build+layout",
-        size: WINDOW,
-        fixture: console_in_files,
-        allocation_ceiling: 50_000,
-    },
-    // Every settled answer is an `agent_markdown` extern — a markdown parse
-    // plus a syntect pass over its fenced block. 6,902 measured 2026-08-23
-    // with the answer rows behind the keyed (body, provider, status, dark)
-    // lazy and their steps folds drawn beside it; 195,968 (and 332 ms a
-    // frame at dev opt-levels) with the extern called straight from view,
-    // where an UNCHANGED frame re-parsed all twenty transcripts — the F2
-    // freeze, and the negative control this ceiling sits between.
-    ScreenProbe {
-        label: "shell answers build+layout",
-        size: WINDOW,
-        fixture: console_in_shell_answers,
-        allocation_ceiling: 9_000,
-    },
-    // The Files preview reading a Markdown document of the same twenty
-    // fenced blocks through the same extern: 3,189 behind its
-    // (preview_text, preview_path, dark) lazy vs 195,246 without.
-    ScreenProbe {
-        label: "files markdown build+layout",
-        size: WINDOW,
-        fixture: console_in_files_markdown,
-        allocation_ceiling: 5_000,
     },
 ];
 
@@ -331,6 +235,7 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
         author: format!("user-{}", seq % 7),
         meta: format!("#{seq}"),
         blocks: backend::paragraph_blocks(&body),
+        edit_body: body.clone(),
         body,
         pending: false,
         rev: 1,
@@ -611,389 +516,6 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
     (app, huddle)
 }
 
-fn forge_tree_rows() -> Vec<backend::TreeEntry> {
-    // The wire caps one listing at forge's MAX_TREE_ENTRIES = 1,000, so this
-    // is the largest directory the un-virtualized tree column can ever be
-    // handed — the honest worst case for its build cost.
-    (0..1_000)
-        .map(|index| backend::TreeEntry {
-            name: format!("file_{index:04}.rs"),
-            path: format!("file_{index:04}.rs"),
-            kind: "file".into(),
-        })
-        .collect()
-}
-
-/// The whole browse is `ForgeCodeBrowser` component state now, seeded
-/// through the test seam: one headless view pass materializes the keyed
-/// instance (its boot queues a real read this harness never runs), the
-/// seam names the instance scope, and the listing arrives as the same
-/// message the runtime would deliver.
-fn console_in_forge_tree(entries: Vec<backend::TreeEntry>) -> (Ducktape, iced::window::Id, String) {
-    let (mut app, console) = console_on(ShellTab::Forge);
-    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
-    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
-        generation: app.forge_generation,
-        repo: "probe".into(),
-        branches: vec!["dev".into()],
-        items: Vec::new(),
-    }));
-    let _ = app.__view(console);
-    let scope = app
-        .__ice_test_scopes_forge_code_browser()
-        .pop()
-        .expect("the code browser materialized");
-    // Deliver the sighting's queued boot NOW — its real read is a dropped
-    // task against a dead endpoint — so the first pumped event pass below
-    // publishes nothing but what the probe itself causes.
-    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
-    for message in boots {
-        let _ = app.__update(message);
-    }
-    let expected = entries.len();
-    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_tree_loaded(
-        scope.clone(),
-        backend::ForgeTreeData {
-            repo: "probe".into(),
-            rev: "1111111111111111111111111111111111111111".into(),
-            path: String::new(),
-            born: true,
-            entries,
-            truncated: false,
-        },
-    ));
-    let state = app
-        .__ice_test_state_forge_code_browser(&scope)
-        .expect("the seeded instance answers");
-    assert_eq!(state.tree_entries.len(), expected);
-    (app, console, scope)
-}
-
-/// The reader open on a LONG file — the syntect surface at its measured
-/// worst case, restored to the ceiling probe by the seam seed.
-fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
-    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: "probe.rs".into(),
-        path: "probe.rs".into(),
-        kind: "file".into(),
-    }]);
-    seed_forge_blob(&mut app, &scope, forge_source());
-    (app, console)
-}
-
-fn forge_source() -> String {
-    (0..LONG_LIST_ROWS)
-        .map(|index| format!("let line_{index:04} = {index};\n"))
-        .collect()
-}
-
-fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
-    seed_forge_file(app, scope, "probe.rs", text);
-}
-
-/// A solid 64×64 picture of one colour, parked under the forge surface as
-/// `path`'s — what `forge_blob` leaves behind for a picture, minus the wire.
-fn park_forge_picture(path: &str, rgb: [u8; 3]) {
-    let pixels = [rgb[0], rgb[1], rgb[2], 255].repeat(64 * 64);
-    backend::park_picture(
-        backend::FORGE_SURFACE,
-        path.to_owned(),
-        backend::Picture {
-            width: 64,
-            height: 64,
-            handle: backend::PictureHandle::Raster(iced::widget::image::Handle::from_rgba(
-                64, 64, pixels,
-            )),
-        },
-    );
-}
-
-/// A solid 64×64 VECTOR picture of one colour, parked under the forge
-/// surface as `path`'s — the SVG branch of the same viewer.
-fn park_forge_vector(path: &str, rgb: [u8; 3]) {
-    let source = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\">\
-         <rect width=\"64\" height=\"64\" fill=\"rgb({},{},{})\"/></svg>",
-        rgb[0], rgb[1], rgb[2]
-    );
-    backend::park_picture(
-        backend::FORGE_SURFACE,
-        path.to_owned(),
-        backend::Picture {
-            width: 64,
-            height: 64,
-            handle: backend::PictureHandle::Vector(iced::widget::svg::Handle::from_memory(
-                source.into_bytes(),
-            )),
-        },
-    );
-}
-
-/// A solid 64×64 picture of one colour, parked as `doc`'s inline picture at
-/// `path` — what `forge_blob` leaves behind for a Markdown blob's image.
-fn park_inline_picture(doc: &str, path: &str, rgb: [u8; 3]) {
-    let pixels = [rgb[0], rgb[1], rgb[2], 255].repeat(64 * 64);
-    backend::park_inline_pictures(
-        doc.to_owned(),
-        std::collections::HashMap::from([(
-            path.to_owned(),
-            backend::Picture {
-                width: 64,
-                height: 64,
-                handle: backend::PictureHandle::Raster(iced::widget::image::Handle::from_rgba(
-                    64, 64, pixels,
-                )),
-            },
-        )]),
-    );
-}
-
-/// Open `path` in the browser and land it as a picture blob through the
-/// same seam `seed_forge_file` uses for text.
-fn seed_forge_picture(app: &mut Ducktape, scope: &str, path: &str) {
-    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
-        scope.to_owned(),
-        "http://node".into(),
-        true,
-        "probe".into(),
-        String::new(),
-        "1111111111111111111111111111111111111111".into(),
-        String::new(),
-        path.into(),
-    ));
-    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_file_loaded(
-        scope.to_owned(),
-        backend::BlobView {
-            repo: "probe".into(),
-            rev: "1111111111111111111111111111111111111111".into(),
-            path: path.into(),
-            text: String::new(),
-            truncated: false,
-            binary: false,
-            lines: 0,
-            picture: true,
-            width: 64,
-            height: 64,
-        },
-    ));
-}
-
-fn seed_forge_file(app: &mut Ducktape, scope: &str, path: &str, text: String) {
-    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
-        scope.to_owned(),
-        "http://node".into(),
-        true,
-        "probe".into(),
-        String::new(),
-        "1111111111111111111111111111111111111111".into(),
-        String::new(),
-        path.into(),
-    ));
-    let lines = text.lines().count() as i64;
-    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_file_loaded(
-        scope.to_owned(),
-        backend::BlobView {
-            repo: "probe".into(),
-            rev: "1111111111111111111111111111111111111111".into(),
-            path: path.into(),
-            text,
-            truncated: false,
-            binary: false,
-            lines,
-            picture: false,
-            width: 0,
-            height: 0,
-        },
-    ));
-    let state = app
-        .__ice_test_state_forge_code_browser(scope)
-        .expect("the seeded instance answers");
-    assert_eq!(state.file_path, path);
-}
-
-fn console_in_forge_tree_only() -> (Ducktape, iced::window::Id) {
-    let (app, console, _) = console_in_forge_tree(forge_tree_rows());
-    (app, console)
-}
-
-fn forge_diff() -> String {
-    let mut diff = String::from(
-        "diff --git a/probe.rs b/probe.rs\n--- a/probe.rs\n+++ b/probe.rs\n@@ -1,1 +1,2048 @@\n",
-    );
-    for index in 0..LONG_LIST_ROWS {
-        use std::fmt::Write as _;
-        writeln!(&mut diff, "+line {index:04}").expect("writing to a String cannot fail");
-    }
-    diff
-}
-
-fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Forge);
-    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
-    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
-        generation: app.forge_generation,
-        repo: "probe".into(),
-        branches: vec!["dev".into()],
-        items: Vec::new(),
-    }));
-    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(7));
-    let diff = forge_diff();
-    assert!(diff.len() < 48 * 1024);
-    let _ = app.__update(__DucktapeMessage::ForgeItemLoaded(backend::ForgeItemData {
-        generation: app.forge_generation,
-        repo: "probe".into(),
-        number: 7,
-        title: "Bound every rendered list".into(),
-        state: "open".into(),
-        kind: "pr".into(),
-        author_name: "reviewer".into(),
-        branches: "perf/probe → dev".into(),
-        channel_id: "forge:probe:7".into(),
-        source_branch: "perf/probe".into(),
-        source_oid: "abc123".into(),
-        target_oid: "def456".into(),
-        diff,
-        files_changed: 1,
-        additions: LONG_LIST_ROWS as i64,
-        ..backend::ForgeItemData::default()
-    }));
-    let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
-        backend::ForgeDiscussionData {
-            channel_id: "forge:probe:7".into(),
-            messages: (1..=DISCUSSION_ROWS as i64).map(probe_message).collect(),
-            members: Vec::new(),
-        },
-    ));
-    assert_eq!(
-        backend::diff_lines(&app.forge_item_diff).len(),
-        LONG_LIST_ROWS + 4
-    );
-    assert_eq!(app.forge_discussion.len(), DISCUSSION_ROWS);
-    (app, console)
-}
-
-fn probe_fs_entry(index: usize) -> backend::FsEntry {
-    let kind = if index.is_multiple_of(2) {
-        "dir"
-    } else {
-        "file"
-    };
-    backend::FsEntry {
-        key: index as i64,
-        path: format!("/shared/entry-{index:04}"),
-        name: format!("entry-{index:04}"),
-        kind: kind.into(),
-        size: index as i64,
-        object: format!("object-{index:04}"),
-    }
-}
-
-fn console_in_files() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Files);
-    let entries: Vec<_> = (0..FILE_ROWS).map(probe_fs_entry).collect();
-    let selected = entries
-        .last()
-        .expect("the fixture is non-empty")
-        .path
-        .clone();
-    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
-        generation: app.fs_generation,
-        path: "/shared".into(),
-        entries,
-    }));
-    let _ = app.__update(__DucktapeMessage::FsOpenFile(selected.clone()));
-    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
-        generation: app.fs_generation,
-        path: selected.clone(),
-        text: "selected file preview".into(),
-        truncated: false,
-        binary: false,
-        picture: false,
-        width: 0,
-        height: 0,
-    }));
-    assert_eq!(app.fs_entries.len(), FILE_ROWS);
-    assert_eq!(app.fs_preview_path, selected);
-    assert_eq!(app.fs_preview_entry.path, app.fs_preview_path);
-    (app, console)
-}
-
-/// One settled answer: a heading, a paragraph, and a fenced Rust block the
-/// markdown extern hands to syntect.
-fn probe_answer_body(index: usize) -> String {
-    let code: String = (0..24)
-        .map(|line| format!("let line_{line:02} = {index} + {line};\n"))
-        .collect();
-    format!(
-        "## Answer {index}\n\nThe run settled and committed this patch to the \
-         network.\n\n```rust\n{code}```\n\nLinks route through `open_link`.\n"
-    )
-}
-
-/// The two steps a settled answer keeps behind its fold.
-fn probe_answer_steps(index: usize) -> Vec<backend::AgentActivity> {
-    (0..2)
-        .map(|step| backend::AgentActivity {
-            id: (index * 2 + step) as i64,
-            title: format!("step {step} of answer {index}"),
-            detail: "ran the tool and read its output".into(),
-            status: "done".into(),
-        })
-        .collect()
-}
-
-/// The shell transcript after `ANSWER_ROWS` prompt/answer turns, installed
-/// through the same append seam the settle handler uses.
-fn console_in_shell_answers() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Shell);
-    let mut entries = Vec::new();
-    for index in 0..ANSWER_ROWS {
-        entries = backend::agent_chat_push_user(entries, format!("prompt {index}"), "codex".into());
-        entries = backend::agent_chat_answer(
-            entries,
-            probe_answer_body(index),
-            "codex".into(),
-            "done".into(),
-            String::new(),
-            probe_answer_steps(index),
-        );
-    }
-    app.shell_chat_entries = entries;
-    assert_eq!(app.shell_chat_entries.len(), ANSWER_ROWS * 2);
-    (app, console)
-}
-
-/// The Files preview open on a Markdown document carrying every probe answer.
-fn console_in_files_markdown() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Files);
-    let path = "/shared/README.md";
-    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
-        generation: app.fs_generation,
-        path: "/shared".into(),
-        entries: vec![backend::FsEntry {
-            key: 0,
-            path: path.into(),
-            name: "README.md".into(),
-            kind: "file".into(),
-            size: 0,
-            object: "object-readme".into(),
-        }],
-    }));
-    let _ = app.__update(__DucktapeMessage::FsOpenFile(path.into()));
-    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
-        generation: app.fs_generation,
-        path: path.into(),
-        text: (0..ANSWER_ROWS).map(probe_answer_body).collect(),
-        truncated: false,
-        binary: false,
-        picture: false,
-        width: 0,
-        height: 0,
-    }));
-    assert_eq!(app.fs_preview_path, path);
-    (app, console)
-}
-
 pub(crate) fn headless_renderer() -> iced::Renderer {
     static LOAD_FONTS: Once = Once::new();
     LOAD_FONTS.call_once(|| {
@@ -1001,13 +523,13 @@ pub(crate) fn headless_renderer() -> iced::Renderer {
             .write()
             .expect("the shared font system lock");
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/Geist[wght].ttf"
+            "../../crates/views/support/design/assets/fonts/Geist[wght].ttf"
         )));
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/GeistMono[wght].ttf"
+            "../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf"
         )));
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/NotoColorEmoji.ttf"
+            "../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf"
         )));
     });
     tokio::runtime::Builder::new_current_thread()
@@ -1021,25 +543,20 @@ pub(crate) fn headless_renderer() -> iced::Renderer {
         .expect("a headless tiny-skia renderer")
 }
 
-/// The stream composer's instance scope, read off a rendered frame — the
-/// composers are component instances now (ducktape-ui#697), so a probe that
-/// types has to name the one it is typing into.
+/// The stream composer's scope — the composers are host surfaces now, keyed
+/// by the room, so a probe that types names the document it types into.
 fn composer_scope(app: &Ducktape) -> String {
-    app.__ice_test_scopes_chat_composer()
-        .into_iter()
-        .find(|scope| scope.contains("/composer("))
-        .expect("the stream composer materialized")
+    backend::composer_scope(&app.connected_rpc, &app.active_channel)
 }
 
-fn keystroke(scope: &str) -> __DucktapeMessage {
-    Ducktape::__ice_test_message_chat_composer_composer_event(
-        scope.to_owned(),
-        super::editor::ComposerEvent::Apply(super::editor::RichAction::Edit(
-            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
-        )),
-        false,
-        crate::ComposerKind::Message,
-    )
+/// One character into the composer's document, as the painted surface
+/// applies it: no app message rides a keystroke any more, only the rebuild.
+fn keystroke(scope: &str) {
+    use crate::composer_surface::testing::{Interaction, interact};
+    let event = super::editor::ComposerEvent::Apply(super::editor::RichAction::Edit(
+        iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
+    ));
+    let _ = interact(scope, "message", false, false, Interaction::Editor(event));
 }
 
 fn probe_posted_update(seq: i64) -> backend::LiveUpdate {
@@ -1082,6 +599,7 @@ fn assert_bounded_allocation_span(label: &str, samples: &[(i64, u64)], headroom:
 
 #[test]
 fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     // The generated view wants a deep stack — the same 4 MiB
     // `full_view_fits_a_four_mib_stack` pins — and its own thread keeps the
     // per-thread counter clear of the rest of the suite.
@@ -1095,6 +613,7 @@ fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
 
 #[test]
 fn chat_keystroke_cost_does_not_grow_with_retained_history() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_chat_keystroke_slope)
@@ -1128,7 +647,7 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
     for _ in 0..SLOPE_FRAMES {
         cache = keystrokes
             .sample(|| {
-                let _ = app.__update(keystroke(&composer));
+                keystroke(&composer);
                 UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
             })
             .into_cache();
@@ -1137,55 +656,8 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
 }
 
 #[test]
-fn a_steps_fold_click_rebuilds_one_answer_not_the_transcript() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_steps_click)
-        .expect("the steps click probe thread spawns")
-        .join()
-        .expect("the steps click probe thread finishes");
-}
-
-/// Open a different answer's fold on every frame — each click closes the
-/// previous fold and opens the next — and measure the rebuild that follows.
-fn probe_steps_click() {
-    let (mut app, console) = console_in_shell_answers();
-    let mut renderer = headless_renderer();
-    let mut cache = warm_settled(
-        "the steps click probe",
-        &mut app,
-        console,
-        WINDOW,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    let answers: Vec<i64> = app
-        .shell_chat_entries
-        .iter()
-        .filter(|entry| entry.role != "user")
-        .map(|entry| entry.id)
-        .collect();
-    let mut clicks = Phase::new("steps click+rebuild");
-    for id in answers.into_iter().take(FRAMES) {
-        cache = clicks
-            .sample(|| {
-                let _ = app.__update(__DucktapeMessage::ShellChatStepsToggled(id));
-                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
-            })
-            .into_cache();
-    }
-    clicks.report();
-    let allocations = clicks.median_allocations();
-    assert!(
-        allocations < STEPS_CLICK_ALLOCATION_CEILING,
-        "a steps click rebuilt in {allocations} allocations, over the \
-         {STEPS_CLICK_ALLOCATION_CEILING} ceiling. Keep `steps_open` out of the answer \
-         memo's key before changing the budget."
-    );
-}
-
-#[test]
 fn a_loading_flip_leaves_the_timeline_memo_alone() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_loading_flip)
@@ -1278,6 +750,7 @@ fn flip_loading_under(label: &'static str, mut app: Ducktape, console: iced::win
 
 #[test]
 fn remote_post_bursts_publish_reduce_and_rebuild_once_per_bounded_batch() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_remote_post_bursts)
@@ -1308,9 +781,7 @@ fn live_chat_batches_take_one_shipping_app_message() {
         live_updated.contains("match next.kind"),
         "live_updated must dispatch once on its closed LiveKind"
     );
-    for variant in [
-        "retry", "tip", "ready", "chat", "bell", "pages", "forge", "plane", "resync",
-    ] {
+    for variant in ["retry", "tip", "ready", "chat", "bell", "pages", "plane", "resync"] {
         assert_eq!(
             live_updated.matches(&format!("LiveKind.{variant}")).count(),
             1,
@@ -1479,6 +950,7 @@ fn remote_post_burst_allocations(history_rows: i64, burst_rows: usize) -> u64 {
 
 #[test]
 fn large_screens_stay_under_their_allocation_ceilings() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_large_screens)
@@ -1488,11 +960,7 @@ fn large_screens_stay_under_their_allocation_ceilings() {
 }
 
 fn probe_large_screens() {
-    eprintln!(
-        "large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows, \
-         {LONG_LIST_ROWS} source/diff rows, {DISCUSSION_ROWS} discussion rows, \
-         {FILE_ROWS} file rows, {ANSWER_ROWS} answer rows"
-    );
+    eprintln!("large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows");
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();
         let allocations = probe_unchanged_build(probe.label, app, window, probe.size);
@@ -1574,57 +1042,19 @@ fn probe_unchanged_build(
     build.median_allocations()
 }
 
-/// One drawn console frame as raw RGBA — settle first (a state change may make
-/// the anchored scroll republish its viewport), then build, update, draw, and
-/// screenshot, exactly the runtime's own paint order.
-fn drawn_frame(
-    app: &mut Ducktape,
-    window: iced::window::Id,
-    renderer: &mut iced::Renderer,
-    cache: user_interface::Cache,
-) -> (user_interface::Cache, Vec<u8>) {
-    use iced::advanced::renderer::Headless as _;
-    use iced::theme::Base as _;
-    let theme = Theme::Dark;
-    let base = theme.base();
-    let cache = warm_settled("the repaint probe", app, window, WINDOW, renderer, cache);
-    let mut ui = UserInterface::build(app.__view(window), WINDOW, cache, renderer);
-    ui.draw(
-        renderer,
-        &theme,
-        &renderer::Style {
-            text_color: base.text_color,
-        },
-        mouse::Cursor::Unavailable,
-    );
-    let cache = ui.into_cache();
-    let physical = Size {
-        width: WINDOW.width as u32,
-        height: WINDOW.height as u32,
-    };
-    let pixels = renderer.screenshot(physical, 1.0, base.background_color);
-    (cache, pixels)
-}
-
 /// A settled optimistic row keeps the identity already mounted in the keyed
-/// virtual timeline. Replacing its client identity with the canonical sequence
-/// used to wedge the main stream while the unkeyed thread rail kept working.
+/// virtual timeline the view draws it in. Replacing its client identity with
+/// the canonical sequence used to wedge the main stream while the unkeyed
+/// thread rail kept working — the timeline is the chat view's now, keyed on
+/// `view_key`, so the reducer's promise is the whole contract.
 #[test]
 fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_optimistic_confirmation)
-        .expect("the confirmation probe thread spawns")
-        .join()
-        .expect("the confirmation probe thread finishes");
-}
-
-fn probe_optimistic_confirmation() {
-    let (mut app, console) = console_in_chat();
+    let (mut app, _) = console_in_chat();
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         crate::ComposerKind::Message,
         "confirmation probe".into(),
         backend::fresh_operation_id("message".into()),
+        backend::composer_scope(&app.connected_rpc, &app.active_channel),
     ));
     assert_eq!(app.messages.len(), backend::CHAT_HOT_WINDOW_LIMIT);
     let pending = app.messages.last().expect("the optimistic row");
@@ -1638,14 +1068,6 @@ fn probe_optimistic_confirmation() {
         app.messages.first().map(|message| message.seq),
         Some(2),
         "making room for the pending row drops the oldest committed root"
-    );
-
-    let mut renderer = headless_renderer();
-    let (cache, pending_frame) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
     );
 
     let canonical = backend::ChatMessage {
@@ -1679,47 +1101,27 @@ fn probe_optimistic_confirmation() {
         Some(ROWS + 1),
         "confirmation keeps the canonical row at the active tail"
     );
-
-    let (_, confirmed_frame) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert_ne!(
-        pending_frame, confirmed_frame,
-        "the pending dot must disappear when the row becomes canonical"
-    );
 }
 
-/// THE STALENESS GUARD. Under the keyed lazy a quiet row repaints ONLY when
+/// THE STALENESS GUARD. The chat view's keyed rows repaint ONLY when
 /// (seq, render_rev) moves, so a mutation path that misses its `render_rev`
 /// bump is not a perf regression but a WRONG FRAME — the reader keeps looking
 /// at the pre-mutation row. Drive the two in-place folds a reader sees most —
 /// a reaction and an edit — through the app's real live-delta path and assert
-/// each repaints the DRAWN frame, with an unchanged-frame control proving the
-/// diffs mean repaint rather than render noise.
+/// each moves the revision the view keys on.
 #[test]
 fn a_reaction_and_an_edit_repaint_the_visible_row() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_row_repaint)
-        .expect("the repaint probe thread spawns")
-        .join()
-        .expect("the repaint probe thread finishes");
-}
+    let (mut app, _) = console_in_chat();
+    let render_rev = |app: &Ducktape| {
+        app.messages
+            .iter()
+            .find(|message| message.seq == ROWS)
+            .map(|message| message.render_rev)
+            .expect("the bottom row")
+    };
+    let quiet = render_rev(&app);
 
-fn probe_row_repaint() {
-    let (mut app, console) = console_in_chat();
-    let mut renderer = headless_renderer();
-
-    let cache = user_interface::Cache::default();
-    let (cache, quiet) = drawn_frame(&mut app, console, &mut renderer, cache);
-    let (cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        quiet == control,
-        "an unchanged frame must draw identical pixels — without this control \
-         the repaint assertions below prove nothing"
-    );
-
-    // A reaction lands on the BOTTOM row — visible under `anchor-y=end`, and
-    // in the quiet arm (nothing selected), so the repaint
-    // must come through the keyed lazy's (seq, render_rev) move.
+    // A reaction lands on the BOTTOM row — visible under `anchor-y=end`.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
         kind: LiveKind::Chat,
         chat: vec![backend::ChatDelta::Reaction {
@@ -1732,11 +1134,11 @@ fn probe_row_repaint() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    let (cache, reacted) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        control != reacted,
+    let reacted = render_rev(&app);
+    assert_ne!(
+        quiet, reacted,
         "a reaction delta must repaint the visible row — `merge_message_reaction` \
-         stopped moving `render_rev` if this frame is unchanged"
+         stopped moving `render_rev` if it is unchanged"
     );
 
     // An edit of the same row, one wire revision up.
@@ -1756,559 +1158,12 @@ fn probe_row_repaint() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    let (_, edited) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        reacted != edited,
+    assert_ne!(
+        reacted,
+        render_rev(&app),
         "an edit delta must repaint the visible row — `apply_edit_content` \
-         stopped moving `render_rev` if this frame is unchanged"
+         stopped moving `render_rev` if it is unchanged"
     );
-}
-
-/// A MARKDOWN BLOB'S INLINE PICTURE IS PROVEN BY ITS PIXELS, the same way:
-/// the document and its text never change between the two frames, only the
-/// picture parked for `logo.png` does.
-#[test]
-fn the_forge_reader_draws_a_markdown_blobs_inline_picture() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_forge_inline_picture_content)
-        .expect("the forge inline picture probe thread spawns")
-        .join()
-        .expect("the forge inline picture probe thread finishes");
-}
-
-fn probe_forge_inline_picture_content() {
-    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: "README.md".into(),
-        path: "README.md".into(),
-        kind: "file".into(),
-    }]);
-    let mut renderer = headless_renderer();
-    let (cache, empty) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-
-    park_inline_picture("README.md", "./logo.png", [220, 40, 40]);
-    seed_forge_file(
-        &mut app,
-        &scope,
-        "README.md",
-        "# Probe\n\nA line before.\n\n![logo](./logo.png)\n\nA line after.\n".into(),
-    );
-    let (cache, red) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        empty != red,
-        "a loaded markdown blob must repaint the reader out of its empty plate"
-    );
-    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red == red_again,
-        "an unchanged frame must draw identical pixels — without this control \
-         the swap assertion below proves nothing"
-    );
-    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red == red_again,
-        "an unchanged frame must draw identical pixels — without this control \
-         the swap assertion below proves nothing"
-    );
-
-    park_inline_picture("README.md", "./logo.png", [40, 40, 220]);
-    let (_cache, blue) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red != blue,
-        "a replaced inline picture must repaint — identical pixels mean the \
-         markdown viewer draws alt text, a stale handle, or no picture at all"
-    );
-}
-
-/// THE READER MUST DRAW THE PICTURE. The `picture` extern reads a handle out
-/// of a process-wide slot, so nothing in the Ice tree changes between two
-/// pictures at the same path: only the pixels can prove the extern drew the
-/// slot's handle at all — and drew the CURRENT one, not a cached first.
-///
-/// Raster and vector run in ONE test, in sequence: the forge surface is one
-/// process-wide slot, and two tests parking different paths in it from
-/// parallel threads would blank each other's frames.
-#[test]
-fn the_forge_reader_draws_the_loaded_picture() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            probe_forge_picture_content("logo.png", park_forge_picture);
-            // THE VECTOR BRANCH DRAWS TOO — resvg under the same headless
-            // renderer, the same red→blue swap with nothing in the Ice tree
-            // changed.
-            probe_forge_picture_content("logo.svg", park_forge_vector);
-        })
-        .expect("the forge picture probe thread spawns")
-        .join()
-        .expect("the forge picture probe thread finishes");
-}
-
-fn probe_forge_picture_content(file: &str, park: fn(&str, [u8; 3])) {
-    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: file.into(),
-        path: file.into(),
-        kind: "file".into(),
-    }]);
-    let mut renderer = headless_renderer();
-    let (cache, empty) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-
-    park(file, [220, 40, 40]);
-    seed_forge_picture(&mut app, &scope, file);
-    let (cache, red) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        empty != red,
-        "a loaded picture must repaint the reader out of its empty plate"
-    );
-    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red == red_again,
-        "an unchanged frame must draw identical pixels — without this control \
-         the swap assertion below proves nothing"
-    );
-    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red == red_again,
-        "an unchanged frame must draw identical pixels — without this control \
-         the swap assertion below proves nothing"
-    );
-
-    // Same path, same Ice state, a different picture in the slot: only the
-    // extern's draw can move these pixels.
-    park(file, [40, 40, 220]);
-    let (_cache, blue) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        red != blue,
-        "a replaced picture must repaint — identical pixels mean the reader \
-         draws a stale handle, or no handle at all"
-    );
-}
-
-/// THE READER MUST DRAW THE BLOB. Everything around the code pane — the path
-/// header, the tabs, the tree — is identical across two blobs at the same
-/// path, so a rewritten blob that paints identical pixels means the
-/// `forge_code` surface renders nothing at all for the file it says it has
-/// open. The allocation probes cannot catch that: a subtree that draws
-/// nothing passes any ceiling trivially.
-#[test]
-fn the_forge_code_pane_draws_the_loaded_blob() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_forge_code_content)
-        .expect("the forge content probe thread spawns")
-        .join()
-        .expect("the forge content probe thread finishes");
-}
-
-// The blob content is `ForgeCodeBrowser` component state, reached through the
-// generated seam (ducktape-ui#696) rather than the app's update loop. Four
-// things must hold: clicking the file row — the reader's real control — moves
-// the component's local state and repaints the pane, a landed blob repaints it
-// out of its loading plate, a REWRITTEN blob repaints it again, and the pane
-// survives an event walk.
-fn probe_forge_code_content() {
-    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: "probe.rs".into(),
-        path: "probe.rs".into(),
-        kind: "file".into(),
-    }]);
-    let mut renderer = headless_renderer();
-    let (cache, first) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    let (mut cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        first == control,
-        "an unchanged frame must draw identical pixels — without this control \
-         the content assertions below prove nothing"
-    );
-
-    // The reader's real control still moves it: walk click points down the
-    // tree column until one produces a message, replay it, and the pane
-    // must repaint out of its empty plate. App-state pins prove the hit was
-    // the component's file row and not an app control beside it.
-    // Walk click points down the tree column until one visibly moves the
-    // reader: an inert hit on the way down (the already-selected Code tab
-    // sets a tab that is already set) delivers a message that repaints
-    // nothing, and only the file row's local open_file does.
-    let mut clipboard = clipboard::Null;
-    let mut picked = Vec::new();
-    for step in 0..40 {
-        let position = Point::new(150.0, 90.0 + step as f32 * 10.0);
-        let cursor = mouse::Cursor::Available(position);
-        let mut queued: Vec<__DucktapeMessage> = Vec::new();
-        let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
-        let _ = ui.update(
-            &[
-                Event::Mouse(mouse::Event::CursorMoved { position }),
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            ],
-            cursor,
-            &mut renderer,
-            &mut clipboard,
-            &mut queued,
-        );
-        cache = ui.into_cache();
-        let delivered = !queued.is_empty();
-        for message in queued {
-            let _ = app.__update(message);
-        }
-        if !delivered {
-            continue;
-        }
-        assert_eq!(app.forge_repo, "probe", "a click must not leave the repo");
-        assert_eq!(
-            app.forge_tab,
-            crate::ForgeTab::Code,
-            "a click must not switch seats"
-        );
-        let (next_cache, frame) = drawn_frame(&mut app, console, &mut renderer, cache);
-        cache = next_cache;
-        if frame != control {
-            picked = frame;
-            break;
-        }
-    }
-    assert!(
-        !picked.is_empty(),
-        "clicking a file row must repaint the reader — identical pixels mean \
-         the component's local state moved nothing on screen"
-    );
-
-    // The blob lands through the seam — the same message the runtime would
-    // deliver — and the syntect surface must draw it.
-    seed_forge_blob(&mut app, &scope, forge_source());
-    let (cache, loaded) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        picked != loaded,
-        "a loaded blob must repaint the reader out of its loading plate"
-    );
-
-    // A REWRITTEN blob must repaint the code pane — identical pixels mean
-    // the reader is drawing nothing for the file it says it has open (the
-    // memo-boundary regression class that shipped once already).
-    seed_forge_blob(&mut app, &scope, "const REWRITTEN: bool = true;\n".into());
-    let (cache, rewritten) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        loaded != rewritten,
-        "a rewritten blob must repaint the code pane — identical pixels mean \
-         the reader is drawing nothing for the file it says it has open"
-    );
-
-    // The live app pumps real events between frames; a cached boundary that
-    // loses its element to the event walk's tree diff evades a build+draw
-    // probe. A scroll down and back over the pane must land on the pixels it
-    // started from.
-    let mut queued: Vec<__DucktapeMessage> = Vec::new();
-    let position = Point::new(700.0, 300.0);
-    let cursor = mouse::Cursor::Available(position);
-    let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
-    let _ = ui.update(
-        &[
-            Event::Mouse(mouse::Event::CursorMoved { position }),
-            Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -3.0 },
-            }),
-            Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 30.0 },
-            }),
-        ],
-        cursor,
-        &mut renderer,
-        &mut clipboard,
-        &mut queued,
-    );
-    let cache = ui.into_cache();
-    let (_, after_events) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        rewritten == after_events,
-        "a scroll down and back over the pane must restore the frame — \
-         different pixels mean the surface lost its content to the event diff"
-    );
-}
-
-/// THE CODE LINES ARE DRAGGABLE. Every plain Ice `text` in the app selects by
-/// drag (ducktape-ui wraps it in `selectable_text`); the reader's coloured
-/// spans render outside Ice, so they must prove the same contract: a
-/// press-drag across the pane paints a selection, Ctrl+C puts exactly the
-/// dragged text on the clipboard — line break included, the drag crossed
-/// one — and Escape gives the quiet pixels back.
-#[test]
-fn the_forge_code_lines_select_by_drag() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_forge_code_selection)
-        .expect("the forge selection probe thread spawns")
-        .join()
-        .expect("the forge selection probe thread finishes");
-}
-
-#[derive(Default)]
-struct RecordingClipboard(Option<String>);
-
-impl iced::advanced::Clipboard for RecordingClipboard {
-    fn read(&self, _kind: clipboard::Kind) -> Option<String> {
-        self.0.clone()
-    }
-
-    fn write(&mut self, _kind: clipboard::Kind, contents: String) {
-        self.0 = Some(contents);
-    }
-}
-
-/// One event walk over the built tree, the way the runtime pumps input
-/// between frames; queued messages are delivered so the walk is complete.
-fn walk_events(
-    app: &mut Ducktape,
-    window: iced::window::Id,
-    renderer: &mut iced::Renderer,
-    cache: user_interface::Cache,
-    clipboard: &mut dyn iced::advanced::Clipboard,
-    events: &[Event],
-    cursor: mouse::Cursor,
-) -> user_interface::Cache {
-    let mut queued: Vec<__DucktapeMessage> = Vec::new();
-    let mut ui = UserInterface::build(app.__view(window), WINDOW, cache, renderer);
-    let _ = ui.update(events, cursor, renderer, clipboard, &mut queued);
-    let cache = ui.into_cache();
-    for message in queued {
-        let _ = app.__update(message);
-    }
-    cache
-}
-
-fn key_press(character: char, modifiers: iced::keyboard::Modifiers) -> Event {
-    use iced::keyboard::{self, Key, key};
-    let code = match character {
-        'c' => key::Code::KeyC,
-        _ => key::Code::Escape,
-    };
-    let key = match character {
-        '\u{1b}' => Key::Named(key::Named::Escape),
-        _ => Key::Character(character.to_string().into()),
-    };
-    Event::Keyboard(keyboard::Event::KeyPressed {
-        key: key.clone(),
-        modified_key: key,
-        physical_key: key::Physical::Code(code),
-        location: keyboard::Location::Standard,
-        modifiers,
-        text: None,
-        repeat: false,
-    })
-}
-
-fn probe_forge_code_selection() {
-    let (mut app, console) = console_in_forge_code();
-    let mut renderer = headless_renderer();
-    let (cache, quiet) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    let mut clipboard = RecordingClipboard::default();
-
-    // Press on one code line and let go one row down — the pane sits right
-    // of the tree column, and 300 → 340 spans two of its 20 px rows. One
-    // walk per cursor position: a walk hit-tests every event against the
-    // cursor it was given, not the event's own coordinates.
-    let from = Point::new(700.0, 300.0);
-    let to = Point::new(760.0, 340.0);
-    let cache = walk_events(
-        &mut app,
-        console,
-        &mut renderer,
-        cache,
-        &mut clipboard,
-        &[
-            Event::Mouse(mouse::Event::CursorMoved { position: from }),
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-        ],
-        mouse::Cursor::Available(from),
-    );
-    let cursor = mouse::Cursor::Available(to);
-    let cache = walk_events(
-        &mut app,
-        console,
-        &mut renderer,
-        cache,
-        &mut clipboard,
-        &[
-            Event::Mouse(mouse::Event::CursorMoved { position: to }),
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-        ],
-        cursor,
-    );
-    let (cache, selected) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        selected != quiet,
-        "a drag across the code lines must paint a selection"
-    );
-
-    let cache = walk_events(
-        &mut app,
-        console,
-        &mut renderer,
-        cache,
-        &mut clipboard,
-        // COMMAND, not CTRL: the copy handler matches `modifiers.command()`,
-        // which is the platform's own copy chord — Cmd on macOS, Ctrl
-        // elsewhere. A hardcoded CTRL only copies where CTRL is that chord.
-        &[key_press('c', iced::keyboard::Modifiers::COMMAND)],
-        cursor,
-    );
-    let copied = clipboard
-        .0
-        .take()
-        .expect("the copy chord copies the dragged lines");
-    assert!(
-        copied.contains('\n'),
-        "the drag crossed a row, so the copy carries the line break: {copied:?}"
-    );
-    assert!(
-        forge_source().contains(&copied),
-        "the copy is the blob's own text: {copied:?}"
-    );
-
-    let cache = walk_events(
-        &mut app,
-        console,
-        &mut renderer,
-        cache,
-        &mut clipboard,
-        &[key_press('\u{1b}', iced::keyboard::Modifiers::empty())],
-        cursor,
-    );
-    let (_, released) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(released == quiet, "Escape must give the quiet pixels back");
-}
-
-/// A MARKDOWN BLOB'S TEXT IS DRAGGABLE TOO, AND ACROSS ITS BLOCKS. A README
-/// renders as a document through `agent_markdown` (iced's markdown widget,
-/// outside Ice), whose heading, paragraph and code plate are each their own
-/// widget — so the drag has to prove more than the one-run code plate does:
-/// a drag DOWN THE DOCUMENT paints a selection, Ctrl+C copies every block it
-/// ran through and nothing else, Escape gives the quiet pixels back.
-#[test]
-fn the_forge_markdown_selects_by_drag() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_forge_markdown_selection)
-        .expect("the forge markdown selection probe thread spawns")
-        .join()
-        .expect("the forge markdown selection probe thread finishes");
-}
-
-fn probe_forge_markdown_selection() {
-    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: "README.md".into(),
-        path: "README.md".into(),
-        kind: "file".into(),
-    }]);
-    let readme = "# Probe\n\nThe quick brown fox jumps over the lazy dog, and keeps \
-                  jumping until the paragraph wraps onto a second line of the pane.\n\n\
-                  ```rust\nlet answer = 42;\nlet other = answer + 1;\n```\n";
-    seed_forge_file(&mut app, &scope, "README.md", readme.into());
-    let mut renderer = headless_renderer();
-    let (mut cache, quiet) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    let mut clipboard = RecordingClipboard::default();
-
-    // Walk press points down the document column until a drag copies: the
-    // header and spacing above the first paragraph are not the document's
-    // business to pin here, a copy is. The first press that lands is the
-    // topmost block, and every drag runs 250 px down from it — past the
-    // paragraph, past the code plate, off the end of the document.
-    let mut copied = None;
-    for step in 0..30 {
-        let y = 190.0 + step as f32 * 8.0;
-        let from = Point::new(520.0, y);
-        let to = Point::new(640.0, y + 250.0);
-        cache = walk_events(
-            &mut app,
-            console,
-            &mut renderer,
-            cache,
-            &mut clipboard,
-            &[
-                Event::Mouse(mouse::Event::CursorMoved { position: from }),
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            ],
-            mouse::Cursor::Available(from),
-        );
-        cache = walk_events(
-            &mut app,
-            console,
-            &mut renderer,
-            cache,
-            &mut clipboard,
-            &[
-                Event::Mouse(mouse::Event::CursorMoved { position: to }),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                key_press('c', iced::keyboard::Modifiers::COMMAND),
-            ],
-            mouse::Cursor::Available(to),
-        );
-        if let Some(text) = clipboard.0.take() {
-            copied = Some(text);
-            break;
-        }
-    }
-    let copied = copied.expect("a drag over the document copies its text");
-    for line in copied.lines() {
-        assert!(
-            readme.contains(line),
-            "the copy is the README's own words: {line:?} is not in it"
-        );
-    }
-    // The press landed in a block above the code plate and the pointer left
-    // the document below it, so everything between is one selection: the copy
-    // runs from wherever in the paragraph it started, through the paragraph's
-    // end, into the plate and off its last line. Where exactly the press
-    // landed is the pane's business; CROSSING is this document's, and one
-    // block's worth is the bug pinned here — a drag used to stop dead at the
-    // block it started in.
-    assert!(
-        copied.contains("second line of the pane.") && copied.contains("let other = answer + 1;"),
-        "the drag ran to the end of the document, so the copy crosses its \
-         blocks: {copied:?}"
-    );
-    let (cache, selected) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        selected != quiet,
-        "a drag across the document must paint a selection"
-    );
-
-    let cache = walk_events(
-        &mut app,
-        console,
-        &mut renderer,
-        cache,
-        &mut clipboard,
-        &[key_press('\u{1b}', iced::keyboard::Modifiers::empty())],
-        mouse::Cursor::Available(Point::new(640.0, 300.0)),
-    );
-    let (_, released) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(released == quiet, "Escape must give the quiet pixels back");
 }
 
 fn probe() {
@@ -2368,7 +1223,7 @@ fn probe() {
         // truth. `no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer`
         // in `tests.rs` is what keeps it honest; the ceiling cannot see it.
         let ui = keystroke_frame.sample(|| {
-            let _ = app.__update(keystroke(&composer));
+            keystroke(&composer);
             UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
         });
         cache = ui.into_cache();
@@ -2452,6 +1307,7 @@ const CHANNEL_SWITCH_FRAME_ALLOCATION_CEILING: u64 = 12_000;
 
 #[test]
 fn a_channel_switch_stays_under_its_allocation_ceiling() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_channel_switch)
@@ -2462,6 +1318,7 @@ fn a_channel_switch_stays_under_its_allocation_ceiling() {
 
 #[test]
 fn channel_switch_loading_frame_is_low_and_does_not_grow_with_loaded_history() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_channel_switch_slope)
@@ -2553,73 +1410,5 @@ fn probe_channel_switch() {
         "one room switch cost {per_switch} allocations, over the \
          {CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING} ceiling. The switch should clear \
          the active rich window, retain only tiny draft stores, and launch one root read."
-    );
-}
-
-/// A press on the pane beside an open message menu dismisses it — the
-/// backdrop's `dismiss`, the one exit a pointer has. The app's codegen wraps
-/// an overlay's LAYER in a press swallower (a press on a menu row's padding
-/// must not fall through to the backdrop), so a fill-sized layer covered the
-/// backdrop end to end: every press on the pane died in the swallower and
-/// Esc was the menu's only exit. Driven through the real event path — the
-/// float overlay, the swallower, the backdrop — not the reducer.
-#[test]
-fn a_press_beside_the_message_menu_dismisses_it() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_message_menu_dismiss)
-        .expect("the menu dismiss probe thread spawns")
-        .join()
-        .expect("the menu dismiss probe thread finishes");
-}
-
-fn probe_message_menu_dismiss() {
-    let (mut app, console) = console_in_chat();
-    let _ = app.__update(__DucktapeMessage::OpenMessageActions(
-        ROWS,
-        "body".into(),
-        1,
-    ));
-    assert_eq!(app.message_action, MessageAction::More, "the menu is open");
-    assert_eq!(app.selected_message_seq, ROWS);
-
-    let mut renderer = headless_renderer();
-    let cache = warm_settled(
-        "the menu dismiss probe",
-        &mut app,
-        console,
-        WINDOW,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    // Mid-pane, well left of the 200px menu that hangs off the right edge.
-    let position = Point::new(520.0, 450.0);
-    let cursor = mouse::Cursor::Available(position);
-    let mut clipboard = clipboard::Null;
-    let mut queued: Vec<__DucktapeMessage> = Vec::new();
-    let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
-    let _ = ui.update(
-        &[
-            Event::Mouse(mouse::Event::CursorMoved { position }),
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-        ],
-        cursor,
-        &mut renderer,
-        &mut clipboard,
-        &mut queued,
-    );
-    drop(ui);
-    for message in queued {
-        let _ = app.__update(message);
-    }
-    assert_eq!(
-        app.message_action,
-        MessageAction::Toolbar,
-        "a press beside the menu must reach the backdrop's dismiss"
-    );
-    assert_eq!(
-        app.selected_message_seq, 0,
-        "the selection clears with the menu"
     );
 }

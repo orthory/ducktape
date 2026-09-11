@@ -34,8 +34,7 @@ component Brand()
 
 // The chain chip left of the network name — a 15px ink plate with the mark.
 // The chip is the way BACK: clicking the network's name returns to the
-// launch window's picker without forgetting anything — the non-destructive
-// sibling of Danger Zone's forget.
+// launch window's picker; the session ends with the network it was on.
 component NetworkChip(name:str)
   emits
     switch_network
@@ -909,8 +908,6 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
               match tab
                 ShellTab.chat
                   slot chat
-                ShellTab.shell
-                  slot shell
                 ShellTab.pages
                   slot pages
                 ShellTab.forge
@@ -932,8 +929,3 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
 
       slot palette
       slot bell
-      // The huddle rides every screen, so it is a window-level layer like the
-      // palette and the bell — not a prop on TitleBar. A titlebar seat would
-      // widen TitleBar's signature, which a source guard in main.rs pins, and
-      // it would land the pill on top of the status/bell cluster already there.
-      slot huddle

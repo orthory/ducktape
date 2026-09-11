@@ -1,23 +1,58 @@
 use std::collections::BTreeMap;
 
-use agent::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use crate::MAX_DUCKFS_WRITE_TEXT_BYTES;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
+use super::action_requests::Prepared;
+use super::catalog::Operation;
+use super::facets::{
+    WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of,
+};
 use super::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
-    Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
-    DispatchMsg, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
-    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg,
-    Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin, TaskMsg, TaskQuery,
-    TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
-    decode_result_event, dispatch_encode_msg, dispatch_id_for, files_decode_reply,
-    files_encode_msg, files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply,
+    AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult,
+    DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error, FilesChange, FilesContent,
+    FilesMsg, FilesQuery, FilesReply, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
+    MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_REPLY_BLOCKS_BYTES,
+    MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ReplyDestination, ResultEvent,
+    RunOrigin, RunsModule, TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply,
+    chat_encode_msg, chat_encode_query, content_blocks, dispatch_encode_msg, dispatch_id_for,
+    files_decode_reply, files_encode_msg, files_encode_query, reply_message_id, tasks_decode_reply,
     tasks_encode_msg, tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
+
+/// A response whose every envelope decoded against the catalog and passed the
+/// strict lane: the response as delivered (the finalize payload embeds it) and
+/// the typed operations the emitters work on.
+#[derive(Debug)]
+pub(super) struct Validated {
+    pub response: AgentResponse,
+    pub operations: Vec<Operation>,
+}
+
+struct ChatPost<'a> {
+    channel_id: &'a str,
+    text: &'a str,
+    thread: Option<u64>,
+    message_id: String,
+}
+
+/// The countable destinations one response has already reserved, so a probe
+/// that reads committed state also counts what this same delivery block will
+/// stage before it. Shared across the pages and conversational lanes.
+#[derive(Default)]
+pub(super) struct ReplyPosts {
+    staged: BTreeMap<(String, u64), u64>,
+    standing: BTreeMap<String, bool>,
+    page_threads: BTreeMap<String, (String, usize)>,
+    page_targets: BTreeMap<String, usize>,
+    /// pages this response has already staged a create for, counted against
+    /// the module's page cap alongside the committed page count.
+    pub(super) pages_created: usize,
+    jobs: BTreeMap<String, usize>,
+}
 
 // ---- response normalization ---------------------------------------------------------
 // the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
@@ -26,25 +61,20 @@ use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
 /// the reply-block kinds normalization keeps — the closed vocabulary the
 /// strict-output instruction names.
-const REPLY_KIND_PARAGRAPH: &str = "paragraph";
+pub(crate) const REPLY_KIND_PARAGRAPH: &str = "paragraph";
 const REPLY_KIND_HEADING: &str = "heading";
 pub(crate) const REPLY_KIND_CODE: &str = "code";
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
 /// when it parses (unknown kinds and empty texts drop), a plain paragraph
-/// reply as the fallback for prose. job runs never carry reply blocks — there
-/// is no channel to deliver them to.
-pub(super) fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
+/// reply as the fallback for prose. Routing belongs to the committed source.
+pub(super) fn agent_response_from_text(text: &str) -> AgentResponse {
     let parsed = parse_strict_response(text).unwrap_or_else(|| AgentResponse {
-        reply_blocks: if job_run {
-            Vec::new()
-        } else {
-            vec![paragraph_block(non_empty_text(text))]
-        },
+        reply_blocks: vec![paragraph_block(non_empty_text(text))],
         actions: Vec::new(),
         commit_message: None,
     });
-    normalize_response(parsed, text, job_run)
+    normalize_response(parsed, text)
 }
 
 /// decode the strict-output contract's [`AgentResponse`] from a provider's
@@ -132,11 +162,7 @@ fn to_page_comment_text(blocks: &[ReplyBlock]) -> String {
         .join("\n\n")
 }
 
-fn page_reply_comment_id(run_id: &str) -> String {
-    format!("agent/{}/reply", crate::dispatch_id_for(run_id))
-}
-
-fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool) -> AgentResponse {
+fn normalize_response(mut response: AgentResponse, raw_text: &str) -> AgentResponse {
     // The host consumed this from the raw provider response before assembling
     // the runner result. It is not a consensus-delivery facet, and retaining
     // it here could needlessly inflate a job's bounded finalize payload.
@@ -168,11 +194,8 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
             }
         })
         .collect();
-    if job_run {
-        response.reply_blocks.clear();
-        return response;
-    }
-    if response.reply_blocks.is_empty() {
+    let empty_response = response.reply_blocks.is_empty() && response.actions.is_empty();
+    if empty_response {
         response
             .reply_blocks
             .push(paragraph_block(non_empty_text(raw_text)));
@@ -199,7 +222,7 @@ fn non_empty_text(text: &str) -> String {
 }
 
 /// byte bound on the error excerpt a failure reply carries — same order as
-/// the host's diagnostic excerpts (capability-host bounds stderr to 400).
+/// the host's diagnostic excerpts (the provider bounds stderr to 400).
 pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
 
 /// a failed run's error as ONE bounded chat line: whitespace runs (newlines
@@ -212,16 +235,17 @@ pub(super) fn failure_excerpt(reason: &str) -> String {
     crate::truncate_on_boundary(&line, FAILURE_EXCERPT_BYTES, "…")
 }
 
-/// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
-pub(super) fn canonical_origin(origin: &Origin) -> SagaOrigin {
+/// Preserve the authenticated creating origin in the run record.
+pub(super) fn canonical_origin(origin: &Origin) -> Result<RunOrigin, Error> {
     match origin {
-        Origin::External(key) => SagaOrigin::External(key.clone()),
-        Origin::Module(module) => SagaOrigin::Module(module.clone()),
-        Origin::System => SagaOrigin::System,
+        Origin::External(key) => Ok(RunOrigin::External(key.clone())),
+        Origin::Module(module) => Ok(RunOrigin::Module(module.clone())),
+        Origin::Program(account) => Ok(RunOrigin::Program(*account)),
+        Origin::System => Ok(RunOrigin::System),
     }
 }
 
-/// the wire name of a task status an [`AgentAction::UpdateTaskStatus`] carries.
+/// the wire name of a task status a `tasks.update_status` operation carries.
 fn task_status(name: &str) -> Option<TaskStatus> {
     match name {
         "open" => Some(TaskStatus::Open),
@@ -231,9 +255,68 @@ fn task_status(name: &str) -> Option<TaskStatus> {
     }
 }
 
-/// whether the registry granted this agent an action name.
-pub(super) fn allows(agent: &AgentRecord, action: &str) -> bool {
-    agent.allowed_actions.iter().any(|a| a == action)
+/// the catalog spelling of a collaboration message kind. The `enum` list in
+/// the `collaboration.deliver` input schema is this map's domain; the two move
+/// together or the schema advertises a kind the composer refuses.
+fn message_kind(name: &str) -> Option<collaboration::MessageKind> {
+    match name {
+        "notice" => Some(collaboration::MessageKind::Notice),
+        "question" => Some(collaboration::MessageKind::Question),
+        "task_request" => Some(collaboration::MessageKind::TaskRequest),
+        "task_update" => Some(collaboration::MessageKind::TaskUpdate),
+        "result" => Some(collaboration::MessageKind::Result),
+        _ => None,
+    }
+}
+
+/// the delivery states a bound service may REPORT. Deliberately narrower than
+/// `DeliveryState`: `stored` is the network's own admission fact and `expired`
+/// is the deadline's, so neither is a service's to claim.
+fn reported_state(name: &str) -> Option<collaboration::DeliveryState> {
+    match name {
+        "queued" => Some(collaboration::DeliveryState::Queued),
+        "adapter_accepted" => Some(collaboration::DeliveryState::AdapterAccepted),
+        "held" => Some(collaboration::DeliveryState::Held),
+        "refused" => Some(collaboration::DeliveryState::Refused),
+        "delivery_unknown" => Some(collaboration::DeliveryState::DeliveryUnknown),
+        _ => None,
+    }
+}
+
+/// the admission half of an `agent.call`: the callee is not the caller, and
+/// the instruction is bounded. `execute_delegation` re-checks these under the
+/// program origin with the live registry; refusing here answers the submitter
+/// instead of burning a program call to be told the same thing.
+fn validate_agent_call(
+    entry: &PendingState,
+    agent_id: &str,
+    instruction: &str,
+    skills: &[String],
+) -> Result<(), String> {
+    if agent_id == entry.agent_id {
+        return Err("an agent cannot call itself".into());
+    }
+    if agent_id.is_empty() {
+        return Err("agent.call requires a callee agent_id".into());
+    }
+    let bounded_instruction =
+        !instruction.trim().is_empty() && instruction.len() <= MAX_DELEGATION_INSTRUCTION_BYTES;
+    if !bounded_instruction {
+        return Err(format!(
+            "instruction must be non-empty and at most {MAX_DELEGATION_INSTRUCTION_BYTES} bytes"
+        ));
+    }
+    let request = crate::DelegationRequest {
+        agent_id: agent_id.into(),
+        instruction: instruction.into(),
+        skills: skills.to_vec(),
+    };
+    if sdk::wire::encode(&request).len() > MAX_DELEGATIONS_BYTES {
+        return Err(format!(
+            "agent call exceeds the {MAX_DELEGATIONS_BYTES}-byte request cap"
+        ));
+    }
+    Ok(())
 }
 
 impl RunsModule {
@@ -251,12 +334,8 @@ impl RunsModule {
     pub(super) async fn on_result_event(
         &mut self,
         ctx: &mut dyn Ctx,
-        payload: &[u8],
+        event: ResultEvent,
     ) -> Result<(), Error> {
-        let Ok(event) = decode_result_event(payload) else {
-            self.note(ctx, "dropped undecodable dispatch result event".into());
-            return Ok(());
-        };
         let Some(entry) = self.pending_entry(&event.dispatch_id).cloned() else {
             self.note(
                 ctx,
@@ -298,7 +377,7 @@ impl RunsModule {
     }
 
     /// Cancel unfinished descendants when their caller exits. A root exit
-    /// removes the complete ephemeral result tree; no AgentRecord relation is
+    /// removes the complete ephemeral result tree; no ModelRecord relation is
     /// left behind.
     fn close_delegations_for_run(&mut self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState) {
         let root_exit = entry.delegation_id.is_none();
@@ -377,26 +456,39 @@ impl RunsModule {
                 .fail_delegated_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let response = agent_response_from_text(&result.response_text, false);
-        let response = match self
+        let response = agent_response_from_text(&result.response_text);
+        let Validated {
+            response,
+            operations,
+        } = match self
             .validate_response(&*ctx, run_id, entry, Lane::DelegatedSettle, response)
             .await
         {
-            Ok(response) => response,
+            Ok(validated) => validated,
             Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
         };
-        let reply_blocks = response.reply_blocks.clone();
-        self.emit_pages_effects(ctx, run_id, entry, Lane::DelegatedSettle, &response.actions)
-            .await;
+        let reply_blocks = response.reply_blocks;
+        let mut posts = ReplyPosts::default();
+        self.emit_pages_effects(
+            ctx,
+            run_id,
+            entry,
+            Lane::DelegatedSettle,
+            &operations,
+            &mut posts,
+        )
+        .await;
+        self.emit_duckfs_effects(ctx, run_id, &operations).await;
+        self.emit_submit_effects(ctx, &operations);
+        // a callee's reply blocks return to its caller, never to the chat.
         self.emit_response(
             ctx,
             run_id,
             entry,
             Lane::DelegatedSettle,
-            AgentResponse {
-                reply_blocks: Vec::new(),
-                ..response
-            },
+            &[],
+            &operations,
+            &mut posts,
         )
         .await;
         let output_ref = output_ref_of(&result.workspace_receipt);
@@ -410,19 +502,23 @@ impl RunsModule {
             },
             ctx.env().consensus_time,
         );
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Delivered,
-            degraded: result.status == WireStatus::Degraded,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node: self.executing_node(&*ctx, run_id).await,
-            output_ref,
-            pr_number: None,
-        });
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::ResultAccepted,
+                degraded: result.status == WireStatus::Degraded,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref,
+                pr: None,
+            },
+            None,
+        );
     }
 
     async fn fail_delegated_run(
@@ -440,23 +536,27 @@ impl RunsModule {
             DelegationResult {
                 reply_blocks: Vec::new(),
                 output_ref: None,
-                error: Some(reason),
+                error: Some(reason.clone()),
             },
             ctx.env().consensus_time,
         );
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Failed,
-            degraded: false,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node: self.executing_node(&*ctx, run_id).await,
-            output_ref: None,
-            pr_number: None,
-        });
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::Failed,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: None,
+                pr: None,
+            },
+            Some(reason),
+        );
     }
 
     fn complete_delegation(
@@ -497,19 +597,22 @@ impl RunsModule {
         self.note(ctx, format!("run {run_id} failed: {reason}"));
         self.emit_failure_reply(ctx, run_id, entry, &reason).await;
         let executing_node = self.executing_node(&*ctx, run_id).await;
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Failed,
-            degraded: false,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node,
-            output_ref: None,
-            pr_number: None,
-        });
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::Failed,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: None,
+                pr: None,
+            },
+            Some(failure_excerpt(&reason)),
+        );
         self.emit_job_finalize_if_current_claimant(ctx, entry, false, reason)
             .await;
     }
@@ -539,12 +642,15 @@ impl RunsModule {
                 .fail_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let response = agent_response_from_text(&result.response_text, entry.job_id.is_some());
-        let response = match self
+        let response = agent_response_from_text(&result.response_text);
+        let Validated {
+            response,
+            operations,
+        } = match self
             .validate_response(&*ctx, run_id, entry, Lane::Settle, response)
             .await
         {
-            Ok(r) => r,
+            Ok(validated) => validated,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
         // build the faceted finalize payload — and render the message facet
@@ -556,47 +662,97 @@ impl RunsModule {
         // computed once here, shared by the PR-body breadcrumb and the ring.
         let executing_node = self.executing_node(&*ctx, run_id).await;
         // the pages effects lane: applied here at the run boundary like every
-        // other effect, but probe-guarded and cap-gated per action — a bad
-        // pages action degrades to a breadcrumb, the run still delivers.
-        self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &response.actions)
+        // other effect, but probe-guarded per action — a bad pages action
+        // degrades to a breadcrumb, the run still delivers. the duckfs write
+        // lane is the same shape: a stale per-path base degrades alone, it
+        // never costs the response its reply or its other actions. a submit
+        // is emitted verbatim; its module's verdict is its receipt.
+        let mut posts = ReplyPosts::default();
+        self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &operations, &mut posts)
             .await;
-        self.emit_response(ctx, run_id, entry, Lane::Settle, response)
-            .await;
-        let pr_number = self
+        self.emit_duckfs_effects(ctx, run_id, &operations).await;
+        self.emit_submit_effects(ctx, &operations);
+        self.emit_module_updates(ctx, run_id, entry, &result, &operations);
+        self.emit_response(
+            ctx,
+            run_id,
+            entry,
+            Lane::Settle,
+            &response.reply_blocks,
+            &operations,
+            &mut posts,
+        )
+        .await;
+        // the binding is the sink COMMITTED at dispatch (#1835), never the
+        // executing node's echo: an echo that disagrees is a lease-holder
+        // trying to redirect the run's output after the fact, so it is
+        // refused wholesale — delivered as `Chain`, not merely clamped back
+        // to the committed shape.
+        let sink_matches_commitment = result.sink.same_commitment(&entry.sink);
+        let sink_to_apply = match sink_matches_commitment {
+            true => entry.sink.clone(),
+            false => {
+                self.note(
+                    ctx,
+                    format!(
+                        "run {run_id} sink_mismatch: delivered sink does not match the sink committed at dispatch; delivering as chain"
+                    ),
+                );
+                WireSink::Chain
+            }
+        };
+        let sink_pr = self
             .emit_sink(
                 ctx,
                 run_id,
                 entry,
-                &result.sink,
+                &sink_to_apply,
                 &message,
                 &result.workspace_receipt,
                 &executing_node,
             )
             .await;
+        // the run's OWN proposals come after the committed sink, so a
+        // proposal of the sink's branch is the sink's PR, never a second one.
+        let proposed_pr = self
+            .emit_forge_proposals(
+                ctx,
+                run_id,
+                entry,
+                &sink_to_apply,
+                &operations,
+                &result.workspace_receipt,
+                &executing_node,
+            )
+            .await;
+        let pr = sink_pr.or(proposed_pr);
         // record the delivery into the ring AFTER the sink so the record can
-        // carry the PR number the sink opened/updated. observation only —
-        // every emitted op above is byte-identical with or without it.
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Delivered,
-            degraded: result.status == WireStatus::Degraded,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node,
-            output_ref: output_ref_of(&result.workspace_receipt),
-            pr_number,
-        });
+        // carry the PR the sink found updated. observation only — every
+        // emitted op above is byte-identical with or without it.
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::ResultAccepted,
+                degraded: result.status == WireStatus::Degraded,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: output_ref_of(&result.workspace_receipt),
+                pr,
+            },
+            None,
+        );
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
     }
 
     /// deterministic response validation — THE safety boundary (design §5).
     /// the response is data until every check here passes; only then do its
-    /// follow-ups exist. beyond grants and caps, this probes everything the
-    /// emitted follow-ups could make chat or tasks REJECT (which would abort
+    /// follow-ups exist. it probes everything the emitted follow-ups could
+    /// make chat or tasks REJECT (which would abort
     /// the delivery block — the no-fail rule): a squatted reply message id, a
     /// full thread, a duplicate, over-cap, or unknown task id.
     ///
@@ -620,11 +776,11 @@ impl RunsModule {
         entry: &PendingState,
         lane: Lane,
         response: AgentResponse,
-    ) -> Result<AgentResponse, String> {
-        let agent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+    ) -> Result<Validated, String> {
+        let registered = self.agent_for_run(ctx, entry).await?.is_some();
+        if !registered {
+            return Err(format!("agent is not registered: {}", entry.agent_id));
+        }
         if response.reply_blocks.is_empty() && response.actions.is_empty() {
             return Err("response carries neither reply blocks nor actions".into());
         }
@@ -645,6 +801,22 @@ impl RunsModule {
                 "actions are {actions_bytes} bytes; the cap is {MAX_ACTIONS_BYTES}"
             ));
         }
+        // every envelope decodes against the catalog before any probe runs: an
+        // operation this module does not know, a target or input outside its
+        // schema, or an operation the lane does not admit fails the response
+        // by name.
+        let mut operations = Vec::with_capacity(response.actions.len());
+        for envelope in &response.actions {
+            let operation = Operation::decode(envelope)?;
+            if !operation.admits(lane.kind()) {
+                return Err(format!(
+                    "{} is not available in the {} lane",
+                    operation.name(),
+                    lane.kind_name()
+                ));
+            }
+            operations.push(operation);
+        }
 
         // the thread posts THIS response has already staged, per (channel,
         // root) — chat's reply cap is the one countable resource a single
@@ -655,7 +827,8 @@ impl RunsModule {
         // at apply, and the block aborts — forever (the mailbox re-injects it).
         // counted in EMISSION order: the run's own reply first, then the
         // actions by index, exactly as `emit_response` emits them.
-        let mut staged_replies: BTreeMap<(String, u64), u64> = BTreeMap::new();
+        // Cache the account's chat standing per channel; it cannot change mid-pass.
+        let mut posts = ReplyPosts::default();
 
         if !response.reply_blocks.is_empty() {
             if matches!(lane, Lane::DelegatedSettle) {
@@ -668,104 +841,128 @@ impl RunsModule {
                     ));
                 }
             } else {
-                let page_run = page_thread_id(&entry.channel_id).is_some();
-                let action = if page_run {
-                    ACTION_PAGES_COMMENT
-                } else {
-                    ACTION_CHAT_POST
-                };
-                if !allows(&agent, action) {
-                    return Err(format!(
-                        "agent {} is not allowed to {action}",
-                        entry.agent_id
-                    ));
-                }
-                let reply_bytes = if page_run {
-                    to_page_comment_text(&response.reply_blocks).into_bytes()
-                } else {
-                    serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
-                        .expect("blocks are serializable")
-                };
-                if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
-                    return Err(format!(
-                        "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
-                        reply_bytes.len()
-                    ));
-                }
-                if page_run {
-                    self.page_reply_msg(ctx, run_id, entry, &response.reply_blocks)
-                        .await?;
-                } else {
-                    self.probe_reply_postable(ctx, run_id, entry).await?;
-                    if let Some(root) = entry.thread_root {
-                        *staged_replies
-                            .entry((entry.channel_id.clone(), root))
-                            .or_default() += 1;
-                    }
-                }
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    "reply",
+                    &response.reply_blocks,
+                    None,
+                    &mut posts,
+                )
+                .await?;
             }
         }
 
-        // the strict all-or-nothing lane covers the CHAT-POST and TASK verbs.
-        // the two pages actions are deliberately NOT validated here: they gate
-        // and validate at apply (`emit_pages_effects`), where a bad one degrades
-        // ALONE with a breadcrumb instead of failing the whole run.
+        // the strict all-or-nothing lane covers the conversational, task,
+        // module-update and agent-call operations. the pages operations and the
+        // duckfs write are deliberately NOT validated here: they gate and
+        // validate at apply (`emit_pages_effects`, `emit_duckfs_effects`), where
+        // a bad one degrades ALONE with a breadcrumb instead of failing the
+        // whole run — a stale write base is a fact about a shared, concurrently
+        // written filesystem, not a defect in this response, so it must never
+        // cost the response its reply.
         //
         // the tasks arms probe BY ID (`task_exists`), so a response carrying no
-        // task action never touches the tasks module at all.
-        let mut created: BTreeSet<&str> = BTreeSet::new();
-        for (index, action) in response.actions.iter().enumerate() {
-            if super::pages_effects::is_pages_action(action) {
+        // task operation never touches the tasks module at all.
+        let mut created: BTreeSet<String> = BTreeSet::new();
+        // the branches this response already proposes a PR from: a second
+        // proposal of the same branch would open a second PR, since every
+        // duplicate probe at delivery reads committed state only.
+        let mut proposed: BTreeSet<(String, String)> = BTreeSet::new();
+        for (index, operation) in operations.iter().enumerate() {
+            if operation.is_pages() || operation.is_duckfs() {
                 continue;
             }
-            let name = action.vocabulary_name();
-            if !allows(&agent, name) {
-                return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
-            }
-            match action {
-                // an agent SPEAKING — its own channel, its own moment — as
-                // opposed to reply_blocks, which only answer where the agent was
-                // engaged. that is the wider power, so it rides its own grant
-                // (`chat.post_message`): holding `chat.post` must NEVER widen
-                // into it, or every already-registered agent would have been
-                // silently handed the wider one.
-                AgentAction::PostMessage {
-                    channel_id,
-                    text,
-                    thread,
-                } => {
-                    if text.trim().is_empty() {
-                        return Err("chat.post_message requires a non-empty text".into());
+            let slot = lane.slot(index);
+            match operation {
+                Operation::ModulesUpdate(update) => {
+                    // only the run's own final response binds a forge output a
+                    // module update can pin; a callee's result returns to its
+                    // caller and stages no update.
+                    if matches!(lane, Lane::DelegatedSettle) {
+                        return Err(
+                            "modules.update requires the run's own final response and its committed forge output"
+                                .into(),
+                        );
                     }
-                    // the whole actions vec is already bounded by
-                    // MAX_ACTIONS_BYTES above, and every post writes its OWN
-                    // message record, so no number of posts can push one head
-                    // past chat's MAX_MESSAGE_HEAD_BYTES.
-                    self.probe_channel_exists(ctx, channel_id).await?;
-                    // the thread cap is the one check a sibling post can move
-                    // out from under: fold in what this response already staged
-                    // into the same thread, then count this post as staged.
-                    let thread_key = thread.map(|root| (channel_id.clone(), root));
-                    let already_staged = thread_key
-                        .as_ref()
-                        .and_then(|key| staged_replies.get(key))
-                        .copied()
-                        .unwrap_or(0);
-                    self.probe_post_lands(
-                        ctx,
-                        channel_id,
-                        &post_message_id(run_id, &lane.slot(index)),
-                        *thread,
-                        already_staged,
-                    )
-                    .await?;
-                    if let Some(key) = thread_key {
-                        *staged_replies.entry(key).or_default() += 1;
+                    update.validate()?
+                }
+                Operation::ForgeOpenPr {
+                    repo,
+                    source_branch,
+                    target_branch,
+                    title,
+                    body,
+                } => {
+                    // on the run's OWN final response only — a callee's result
+                    // returns to its caller and proposes nothing on the forge.
+                    if matches!(lane, Lane::DelegatedSettle) {
+                        return Err("forge.open_pr requires the run's own final response".into());
+                    }
+                    sink::validate_pr_proposal(source_branch, target_branch, title, body)?;
+                    let first_proposal_of_branch =
+                        proposed.insert((repo.clone(), source_branch.clone()));
+                    if !first_proposal_of_branch {
+                        return Err(format!(
+                            "forge.open_pr proposes {repo} branch {source_branch} twice"
+                        ));
                     }
                 }
-                AgentAction::CreateTask { task_id, title } => {
-                    if task_id.is_empty() || title.is_empty() {
-                        return Err("task actions require a non-empty task_id and title".into());
+                Operation::Reply { content } => {
+                    self.reply_msg(
+                        ctx,
+                        run_id,
+                        entry,
+                        &slot,
+                        &content_blocks(content),
+                        None,
+                        &mut posts,
+                    )
+                    .await?;
+                }
+                Operation::React { .. } | Operation::Unreact { .. } => {
+                    self.reaction_msg(ctx, entry, operation, &mut posts).await?;
+                }
+                Operation::JobsComment { job_id, content } => {
+                    self.reply_msg(
+                        ctx,
+                        run_id,
+                        entry,
+                        &slot,
+                        &content_blocks(content),
+                        Some(ReplyDestination::Job {
+                            job_id: job_id.clone(),
+                        }),
+                        &mut posts,
+                    )
+                    .await?;
+                }
+                Operation::ChatPost {
+                    channel_id,
+                    thread,
+                    content,
+                } => {
+                    let text = to_page_comment_text(&content_blocks(content));
+                    self.probe_chat_action(
+                        ctx,
+                        entry,
+                        ChatPost {
+                            channel_id,
+                            text: &text,
+                            thread: *thread,
+                            message_id: post_message_id(run_id, &slot),
+                        },
+                        &mut posts,
+                    )
+                    .await?;
+                }
+                Operation::TasksCreate { task_id, title } => {
+                    let task_id = task_id
+                        .clone()
+                        .unwrap_or_else(|| task_id_for(run_id, &slot));
+                    if title.is_empty() {
+                        return Err("tasks.create requires a non-empty title".into());
                     }
                     // tasks' OWN admission rule for an id, applied with tasks'
                     // OWN call so the two can never drift: at most
@@ -773,65 +970,89 @@ impl RunsModule {
                     // model-authored id is bounded only by MAX_ACTIONS_BYTES,
                     // so without this an id tasks REJECTS at apply aborts the
                     // whole settle op instead of failing the run.
-                    sdk::validate_id("task_id", task_id, tasks::MAX_TASK_ID)
+                    sdk::validate_id("task_id", &task_id, tasks::MAX_TASK_ID)
                         .map_err(|e| e.to_string())?;
                     // duplicates — committed or earlier in this very
                     // response — would make tasks reject the follow-up.
-                    let on_board = self.task_exists(ctx, task_id).await?;
-                    if on_board || !created.insert(task_id) {
+                    let on_board = self.task_exists(ctx, &task_id).await?;
+                    if on_board || !created.insert(task_id.clone()) {
                         return Err(format!("task already exists: {task_id}"));
                     }
                 }
-                AgentAction::UpdateTaskStatus { task_id, status } => {
+                Operation::TasksUpdateStatus { task_id, status } => {
                     if task_status(status).is_none() {
                         return Err(format!("unknown task status: {status}"));
                     }
-                    let staged_here = created.contains(task_id.as_str());
+                    let staged_here = created.contains(task_id);
                     if !staged_here && !self.task_exists(ctx, task_id).await? {
                         return Err(format!("unknown task: {task_id}"));
                     }
                 }
-                AgentAction::DuckfsWriteText {
-                    path,
-                    text,
-                    base_snapshot,
-                } => {
-                    validate_duckfs_text_write(&agent, path, text)?;
-                    self.validate_duckfs_write_base(ctx, base_snapshot).await?;
+                Operation::AgentCall {
+                    agent_id,
+                    instruction,
+                    skills,
+                } => validate_agent_call(entry, agent_id, instruction, skills)?,
+                // carried verbatim: the target module is the only judge of a
+                // submit, and its verdict is the receipt's outcome.
+                Operation::Submit { .. } => {}
+                // the composable half only. WHO may act as this participant is
+                // not decided here and cannot be: the binding is judged against
+                // the `Origin::Program(account)` the effect arrives under, which
+                // exists only after the account's program claims this proposal.
+                // Probing collaboration from here would ask under the
+                // SUBMITTER's origin and answer about the wrong principal.
+                Operation::CollaborationDeliver { .. }
+                | Operation::CollaborationAcknowledge { .. } => {
+                    self.collaboration_msg(operation)?;
                 }
-                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
-                    unreachable!("pages actions are skipped above")
+                Operation::PagesComment { .. }
+                | Operation::PagesSetChecked { .. }
+                | Operation::PagesPost { .. }
+                | Operation::DuckfsWriteText { .. } => {
+                    unreachable!("degrade-lane operations are skipped above")
                 }
             }
         }
 
-        Ok(response)
+        Ok(Validated {
+            response,
+            operations,
+        })
     }
 
-    /// prove a reply under the run's message id could land in chat RIGHT NOW
-    /// — the no-fail rule again: an emitted post must be valid by
-    /// construction, so anything chat would reject is probed first. the run's
-    /// own channel is where its anchor came from, so only the post itself needs
-    /// probing.
-    ///
-    /// the reply is always the FIRST post a response stages (`emit_response`
-    /// emits it before any action, and a failure reply is the only post its run
-    /// makes), so it never has a sibling to account for: it probes at zero
-    /// already-staged, and its caller counts it for the actions that follow.
-    async fn probe_reply_postable(
+    async fn probe_chat_action(
         &self,
         ctx: &dyn Ctx,
-        run_id: &str,
         entry: &PendingState,
+        post: ChatPost<'_>,
+        posts: &mut ReplyPosts,
     ) -> Result<(), String> {
-        self.probe_post_lands(
-            ctx,
-            &entry.channel_id,
-            &reply_message_id(run_id),
-            entry.thread_root,
-            0,
-        )
-        .await
+        if post.text.trim().is_empty() {
+            return Err("chat posts require a non-empty text".into());
+        }
+        self.probe_channel_exists(ctx, post.channel_id).await?;
+        let may_post = self
+            .account_may_post(ctx, entry, post.channel_id, &mut posts.standing)
+            .await?;
+        if !may_post {
+            return Err(format!(
+                "the agent's account may not post to channel: {}",
+                post.channel_id
+            ));
+        }
+        let thread_key = post.thread.map(|root| (post.channel_id.to_string(), root));
+        let staged = thread_key
+            .as_ref()
+            .and_then(|key| posts.staged.get(key))
+            .copied()
+            .unwrap_or(0);
+        self.probe_post_lands(ctx, post.channel_id, &post.message_id, post.thread, staged)
+            .await?;
+        if let Some(key) = thread_key {
+            *posts.staged.entry(key).or_default() += 1;
+        }
+        Ok(())
     }
 
     /// THE chat-post probe, shared by the run's reply and by a
@@ -912,61 +1133,226 @@ impl RunsModule {
         Ok(())
     }
 
-    /// Build a Pages reply only after proving every rejection surface: thread
-    /// and target still exist, reply id is free, thread has room, and the
-    /// agent holds pages_write for the owning page.
-    async fn page_reply_msg(
+    /// Resolve and validate one conversational write. `None` resolves the
+    /// destination from the run's committed source (the `reply` operation, the
+    /// run's own reply and its failure reply); `Some` is an explicit
+    /// operation's destination. The session, final and failure paths all use
+    /// this route; only the program executes its result.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source, deterministic slot and batch reservations are independent inputs"
+    )]
+    pub(super) async fn reply_msg(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
+        slot: &str,
         blocks: &[ReplyBlock],
-    ) -> Result<Msg, String> {
+        destination: Option<ReplyDestination>,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        let explicit = destination.is_some();
+        let resolved = match destination {
+            Some(destination) => destination,
+            None => {
+                if let Some(job_id) = &entry.job_id {
+                    let original_claim = self
+                        .job_claimed_by_run(ctx, job_id, entry.job_claim_height)
+                        .await?;
+                    if !original_claim {
+                        return Err("reply source no longer has the original job claim".into());
+                    }
+                }
+                entry.reply_destination()?
+            }
+        };
+        let text = to_page_comment_text(blocks);
+        let empty_text = text.trim().is_empty();
+        if empty_text {
+            return Err("replies require non-empty text".into());
+        }
+        let bytes = serde_json::to_vec(blocks).expect("reply blocks serialize");
+        let oversized_reply = bytes.len() > MAX_REPLY_BLOCKS_BYTES;
+        if oversized_reply {
+            return Err(format!(
+                "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
+                bytes.len()
+            ));
+        }
+        // the receipt names the operation the caller invoked: a source reply is
+        // `reply` and reports where it landed; an explicit destination is its
+        // own operation and reports that operation's coordinates.
+        let operation = if explicit {
+            resolved.operation()
+        } else {
+            crate::OP_REPLY
+        };
+        let destination_json = serde_json::to_value(&resolved).expect("destinations serialize");
+        let source_result =
+            |id: &str| serde_json::json!({"destination": destination_json, "id": id});
+        match resolved {
+            ReplyDestination::Chat { channel_id, thread } => {
+                let message_id = match slot {
+                    "reply" => reply_message_id(run_id),
+                    _ => post_message_id(run_id, slot),
+                };
+                self.probe_chat_action(
+                    ctx,
+                    entry,
+                    ChatPost {
+                        channel_id: &channel_id,
+                        text: &text,
+                        thread,
+                        message_id: message_id.clone(),
+                    },
+                    posts,
+                )
+                .await?;
+                let result = if explicit {
+                    serde_json::json!({"channel_id": channel_id, "thread": thread, "message_id": message_id})
+                } else {
+                    source_result(&message_id)
+                };
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.chat.clone(),
+                        payload: chat_encode_msg(&ChatMsg::PostMessage {
+                            channel_id,
+                            message_id,
+                            blocks: to_chat_blocks(blocks),
+                            thread,
+                        }),
+                    },
+                    operation,
+                    result,
+                ))
+            }
+            ReplyDestination::Page { target } => {
+                // a source reply lands in the run's ONE shared thread on the
+                // mentioned block; an explicit comment opens a thread per slot.
+                let thread_slot = if explicit { slot } else { "reply" };
+                let thread_id = super::pages_effects::page_thread_id(run_id, thread_slot);
+                let (message, target, comment_id) = self
+                    .page_reply_msg(ctx, run_id, slot, &thread_id, Some(&target), text, posts)
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
+            }
+            ReplyDestination::PageThread { thread_id } => {
+                let (message, target, comment_id) = self
+                    .page_reply_msg(ctx, run_id, slot, &thread_id, None, text, posts)
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
+            }
+            ReplyDestination::Job { job_id } => {
+                let (message, comment_id) = self
+                    .job_reply_msg(ctx, &job_id, run_id, slot, text, posts)
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"job_id": job_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "page target resolution shares deterministic reply coordinates and batch reservations"
+    )]
+    async fn page_reply_msg(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        slot: &str,
+        thread_id: &str,
+        new_target: Option<&str>,
+        text: String,
+        posts: &mut ReplyPosts,
+    ) -> Result<(Msg, String, String), String> {
         let pages = self
             .pages
             .as_deref()
-            .ok_or_else(|| "pages module is not configured".to_string())?;
-        let thread_id = page_thread_id(&entry.channel_id)
-            .ok_or_else(|| "run is not a pages comment run".to_string())?;
-        let reply = ctx
-            .query(
-                pages,
-                &pages::encode_query(&pages::PageQuery::CommentThread {
-                    thread_id: thread_id.to_string(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages thread lookup failed: {e}"))?;
-        let view = match pages::decode_reply(&reply) {
-            Ok(pages::PageReply::CommentThread(Some(view))) => view,
-            _ => return Err(format!("pages thread is missing: {thread_id}")),
-        };
-        if view.thread.comment_ids.len() >= pages::MAX_COMMENTS_PER_THREAD {
-            return Err(format!("pages comment thread is full: {thread_id}"));
+            .ok_or("pages module is not configured")?;
+        let comment_id = super::pages_effects::page_comment_id(run_id, slot);
+        let valid_ids = pages::id_is_index_safe(thread_id)
+            && thread_id.len() <= pages::MAX_THREAD_ID_BYTES
+            && pages::id_is_index_safe(&comment_id)
+            && comment_id.len() <= pages::MAX_COMMENT_ID_BYTES;
+        if !valid_ids {
+            return Err("invalid pages reply coordinates".into());
         }
-        let target_reply = ctx
-            .query(
-                pages,
-                &pages::encode_query(&pages::PageQuery::GetBlock {
-                    block_id: view.thread.target.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages target lookup failed: {e}"))?;
-        let target = match pages::decode_reply(&target_reply) {
-            Ok(pages::PageReply::Block(Some(block))) => block,
-            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
-        };
-        let agent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        self.check_pages_write(&agent, &target.page)?;
-        let comment_id = page_reply_comment_id(run_id);
-        if comment_id.len() > pages::MAX_COMMENT_ID_BYTES || !pages::id_is_index_safe(&comment_id) {
-            return Err("derived pages reply id is invalid".into());
+        let oversized_comment = text.len() > pages::MAX_COMMENT_TEXT_BYTES;
+        if oversized_comment {
+            return Err("pages reply exceeds the comment byte cap".into());
         }
-        let existing = ctx
+        let (target, count) = match posts.page_threads.get(thread_id) {
+            Some(staged) => staged.clone(),
+            None => {
+                let bytes = ctx
+                    .query(
+                        pages,
+                        &pages::encode_query(&pages::PageQuery::CommentThreadHead {
+                            thread_id: thread_id.into(),
+                        }),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match pages::decode_reply(&bytes).map_err(|e| e.to_string())? {
+                    pages::PageReply::CommentThreadHead(Some(head)) => {
+                        (head.target, head.comment_count as usize)
+                    }
+                    pages::PageReply::CommentThreadHead(None) => {
+                        let target = new_target
+                            .ok_or_else(|| format!("pages thread is missing: {thread_id}"))?;
+                        let bytes = ctx
+                            .query(
+                                pages,
+                                &pages::encode_query(&pages::PageQuery::TargetThreadCount {
+                                    target: target.into(),
+                                }),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let pages::PageReply::TargetThreadCount(count) =
+                            pages::decode_reply(&bytes).map_err(|e| e.to_string())?
+                        else {
+                            return Err("unexpected pages thread count reply".into());
+                        };
+                        let staged = posts.page_targets.entry(target.into()).or_default();
+                        let full = count as usize + *staged >= pages::MAX_THREADS_PER_TARGET;
+                        if full {
+                            return Err("pages target is full".into());
+                        }
+                        *staged += 1;
+                        (target.into(), 0)
+                    }
+                    _ => return Err("unexpected pages thread reply".into()),
+                }
+            }
+        };
+        let wrong_target = new_target.is_some_and(|expected| expected != target);
+        if wrong_target {
+            return Err("pages reply thread belongs to another target".into());
+        }
+        let full_thread = count >= pages::MAX_COMMENTS_PER_THREAD;
+        if full_thread {
+            return Err("pages comment thread is full".into());
+        }
+        self.page_block(ctx, pages, &target).await?;
+        let bytes = ctx
             .query(
                 pages,
                 &pages::encode_query(&pages::PageQuery::GetComment {
@@ -974,40 +1360,120 @@ impl RunsModule {
                 }),
             )
             .await
-            .map_err(|e| format!("pages comment lookup failed: {e}"))?;
-        match pages::decode_reply(&existing) {
-            Ok(pages::PageReply::Comment(None)) => {}
-            Ok(pages::PageReply::Comment(Some(_))) => {
-                return Err(format!("pages reply id already taken: {comment_id}"));
-            }
-            _ => return Err("unexpected pages reply for a comment lookup".into()),
+            .map_err(|e| e.to_string())?;
+        match pages::decode_reply(&bytes).map_err(|e| e.to_string())? {
+            pages::PageReply::Comment(None) => {}
+            pages::PageReply::Comment(Some(_)) => return Err("pages reply id already taken".into()),
+            _ => return Err("unexpected pages comment reply".into()),
         }
-        let text = to_page_comment_text(blocks);
-        if text.len() > pages::MAX_COMMENT_TEXT_BYTES {
-            return Err(format!(
-                "pages reply is {} bytes; the cap is {}",
-                text.len(),
-                pages::MAX_COMMENT_TEXT_BYTES
-            ));
-        }
-        Ok(Msg {
-            target: pages.to_string(),
+        posts
+            .page_threads
+            .insert(thread_id.into(), (target.clone(), count + 1));
+        let message = Msg {
+            target: pages.into(),
             payload: pages::encode_msg(&pages::PageMsg::AddComment {
-                thread_id: thread_id.to_string(),
-                comment_id,
-                target: view.thread.target,
+                thread_id: thread_id.into(),
+                comment_id: comment_id.clone(),
+                target: target.clone(),
                 text,
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: Some(entry.agent_id.clone()),
             }),
-        })
+        };
+        Ok((message, target, comment_id))
+    }
+
+    async fn job_reply_msg(
+        &self,
+        ctx: &dyn Ctx,
+        job_id: &str,
+        run_id: &str,
+        slot: &str,
+        text: String,
+        posts: &mut ReplyPosts,
+    ) -> Result<(Msg, String), String> {
+        let jobs = self
+            .jobs
+            .as_deref()
+            .ok_or("jobs module is not configured")?;
+        let oversized_comment = text.len() > tasks::MAX_JOB_COMMENT_TEXT_BYTES;
+        if oversized_comment {
+            return Err("job reply exceeds the comment byte cap".into());
+        }
+        let bytes = ctx
+            .query(
+                jobs,
+                &super::jobs_encode_query(&super::JobsQuery::Get {
+                    job_id: job_id.into(),
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let super::JobsReply::Job(Some(job)) =
+            super::jobs_decode_reply(&bytes).map_err(|e| e.to_string())?
+        else {
+            return Err(format!("job is missing: {job_id}"));
+        };
+        let comment_id = post_message_id(run_id, slot);
+        let duplicate = job.comments.iter().any(|comment| comment.id == comment_id);
+        if duplicate {
+            return Err("job reply id already taken".into());
+        }
+        let staged = posts.jobs.entry(job_id.into()).or_default();
+        let full = job.comments.len() + *staged >= tasks::MAX_JOB_COMMENTS;
+        if full {
+            return Err("job discussion is full".into());
+        }
+        *staged += 1;
+        let message = Msg {
+            target: jobs.into(),
+            payload: super::jobs_encode_msg(&super::JobsMsg::Comment {
+                job_id: job_id.into(),
+                created_at_revision: job.created_at_revision,
+                comment_id: comment_id.clone(),
+                text,
+            }),
+        };
+        Ok((message, comment_id))
+    }
+
+    /// chat's own verdict on the model account posting to a channel — the
+    /// probe that keeps an emitted post from being rejected at apply. chat
+    /// judges the same account again when the program's call actually runs.
+    async fn account_may_post(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+        channel_id: &str,
+        known: &mut BTreeMap<String, bool>,
+    ) -> Result<bool, String> {
+        if let Some(answer) = known.get(channel_id) {
+            return Ok(*answer);
+        }
+        let bytes = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.into(),
+                    party: chat::Party::Account(entry.account),
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) =
+            chat_decode_reply(&bytes).map_err(|error| error.to_string())?
+        else {
+            return Err("unexpected chat access reply".into());
+        };
+        known.insert(channel_id.to_string(), access.may_post);
+        Ok(access.may_post)
     }
 
     /// prove a channel EXISTS before an agent speaks into it — chat rejects a
     /// post to an unknown channel, and on the settle path that rejection would
-    /// abort the delivery block. (its post policy needs no probe: chat always
-    /// admits a module/agent author.)
+    /// abort the delivery block. existence ONLY: chat admits a module/agent
+    /// author into any channel it holds, which is exactly why the standing
+    /// probe ([`RunsModule::account_may_post`]) has to run beside this one.
     async fn probe_channel_exists(&self, ctx: &dyn Ctx, channel_id: &str) -> Result<(), String> {
         let reply = ctx
             .query(
@@ -1025,39 +1491,147 @@ impl RunsModule {
         }
     }
 
-    async fn validate_duckfs_write_base(
+    /// resolve the committed entry at `path` under one snapshot: `None` is
+    /// files' OWN meaning for "no snapshot" everywhere else it appears as a
+    /// query argument — the CURRENT head, not the empty tree (that inversion
+    /// is `FilesMsg::Commit`'s `base_snapshot`-only special case, handled by
+    /// the caller, never here).
+    async fn duckfs_stat(
         &self,
         ctx: &dyn Ctx,
+        files: &str,
+        path: &str,
+        snapshot: Option<String>,
+    ) -> Result<Option<EntryInfo>, String> {
+        let reply = ctx
+            .query(
+                files,
+                &files_encode_query(&FilesQuery::Stat {
+                    path: path.to_string(),
+                    snapshot,
+                }),
+            )
+            .await
+            .map_err(|e| format!("files stat query failed: {e}"))?;
+        match files_decode_reply(&reply) {
+            Ok(FilesReply::Stat(info)) => Ok(info),
+            Ok(_) => Err("unexpected files reply for a stat query".into()),
+            Err(e) => Err(format!("files stat reply failed to decode: {e}")),
+        }
+    }
+
+    /// predict whether files' own per-path CAS (`fs.rs` step 7: `entry_at(base)
+    /// != entry_at(head)` -> "changed since base") would accept this write —
+    /// the ONE base rule; there is no global-head check here on purpose, since
+    /// files never applies one and a global check refuses disjoint-path writes
+    /// files itself would take. `base_snapshot: None` is files' create-only
+    /// sense (the empty tree, matching `FilesMsg::Commit`'s own doc comment):
+    /// the path must not already exist. `Some(snapshot)` resolves that
+    /// snapshot's entry at `path` and requires it match the current one.
+    async fn probe_duckfs_write_base(
+        &self,
+        ctx: &dyn Ctx,
+        files: &str,
+        path: &str,
         base_snapshot: &Option<String>,
     ) -> Result<(), String> {
+        let base_entry = match base_snapshot {
+            None => None,
+            Some(snapshot) => {
+                self.duckfs_stat(ctx, files, path, Some(snapshot.clone()))
+                    .await?
+            }
+        };
+        let current_entry = self.duckfs_stat(ctx, files, path, None).await?;
+        if base_entry != current_entry {
+            return Err(format!(
+                "duckfs.write_text base snapshot is stale for {path}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// ONE duckfs.write_text operation as an emit-ready follow-up, or the
+    /// reason it must not be emitted: shape first, then the per-path base
+    /// probe. `Err` degrades to a breadcrumb on the settle path and returns to
+    /// the submitter on the session lane; same verdict, two failure policies.
+    pub(super) async fn duckfs_write_msg(
+        &self,
+        ctx: &dyn Ctx,
+        operation: &Operation,
+    ) -> Result<Prepared, String> {
+        let Operation::DuckfsWriteText {
+            path,
+            text,
+            base_snapshot,
+        } = operation
+        else {
+            unreachable!("only the duckfs operation reaches this lane");
+        };
+        let name = operation.name();
+        validate_duckfs_text_write(path, text)?;
         let files = self
             .files
             .as_ref()
             .ok_or_else(|| "no files module is configured".to_string())?;
-        let reply = ctx
-            .query(files, &files_encode_query(&FilesQuery::Refs {}))
-            .await
-            .map_err(|e| format!("files refs query failed: {e}"))?;
-        let current = match files_decode_reply(&reply) {
-            Ok(FilesReply::Refs(info)) => info.head,
-            Ok(_) => return Err("unexpected files reply for a refs query".into()),
-            Err(e) => return Err(format!("files refs reply failed to decode: {e}")),
-        };
-        if base_snapshot != &current {
-            return Err(format!(
-                "duckfs.write_text base snapshot is stale: signed {:?}, current {:?}",
-                base_snapshot, current
-            ));
+        self.probe_duckfs_write_base(ctx, files, path, base_snapshot)
+            .await?;
+        Ok(Prepared::new(
+            Msg {
+                target: files.clone(),
+                payload: files_encode_msg(&FilesMsg::Commit {
+                    base_snapshot: base_snapshot.clone(),
+                    message: "agent duckfs.write_text".into(),
+                    changes: vec![FilesChange::Put {
+                        path: path.clone(),
+                        exec: false,
+                        meta: BTreeMap::new(),
+                        content: FilesContent::Inline {
+                            b64: STANDARD.encode(text.as_bytes()),
+                        },
+                    }],
+                }),
+            },
+            name,
+            serde_json::json!({"path": path, "base_snapshot": base_snapshot}),
+        ))
+    }
+
+    /// apply the duckfs.write_text actions of a validated response — its own
+    /// lane, mirroring `emit_pages_effects`: each action either emits its files
+    /// follow-up or degrades to a breadcrumb. never errors, never fails the
+    /// run — a base gone stale under a concurrent commit is expected traffic
+    /// on a shared filesystem, not a reason to discard the reply and every
+    /// other effect this response staged.
+    pub(super) async fn emit_duckfs_effects(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        operations: &[Operation],
+    ) {
+        if !operations.iter().any(Operation::is_duckfs) {
+            return;
         }
-        Ok(())
+        for (index, operation) in operations.iter().enumerate() {
+            if !operation.is_duckfs() {
+                continue;
+            }
+            match self.duckfs_write_msg(&*ctx, operation).await {
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
+                Err(why) => self.note(
+                    ctx,
+                    format!("run {run_id} duckfs.write_text action {index} skipped: {why}"),
+                ),
+            }
+        }
     }
 
     /// surface a failed CHAT run as a threaded reply authored by the agent —
     /// same message id as a success reply would use, so the one-reply-per-run
     /// dedup holds and a redelivered result (entry already pruned) can never
     /// double-post. anything that keeps the post from being valid by
-    /// construction (job run, unregistered agent, missing chat.post grant,
-    /// squatted id, full thread) degrades to the pre-existing breadcrumb-only
+    /// construction (job run, unregistered agent, squatted id, full thread)
+    /// degrades to the pre-existing breadcrumb-only
     /// silence — never an error on this no-fail arm.
     async fn emit_failure_reply(
         &self,
@@ -1066,12 +1640,8 @@ impl RunsModule {
         entry: &PendingState,
         reason: &str,
     ) {
-        if entry.job_id.is_some() {
-            // job runs have no channel; the finalize payload carries the error.
-            return;
-        }
         match self.failure_reply(&*ctx, run_id, entry, reason).await {
-            Ok(msg) => ctx.emit_msg(msg),
+            Ok(prepared) => self.emit_prepared(ctx, prepared),
             Err(why) => self.note(ctx, format!("run {run_id} failure not surfaced: {why}")),
         }
     }
@@ -1083,56 +1653,27 @@ impl RunsModule {
         run_id: &str,
         entry: &PendingState,
         reason: &str,
-    ) -> Result<Msg, String> {
+    ) -> Result<Prepared, String> {
         let agent = self
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        let page_run = page_thread_id(&entry.channel_id).is_some();
-        // posting the failure is a reply like any success — ungranted
-        // agents keep the old silent-fail.
-        let action = if page_run {
-            ACTION_PAGES_COMMENT
-        } else {
-            ACTION_CHAT_POST
-        };
-        if !allows(&agent, action) {
-            return Err(format!(
-                "agent {} is not allowed to {action}",
-                entry.agent_id
-            ));
-        }
         let name = if agent.display_name.is_empty() {
             agent.agent_id.as_str()
         } else {
             agent.display_name.as_str()
         };
         let text = format!("⚠ {name} failed: {}", failure_excerpt(reason));
-        if page_run {
-            return self
-                .page_reply_msg(
-                    ctx,
-                    run_id,
-                    entry,
-                    &[ReplyBlock {
-                        kind: REPLY_KIND_PARAGRAPH.into(),
-                        text,
-                        lang: None,
-                    }],
-                )
-                .await;
-        }
-        self.probe_reply_postable(ctx, run_id, entry).await?;
-        Ok(Msg {
-            target: self.chat.clone(),
-            payload: chat_encode_msg(&ChatMsg::PostMessage {
-                channel_id: entry.channel_id.clone(),
-                message_id: reply_message_id(run_id),
-                blocks: vec![Block::paragraph(text)],
-                thread: entry.thread_root,
-                as_agent: Some(entry.agent_id.clone()),
-            }),
-        })
+        self.reply_msg(
+            ctx,
+            run_id,
+            entry,
+            "reply",
+            &[paragraph_block(text)],
+            None,
+            &mut ReplyPosts::default(),
+        )
+        .await
     }
 
     /// does `task_id` name a live task RIGHT NOW — this block's staged creates
@@ -1158,99 +1699,363 @@ impl RunsModule {
             .map_err(|e| format!("tasks lookup failed: {e}"))?;
         match tasks_decode_reply(&reply) {
             Ok(TaskReply::Task(task)) => Ok(task.is_some()),
-            Ok(TaskReply::Tasks(_)) => Err("tasks answered a page, not a task".into()),
+            Ok(TaskReply::Tasks(_) | TaskReply::OwnerOpenCount(_)) => {
+                Err("tasks answered a page, not a task".into())
+            }
             Err(e) => Err(format!("undecodable tasks reply: {e}")),
         }
     }
 
-    /// hand a VALIDATED response its follow-ups: the chat reply (authored as
-    /// the agent, threaded like its anchor — or, for a run invoked from a page
-    /// comment, a reply IN that comment thread), the agent's own chat posts, and
-    /// the task writes — all drained in this same delivery block (P2, P6). every
-    /// one rides this MODULE's origin, which is what lets chat and pages refine
-    /// `as_agent` into `AuthorRef::Agent { module, agent_id }` — authorship no
-    /// external submitter can forge.
+    /// Prepare validated chat, job and task intents. The result/session
+    /// boundary records them for the account's program to execute. `posts` is
+    /// shared with the pages lane so every countable destination this response
+    /// touches is counted once across both. An operation this lane cannot
+    /// prepare degrades alone to a breadcrumb; the run keeps every other
+    /// effect.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reply blocks, operations, lane slot and shared reservations are independent inputs"
+    )]
     pub(super) async fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
         lane: Lane,
-        response: AgentResponse,
+        reply_blocks: &[ReplyBlock],
+        operations: &[Operation],
+        posts: &mut ReplyPosts,
     ) {
-        if !response.reply_blocks.is_empty() {
-            if page_thread_id(&entry.channel_id).is_some() {
-                match self
-                    .page_reply_msg(&*ctx, run_id, entry, &response.reply_blocks)
-                    .await
-                {
-                    Ok(msg) => ctx.emit_msg(msg),
-                    Err(why) => self.note(ctx, format!("run {run_id} page reply skipped: {why}")),
-                }
-            } else {
-                ctx.emit_msg(Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id: entry.channel_id.clone(),
-                        message_id: reply_message_id(run_id),
-                        blocks: to_chat_blocks(&response.reply_blocks),
-                        thread: entry.thread_root,
-                        as_agent: Some(entry.agent_id.clone()),
-                    }),
-                });
+        if !reply_blocks.is_empty() {
+            match self
+                .reply_msg(&*ctx, run_id, entry, "reply", reply_blocks, None, posts)
+                .await
+            {
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
+                Err(why) => self.note(ctx, format!("run {run_id} reply skipped: {why}")),
             }
         }
-        for (index, action) in response.actions.into_iter().enumerate() {
-            let msg = match action {
-                AgentAction::PostMessage {
-                    channel_id,
-                    text,
-                    thread,
-                } => Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id,
-                        message_id: post_message_id(run_id, &lane.slot(index)),
-                        blocks: vec![Block::paragraph(text)],
-                        thread,
-                        as_agent: Some(entry.agent_id.clone()),
+        for (index, operation) in operations.iter().enumerate() {
+            if !operation.is_conversational() {
+                continue;
+            }
+            match self
+                .conversational_msg(&*ctx, run_id, entry, &lane.slot(index), operation, posts)
+                .await
+            {
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
+                Err(why) => self.note(
+                    ctx,
+                    format!(
+                        "run {run_id} {} action {index} skipped: {why}",
+                        operation.name()
+                    ),
+                ),
+            }
+        }
+    }
+
+    /// A reaction on the message this run was called on, as the chat op the
+    /// program executes, or the reason it cannot be prepared. The reaction is
+    /// held to the same standing as a source reply: a chat source and chat's
+    /// own post standing for the account. The emoji is bounded by chat's own
+    /// rule so the follow-up is never rejected at apply.
+    async fn reaction_msg(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+        operation: &Operation,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        let emoji = match operation {
+            Operation::React { emoji } | Operation::Unreact { emoji } => emoji,
+            other => unreachable!("{} is not a reaction", other.name()),
+        };
+        let ReplyDestination::Chat { channel_id, .. } = entry.reply_destination()? else {
+            return Err(format!(
+                "{} needs a chat message to react to; this run was called from elsewhere",
+                operation.name()
+            ));
+        };
+        if emoji.is_empty() {
+            return Err(format!("{} requires an emoji", operation.name()));
+        }
+        if emoji.len() > chat::MAX_EMOJI_BYTES {
+            return Err(format!(
+                "emoji is {} bytes; chat's cap is {}",
+                emoji.len(),
+                chat::MAX_EMOJI_BYTES
+            ));
+        }
+        self.probe_channel_exists(ctx, &channel_id).await?;
+        let may_post = self
+            .account_may_post(ctx, entry, &channel_id, &mut posts.standing)
+            .await?;
+        if !may_post {
+            return Err(format!(
+                "the agent's account may not post to channel: {channel_id}"
+            ));
+        }
+        let seq = entry.anchor_seq;
+        let msg = match operation {
+            Operation::React { .. } => ChatMsg::AddReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji: emoji.clone(),
+            },
+            _ => ChatMsg::RemoveReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji: emoji.clone(),
+            },
+        };
+        Ok(Prepared::new(
+            Msg {
+                target: self.chat.clone(),
+                payload: chat_encode_msg(&msg),
+            },
+            operation.name(),
+            serde_json::json!({"channel_id": channel_id, "seq": seq, "emoji": emoji}),
+        ))
+    }
+
+    /// One conversational operation (a reply, a reaction, a chat post, a job
+    /// comment, a task create or status update) as an emit-ready follow-up,
+    /// or the reason it cannot be prepared. The settle path degrades an `Err`
+    /// to a breadcrumb; the session lane returns it to the submitter.
+    pub(super) async fn conversational_msg(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        slot: &str,
+        operation: &Operation,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        match operation {
+            Operation::Reply { content } => {
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    slot,
+                    &content_blocks(content),
+                    None,
+                    posts,
+                )
+                .await
+            }
+            Operation::React { .. } | Operation::Unreact { .. } => {
+                self.reaction_msg(ctx, entry, operation, posts).await
+            }
+            Operation::JobsComment { job_id, content } => {
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    slot,
+                    &content_blocks(content),
+                    Some(ReplyDestination::Job {
+                        job_id: job_id.clone(),
                     }),
-                },
-                AgentAction::CreateTask { task_id, title } => Msg {
-                    target: self.task_target(),
-                    payload: tasks_encode_msg(&TaskMsg::CreateTask { task_id, title }),
-                },
-                AgentAction::UpdateTaskStatus { task_id, status } => Msg {
-                    target: self.task_target(),
-                    payload: tasks_encode_msg(&TaskMsg::UpdateStatus {
-                        task_id,
-                        status: task_status(&status).expect("status was validated"),
+                    posts,
+                )
+                .await
+            }
+            Operation::ChatPost {
+                channel_id,
+                thread,
+                content,
+            } => {
+                let message_id = post_message_id(run_id, slot);
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.chat.clone(),
+                        payload: chat_encode_msg(&ChatMsg::PostMessage {
+                            channel_id: channel_id.clone(),
+                            message_id: message_id.clone(),
+                            blocks: to_chat_blocks(&content_blocks(content)),
+                            thread: *thread,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "channel_id": channel_id,
+                        "thread": thread,
+                        "message_id": message_id,
                     }),
-                },
-                AgentAction::DuckfsWriteText {
-                    path,
-                    text,
-                    base_snapshot,
-                } => Msg {
-                    target: self.files_target(),
-                    payload: files_encode_msg(&FilesMsg::Commit {
-                        base_snapshot,
-                        message: "agent duckfs.write_text".into(),
-                        changes: vec![FilesChange::Put {
-                            path,
-                            exec: false,
-                            meta: BTreeMap::new(),
-                            content: FilesContent::Inline {
-                                b64: STANDARD.encode(text.as_bytes()),
+                ))
+            }
+            Operation::TasksCreate { task_id, title } => {
+                let task_id = task_id.clone().unwrap_or_else(|| task_id_for(run_id, slot));
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.task_target(),
+                        // runs' own task creation stays owned by this module's
+                        // id ("runs"): the program call supplies the
+                        // authenticated account actor.
+                        payload: tasks_encode_msg(&TaskMsg::CreateTask {
+                            task_id: task_id.clone(),
+                            title: title.clone(),
+                            owner: None,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({"task_id": task_id}),
+                ))
+            }
+            Operation::TasksUpdateStatus { task_id, status } => {
+                let status_value =
+                    task_status(status).ok_or_else(|| format!("unknown task status: {status}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.task_target(),
+                        payload: tasks_encode_msg(&TaskMsg::UpdateStatus {
+                            task_id: task_id.clone(),
+                            status: status_value,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({"task_id": task_id, "status": status}),
+                ))
+            }
+            Operation::PagesComment { .. }
+            | Operation::PagesSetChecked { .. }
+            | Operation::PagesPost { .. }
+            | Operation::DuckfsWriteText { .. }
+            | Operation::ModulesUpdate(_)
+            | Operation::ForgeOpenPr { .. }
+            | Operation::CollaborationDeliver { .. }
+            | Operation::CollaborationAcknowledge { .. }
+            | Operation::AgentCall { .. }
+            | Operation::Submit { .. } => {
+                unreachable!("only conversational operations reach this lane")
+            }
+        }
+    }
+
+    /// A submit as the exact message the account's program will execute: the
+    /// module the target names, and the message's own JSON bytes — what a
+    /// member submitting the same message would put on the wire. Nothing is
+    /// probed: the module's verdict is the receipt's outcome.
+    pub(super) fn submit_msg(&self, operation: &Operation) -> Prepared {
+        let Operation::Submit { module, message } = operation else {
+            unreachable!("{} is not a submit", operation.name());
+        };
+        let name =
+            super::catalog::message_name(message).expect("a decoded submit names its message");
+        Prepared::new(
+            Msg {
+                target: module.clone(),
+                payload: sdk::wire::encode(message),
+            },
+            operation.name(),
+            serde_json::json!({"module": module, "message": name}),
+        )
+    }
+
+    /// apply the submits of a validated response — its own lane beside the
+    /// pages and duckfs lanes: each one is emitted verbatim, and the target
+    /// module's outcome lands in its receipt. never errors, never fails the
+    /// run.
+    pub(super) fn emit_submit_effects(&self, ctx: &mut dyn Ctx, operations: &[Operation]) {
+        for operation in operations {
+            if !matches!(operation, Operation::Submit { .. }) {
+                continue;
+            }
+            self.emit_prepared(ctx, self.submit_msg(operation));
+        }
+    }
+
+    /// One `collaboration.*` operation as the exact message the account's
+    /// program will execute, or the reason it cannot be composed.
+    ///
+    /// This composes bytes; it does not authorize them. The message carries no
+    /// actor field — collaboration reads the acting principal off
+    /// `Origin::Program(account)`, and admits the op only if the participant's
+    /// OWNER bound that account to that conversation under a live credential.
+    /// So the human's binding is what holds: this module composes the
+    /// action, and it can never confer it.
+    pub(super) fn collaboration_msg(&self, operation: &Operation) -> Result<Prepared, String> {
+        let Some(target) = self.collaboration.clone() else {
+            return Err(format!(
+                "{} needs a collaboration module, and this network wires none",
+                operation.name()
+            ));
+        };
+        // every op is bound to THIS network by name, so a signed or replayed
+        // payload cannot be re-submitted on another one.
+        let request = |op| collaboration::Request::new(self.chain_id.clone(), op);
+        match operation {
+            Operation::CollaborationDeliver {
+                channel_id,
+                message_id,
+                recipient,
+                kind,
+                expires_at,
+                task,
+                references,
+            } => {
+                let kind =
+                    message_kind(kind).ok_or_else(|| format!("unknown message kind: {kind}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target,
+                        payload: collaboration::encode_msg(&request(
+                            collaboration::CollaborationMsg::Deliver(
+                                collaboration::DeliverRequest {
+                                    channel_id: channel_id.clone(),
+                                    message_id: message_id.clone(),
+                                    recipient: recipient.clone(),
+                                    kind,
+                                    task: task.clone(),
+                                    references: references.clone(),
+                                    expires_at: *expires_at,
+                                },
+                            ),
+                        )),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                        "recipient": collaboration::party_handle(recipient),
+                    }),
+                ))
+            }
+            Operation::CollaborationAcknowledge {
+                channel_id,
+                participant,
+                credential,
+                seq,
+                state,
+                reason,
+            } => {
+                let delivery = reported_state(state)
+                    .ok_or_else(|| format!("unknown delivery state: {state}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target,
+                        payload: collaboration::encode_msg(&request(
+                            collaboration::CollaborationMsg::Acknowledge {
+                                channel_id: channel_id.clone(),
+                                seq: *seq,
+                                recipient: participant.clone(),
+                                binding_credential: *credential,
+                                state: delivery,
+                                reason: reason.clone(),
                             },
-                        }],
+                        )),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "channel_id": channel_id,
+                        "seq": seq,
+                        "state": state,
                     }),
-                },
-                // pages actions were already applied by `emit_pages_effects`
-                // (its own lane: probes, cap gate, per-action degrade).
-                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => continue,
-            };
-            ctx.emit_msg(msg);
+                ))
+            }
+            other => unreachable!("{} is not a collaboration operation", other.name()),
         }
     }
 
@@ -1259,26 +2064,21 @@ impl RunsModule {
             .clone()
             .expect("task actions were validated against a configured tasks module")
     }
-
-    fn files_target(&self) -> super::ModuleId {
-        self.files
-            .clone()
-            .expect("duckfs writes were validated against a configured files module")
-    }
 }
 
-fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Result<(), String> {
+/// the task id `tasks.create` mints when the caller supplies none: derived
+/// from the run and the action's lane slot like every other agent-minted id,
+/// so every replaying validator derives the same one.
+pub(super) fn task_id_for(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/task/{slot}", dispatch_id_for(run_id))
+}
+
+fn validate_duckfs_text_write(path: &str, text: &str) -> Result<(), String> {
     canonical_duckfs_path(path)?;
     if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
         return Err(format!(
             "duckfs.write_text content is {} bytes; the cap is {MAX_DUCKFS_WRITE_TEXT_BYTES}",
             text.len()
-        ));
-    }
-    if !agent.permits(&CapRequest::DuckfsWrite(path)) {
-        return Err(format!(
-            "agent {} may not write duckfs path {path}",
-            agent.agent_id
         ));
     }
     Ok(())
@@ -1287,49 +2087,20 @@ fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::{AgentStatus, ResourceCaps};
-
-    fn agent_with_write(prefix: &str) -> AgentRecord {
-        AgentRecord {
-            agent_id: "bot".into(),
-            owner: SagaOrigin::System,
-            display_name: "Bot".into(),
-            capability: "codex".into(),
-            allowed_actions: vec![agent::ACTION_DUCKFS_WRITE_TEXT.into()],
-            status: AgentStatus::Active,
-            role: agent::AgentRole::General,
-            created_at: 0,
-            updated_at: 0,
-            recipe_hash: Vec::new(),
-            caps: ResourceCaps {
-                duckfs_write: vec![prefix.into()],
-                ..Default::default()
-            },
-            skills: Vec::new(),
-        }
-    }
 
     #[test]
-    fn duckfs_text_write_validation_is_path_size_and_cap_gated() {
-        let agent = agent_with_write("/shared/agents/qa-fixer");
+    fn duckfs_text_write_validation_is_path_and_size_gated() {
         validate_duckfs_text_write(
-            &agent,
             "/shared/agents/qa-fixer/self-improvement/SKILL.md",
             "lesson",
         )
-        .expect("granted path");
+        .expect("an absolute path within the cap");
 
-        let sibling =
-            validate_duckfs_text_write(&agent, "/shared/agents/qa-fixer-policy/SKILL.md", "lesson")
-                .unwrap_err();
-        assert!(sibling.contains("may not write duckfs path"), "{sibling}");
-
-        let relative = validate_duckfs_text_write(&agent, "shared/out.txt", "lesson").unwrap_err();
+        let relative = validate_duckfs_text_write("shared/out.txt", "lesson").unwrap_err();
         assert!(relative.contains("path must be absolute"), "{relative}");
 
         let too_large = "x".repeat(MAX_DUCKFS_WRITE_TEXT_BYTES + 1);
         let oversized = validate_duckfs_text_write(
-            &agent,
             "/shared/agents/qa-fixer/self-improvement/SKILL.md",
             &too_large,
         )

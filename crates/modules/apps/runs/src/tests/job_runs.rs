@@ -63,7 +63,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
             .contains("Return ONLY a JSON object")
     );
     assert!(
-        conversation.contains("chat replies are not delivered for job runs"),
+        conversation.contains("replies are delivered to this job discussion"),
         "job framing rides along"
     );
 
@@ -71,7 +71,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
     assert_eq!(entry.job_id, Some("job-1".into()));
     assert_eq!(entry.job_claim_height, 3);
     assert_eq!(entry.agent_id, "duck");
-    assert_eq!(entry.requester, SagaOrigin::Module("jobs".into()));
+    assert_eq!(entry.requester, RunOrigin::Program(2));
 }
 
 #[test]
@@ -106,7 +106,6 @@ fn an_oversized_job_spec_is_left_unclaimed_by_the_payload_cap() {
 fn unknown_paused_or_foreign_kind_jobs_are_left_unclaimed() {
     let mut registry = job_registry();
     let mut m = module();
-    let root = m.root();
 
     // an unregistered agent kind: no claim, no dispatch, no entry.
     let mut ctx = CaptureCtx::new()
@@ -133,7 +132,6 @@ fn unknown_paused_or_foreign_kind_jobs_are_left_unclaimed() {
     exec(&mut m, &mut ctx, &jobs_event("j", "agent/duck", "s")).unwrap();
     assert!(ctx.msgs.is_empty());
     commit(&mut m);
-    assert_eq!(m.root(), root, "nothing moved the root");
     assert!(pending_runs(&m).is_empty());
 }
 
@@ -149,20 +147,8 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
     commit(&mut m);
     let run_id = job_run_id_for("job-1", "duck", 3);
 
-    let bytes = response(
-        &[],
-        vec![AgentAction::CreateTask {
-            task_id: "job-task".into(),
-            title: "complete job".into(),
-        }],
-    );
-    let inner = response_json(
-        &[],
-        vec![AgentAction::CreateTask {
-            task_id: "job-task".into(),
-            title: "complete job".into(),
-        }],
-    );
+    let bytes = response(&[], vec![create_task("job-task", "complete job")]);
+    let inner = response_json(&[], vec![create_task("job-task", "complete job")]);
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -177,6 +163,7 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
         vec![TaskMsg::CreateTask {
             task_id: "job-task".into(),
             title: "complete job".into(),
+            owner: None,
         }]
     );
     let finalize = ctx.job_msgs();
@@ -241,19 +228,25 @@ fn a_failed_job_result_finalizes_with_error_detail() {
     );
     assert_eq!(
         ctx.job_msgs(),
-        vec![JobsMsg::Finalize {
-            job_id: "job-1".into(),
-            ok: false,
-            payload: "model unavailable".into(),
-        }]
+        vec![
+            JobsMsg::Finalize {
+                job_id: "job-1".into(),
+                ok: false,
+                payload: "model unavailable".into(),
+            },
+            JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "job-1".into(),
+                comment_id: post_message_id(&run_id, "reply"),
+                text: "⚠ DUCK failed: model unavailable".into(),
+            }
+        ]
     );
 }
 
 #[test]
-fn a_job_response_with_reply_blocks_normalizes_to_actions_only() {
-    // job runs have no channel: normalization CLEARS reply blocks. a
-    // response left with neither blocks nor actions fails the run and
-    // finalizes the job as failed.
+fn a_job_response_posts_to_its_discussion_and_finalizes_successfully() {
+    // A text-only answer belongs to the job discussion and its result receipt.
     let registry = job_registry();
     let mut m = module();
     let mut ctx = CaptureCtx::new()
@@ -279,12 +272,15 @@ fn a_job_response_with_reply_blocks_normalizes_to_actions_only() {
 
     assert!(ctx.chat_msgs().is_empty(), "no chat post for a job run");
     let finalize = ctx.job_msgs();
-    assert_eq!(finalize.len(), 1);
+    assert_eq!(finalize.len(), 2);
+    assert!(
+        matches!(&finalize[1], JobsMsg::Comment { job_id, text, .. } if job_id == "job-1" && text == "chatty")
+    );
     let JobsMsg::Finalize { ok, payload, .. } = &finalize[0] else {
         panic!("expected a finalize");
     };
-    assert!(!*ok, "an empty normalized response fails the job run");
-    assert!(payload.contains("neither reply blocks nor actions"));
+    assert!(*ok, "a text-only answer completes the job");
+    assert!(payload.contains("chatty"));
     assert_eq!(get_pending(&m, &run_id), None);
 }
 
@@ -312,13 +308,7 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(response(
-                &[],
-                vec![AgentAction::CreateTask {
-                    task_id: "stale".into(),
-                    title: "late".into(),
-                }],
-            )),
+            Ok(response(&[], vec![create_task("stale", "late")])),
         ),
     )
     .unwrap();

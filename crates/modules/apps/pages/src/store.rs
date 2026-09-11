@@ -1,9 +1,10 @@
 use super::{
     BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS, MAX_PAGE_DEPTH,
-    MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_TRAVERSAL_WORK,
+    MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_PAGES, MAX_TRAVERSAL_WORK,
     MerkleStore, ModuleId, PAGE_INDEX_KEY, PageBlockPage, PageError, Pages, StagedStore,
     to_page_err,
 };
+use crate::comment_ops::{comment_key, target_index_key, thread_key};
 
 impl Pages {
     /// wrap the host-constructed store under module identity `id`. sync — the
@@ -12,13 +13,19 @@ impl Pages {
         Self {
             id: id.into(),
             staged: StagedStore::new(store),
-            tagging: None,
+            attribution: None,
+            identity: None,
         }
     }
 
-    /// Report newly-added comments to the shared engagement router.
-    pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
-        self.tagging = Some(tagging.into());
+    /// Publish every changed block and comment relation set to attribution.
+    pub fn with_attribution(mut self, attribution: impl Into<ModuleId>) -> Self {
+        self.attribution = Some(attribution.into());
+        self
+    }
+
+    pub fn with_identity(mut self, identity: impl Into<ModuleId>) -> Self {
+        self.identity = Some(identity.into());
         self
     }
 
@@ -77,16 +84,36 @@ impl Pages {
         root: Block,
     ) -> Result<Vec<Block>, PageError> {
         let mut reads = 0_usize;
-        let mut stack = vec![root];
+        let mut frontier = vec![root];
         let mut blocks = Vec::new();
-        while let Some(block) = stack.pop() {
-            take_traversal_work(&mut reads, 1, PageError::RemoveSubtreeTooLarge)?;
-            let thread_ids = self.load_target_index(&block.id).await?;
-            take_traversal_work(
-                &mut reads,
-                thread_ids.len(),
-                PageError::RemoveSubtreeTooLarge,
-            )?;
+        while !frontier.is_empty() {
+            // A guest resolves all missing records in a frontier with one
+            // replay. Sequential reads would repeatedly decode the entire
+            // already-visited tree and exhaust fuel on valid wide subtrees.
+            let mut keys = Vec::new();
+            for block in &frontier {
+                take_traversal_work(&mut reads, 1, PageError::RemoveSubtreeTooLarge)?;
+                take_traversal_work(
+                    &mut reads,
+                    block.children.len(),
+                    PageError::RemoveSubtreeTooLarge,
+                )?;
+                keys.push(target_index_key(&block.id).into_bytes());
+                keys.extend(block.children.iter().map(|child| child.as_bytes().to_vec()));
+            }
+            self.staged.prefetch(&keys).await.map_err(to_page_err)?;
+            let mut thread_ids = Vec::new();
+            for block in &frontier {
+                let ids = self.load_target_index(&block.id).await?;
+                take_traversal_work(&mut reads, ids.len(), PageError::RemoveSubtreeTooLarge)?;
+                thread_ids.extend(ids);
+            }
+            let keys: Vec<_> = thread_ids
+                .iter()
+                .map(|id| thread_key(id).into_bytes())
+                .collect();
+            self.staged.prefetch(&keys).await.map_err(to_page_err)?;
+            let mut comment_keys = Vec::new();
             for thread_id in thread_ids {
                 let Some(thread) = self.load_thread(&thread_id).await? else {
                     continue;
@@ -96,16 +123,25 @@ impl Pages {
                     thread.comment_ids.len(),
                     PageError::RemoveSubtreeTooLarge,
                 )?;
+                comment_keys.extend(
+                    thread
+                        .comment_ids
+                        .iter()
+                        .map(|id| comment_key(id).into_bytes()),
+                );
             }
-            take_traversal_work(
-                &mut reads,
-                block.children.len(),
-                PageError::RemoveSubtreeTooLarge,
-            )?;
-            for child in block.children.iter().rev() {
-                stack.push(self.require_block(child, PageError::Corrupt).await?);
+            self.staged
+                .prefetch(&comment_keys)
+                .await
+                .map_err(to_page_err)?;
+            let mut next = Vec::new();
+            for block in &frontier {
+                for child in &block.children {
+                    next.push(self.require_block(child, PageError::Corrupt).await?);
+                }
             }
-            blocks.push(block);
+            blocks.append(&mut frontier);
+            frontier = next;
         }
         Ok(blocks)
     }
@@ -159,6 +195,9 @@ impl Pages {
     ) -> Result<(), PageError> {
         let mut index = self.load_index().await.map_err(to_page_err)?;
         if !index.contains_key(page_id) {
+            if index.len() >= MAX_PAGES {
+                return Err(PageError::TooManyPages);
+            }
             index.insert(page_id.to_string(), parent);
             self.stage_index(&index)?;
         }

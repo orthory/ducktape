@@ -2,8 +2,9 @@
 
 A **capability spec** is a TOML file that teaches a Ducktape node how to run
 one executor — an installed CLI that can turn a prompt into text. Everything
-the node needs is in the file: how to detect the binary, the exact argv to
-invoke it, and how to parse its output. **Adding an executor is a config
+the node needs is in the file: how to detect the binary, where its Linux
+build comes from, the exact argv to invoke it, and how to parse its output.
+**Adding an executor is a config
 change, never a code change** — the embedded built-ins are themselves spec
 files globbed out of `crates/services/provider/specs/` at build time; no
 Rust source names an executor.
@@ -93,12 +94,10 @@ Specs load in two passes:
    (globbed by `build.rs`, sorted by file name). These parse through the
    exact same code path as operator files and serve as the reference
    examples.
-2. **Operator directory** — every `*.toml` in:
-   - `$DUCKTAPE_CAPABILITY_DIR` if set. Pointing this at a missing directory
-     is a **hard error** (you asked for a dir that isn't there);
-   - otherwise `<ducktape home>/capabilities` (`$DUCKTAPE_HOME` when set,
-     else `~/.ducktape`), only if it exists (absent default simply means "no
-     operator specs").
+2. **Workspace directory** — every `*.toml` in `<workspace>/capabilities`
+   (`workspace_config::capability_dir`), only if it exists (an absent
+   directory simply means "no operator specs"). Per workspace: two networks
+   on one host offer two spec sets.
 
 **Override rule:** an operator spec whose `tag` matches a built-in **replaces
 it wholesale** — there is no field-level merging; the spec file is the unit of
@@ -172,8 +171,8 @@ hard_timeout_factor = 36
 #   "jsonl-events" — a JSONL event stream; the LAST agent_message item wins;
 #                    tolerates both item shapes seen in the wild and skips
 #                    non-JSON noise lines.
-#   "json-result"  — a single {"type":"result",...} object; an is_error
-#                    result is surfaced as the error it is.
+#   "json-result"  — a {"type":"result",...} object, alone or the last
+#                    result in a JSONL stream; is_error surfaces as an error.
 #   "text"         — raw stdout, trimmed. THE GENERIC ESCAPE HATCH: any CLI
 #                    that prints the answer plainly works with zero code.
 #                    empty output on a zero exit is an error ("ran fine,
@@ -201,6 +200,7 @@ fake CLI.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
+| `[source]` | table | no | the vendor release channel `ducktape agent install` resolves the latest build from — see [Source](#source--where-the-executable-comes-from) |
 | `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
@@ -223,6 +223,17 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 | `bin` | string | yes | non-empty; probed on `PATH` |
 | `env` | string | no | env var naming an explicit binary path; override wins, broken override = warn + absent |
 | `companions` | string array | no (default `[]`) | required executable sibling file names; each is mounted beside `bin` in sandbox guests, and a missing one makes the capability absent |
+
+### `[source]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `kind` | string | yes | `"claude-releases"` \| `"github-release"`; the rest of the table is that kind's fields, any other field is unknown |
+| `base` | string | `claude-releases` | https url of the feed: `<base>/latest`, `<base>/<version>/manifest.json`, `<base>/<version>/<platform>/<bin>`; `detect.companions` must be empty |
+| `repo` | string | `github-release` | `owner/name` |
+| `asset` | string | `github-release` | the release's gzipped-tar asset name, with `{arch}` where the Rust triple's arch goes (`x86_64` \| `aarch64`) |
+| `sums` | string | `github-release` | the release's sha256 sums file, `<hex>  <asset>` per line |
+| `members` | string array | `github-release` | archive paths of exactly `detect.bin` and every `detect.companions` entry |
 
 ### `[invoke]`
 
@@ -258,6 +269,41 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 |---|---|---|---|
 | `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
 | `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
+
+---
+
+## Source — where the executable comes from
+
+`[source]` names the vendor channel the executor's **Linux build** comes
+from, which is what makes `ducktape agent install <tag>` able to fill the
+workspace's `executors/` directory with it. The verb resolves the channel's
+**latest** release at install time, downloads that release's artifact for the
+guest's arch, verifies it against the checksum the vendor publishes **for
+that release**, lifts the declared files into the directory and writes a
+receipt (`<workspace>/executors.toml`: the version installed and the sha256
+of the bytes written). No version and no hash is written down ahead of time,
+in a spec or in Rust: what installs is whatever is current when the operator
+approves it, and a receipt behind the channel's latest is offered as a bump on
+the next install.
+
+Two channel kinds exist:
+
+- `claude-releases` — Anthropic's feed: `<base>/latest` is the version,
+  `<base>/<version>/manifest.json` carries `platforms.<platform>.checksum`,
+  and `<base>/<version>/<platform>/<detect.bin>` is the executable itself
+  (`linux-x64` | `linux-arm64`). A single binary, so the spec declares no
+  companions.
+- `github-release` — a GitHub release: `releases/latest` names the tag,
+  `asset` (with `{arch}` filled in) is a gzipped tar the release publishes a
+  `sums` file beside, and `members` are the archive paths to lift. The
+  members' file names must be exactly `detect.bin` plus `detect.companions`:
+  a source that delivered fewer would leave a declared companion missing, and
+  one that delivered more would bake an undeclared executable into the guest
+  image.
+
+A spec with no `[source]` is still a complete executor: the operator puts the
+Linux build in the executors directory themselves, and `agent install`
+reports it as their own.
 
 ---
 
@@ -311,7 +357,7 @@ Ducktape MCP server — without making every argv in the file repeat them:
 
 ```toml
 [tools]
-args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
+args = ["-c", 'mcp_servers.ducktape.command="ducktape"', "-c", 'mcp_servers.ducktape.args=["mcp"]']
 ```
 
 - **Insertion is immediately after `args[0]`, never at the end.** An argv
@@ -328,12 +374,16 @@ args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
   built-in replaces its `[tools]` too. A `[tools]` section with no `args` is
   a hard error, like every other section that would do nothing.
 
-The binary a `[tools]` argv names (`ducktape-mcp` in the built-ins) is resolved
+The binary a `[tools]` argv names (`ducktape`, with `mcp` as its argument) is resolved
 from the **run's `PATH`** — the provisioner puts its directory there — so specs
 name no absolute path and stay portable across hosts. Claude's built-in also
 passes `--allowedTools mcp__ducktape`: in `-p` print mode there is no human to
 approve a tool call, so an unapproved MCP call is a denial and a merely
-*configured* server would be dead weight.
+*configured* server would be dead weight. Headless Claude invocation also allows
+shell and file tools inside the microVM, so builds need no permission prompt.
+Interactive and restricted invocation keep their separate arguments. Claude streams verbose
+JSON events and the provider extracts its terminal result. Events refresh the
+idle budget and count toward the same 4 MiB output bound as other providers.
 
 ---
 
@@ -395,7 +445,6 @@ model actually supports, so the codex side is not a rectangle), and `claude`
 
 | Variable | Effect |
 |---|---|
-| `DUCKTAPE_CAPABILITY_DIR` | operator spec directory (explicit; missing dir = boot error) |
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
 

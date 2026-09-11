@@ -9,10 +9,10 @@
 //! record, so authorship stays origin-derived (a chat follow-up would be
 //! attributed to the forge module, not the opening user).
 //!
-//! authorship reuses chat's [`AuthorRef`] so the app renders forge authors
+//! authorship reuses chat's [`Party`] so the app renders forge authors
 //! through the exact same display-name path as chat messages.
 
-use chat::AuthorRef;
+use chat::Party;
 use serde::{Deserialize, Serialize};
 
 // ---- write-time caps (consensus constants) ---------------------------------
@@ -35,6 +35,18 @@ pub const MAX_PATH_BYTES: usize = 512;
 pub const MAX_REFS_PER_PUSH: usize = 32;
 /// reviews per PR; further submissions are rejected.
 pub const MAX_REVIEWS_PER_ITEM: usize = 256;
+/// OPEN issues + PRs a repo may hold at once (they share one number space, so
+/// one ceiling covers both). closing or merging an item frees its slot —
+/// there is no delete op, so this is the whole of the defense against an
+/// unbounded number of live items.
+pub const MAX_OPEN_ITEMS_PER_REPO: usize = 4096;
+/// one actor's share of [`MAX_OPEN_ITEMS_PER_REPO`]: no single account may
+/// hold more than this many OPEN items in one repo, so the repo cap cannot be
+/// filled by one account crowding out everyone else.
+pub const MAX_OPEN_ITEMS_PER_ACTOR: usize = 256;
+/// branches one repo may hold at once. deletes are always allowed, so this is
+/// a ceiling on live branches, not on a repo's history.
+pub const MAX_BRANCHES_PER_REPO: usize = 1024;
 
 /// an item's lifecycle state. `Merged` is PR-only and terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +104,7 @@ pub struct ReviewComment {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewView {
-    pub author: AuthorRef,
+    pub author: Party,
     pub verdict: ReviewVerdict,
     pub body: String,
     /// the PR source head hex (40-char sha1) the review was made against —
@@ -110,7 +122,7 @@ pub struct ItemSummary {
     pub kind: ItemKind,
     pub title: String,
     pub state: ItemState,
-    pub author: AuthorRef,
+    pub author: Party,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -182,7 +194,7 @@ mod tests {
                 kind: ItemKind::Pr,
                 title: "t".into(),
                 state: ItemState::Open,
-                author: AuthorRef::User(vec![1; 4]),
+                author: Party::Key(vec![1; 4]),
                 created_at: 10,
                 updated_at: 11,
             },
@@ -192,7 +204,7 @@ mod tests {
             target_branch: Some("main".into()),
             merge_oid: None,
             reviews: vec![ReviewView {
-                author: AuthorRef::User(vec![2; 4]),
+                author: Party::Key(vec![2; 4]),
                 verdict: ReviewVerdict::Approve,
                 body: "lgtm".into(),
                 commit_oid: "a".repeat(40),

@@ -9,7 +9,6 @@ pub struct SettingsFacts {
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
-    pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
     /// `ChatMember.key` is `member_id(..)` at full width, and the account card
     /// carries an account NUMBER, not a key, so neither the account card nor
@@ -20,23 +19,19 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-/// Load the settings facts: the local user key's location and state, the
-/// workspace directory, and the persisted tab count.
+/// Load the settings facts: the local user key's location and state, and the
+/// workspace directory.
 pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
     async {
-        // the launch window's `user_key_state` reading, on the same file: one
+        // the launch window's key-state reading, on the same file: one
         // classifier, so Settings and the wallet list cannot disagree about it.
-        let (key_path, key_state) = match user_key_path() {
+        let (key_path, key_state) = match session_key_path(&rpc) {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
-            Ok(path) => {
-                let state = keystore::userkey::key_file_state(&path);
-                (path.display().to_string(), state.as_str().to_string())
-            }
+            Ok(path) => (path.display().to_string(), key_state_of(&path)),
         };
-        let tabs = load_doc_tabs(rpc.clone()).await;
         let data_dir = workspace_at(&rpc)
             .map(|(_, dir)| dir.display().to_string())
             .or_else(|| ducktape_home().map(|home| home.display().to_string()))
@@ -46,7 +41,6 @@ pub async fn load_settings_facts(
             key_path,
             key_state,
             data_dir,
-            open_tabs: count_i64(tabs.len()),
             user_key: local_user_key()
                 .await
                 .map(|key| hex_encode(&key))
@@ -58,11 +52,6 @@ pub async fn load_settings_facts(
         generation,
         message: user_error(message),
     })
-}
-
-/// Forget this endpoint's persisted doc tabs.
-pub async fn clear_doc_tabs(rpc: String) -> bool {
-    save_doc_tabs(rpc, Vec::new()).await
 }
 
 /// One log line for the operator pane.
@@ -178,10 +167,12 @@ pub fn node_log_timeline_apply(
     state
 }
 
-pub fn node_log_timeline<'a>(
-    state: &'a NodeLogTimelineState,
-    source: &'a str,
-) -> iced::Element<'a, NodeLogTimelineEvent> {
+/// The ring as the Node tab's slot paints it — owned, because the slot is a
+/// host surface that outlives the call that drew it.
+pub fn node_log_timeline(
+    state: NodeLogTimelineState,
+    source: String,
+) -> iced::Element<'static, NodeLogTimelineEvent> {
     use iced::widget::{Space, button, column, container, row, text};
     use iced::{Border, Color, Font, Length};
     use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
@@ -192,22 +183,36 @@ pub fn node_log_timeline<'a>(
         family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
         ..Font::DEFAULT
     };
-    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
-        text("LIVE")
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.success)
-            .into()
-    } else {
-        button(
-            text(format!("RESUME · {} NEW", inspection.unread_count))
-                .size(10)
-                .font(mono),
-        )
-        .padding([3, 7])
-        .on_press(LogTimelineEvent::ResumeTail)
-        .into()
+    // ALWAYS A BUTTON, NEVER A BUTTON-OR-A-TEXT. A `button` carries widget
+    // state and a `text` carries none, so alternating the two at one position
+    // hands iced a state slot whose type changed under it — `Tree`'s downcast
+    // then aborts the process (`iced_core widget/tree.rs`), and this position
+    // flips the moment a line arrives while the reader is scrolled back. The
+    // resting state is the same button with no `on_press`, which is how iced
+    // spells "not pressable", and the label carries the difference.
+    let following_tail = inspection.following_tail;
+    let tail_label = match following_tail {
+        true => "LIVE".to_owned(),
+        false => format!("RESUME · {} NEW", inspection.unread_count),
     };
+    let tail_color = match following_tail {
+        true => DARK.palette.success,
+        false => DARK.palette.foreground,
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> =
+        button(text(tail_label).size(10).font(mono).color(tail_color))
+            .padding([3, 7])
+            .style(move |theme, status| match following_tail {
+                // resting: the word IS the status, so it wears no chrome
+                true => button::Style {
+                    background: None,
+                    text_color: DARK.palette.success,
+                    ..button::text(theme, status)
+                },
+                false => button::secondary(theme, status),
+            })
+            .on_press_maybe((!following_tail).then_some(LogTimelineEvent::ResumeTail))
+            .into();
     let header = row![
         text("NODE LOG")
             .size(10)
@@ -222,65 +227,70 @@ pub fn node_log_timeline<'a>(
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
-    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
-        let message = if state.lines.is_empty() {
-            "Waiting for the node's log ring…"
-        } else {
-            "No lines match this filter."
-        };
+    // THE LIST IS ALWAYS MOUNTED, and the empty note rides ON it rather than
+    // instead of it. `log_timeline` is a stateful virtual list and the note is
+    // a plain container: swapping one for the other at this position is the
+    // crash above, and this position swaps the FIRST time a line arrives —
+    // which is every visit to this tab. A stack keeps both children present
+    // with stable types; the note draws nothing when its text is empty.
+    let empty_note = match (state.visible.is_empty(), state.lines.is_empty()) {
+        (false, _) => "",
+        (true, true) => "Waiting for the node's log ring…",
+        (true, false) => "No lines match this filter.",
+    };
+    let timeline: iced::Element<'static, NodeLogTimelineEvent> = log_timeline(
+        &state.timeline,
+        &state.visible,
+        node_log_timeline_config(),
+        "Node log",
+        |line| line.cursor.clone(),
+        |line| line.line.clone(),
+        |_, line, _selected| {
+            let parts = split_log_line(line.line.clone());
+            let level_color = match parts.level.as_str() {
+                "ERROR" => DARK.palette.destructive,
+                "WARN" => DARK.palette.warning,
+                "INFO" => DARK.palette.success,
+                "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
+                _ => Color::TRANSPARENT,
+            };
+            row![
+                // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
+                // need ~158 px; 150 let the tail paint over the level.
+                text(parts.time)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.muted_foreground)
+                    .width(170),
+                text(parts.level)
+                    .size(11)
+                    .font(mono)
+                    .color(level_color)
+                    .width(48),
+                text(parts.message)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.foreground),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        },
+        |event| event,
+        &DARK,
+    );
+    let body = iced::widget::stack![
+        timeline,
         container(
-            text(message)
+            text(empty_note)
                 .size(12)
                 .font(mono)
                 .color(DARK.palette.muted_foreground),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-    } else {
-        log_timeline(
-            &state.timeline,
-            &state.visible,
-            node_log_timeline_config(),
-            "Node log",
-            |line| line.cursor.clone(),
-            |line| line.line.clone(),
-            |_, line, _selected| {
-                let parts = split_log_line(line.line.clone());
-                let level_color = match parts.level.as_str() {
-                    "ERROR" => DARK.palette.destructive,
-                    "WARN" => DARK.palette.warning,
-                    "INFO" => DARK.palette.success,
-                    "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
-                    _ => Color::TRANSPARENT,
-                };
-                row![
-                    // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
-                    // need ~158 px; 150 let the tail paint over the level.
-                    text(parts.time)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.muted_foreground)
-                        .width(170),
-                    text(parts.level)
-                        .size(11)
-                        .font(mono)
-                        .color(level_color)
-                        .width(48),
-                    text(parts.message)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.foreground),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center)
-                .into()
-            },
-            |event| event,
-            &DARK,
-        )
-    };
+        .center_y(Length::Fill),
+    ];
     container(column![header, body].spacing(10))
         .width(Length::Fill)
         .height(Length::Fill)
@@ -404,7 +414,10 @@ pub fn split_log_line(line: String) -> LogParts {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (trim_time_to_millis(first), fields.next().unwrap_or_default()),
+        true => (
+            trim_time_to_millis(first),
+            fields.next().unwrap_or_default(),
+        ),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -713,7 +726,7 @@ pub fn optional_number(value: Option<i64>) -> String {
 /// every peer and call it theirs. `role` is the standing the peers view does
 /// carry (`validator` / `resident`), absent on a lane that cannot read the
 /// valset — and absent renders as nothing, which is the honest answer.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PeerRow {
     pub key: String,
     pub role: String,
@@ -890,7 +903,7 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
 /// verification badge, an install count and a catalog description exist in no
 /// module, no index and no manifest. This is the INSTALLED/RUNTIME truth —
 /// what is registered, at which code, with which swap pending.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ModuleRow {
     pub id: String,
     /// `workspace` | `developer` | `automation` | `system` — the presentation
@@ -899,7 +912,7 @@ pub struct ModuleRow {
     /// The module's own state root, short form.
     pub root: String,
     /// The active component's sha256, short form. Empty when this network runs
-    /// no lifecycle module (the daemon's default set does not).
+    /// no modules registry (the daemon's default set does not).
     pub code_hash: String,
     /// The scheduled swap's target hash, short form; empty when none is armed.
     pub pending_hash: String,
@@ -917,11 +930,11 @@ pub struct ModulesData {
 }
 
 /// The registered module set: `/v1/status` publishes id, root and category for
-/// every module, and the lifecycle module (where a network runs one) adds the
+/// every module, and the modules registry (where a network runs one) adds the
 /// active code hash and any armed swap.
 ///
-/// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
-/// set has no `lifecycle`, and a network without one still has a real,
+/// The registry half is BEST EFFORT on purpose — the daemon's default module
+/// set has no `modules`, and a network without one still has a real,
 /// complete registered set to show.
 pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     async {
@@ -935,13 +948,13 @@ pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
             .into_iter()
             .map(|module| {
                 let id = module["id"].as_str().unwrap_or_default().to_string();
-                let lifecycle = code.get(&id);
+                let registry = code.get(&id);
                 let pending =
-                    lifecycle.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
+                    registry.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
                 ModuleRow {
                     category: module["category"].as_str().unwrap_or_default().to_string(),
                     root: short_digest(module["root"].as_str().unwrap_or_default()),
-                    code_hash: lifecycle
+                    code_hash: registry
                         .map(|entry| {
                             short_digest(&hex_encode(&json_bytes(&entry["active_code_hash"])))
                         })
@@ -977,9 +990,9 @@ mod module_row_tests {
 
     /// the Modules row's readiness flag keys on `ScheduledSwap.ready_at` —
     /// the block the latch closed in, `null` until then. the literal is the
-    /// real `lifecycle::interface::{ModuleCode, ScheduledSwap}` serde field
+    /// real `modules::interface::{ModuleCode, ScheduledSwap}` serde field
     /// set (both `deny_unknown_fields`); this crate cannot decode the typed
-    /// struct (no `lifecycle` dependency), so the field names are pinned here.
+    /// struct (no `modules` dependency), so the field names are pinned here.
     #[test]
     fn a_pending_swap_is_ready_once_ready_at_is_set() {
         let entry = |ready_at: serde_json::Value| {
@@ -1005,11 +1018,11 @@ mod module_row_tests {
     }
 }
 
-/// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
-/// runs no lifecycle module.
+/// `ModulesQuery::ModuleStatus` keyed by module id, empty when this network
+/// runs no modules registry.
 async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::Value> {
     let Ok(reply) = client
-        .query::<_, serde_json::Value>("lifecycle", &serde_json::json!("module_status"))
+        .query::<_, serde_json::Value>("modules", &serde_json::json!("module_status"))
         .await
     else {
         return BTreeMap::new();
@@ -1026,22 +1039,62 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One registered agent, rendered from its registry record and live-run fact.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One curated skill as the record carries it: a duckfs subtree, pinned at a
+/// snapshot or tracking the committed head (an empty `source_snapshot`), and
+/// whether its body is the agent's persona (`always`) or read on demand.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentSkill {
+    pub name: String,
+    pub source_prefix: String,
+    pub source_snapshot: String,
+    pub always: bool,
+}
+
+impl From<runs::SkillRef> for AgentSkill {
+    fn from(skill: runs::SkillRef) -> Self {
+        Self {
+            name: skill.name,
+            source_prefix: skill.source_prefix,
+            source_snapshot: skill.source_snapshot.unwrap_or_default(),
+            always: matches!(skill.load, runs::LoadMode::Always),
+        }
+    }
+}
+
+impl From<AgentSkill> for runs::SkillRef {
+    fn from(skill: AgentSkill) -> Self {
+        let pinned = !skill.source_snapshot.is_empty();
+        Self {
+            name: skill.name,
+            source_prefix: skill.source_prefix,
+            source_snapshot: pinned.then_some(skill.source_snapshot),
+            load: if skill.always {
+                runs::LoadMode::Always
+            } else {
+                runs::LoadMode::OnDemand
+            },
+        }
+    }
+}
+
+/// One configured model: its record, whole, with its live-run fact.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// the external key shortened for display, else the origin's variant tag.
+    /// The current controller of the model's programmable account, by name.
     pub owner_handle: String,
+    /// That controller's account number, decimal: the one principal whose
+    /// signature may change this record.
+    pub controller: String,
     /// this agent holds a RUN in flight right now — the runs module's pending
-    /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
+    /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub skill_count: i64,
-    pub cap_count: i64,
+    pub skills: Vec<AgentSkill>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1050,71 +1103,60 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// The owner origin rendered as a handle. An external origin carries raw key
-/// bytes; a module/system origin reads as its own name.
-fn agent_owner_handle(owner: &serde_json::Value) -> String {
-    let Some(tagged) = owner.as_object() else {
-        return owner.as_str().unwrap_or_default().to_string();
-    };
-    let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
-    };
-    if variant != "external" {
-        return payload.as_str().unwrap_or(variant.as_str()).to_string();
-    }
-    short_label(&hex_encode(&json_bytes(payload)))
-}
-
-/// Load the agent roster from the canonical registry.
+/// Load model configurations with current account controllers and run activity.
+/// The model's registration origin does not change when control transfers.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
-        let working = agents_with_a_run_in_flight(&client).await;
-        let agents = reply["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let reply: runs::RunsReply = client
+            .query(
+                "runs",
+                &runs::RunsQuery::Model {
+                    query: runs::ModelQuery::Agents,
+                },
+            )
+            .await?;
+        let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
+            return Err("the runs module returned the wrong model roster reply".into());
+        };
+        let (accounts, working) = tokio::join!(
+            read_accounts(&client),
+            agents_with_a_run_in_flight(&client)
+        );
+        let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
-            .map(|record| {
-                let status = tagged_name(&record["status"]);
-                let owner_handle = agent_owner_handle(&record["owner"]);
-                let name = record["display_name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                let caps = &record["caps"];
-                let has_subagent_grant = caps["subagent_budget"].as_i64().unwrap_or(0) > 0;
-                let cap_count = [
-                    "forge_read",
-                    "forge_push",
-                    "duckfs_read",
-                    "duckfs_write",
-                    "tools",
-                    "secrets",
-                    "pages_write",
-                ]
-                .into_iter()
-                .map(|field| caps[field].as_array().map_or(0, Vec::len))
-                .sum::<usize>()
-                    + usize::from(has_subagent_grant);
-                let id = record["agent_id"].as_str().unwrap_or_default().to_string();
-                AgentRow {
-                    live: working.contains(&id),
-                    initials: initials_of(&name),
-                    capability: record["capability"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    skill_count: count_i64(record["skills"].as_array().map_or(0, Vec::len)),
-                    cap_count: count_i64(cap_count),
-                    id,
-                    name,
-                    status,
-                    owner_handle,
-                }
+            .filter_map(|account| match account.control {
+                identity::Control::Program { controller, .. }
+                | identity::Control::Revoked { controller } => Some((account.number, controller)),
+                identity::Control::Keys => None,
             })
             .collect();
+        let names = names();
+        let agents = records
+            .into_iter()
+            .map(|record| {
+                let status = match record.status {
+                    runs::ModelStatus::Active => "active",
+                    runs::ModelStatus::Paused => "paused",
+                }
+                .to_string();
+                let controller = controllers
+                    .get(&record.account)
+                    .ok_or_else(|| "the model account has no program controller".to_string())?;
+                let owner_handle = author_display(&format!("acct:{controller}"), &names);
+                Ok(AgentRow {
+                    live: working.contains(&record.agent_id),
+                    initials: initials_of(&record.display_name),
+                    capability: record.capability,
+                    id: record.agent_id,
+                    name: record.display_name,
+                    status,
+                    owner_handle,
+                    controller: controller.to_string(),
+                    skills: record.skills.into_iter().map(AgentSkill::from).collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(AgentsData { generation, agents })
     }
     .await
@@ -1143,72 +1185,6 @@ async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether any agent is engaging work right now — the rail's Forge pulse dot.
-pub fn any_agent_active(rows: &[AgentRow]) -> bool {
-    rows.iter().any(|row| row.live)
-}
-
-/// One agent run indexed by workspace search.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct RunRow {
-    pub run_id: String,
-    pub agent_id: String,
-    pub outcome: String,
-    /// A consensus counter (the creation block), NOT a unix stamp — render it
-    /// with `height_ago`/`height_label_short`, never with `relative_time`.
-    pub created_at: i64,
-}
-
-/// Pending runs first, then the delivered ring newest-first. Two queries because
-/// the runs module keeps in-flight correlation and settled history separate.
-pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        // Two independent reads of one module, awaited one after the other. On a
-        // cold `runs` module the first touch measured 54 s on this box, so the
-        // serial pair was two ceilings deep for no ordering reason.
-        let ask_pending = serde_json::json!("pending_runs");
-        let ask_recent = serde_json::json!("recent_runs");
-        let (pending, recent) = tokio::join!(
-            client.query::<_, serde_json::Value>("runs", &ask_pending),
-            client.query::<_, serde_json::Value>("runs", &ask_recent),
-        );
-        let pending = pending?;
-        let recent = recent?;
-        let mut runs: Vec<RunRow> = pending["pending_runs"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|record| RunRow {
-                run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                outcome: "running".into(),
-                created_at: record["created_at"].as_i64().unwrap_or(0),
-            })
-            .collect();
-        runs.extend(
-            recent["recent_runs"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|record| {
-                    let outcome = tagged_name(&record["outcome"]);
-                    RunRow {
-                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                        created_at: record["created_at"].as_i64().unwrap_or(0),
-                        outcome,
-                    }
-                }),
-        );
-        Ok(runs)
-    }
-    .await
-    .map_err(app_error)
-}
-
 /// Pause or resume one agent — owner-gated at the module, not quorum-gated.
 pub async fn set_agent_status(
     rpc: String,
@@ -1219,19 +1195,136 @@ pub async fn set_agent_status(
     async {
         let agent_id = required_id(agent_id, "agent")?;
         let rpc = rpc_client(&rpc)?;
-        // `AgentMsg` is snake_case-tagged serde over `sdk::wire` (plain JSON);
-        // the app does not depend on the agent crate, so the two owner-gated
-        // verbs are written as their wire form.
-        let verb = match paused {
-            true => "pause_agent",
-            false => "resume_agent",
+        let operation = match paused {
+            true => runs::ModelMsg::PauseModel { agent_id },
+            false => runs::ModelMsg::ResumeModel { agent_id },
         };
-        let payload = serde_json::json!({ verb: { "agent_id": agent_id } });
-        signed_write(&rpc, "agent", encode_wire(&payload), password).await
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
     }
     .await
     .map_err(app_error)?;
     Ok(true)
+}
+
+/// The editor's record as the Agents view hands it back: every field the
+/// controller may set, in one piece. The view holds the drafts; this is what
+/// leaves it with the save.
+#[derive(Debug, serde::Deserialize)]
+pub struct AgentDraft {
+    pub agent_id: String,
+    pub display_name: String,
+    pub capability: String,
+    pub skills: Vec<AgentSkill>,
+}
+
+impl AgentDraft {
+    fn decode(draft: &str) -> Result<Self, String> {
+        serde_json::from_str(draft)
+            .map_err(|error| format!("the agent draft does not decode: {error}"))
+    }
+}
+
+/// Bring a new agent into the register: provision its keyless program account
+/// under the signing account (`controller`, the wallet's own account number),
+/// read that account back, and register the draft against it. Two committed
+/// writes and one read, in order; the first write is a full block, so the
+/// read never runs ahead of it.
+pub async fn register_agent(
+    rpc: String,
+    password: String,
+    controller: String,
+    draft: String,
+) -> Result<bool, AppError> {
+    async {
+        let draft = AgentDraft::decode(&draft)?;
+        let controller: u64 = controller.parse().map_err(|_| {
+            "registering an agent needs an account to control it — create one in Settings first"
+                .to_string()
+        })?;
+        runs::validate_agent_id(&draft.agent_id)?;
+        let display_name = draft.display_name.trim().to_owned();
+        if display_name.is_empty() {
+            return Err("give the agent a display name".to_string());
+        }
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "agent",
+            ::agent::encode_msg(&::agent::AgentMsg::Provision {
+                name: display_name.clone(),
+                program: runs::model_program(&draft.agent_id),
+            }),
+            password.clone(),
+        )
+        .await?;
+        let account = newest_program_account(&rpc, controller, &display_name).await?;
+        let operation = runs::ModelMsg::RegisterModel {
+            account,
+            agent_id: draft.agent_id,
+            display_name,
+            capability: draft.capability,
+            recipe_hash: None,
+            skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
+        };
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The highest-numbered agent-executed program account named `name` under
+/// `controller`. Accounts are numbered upward with no gaps, so after a
+/// provision the newest match IS the account it minted, whatever older
+/// accounts share the name.
+async fn newest_program_account(
+    rpc: &RpcClient,
+    controller: u64,
+    name: &str,
+) -> Result<u64, String> {
+    let page_limit =
+        usize::try_from(identity::MAX_QUERY_LIMIT).expect("the identity page cap fits a usize");
+    let mut newest = None;
+    let mut from: identity::AccountNumber = 0;
+    loop {
+        let reply: identity::IdentityReply = rpc
+            .query(
+                "identity",
+                &identity::IdentityQuery::Controlled {
+                    by: controller,
+                    from,
+                    limit: identity::MAX_QUERY_LIMIT,
+                },
+            )
+            .await?;
+        let identity::IdentityReply::Accounts(page) = reply else {
+            return Err("the identity module returned the wrong reply".to_string());
+        };
+        let page_is_last = page.len() < page_limit;
+        let Some(last) = page.last().map(|account| account.number) else {
+            break;
+        };
+        let runs_agent_program = |account: &identity::AccountView| {
+            matches!(
+                &account.control,
+                identity::Control::Program { executor, .. } if executor == "agent"
+            )
+        };
+        newest = page
+            .iter()
+            .filter(|account| account.name == name && runs_agent_program(account))
+            .map(|account| account.number)
+            .max()
+            .or(newest);
+        if page_is_last {
+            break;
+        }
+        from = last + 1;
+    }
+    newest
+        .ok_or_else(|| format!("the program account for {name:?} was not found after provisioning"))
 }
 
 /// The local account picture: whether the local user key belongs to an
@@ -1264,7 +1357,7 @@ impl AccountData {
 
 /// One key association as the settings card lists it: the scheme token the
 /// CLI prints, the hex key, the label ("" when none) and the admission time.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AccountKeyRow {
     pub scheme: String,
     pub pubkey: String,
@@ -1302,7 +1395,9 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             .await?;
         let account = match reply {
             identity::IdentityReply::Account(account) => account,
-            identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -1342,15 +1437,6 @@ pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
 /// Test seam: Ice reads extern structs but cannot construct one.
 pub fn account_data_none(generation: i64) -> AccountData {
     AccountData::none(generation)
-}
-
-/// A network pick's gate: no password means a read-only session with no key
-/// to probe an account for — the console opens outright.
-pub fn pick_gate(password: &str) -> crate::PickGate {
-    match password.is_empty() {
-        true => crate::PickGate::ReadOnly,
-        false => crate::PickGate::Probe,
-    }
 }
 
 /// The probe's answer as the discriminant the launch window branches on.
@@ -1482,14 +1568,23 @@ async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
         .await?;
     match reply {
         identity::IdentityReply::Gen(generation) => Ok(generation),
-        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
+        identity::IdentityReply::Account(_)
+        | identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }
 }
 
+/// How long a consent this app mints stays spendable, in blocks —
+/// `consensus_time` is a block height and a validator network heartbeats about
+/// once a second, so this is roughly a day. There is no revoke op: this window
+/// IS how a mis-issued ticket dies.
+const CONSENT_TTL: u64 = 86_400;
+
 /// The `AddKey` this device consents to for `new_key` (of `scheme`) at its
-/// current generation.
+/// current generation, into THIS device's account, spendable for
+/// [`CONSENT_TTL`] blocks.
 async fn consented_add_key(
     client: &RpcClient,
     password: String,
@@ -1499,12 +1594,27 @@ async fn consented_add_key(
     label: Option<String>,
 ) -> Result<identity::IdentityMsg, String> {
     let generation = key_generation(client, new_key).await?;
-    let authorizer = sign_add_key_consent(password, chain_id, scheme, new_key, generation).await?;
+    let account = own_account(client).await?.number;
+    let expires_at = consent_expiry(client).await?;
+    let authorizer = sign_add_key_consent(
+        password, chain_id, scheme, new_key, generation, account, expires_at,
+    )
+    .await?;
     Ok(identity::IdentityMsg::AddKey {
         scheme,
         label,
         authorizer,
     })
+}
+
+/// The `expires_at` a consent minted right now carries.
+async fn consent_expiry(client: &RpcClient) -> Result<u64, String> {
+    Ok(client
+        .status()
+        .await
+        .map_err(|error| error.to_string())?
+        .height
+        + CONSENT_TTL)
 }
 
 /// The account this device's key belongs to, by the canonical resolver.
@@ -1523,7 +1633,9 @@ async fn own_account(client: &RpcClient) -> Result<identity::AccountView, String
 fn account_reply(reply: identity::IdentityReply) -> Result<Option<identity::AccountView>, String> {
     match reply {
         identity::IdentityReply::Account(account) => Ok(account),
-        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+        identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_)
+        | identity::IdentityReply::Gen(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }
@@ -1543,11 +1655,12 @@ fn identity_msg(msg: &identity::IdentityMsg) -> sdk::Msg {
 /// How long a browser touch may take before the app gives up on it.
 const CEREMONY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// One browser round trip, off the async runtime (the callback listener is a
-/// blocking accept): open the page, block for its result. On timeout the
-/// listener is poked with an abandon result so its thread ends too.
+/// The ceremony owns its callback socket. Cancelling the UI task or timing out
+/// drops the listener and any partial request along with the wait.
 async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcome, String> {
-    let listener = authpage::Listener::bind().map_err(|e| format!("auth callback: {e}"))?;
+    let listener = authpage::Listener::bind()
+        .await
+        .map_err(|e| format!("auth callback: {e}"))?;
     let callback = listener.callback_url();
     let url = authpage::request_url(authpage::AUTH_PAGE, &request, &callback);
     let op = request_op(&request);
@@ -1557,15 +1670,10 @@ async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcom
         return Err("no browser opener on this machine (xdg-open / open)".to_string());
     }
     tracing::info!(target: "ducktape::auth", event = "ceremony_shown", surface = "browser", op);
-    let waiting = tokio::task::spawn_blocking(move || listener.wait());
-    let answered = tokio::time::timeout(CEREMONY_TIMEOUT, waiting).await;
-    let outcome = match answered {
-        Ok(joined) => joined.map_err(|_| "the browser ceremony did not finish".to_string())?,
-        Err(_elapsed) => {
-            authpage::abandon(&callback, "no answer from the browser");
-            Err("the browser did not answer in time".to_string())
-        }
-    };
+    let outcome = tokio::time::timeout(CEREMONY_TIMEOUT, listener.wait())
+        .await
+        .map_err(|_| "the browser did not answer in time".to_string())
+        .and_then(|outcome| outcome);
     match &outcome {
         Ok(_) => {
             tracing::info!(target: "ducktape::auth", event = "ceremony_answered", surface = "browser", op)
@@ -1593,6 +1701,7 @@ pub async fn register_passkey(
         let client = rpc_client(&rpc)?;
         let account = own_account(&client).await?;
         let registered = browser_ceremony(authpage::Request::Create {
+            chain_id: chain_id.to_string(),
             challenge: authpage::create_challenge(),
             user: account.number,
             name: account.name,
@@ -1670,9 +1779,11 @@ pub async fn link_wallet(
     Ok(true)
 }
 
-/// Admit THIS device into an account by a passkey's consent: the assertion
-/// over this key's `AddKey` preimage IS the consent, its `userHandle` names
-/// the account, and this device signs the frame (the key being admitted).
+/// Admit THIS device into an account by a passkey's consent. TWO browser
+/// touches: a consent names the account it admits into, and only the passkey
+/// knows which that is — touch 1 asks (`userHandle`), touch 2 is the assertion
+/// over this key's `AddKey` preimage for that account. This device signs the
+/// frame (the key being admitted).
 pub async fn login_with_passkey(
     rpc: String,
     password: String,
@@ -1688,17 +1799,35 @@ pub async fn login_with_passkey(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent =
-            browser_ceremony(authpage::login_request(&chain_id, &device_key, generation)).await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
+        let number = authpage::assertion_account(
+            &chain_id,
+            &browser_ceremony(authpage::account_request()).await?,
+        )?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = browser_ceremony(authpage::login_request(
+            &chain_id,
+            &device_key,
+            generation,
+            number,
+            expires_at,
+        ))
+        .await?;
+        let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            label,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await
     }
     .await
@@ -1830,7 +1959,7 @@ pub(crate) async fn qr_ceremony(
     )
     .await?;
     let started = std::time::Instant::now();
-    let waiting = tokio::task::spawn_blocking(move || relay.wait(CEREMONY_TIMEOUT));
+    let waiting = relay.wait(CEREMONY_TIMEOUT);
     tokio::pin!(waiting);
     // The countdown: the same QR re-sent each second with the time it has
     // left, so the screen can show it. The first tick is a second away —
@@ -1839,8 +1968,8 @@ pub(crate) async fn qr_ceremony(
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + second, second);
     let outcome = loop {
         tokio::select! {
-            joined = &mut waiting => {
-                break joined.map_err(|_| "the ceremony did not finish".to_string())?;
+            answered = &mut waiting => {
+                break answered;
             }
             _ = ticks.tick() => {
                 let left = CEREMONY_TIMEOUT.saturating_sub(started.elapsed());
@@ -1938,6 +2067,7 @@ async fn add_passkey_steps(
     let registered = qr_ceremony(
         authpage::AUTH_PAGE,
         authpage::Request::Create {
+            chain_id: chain_id.to_string(),
             challenge: authpage::create_challenge(),
             user: account.number,
             name: account.name,
@@ -1978,8 +2108,10 @@ async fn add_passkey_steps(
     Ok(())
 }
 
-/// Admit THIS device by a passkey's consent given on the phone: one QR. The
-/// phone half of `login_with_passkey`.
+/// Admit THIS device by a passkey's consent given on the phone: two QRs, one
+/// per touch — the first asks the passkey which account it speaks for, the
+/// second is the consent, bound to that account. The phone half of
+/// `login_with_passkey`.
 pub fn login_by_qr(
     rpc: String,
     password: String,
@@ -1993,23 +2125,40 @@ pub fn login_by_qr(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent = qr_ceremony(
+        let named = qr_ceremony(
             authpage::AUTH_PAGE,
-            authpage::login_request(&chain_id, &device_key, generation),
+            authpage::account_request(),
             "Confirm with the passkey that belongs to your account.",
             &mut tx,
         )
         .await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
-        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let number = authpage::assertion_account(&chain_id, &named)?;
+        step(&mut tx, CeremonyStep::working("Reading the account…")).await?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, None, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = qr_ceremony(
+            authpage::AUTH_PAGE,
+            authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
+            "Confirm once more to admit this device to the account.",
+            &mut tx,
+        )
+        .await?;
+        let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
+        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            None,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await?;
         Ok(())
     })
@@ -2097,6 +2246,8 @@ mod account_ticket_tests {
             identity::KeyScheme::Ed25519,
             &new_key,
             3,
+            11,
+            900,
         );
         let ticket = add_key_ticket(&identity::IdentityMsg::AddKey {
             scheme: identity::KeyScheme::Ed25519,
@@ -2115,24 +2266,30 @@ mod account_ticket_tests {
         assert_eq!(scheme, identity::KeyScheme::Ed25519);
         assert_eq!(label.as_deref(), Some("phone"));
         assert_eq!(authorizer.key, member().public_key().as_ref());
-        let preimage = |generation| {
+        assert_eq!(authorizer.account, 11);
+        assert_eq!(authorizer.expires_at, 900);
+        let preimage = |generation, account, expires_at| {
             identity::add_key_preimage(
                 "chain-a",
                 identity::KeyScheme::Ed25519,
                 &new_key,
                 generation,
+                account,
+                expires_at,
             )
         };
-        let verifies = |generation| {
+        let verifies = |generation, account, expires_at| {
             identity::KeyScheme::Ed25519.verify(
                 &authorizer.key,
                 identity::IDENTITY_ADD_KEY_NS,
-                &preimage(generation),
+                &preimage(generation, account, expires_at),
                 &authorizer.proof,
             )
         };
-        assert!(verifies(3), "the consent is over the minted generation");
-        assert!(!verifies(4), "and is single-use");
+        assert!(verifies(3, 11, 900), "the consent is over the minted terms");
+        assert!(!verifies(4, 11, 900), "and is single-use");
+        assert!(!verifies(3, 12, 900), "account-bound");
+        assert!(!verifies(3, 11, 901), "expiry-bound");
         assert_eq!(
             add_key_ticket_bytes(&format!("  {ticket}\n")).unwrap(),
             ticket.as_bytes(),
@@ -2157,12 +2314,12 @@ mod qr_ceremony_tests {
     use super::*;
     use std::io::{BufRead as _, BufReader, Write as _};
 
-    /// a relay that answers 204 `absent` times, then `json` once, then 204.
+    /// A relay that answers 204 `absent` times, then `json` once and exits.
     fn fake_relay(absent: usize, json: &'static str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for (served, stream) in listener.incoming().enumerate() {
+            for (served, stream) in listener.incoming().take(absent + 1).enumerate() {
                 let mut stream = stream.unwrap();
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line).unwrap();
@@ -2181,7 +2338,53 @@ mod qr_ceremony_tests {
         base
     }
 
-    const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#;
+    const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#;
+
+    /// Invalidating the UI stream must close the request already at the relay,
+    /// even if that relay never sends a response or the next countdown tick.
+    #[tokio::test]
+    async fn cancelling_a_ceremony_stream_closes_the_pending_relay_request() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let mut stream = ceremony_stream(move |mut tx| async move {
+            qr_ceremony(
+                &base,
+                authpage::Request::Get { challenge: [7; 32] },
+                "Confirm with the passkey.",
+                &mut tx,
+            )
+            .await?;
+            Ok(())
+        });
+        let receive_request = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                let read = socket.read_line(&mut line).await.unwrap();
+                assert_ne!(
+                    read, 0,
+                    "the request must reach the relay before cancellation"
+                );
+                let headers_complete = line == "\r\n";
+                if headers_complete {
+                    return socket;
+                }
+            }
+        };
+        let mut socket = {
+            let consume = async { while stream.next().await.is_some() {} };
+            tokio::select! {
+                socket = receive_request => socket,
+                () = consume => panic!("the unanswered ceremony ended before cancellation"),
+            }
+        };
+        drop(stream);
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    }
 
     /// the first reading is the QR — the auth page URL carrying this relay's
     /// slot as its callback — and the outcome is the phone's answer.
@@ -2202,9 +2405,9 @@ mod qr_ceremony_tests {
         assert!(matches!(
             outcome,
             authpage::Outcome::Get {
-                user_handle: Some(42),
+                user_handle: Some(handle),
                 ..
-            }
+            } if handle == authpage::UserHandle::new("demo#a1b2c3d4", 42)
         ));
         let shown = rx.next().await.unwrap();
         assert_eq!(shown.phase, "show_qr");

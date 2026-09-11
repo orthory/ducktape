@@ -1,46 +1,16 @@
-//! the pages effects lane (M2): `pages.comment` / `pages.set_checked` applied
-//! at the run boundary from the winning attempt (X2), alongside the chat/task
-//! follow-ups — but with PER-ACTION degrade: a pages action that fails its
-//! grant, cap, target resolution, payload validation, or any freshness probe
-//! is dropped with a breadcrumb while the run still DELIVERS (reply, other
-//! effects, finalize). that is deliberately narrower than the task lane's
-//! all-or-nothing validation — a page annotation is garnish, never worth
-//! failing a delivery over — and mirrors the PR sink's degrade discipline.
-//!
-//! every emitted op must be valid BY CONSTRUCTION (the no-fail rule: a
-//! follow-up pages would reject aborts the whole delivery block, forever).
-//! pages can reject an `AddComment`/`SetChecked` on: a missing/non-todo
-//! block, an oversized text, a squatted thread or comment id (both are
-//! client-mintable by anyone), a target-mismatched thread, and a full
-//! target (thread cap). each reject path is probed against committed pages
-//! state here first — the same discipline as chat's `probe_reply_postable`
-//! and the forge sink's branch probes.
-//!
-//! attribution: `AddComment` carries `as_agent` (pages refines the
-//! `Module("runs")` origin into `AuthorRef::Agent`, exactly like chat);
-//! `SetChecked` stores no author — a `Block` has no author field — so it is
-//! origin-gated only.
+//! Prepare page annotations. Invalid or stale page effects produce diagnostics
+//! while other valid result facets can proceed. The account's program later
+//! executes each prepared message, and pages stamps the actual account actor
+//! under its normal write gate.
 
-use std::collections::BTreeMap;
-
-use agent::CapRequest;
-
-use super::response::allows;
-use super::{AgentAction, AgentRecord, Ctx, Lane, Msg, PendingState, RunsModule};
+use super::action_requests::Prepared;
+use super::catalog::{ContentPart, Operation, PageAnchor};
+use super::response::ReplyPosts;
+use super::{Ctx, Lane, Msg, PendingState, ReplyDestination, RunsModule};
 use pages::{
-    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
-    MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
-    encode_query as pages_encode_query, id_is_index_safe,
+    BlockKind, NewBlock, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
+    encode_query as pages_encode_query,
 };
-
-/// whether an action belongs to this lane (and is therefore skipped by the
-/// strict task-action validator and the task emitter).
-pub(super) fn is_pages_action(action: &AgentAction) -> bool {
-    matches!(
-        action,
-        AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. }
-    )
-}
 
 /// deterministic ids for an agent comment: derived from the run id and the
 /// action's [`Lane`] slot — its index in the validated response on the settle
@@ -53,77 +23,82 @@ pub(super) fn is_pages_action(action: &AgentAction) -> bool {
 /// be neither index-safe nor length-bounded — pages would reject it and the
 /// emitted op would abort the delivery block. the 64-char hex hash is short,
 /// escape-free, and still fully replay-deterministic.
-fn page_thread_id(run_id: &str, slot: &str) -> String {
+pub(super) fn page_thread_id(run_id: &str, slot: &str) -> String {
     format!("agent/{}/thread/{slot}", crate::dispatch_id_for(run_id))
 }
-fn page_comment_id(run_id: &str, slot: &str) -> String {
+pub(super) fn page_comment_id(run_id: &str, slot: &str) -> String {
     format!("agent/{}/comment/{slot}", crate::dispatch_id_for(run_id))
+}
+/// the page a `pages.post` operation mints, one per run and lane slot: a
+/// replay mints the identical id, and pages treats a re-create of an existing
+/// id as a no-op, so a retried slot never doubles the page.
+pub(super) fn page_post_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/page/{slot}", crate::dispatch_id_for(run_id))
+}
+
+/// the body a page post carries: one block per content part, text as a
+/// paragraph and code as a code block, each id minted under the page in
+/// document order. blank parts are dropped, as a reply drops blank blocks.
+fn page_body(page_id: &str, content: &[ContentPart]) -> Vec<NewBlock> {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => {
+                let text = text.trim();
+                (!text.is_empty()).then(|| (BlockKind::Paragraph, text.to_string()))
+            }
+            ContentPart::Code { text, .. } => {
+                (!text.trim().is_empty()).then(|| (BlockKind::Code, text.clone()))
+            }
+        })
+        .enumerate()
+        .map(|(index, (kind, text))| NewBlock {
+            id: format!("{page_id}/b{index}"),
+            kind,
+            text,
+            marks: Vec::new(),
+        })
+        .collect()
+}
+
+/// the explicit destination a `pages.comment` operation names.
+pub(super) fn page_destination(anchor: &PageAnchor) -> ReplyDestination {
+    match anchor {
+        PageAnchor::Target(target) => ReplyDestination::Page {
+            target: target.clone(),
+        },
+        PageAnchor::Thread(thread_id) => ReplyDestination::PageThread {
+            thread_id: thread_id.clone(),
+        },
+    }
 }
 
 impl RunsModule {
-    /// apply the pages actions of a validated response. each action either
-    /// emits one pages follow-up or degrades to a breadcrumb — this lane
-    /// never errors and never fails the run.
+    /// apply the pages operations of a validated response. each operation
+    /// either emits one pages follow-up or degrades to a breadcrumb — this lane
+    /// never errors and never fails the run. `posts` carries the same-block
+    /// thread and target reservations shared with the conversational lane.
     pub(super) async fn emit_pages_effects(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
         lane: Lane,
-        actions: &[AgentAction],
+        operations: &[Operation],
+        posts: &mut ReplyPosts,
     ) {
-        if !actions.iter().any(is_pages_action) {
+        if !operations.iter().any(Operation::is_pages) {
             return;
         }
-        let skip = |what: &str| format!("run {run_id} pages action skipped: {what}");
-        let Some(pages) = self.pages.clone() else {
-            self.note(ctx, skip("no pages module wired"));
-            return;
-        };
-        let agent = match self.agent_for_run(&*ctx, entry).await {
-            Ok(Some(a)) => a,
-            _ => {
-                self.note(ctx, skip("agent not registered"));
-                return;
-            }
-        };
-        // threads THIS run has already staged, per target: pages reads its
-        // pending overlay first, so the committed-only thread-cap probe is
-        // blind to threads staged earlier in this same delivery block. a run
-        // emitting several comments to a near-full target would pass every
-        // committed probe, then abort the block on the sibling pages rejects
-        // (TooManyThreads) — the permanent-abort R4 hole. account for them.
-        let mut staged_threads: BTreeMap<String, usize> = BTreeMap::new();
-        for (index, action) in actions.iter().enumerate() {
-            if !is_pages_action(action) {
+        for (index, operation) in operations.iter().enumerate() {
+            if !operation.is_pages() {
                 continue;
             }
-            let already_staged = match action {
-                AgentAction::AddPageComment { target, .. } => {
-                    staged_threads.get(target).copied().unwrap_or(0)
-                }
-                _ => 0,
-            };
             match self
-                .pages_action_msg(
-                    &*ctx,
-                    &pages,
-                    &agent,
-                    run_id,
-                    &lane.slot(index),
-                    action,
-                    already_staged,
-                )
+                .pages_operation_msg(&*ctx, entry, run_id, &lane.slot(index), operation, posts)
                 .await
             {
-                Ok(msg) => {
-                    // a landed comment opens one new thread on its target;
-                    // the next sibling to that target must count it.
-                    if let AgentAction::AddPageComment { target, .. } = action {
-                        *staged_threads.entry(target.clone()).or_default() += 1;
-                    }
-                    ctx.emit_msg(msg)
-                }
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(
                     ctx,
                     format!("run {run_id} pages action {index} skipped: {why}"),
@@ -132,120 +107,135 @@ impl RunsModule {
         }
     }
 
-    /// one pages action as an emit-ready follow-up, or the reason it must not be
-    /// emitted. gate order: grant → target resolution → cap → payload →
-    /// freshness probes. `already_staged` is how many threads this run has
-    /// staged to this comment's target already (the same-block thread-cap
-    /// accounting).
+    /// one pages operation as an emit-ready follow-up, or the reason it must
+    /// not be emitted. order: target resolution → payload → freshness probes.
     ///
     /// THE ONE pages gate. the settle path degrades an `Err` here to a
     /// breadcrumb (a page annotation is garnish, never worth failing a delivery
     /// over); the session lane returns it to the submitter as an error. same
     /// verdict, two failure policies — never two verdicts.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "run_id + slot derive the deterministic ids; already_staged is the same-block cap counter"
-    )]
-    pub(super) async fn pages_action_msg(
+    pub(super) async fn pages_operation_msg(
         &self,
         ctx: &dyn Ctx,
-        pages: &str,
-        agent: &AgentRecord,
+        entry: &PendingState,
         run_id: &str,
         slot: &str,
-        action: &AgentAction,
-        already_staged: usize,
-    ) -> Result<Msg, String> {
-        let name = action.vocabulary_name();
-        if !allows(agent, name) {
-            return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
-        }
-        match action {
-            AgentAction::AddPageComment { target, body } => {
-                if body.is_empty() {
-                    return Err("comment body is empty".into());
-                }
-                if body.len() > MAX_COMMENT_TEXT_BYTES {
-                    return Err(format!(
-                        "comment body is {} bytes; the cap is {MAX_COMMENT_TEXT_BYTES}",
-                        body.len()
-                    ));
-                }
-                // never emit an id pages would reject (length OR escaping
-                // char) — that rejection aborts the delivery block. the
-                // TARGET is external (from model output / injected context),
-                // so this is live for it; the minted ids are hash-derived
-                // (short, hex, escape-free) so their check is belt against a
-                // future scheme change. one shared `id_is_index_safe`
-                // predicate, no drift with pages admission.
-                if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(target) {
-                    return Err("target exceeds pages' id length/charset cap".into());
-                }
-                if page_thread_id(run_id, slot).len() > MAX_THREAD_ID_BYTES
-                    || page_comment_id(run_id, slot).len() > MAX_COMMENT_ID_BYTES
-                    || !id_is_index_safe(&page_thread_id(run_id, slot))
-                    || !id_is_index_safe(&page_comment_id(run_id, slot))
-                {
-                    return Err("run id yields a comment id pages would reject".into());
-                }
-                // target → owning page (the cap is PAGE-scoped). a page root
-                // is itself a block that names itself as `page`, so GetBlock
-                // resolves both anchor shapes; None == the target exists
-                // nowhere — unresolvable, degrade.
-                let block = self.page_block(ctx, pages, target).await?;
-                self.check_pages_write(agent, &block.page)?;
-                self.probe_comment_lands(ctx, pages, run_id, slot, target, already_staged)
-                    .await?;
-                Ok(Msg {
-                    target: pages.to_string(),
-                    payload: pages_encode_msg(&PageMsg::AddComment {
-                        thread_id: page_thread_id(run_id, slot),
-                        comment_id: page_comment_id(run_id, slot),
-                        target: target.clone(),
-                        text: body.clone(),
-                        anchor: None,
-                        mentions: Vec::new(),
-                        // pages refines Module("runs") + as_agent into
-                        // AuthorRef::Agent — the same wire chat replies use.
-                        as_agent: Some(agent.agent_id.clone()),
-                    }),
-                })
+        operation: &Operation,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        match operation {
+            Operation::PagesComment { anchor, content } => {
+                // a comment is a conversational write with an explicit page
+                // destination: the same resolver every reply goes through.
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    slot,
+                    &crate::content_blocks(content),
+                    Some(page_destination(anchor)),
+                    posts,
+                )
+                .await
             }
-            AgentAction::SetPageChecked { block, checked } => {
-                let resolved = self.page_block(ctx, pages, block).await?;
+            Operation::PagesSetChecked { block_id, checked } => {
+                let name = operation.name();
+                let pages = self
+                    .pages
+                    .as_deref()
+                    .ok_or("no pages module is configured")?;
+                let resolved = self.page_block(ctx, pages, block_id).await?;
                 // pages rejects SetChecked on any non-todo kind; probed here
                 // so the emitted op cannot abort the delivery block.
                 if resolved.kind != pages::BlockKind::Todo {
-                    return Err(format!("block {block} is not a todo"));
+                    return Err(format!("block {block_id} is not a todo"));
                 }
-                self.check_pages_write(agent, &resolved.page)?;
-                Ok(Msg {
-                    target: pages.to_string(),
-                    payload: pages_encode_msg(&PageMsg::SetChecked {
-                        block_id: block.clone(),
-                        checked: *checked,
-                    }),
-                })
+                Ok(Prepared::new(
+                    Msg {
+                        target: pages.to_string(),
+                        payload: pages_encode_msg(&PageMsg::SetChecked {
+                            block_id: block_id.clone(),
+                            checked: *checked,
+                        }),
+                    },
+                    name,
+                    serde_json::json!({"block_id": block_id, "checked": checked}),
+                ))
             }
-            _ => unreachable!("only pages actions reach this lane"),
+            Operation::PagesPost { title, content } => {
+                let name = operation.name();
+                let pages = self
+                    .pages
+                    .as_deref()
+                    .ok_or("no pages module is configured")?;
+                let page_id = page_post_id(run_id, slot);
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err(format!("{name} requires a non-empty title"));
+                }
+                if title.len() > pages::MAX_PAGE_TITLE_LEN {
+                    return Err(format!(
+                        "page title is {} bytes; pages' cap is {}",
+                        title.len(),
+                        pages::MAX_PAGE_TITLE_LEN
+                    ));
+                }
+                let blocks = page_body(&page_id, content);
+                // pages refuses a block record over its size cap and a page
+                // past its page cap; both probed here so the emitted op
+                // cannot abort the delivery block.
+                if let Some(block) = blocks.iter().find(|b| b.text.len() > pages::MAX_BLOCK_LEN) {
+                    return Err(format!(
+                        "page block {} is {} bytes; pages' cap is {}",
+                        block.id,
+                        block.text.len(),
+                        pages::MAX_BLOCK_LEN
+                    ));
+                }
+                self.reserve_page_slot(ctx, pages, posts).await?;
+                Ok(Prepared::new(
+                    Msg {
+                        target: pages.to_string(),
+                        payload: pages_encode_msg(&PageMsg::CreatePage {
+                            page_id: page_id.clone(),
+                            title: title.to_string(),
+                            blocks,
+                        }),
+                    },
+                    name,
+                    serde_json::json!({"page_id": page_id, "title": title}),
+                ))
+            }
+            _ => unreachable!("only pages operations reach this lane"),
         }
     }
 
-    /// the D3 cap gate: pages_write is page-id scoped with `"*"` allowed.
-    pub(super) fn check_pages_write(&self, agent: &AgentRecord, page: &str) -> Result<(), String> {
-        if agent.permits(&CapRequest::PagesWrite(page)) {
-            Ok(())
-        } else {
-            Err(format!(
-                "agent {} lacks pages_write for {page}",
-                agent.agent_id
-            ))
+    /// count one more page against pages' cap: the committed page count plus
+    /// every create this same block has already staged.
+    async fn reserve_page_slot(
+        &self,
+        ctx: &dyn Ctx,
+        pages: &str,
+        posts: &mut ReplyPosts,
+    ) -> Result<(), String> {
+        let reply = ctx
+            .query(pages, &pages_encode_query(&PageQuery::PageCount))
+            .await
+            .map_err(|e| format!("pages page count failed: {e}"))?;
+        let Ok(PageReply::PageCount(count)) = pages::decode_reply(&reply) else {
+            return Err("unexpected pages reply for a page count".into());
+        };
+        let full = count as usize + posts.pages_created >= pages::MAX_PAGES;
+        if full {
+            return Err("pages is full".into());
         }
+        posts.pages_created += 1;
+        Ok(())
     }
 
     /// resolve a target/block id against committed pages state. `Err` == the
     /// id resolves to nothing (or the lookup failed) — degrade material.
-    async fn page_block(
+    pub(super) async fn page_block(
         &self,
         ctx: &dyn Ctx,
         pages: &str,
@@ -264,77 +254,6 @@ impl RunsModule {
             Ok(PageReply::Block(Some(block))) => Ok(block),
             Ok(PageReply::Block(None)) => Err(format!("target does not exist: {block_id}")),
             _ => Err("unexpected pages reply for a block lookup".into()),
-        }
-    }
-
-    /// prove the AddComment we are about to emit would land RIGHT NOW: the
-    /// deterministic thread and comment ids are client-mintable (anyone could
-    /// squat them), and the target's thread list is capped — any of those
-    /// would make pages reject the follow-up and abort the delivery block.
-    async fn probe_comment_lands(
-        &self,
-        ctx: &dyn Ctx,
-        pages: &str,
-        run_id: &str,
-        slot: &str,
-        target: &str,
-        already_staged: usize,
-    ) -> Result<(), String> {
-        let thread_id = page_thread_id(run_id, slot);
-        let reply = ctx
-            .query(
-                pages,
-                &pages_encode_query(&PageQuery::CommentThread {
-                    thread_id: thread_id.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages thread lookup failed: {e}"))?;
-        match pages::decode_reply(&reply) {
-            Ok(PageReply::CommentThread(None)) => {}
-            Ok(PageReply::CommentThread(Some(_))) => {
-                return Err(format!("thread id already taken: {thread_id}"));
-            }
-            _ => return Err("unexpected pages reply for a thread lookup".into()),
-        }
-        let comment_id = page_comment_id(run_id, slot);
-        let reply = ctx
-            .query(
-                pages,
-                &pages_encode_query(&PageQuery::GetComment {
-                    comment_id: comment_id.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages comment lookup failed: {e}"))?;
-        match pages::decode_reply(&reply) {
-            Ok(PageReply::Comment(None)) => {}
-            Ok(PageReply::Comment(Some(_))) => {
-                return Err(format!("comment id already taken: {comment_id}"));
-            }
-            _ => return Err("unexpected pages reply for a comment lookup".into()),
-        }
-        // a fresh thread still needs a slot in the target's thread list —
-        // counting both committed threads and the ones this run already
-        // staged to this target (else the sibling AddComment aborts).
-        let reply = ctx
-            .query(
-                pages,
-                &pages_encode_query(&PageQuery::TargetThreadCount {
-                    target: target.to_string(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages target lookup failed: {e}"))?;
-        match pages::decode_reply(&reply) {
-            Ok(PageReply::TargetThreadCount(committed)) => {
-                let taken = committed as usize + already_staged;
-                if taken >= MAX_THREADS_PER_TARGET {
-                    return Err(format!("target {target} already holds {taken} threads"));
-                }
-                Ok(())
-            }
-            _ => Err("unexpected pages reply for a target lookup".into()),
         }
     }
 }

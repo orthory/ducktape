@@ -27,18 +27,24 @@ use common::NetworkShapeCluster;
 
 /// standing + follow-arm pre-sync is several blocks of slack.
 const CONVERGE: Duration = Duration::from_secs(180);
-/// the lookup dialer/tracker act within seconds; this many rounds is plenty
-/// to surface a permanent tracking disagreement as repeated rejections.
-const SETTLE: Duration = Duration::from_secs(20);
+/// the lookup dialer/tracker act within seconds; this many quiet re-track
+/// rounds (`bin/node/src/replica/park.rs`'s "tracker round completed"
+/// marker, one per drain pass) is plenty to surface a permanent tracking
+/// disagreement as repeated rejections.
+const SETTLE_ROUNDS: usize = 20;
+/// generous upper bound on how long SETTLE_ROUNDS should take on a slow box.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[test]
 fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
     let mut cluster = NetworkShapeCluster::new();
     // capture the resident's mesh layer: tracker rejections are
-    // `commonware_p2p ... warn` lines.
+    // `commonware_p2p ... warn` lines, and each re-track round the resident
+    // completes is a `ducktape::consensus ... debug` line (SETTLE below rides
+    // it).
     cluster.env[1] = vec![(
         "RUST_LOG".to_string(),
-        "commonware_p2p=debug".to_string(),
+        "commonware_p2p=debug,ducktape::consensus=debug".to_string(),
     )];
 
     let chain_id = cluster.init_founder("peerset-stability");
@@ -57,10 +63,15 @@ fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
-    // let the parked resident run several quiet rounds at the post-grant
-    // generation. a window-sync that re-tracked or regressed an index would
-    // be warn-dropped here, once per sync attempt.
-    std::thread::sleep(SETTLE);
+    // let the parked resident run several quiet tracker rounds AT the
+    // post-grant generation it just reached (a baseline, since the join
+    // itself already logged some). a window-sync that re-tracked or
+    // regressed an index would be warn-dropped here, once per round —
+    // riding the resident's own "tracker round completed" marker means this
+    // waits on the SAME re-track calls that would trip the rejection,
+    // rather than a wall-clock guess at how long that takes.
+    let settled = cluster.marker_count(1, "tracker round completed") + SETTLE_ROUNDS;
+    cluster.wait_marker_count(1, "tracker round completed", settled, SETTLE_TIMEOUT);
 
     // the resident's own log (the friend node, idx 1): dir/friend.log.
     let log_path = cluster

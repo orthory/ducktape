@@ -273,6 +273,10 @@ fn origin_address(origin: &Origin) -> Address {
             preimage.extend_from_slice(b"module\0");
             preimage.extend_from_slice(id.as_bytes());
         }
+        Origin::Program(account) => {
+            preimage.extend_from_slice(b"acct\0");
+            preimage.extend_from_slice(&account.to_le_bytes());
+        }
         Origin::System => preimage.extend_from_slice(b"system"),
     }
     let hash = keccak256(preimage);

@@ -15,10 +15,13 @@
 //! registered fails the drain on the remove with `Error::UnknownModule` — a
 //! deterministically-REJECTING op (the same shape the node's heartbeat nop uses).
 
-use directory::{DirMsg, Directory, encode_msg as dir_encode};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use directory::{DirMsg, Directory, decode_msg, encode_msg as dir_encode};
 use futures::executor::block_on;
 use host::{BlockContext, Host, MemberOutcome};
-use sdk::{Msg, Origin};
+use sdk::{Module, Msg, Origin};
 
 const DIR: &str = "directory";
 
@@ -201,5 +204,184 @@ fn submit_block_empty_is_empty_block() {
             "no ops, no injections — root-hash unchanged (an empty block)"
         );
         assert_eq!(host.root_hash(), app0);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the COST of isolation: a rejection that staged nothing must not roll back and
+// replay the members before it, and the replays a staging rejection does cost
+// are bounded per block.
+
+/// a `Directory` that counts its `execute` calls and, on the key `fail`, STAGES
+/// a write and then rejects — the rejection class whose partial stage really is
+/// entangled with the accepted members' (unlike an unknown target, which never
+/// reaches a module at all).
+struct Counting {
+    inner: Directory,
+    executes: Rc<Cell<u32>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for Counting {
+    fn id(&self) -> sdk::ModuleId {
+        self.inner.id()
+    }
+
+    fn root(&self) -> sdk::StateRoot {
+        self.inner.root()
+    }
+
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        self.inner.state_sync_handle()
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn sdk::Ctx, msg: &Msg) -> Result<(), sdk::Error> {
+        self.executes.set(self.executes.get() + 1);
+        self.inner.execute(ctx, msg).await?;
+        match decode_msg(&msg.payload) {
+            Ok(DirMsg::Set { key, .. }) if key == "fail" => {
+                Err(sdk::Error::Module("staged, then rejected".into()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, sdk::Error> {
+        self.inner.query(req).await
+    }
+
+    async fn commit_block(&mut self) -> Result<(), sdk::Error> {
+        self.inner.commit_block().await
+    }
+
+    async fn abort_block(&mut self) -> Result<(), sdk::Error> {
+        self.inner.abort_block().await
+    }
+}
+
+/// a host whose one module counts executions; returns the shared counter.
+fn counting_host() -> (Host, Rc<Cell<u32>>) {
+    let executes = Rc::new(Cell::new(0));
+    let module = Counting {
+        inner: Directory::new(DIR),
+        executes: Rc::clone(&executes),
+    };
+    (
+        Host::genesis(vec![Box::new(module)]).expect("genesis"),
+        executes,
+    )
+}
+
+async fn committed(host: &Host, key: &str) -> Option<String> {
+    let req = directory::encode_query(&directory::DirQuery::Get { key: key.into() });
+    let bytes = host.query(DIR, &req).await.expect("query");
+    match directory::decode_reply(&bytes).expect("decode") {
+        directory::DirReply::Value(v) => v,
+    }
+}
+
+// a batch of [applies, unknown-target] * N executes each applied op EXACTLY
+// ONCE: an unknown target is rejected before any module is reached, so it has
+// nothing to roll back and nothing to replay. rolling back regardless made this
+// quadratic (~N²/2 executions) — one 1 MiB frame of alternating members stalled
+// every validator.
+#[test]
+fn a_rejection_that_staged_nothing_replays_nothing() {
+    block_on(async {
+        const N: usize = 16;
+        let (mut host, executes) = counting_host();
+        let mut ops = Vec::new();
+        for i in 0..N {
+            ops.push((ext(), set(&format!("k{i}"), "v")));
+            ops.push((ext(), reject()));
+        }
+
+        let out = host
+            .submit_block(BlockContext::default(), ops)
+            .await
+            .expect("the batch applies");
+
+        assert_eq!(out.members.len(), 2 * N);
+        assert_eq!(
+            executes.get(),
+            N as u32,
+            "each applied member executes exactly once — no replay",
+        );
+        for i in 0..N {
+            assert!(matches!(out.members[2 * i], MemberOutcome::Applied { .. }));
+            assert!(matches!(
+                out.members[2 * i + 1],
+                MemberOutcome::Rejected { .. }
+            ));
+            assert_eq!(committed(&host, &format!("k{i}")).await, Some("v".into()));
+        }
+    });
+}
+
+// a member that STAGED and then failed is still rolled back and the accepted
+// members replayed — the batch commits exactly the accepted subset, and the
+// failed member's staged write is not in it.
+#[test]
+fn a_staged_then_failing_member_commits_the_accepted_subset() {
+    block_on(async {
+        let (mut host, executes) = counting_host();
+        let out = host
+            .submit_block(
+                BlockContext::default(),
+                vec![
+                    (ext(), set("a", "1")),
+                    (ext(), set("fail", "x")),
+                    (ext(), set("b", "2")),
+                ],
+            )
+            .await
+            .expect("the batch applies");
+
+        assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
+        assert!(matches!(out.members[1], MemberOutcome::Rejected { .. }));
+        assert!(matches!(out.members[2], MemberOutcome::Applied { .. }));
+        assert_eq!(committed(&host, "a").await, Some("1".into()));
+        assert_eq!(committed(&host, "b").await, Some("2".into()));
+        assert_eq!(
+            committed(&host, "fail").await,
+            None,
+            "the rejected member's staged write never commits"
+        );
+        // a=1, fail, b=2, plus the ONE replay of `a` the rollback owes.
+        assert_eq!(executes.get(), 4, "exactly one rollback+replay cycle");
+    });
+}
+
+// past `MAX_BLOCK_REPLAYS` staging rejections the block stops replaying: every
+// remaining member is rejected UNEXECUTED. the budget is a function of the block
+// alone, so every validator rejects the identical suffix.
+#[test]
+fn the_replay_budget_rejects_the_rest_unexecuted() {
+    block_on(async {
+        let (mut host, executes) = counting_host();
+        let mut ops = vec![(ext(), set("a", "1"))];
+        for _ in 0..=host::MAX_BLOCK_REPLAYS {
+            ops.push((ext(), set("fail", "x")));
+        }
+        let over_budget = ops.len();
+        ops.push((ext(), set("b", "2")));
+
+        let out = host
+            .submit_block(BlockContext::default(), ops)
+            .await
+            .expect("the batch applies");
+
+        assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
+        assert!(
+            matches!(&out.members[over_budget], MemberOutcome::Rejected { reason }
+                if reason.contains("replay budget")),
+            "the member past the budget is rejected unexecuted"
+        );
+        assert_eq!(committed(&host, "b").await, None, "it never executed");
+        assert_eq!(committed(&host, "a").await, Some("1".into()));
+        // 1 accepted + (MAX_BLOCK_REPLAYS + 1) failures + one replay of `a` per
+        // failure. never the whole prefix per failure, which is the quadratic.
+        let failures = host::MAX_BLOCK_REPLAYS + 1;
+        assert_eq!(executes.get(), 1 + failures + failures);
     });
 }

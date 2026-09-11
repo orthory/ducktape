@@ -10,19 +10,6 @@ fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
         text: text.into(),
         anchor: None,
         mentions: Vec::new(),
-        as_agent: None,
-    }
-}
-
-fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageMsg {
-    PageMsg::AddComment {
-        thread_id: thread.into(),
-        comment_id: comment.into(),
-        target: target.into(),
-        text: "agent says".into(),
-        anchor: None,
-        mentions: Vec::new(),
-        as_agent: Some(agent.into()),
     }
 }
 
@@ -66,7 +53,10 @@ fn exact_comment_anchor_rebases_with_target_text() {
         .await;
         let moved = query_thread(&p, "t1").await.unwrap();
         assert_eq!(moved.thread.target, "b2");
-        assert_eq!(moved.thread.anchor, Some(RelativeAnchor { start: 0, end: 2 }));
+        assert_eq!(
+            moved.thread.anchor,
+            Some(RelativeAnchor { start: 0, end: 2 })
+        );
         // the per-target index re-homed with it.
         assert_eq!(target_thread_count(&p, "b1").await, 0);
         assert_eq!(target_thread_count(&p, "b2").await, 1);
@@ -74,74 +64,10 @@ fn exact_comment_anchor_rebases_with_target_text() {
 }
 
 #[test]
-fn add_comment_reports_structured_agent_mentions_to_tagging() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages").with_tagging("tagging");
-        let mut op = add("t1", "c1", "page-1", "@qa-luna please review");
-        let PageMsg::AddComment { mentions, .. } = &mut op else {
-            unreachable!()
-        };
-        mentions.push(AuthorRef::Agent {
-            module: "runs".into(),
-            agent_id: "qa-luna".into(),
-        });
-        let mut ctx = ctx_as(user("carol"));
-        p.execute(&mut ctx, &msg(&op)).await.unwrap();
-        assert_eq!(ctx.msgs().len(), 1);
-        assert_eq!(ctx.msgs()[0].target, "tagging");
-        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()
-        else {
-            panic!("expected tag event")
-        };
-        assert_eq!(event.container, "t1");
-        assert_eq!(event.content_seq, 1);
-        assert_eq!(event.author, tagging::Author::User(b"carol".to_vec()));
-        assert_eq!(
-            event.tags,
-            vec![tagging::EntityRef {
-                module: "runs".into(),
-                entity: "qa-luna".into(),
-            }]
-        );
-    });
-}
-
-#[test]
-fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages").with_tagging("tagging");
-        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("carol")).await;
-        let edit = PageMsg::EditComment {
-            comment_id: "c1".into(),
-            text: "@qa-luna please review".into(),
-            mentions: vec![AuthorRef::Agent {
-                module: "runs".into(),
-                agent_id: "qa-luna".into(),
-            }],
-        };
-        let mut ctx = ctx_as(user("carol"));
-        p.execute(&mut ctx, &msg(&edit)).await.unwrap();
-
-        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()
-        else {
-            panic!("expected tag event")
-        };
-        assert_eq!(event.container, "t1");
-        assert_eq!(event.content_seq, 1);
-        assert_eq!(
-            event.tags,
-            vec![tagging::EntityRef {
-                module: "runs".into(),
-                entity: "qa-luna".into(),
-            }]
-        );
-    });
-}
-
-#[test]
 fn add_comment_rejects_over_length_ids_before_staging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         let long_thread = "t".repeat(MAX_THREAD_ID_BYTES + 1);
         apply_err_as(
             &mut p,
@@ -249,7 +175,7 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
     let thread = Thread {
         id: "t".repeat(MAX_THREAD_ID_BYTES),
         target: "b".repeat(MAX_COMMENT_TARGET_BYTES),
-        opener: AuthorRef::System,
+        opener: Party::System,
         created_at: 0,
         anchor: None,
         resolved: false,
@@ -274,6 +200,7 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
             .map(|index| format!("comment-{index}"))
             .collect();
         p.store_block(&Block {
+            author: Party::System,
             id: "target".into(),
             parent: None,
             page: "target".into(),
@@ -291,7 +218,7 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
             serde_json::to_vec(&Thread {
                 id: "thread".into(),
                 target: "target".into(),
-                opener: AuthorRef::System,
+                opener: Party::System,
                 created_at: 0,
                 anchor: None,
                 resolved: false,
@@ -309,8 +236,9 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
                 serde_json::to_vec(&Comment {
                     id: id.clone(),
                     thread_id: "thread".into(),
-                    author: AuthorRef::System,
+                    author: Party::System,
                     text: String::new(),
+                    mentions: Vec::new(),
                     created_at: 0,
                     edited_at: None,
                     deleted: false,
@@ -325,7 +253,7 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
             PageMsg::RemoveBlock {
                 block_id: "target".into(),
             },
-            &Origin::System,
+            &Party::System,
             0,
         )
         .await
@@ -339,65 +267,10 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
 }
 
 #[test]
-fn as_agent_refines_a_module_origin_into_an_agent_author() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        apply_commit_as(
-            &mut p,
-            &add_as_agent("t1", "m1", "b1", "bot"),
-            sdk::Origin::Module("runs".into()),
-        )
-        .await;
-        let view = query_thread(&p, "t1").await.unwrap();
-        let agent = AuthorRef::Agent {
-            module: "runs".into(),
-            agent_id: "bot".into(),
-        };
-        assert_eq!(view.thread.opener, agent, "the opener is the agent");
-        assert_eq!(
-            view.comments[0].author, agent,
-            "the comment author too"
-        );
-    });
-}
-
-#[test]
-fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        apply_err_as(
-            &mut p,
-            &add_as_agent("t1", "m1", "b1", "bot"),
-            user("alice"),
-            "as_agent requires a module origin",
-        )
-        .await;
-        apply_err_as(
-            &mut p,
-            &add_as_agent("t1", "m1", "b1", ""),
-            sdk::Origin::Module("runs".into()),
-            "empty as_agent",
-        )
-        .await;
-        apply_err_as(
-            &mut p,
-            &add_as_agent(
-                "t1",
-                "m1",
-                "b1",
-                &"a".repeat(MAX_COMMENT_AGENT_ID_BYTES + 1),
-            ),
-            sdk::Origin::Module("runs".into()),
-            "as_agent is too large",
-        )
-        .await;
-    });
-}
-
-#[test]
 fn get_comment_serves_the_record_tombstones_included() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         assert_eq!(query_comment(&p, "m1").await, None, "absent id is None");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         assert!(query_comment(&p, "m1").await.is_some());
@@ -421,6 +294,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 fn comment_add_opens_then_appends_and_counts_per_target() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
@@ -434,8 +308,8 @@ fn comment_add_opens_then_appends_and_counts_per_target() {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
-        assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
+        assert_eq!(t1.thread.opener, Party::Key(b"alice".to_vec()));
+        assert_eq!(t1.comments[1].author, Party::Key(b"bob".to_vec()));
         // the per-target index counts THREADS, not comments (per-target
         // thread ENUMERATION is `index::tests`' now).
         assert_eq!(target_thread_count(&p, "b1").await, 2);
@@ -448,6 +322,7 @@ fn comment_add_opens_then_appends_and_counts_per_target() {
 fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         apply_err_as(
             &mut p,
@@ -474,30 +349,11 @@ fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
 }
 
 #[test]
-fn comment_edit_and_delete_are_author_only() {
+fn any_member_edits_and_deletes_any_comment() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
-        apply_err_as(
-            &mut p,
-            &PageMsg::EditComment {
-                comment_id: "m1".into(),
-                text: "hax".into(),
-                mentions: Vec::new(),
-            },
-            user("bob"),
-            "not the comment author",
-        )
-        .await;
-        apply_err_as(
-            &mut p,
-            &PageMsg::DeleteComment {
-                comment_id: "m1".into(),
-            },
-            user("bob"),
-            "not the comment author",
-        )
-        .await;
         apply_commit_as(
             &mut p,
             &PageMsg::EditComment {
@@ -505,12 +361,22 @@ fn comment_edit_and_delete_are_author_only() {
                 text: "edited".into(),
                 mentions: Vec::new(),
             },
-            user("alice"),
+            user("bob"),
         )
         .await;
         let v = query_thread(&p, "t1").await.unwrap();
         assert_eq!(v.comments[0].text, "edited");
         assert_eq!(v.comments[0].edited_at, Some(7));
+        assert_eq!(v.comments[0].author, Party::Key(b"alice".to_vec()));
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("bob"),
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_none());
     });
 }
 
@@ -518,6 +384,7 @@ fn comment_edit_and_delete_are_author_only() {
 fn comment_deleting_last_live_removes_the_thread() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
         apply_commit_as(
@@ -553,6 +420,7 @@ fn comment_deleting_last_live_removes_the_thread() {
 fn comment_resolve_toggles_and_records_resolver() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(
             &mut p,
@@ -560,12 +428,12 @@ fn comment_resolve_toggles_and_records_resolver() {
                 thread_id: "t1".into(),
                 resolved: true,
             },
-            user("bob"),
+            user("alice"),
         )
         .await;
         let v = query_thread(&p, "t1").await.unwrap();
         assert!(v.thread.resolved);
-        assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
+        assert_eq!(v.thread.resolved_by, Some(Party::Key(b"alice".to_vec())));
         apply_commit_as(
             &mut p,
             &PageMsg::ResolveThread {
@@ -589,6 +457,207 @@ fn comment_resolve_toggles_and_records_resolver() {
             "thread not found",
         )
         .await;
+    });
+}
+
+// Whoever resolves or reopens a thread is recorded as having done so.
+#[test]
+fn any_member_resolves_and_reopens_any_thread() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+
+        apply_commit_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
+                resolved: true,
+            },
+            user("mallory"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert!(v.thread.resolved);
+        assert_eq!(v.thread.resolved_by, Some(Party::Key(b"mallory".to_vec())));
+
+        apply_commit_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
+                resolved: false,
+            },
+            user("carol"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert!(!v.thread.resolved);
+        assert_eq!(v.thread.resolved_by, None);
+    });
+}
+
+#[test]
+fn programs_and_modules_resolve_threads_as_themselves() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "system-page").await;
+        // Module-level permissions consume the host-authenticated Program
+        // origin, just as every other page/comment operation does.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "program-page".into(),
+                title: "Program".into(),
+                blocks: Vec::new(),
+            },
+            sdk::Origin::Program(7),
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &add("page-thread", "m1", "program-page", "x"),
+            user("alice"),
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &add("opened", "m2", "b1", "x"),
+            sdk::Origin::Program(7),
+        )
+        .await;
+        for thread_id in ["page-thread", "opened"] {
+            let resolve = PageMsg::ResolveThread {
+                thread_id: thread_id.into(),
+                resolved: true,
+            };
+            apply_commit_as(&mut p, &resolve, sdk::Origin::Program(8)).await;
+            assert_eq!(
+                query_thread(&p, thread_id)
+                    .await
+                    .unwrap()
+                    .thread
+                    .resolved_by,
+                Some(Party::Account(8))
+            );
+            apply_commit_as(
+                &mut p,
+                &PageMsg::ResolveThread {
+                    thread_id: thread_id.into(),
+                    resolved: false,
+                },
+                sdk::Origin::Module("agent".into()),
+            )
+            .await;
+            apply_commit_as(&mut p, &resolve, sdk::Origin::Program(7)).await;
+            assert_eq!(
+                query_thread(&p, thread_id)
+                    .await
+                    .unwrap()
+                    .thread
+                    .resolved_by,
+                Some(Party::Account(7))
+            );
+            apply_commit_as(
+                &mut p,
+                &PageMsg::ResolveThread {
+                    thread_id: thread_id.into(),
+                    resolved: false,
+                },
+                sdk::Origin::Program(7),
+            )
+            .await;
+            assert_eq!(
+                query_thread(&p, thread_id)
+                    .await
+                    .unwrap()
+                    .thread
+                    .resolved_by,
+                None
+            );
+        }
+    });
+}
+
+#[test]
+fn resolving_with_real_accounts_preserves_source_relations() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = host::Host::genesis(vec![
+            Box::new(
+                pages_on!(context, "pages")
+                    .with_identity("identity")
+                    .with_attribution("attribution"),
+            ),
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(sdk_testkit::MemStore::new()),
+                "resolve".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(sdk_testkit::MemStore::new()),
+            )),
+        ])
+        .unwrap();
+        let block = |number| host::BlockContext {
+            height: 1,
+            consensus_time: 1,
+            origin: sdk::Origin::External(vec![number; 32]),
+        };
+        for number in [1, 2] {
+            host.submit_at(
+                block(number),
+                Msg {
+                    target: "identity".into(),
+                    payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                        name: format!("person-{number}"),
+                        scheme: identity::KeyScheme::Ed25519,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        host.submit_at(
+            block(1),
+            msg(&PageMsg::CreatePage {
+                page_id: "p1".into(),
+                title: "Page".into(),
+                blocks: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        host.submit_at(block(2), msg(&add("thread", "comment", "p1", "x")))
+            .await
+            .unwrap();
+        let relations = host.module_root("attribution");
+        let query = encode_query(&PageQuery::CommentThread {
+            thread_id: "thread".into(),
+        });
+        for (resolved, signer, expected) in [(true, 1, Some(Party::Account(1))), (false, 2, None)] {
+            let operation = msg(&PageMsg::ResolveThread {
+                thread_id: "thread".into(),
+                resolved,
+            });
+            let outcome = host.submit_at(block(signer), operation).await.unwrap();
+            let PageReply::CommentThread(Some(view)) =
+                decode_reply(&host.query("pages", &query).await.unwrap()).unwrap()
+            else {
+                panic!("thread")
+            };
+            assert_eq!(view.thread.resolved, resolved);
+            assert_eq!(view.thread.resolved_by, expected);
+            assert_eq!(host.module_root("attribution"), relations);
+            let dispatch = outcome
+                .dispatches
+                .iter()
+                .find(|dispatch| dispatch.module == "pages")
+                .unwrap();
+            assert_eq!(
+                crate::decode_assigned(&dispatch.assigned).unwrap().actor,
+                Party::Account(u64::from(signer))
+            );
+        }
     });
 }
 
@@ -665,6 +734,7 @@ fn deleting_a_block_purges_its_comment_threads() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "keep".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -680,12 +750,11 @@ fn deleting_a_block_purges_its_comment_threads() {
     });
 }
 
-// re-homing a thread is the opener's call — the same stored-author rule
-// `EditComment`/`DeleteComment` already enforce. It is also what bounds the
-// comment purge: without it, a stranger aims `RemoveBlock` at comments they
-// may not delete by first moving the thread onto a block of their own.
+// re-homing a thread is any member's call, and the purge on `RemoveBlock`
+// follows the anchor: it reaches exactly the threads anchored to the removed
+// subtree, wherever they were moved from.
 #[test]
-fn a_thread_moves_only_by_its_opener() {
+fn any_member_moves_a_thread_and_the_purge_follows_its_anchor() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
@@ -696,16 +765,7 @@ fn a_thread_moves_only_by_its_opener() {
             target: "b2".into(),
             anchor: None,
         };
-        // a stranger, a module and the system are all refused: the opener is a
-        // stored author, not an origin KIND, so nothing outranks it here.
-        for origin in [
-            user("mallory"),
-            sdk::Origin::Module("runs".into()),
-            sdk::Origin::System,
-        ] {
-            apply_err_as(&mut p, &move_to_b2, origin, "not the comment author").await;
-        }
-        // and the pre-consensus empty origin never passes as a real user,
+        // the pre-consensus empty origin never passes as a real user,
         // exactly as on `AddComment`/`EditComment`/`DeleteComment`.
         apply_err_as(
             &mut p,
@@ -717,31 +777,12 @@ fn a_thread_moves_only_by_its_opener() {
         assert_eq!(target_thread_count(&p, "b1").await, 1);
         assert_eq!(target_thread_count(&p, "b2").await, 0);
 
-        // so mallory removing her OWN block takes nothing of alice's with it:
-        // the purge reaches exactly what was anchored to the removed subtree.
-        apply_commit(
-            &mut p,
-            &PageMsg::RemoveBlock {
-                block_id: "b2".into(),
-            },
-        )
-        .await;
-        assert!(query_comment(&p, "m1").await.is_some());
-        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b1");
+        apply_commit_as(&mut p, &move_to_b2, user("mallory")).await;
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
+        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b2");
 
-        // the opener re-homes it herself, and then the purge does reach it —
-        // that is the block op's authority, and it is unchanged.
-        apply_commit_as(
-            &mut p,
-            &PageMsg::MoveCommentThread {
-                thread_id: "t1".into(),
-                target: "b3".into(),
-                anchor: None,
-            },
-            user("alice"),
-        )
-        .await;
-        assert_eq!(target_thread_count(&p, "b3").await, 1);
+        // removing b3 takes nothing anchored elsewhere …
         apply_commit(
             &mut p,
             &PageMsg::RemoveBlock {
@@ -749,7 +790,63 @@ fn a_thread_moves_only_by_its_opener() {
             },
         )
         .await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        // … and removing b2 purges the thread now anchored there.
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b2".into(),
+            },
+        )
+        .await;
         assert!(query_thread(&p, "t1").await.is_none());
         assert!(query_comment(&p, "m1").await.is_none());
+        assert_eq!(target_thread_count(&p, "b2").await, 0);
+    });
+}
+
+#[test]
+fn add_comment_on_a_nonexistent_target_is_refused() {
+    // #1687: a NEW thread's target must be a real block whether or not an
+    // anchor is given — otherwise a thread can be squatted on an id that
+    // never becomes a block, and RemoveBlock (which needs the block to load)
+    // can never purge it.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", "ghost", "squat"),
+            user("mallory"),
+            "block not found",
+        )
+        .await;
+        assert!(p.staged.is_empty(), "a rejected comment op stages nothing");
+    });
+}
+
+#[test]
+fn reply_metadata_excludes_comment_bodies() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
+        apply_commit(
+            &mut p,
+            &add("t", "c", "b1", &"x".repeat(MAX_COMMENT_TEXT_BYTES)),
+        )
+        .await;
+        let bytes = p
+            .query(&encode_query(&PageQuery::CommentThreadHead {
+                thread_id: "t".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&bytes).unwrap(),
+            PageReply::CommentThreadHead(Some(CommentThreadHead {
+                target: "b1".into(),
+                comment_count: 1
+            }))
+        );
+        assert!(bytes.len() < 128);
     });
 }

@@ -6,13 +6,33 @@
 //! passes the loopback http URL (that lane is Task 6's e2e). stock git's
 //! fetch-first refusal on the bare remote is the CAS-reject stand-in.
 
-use crate::NodeHandle;
 use super::super::NodedProvisioner;
 use super::super::plane_tests::{
     SKILL_BODY, SKILL_FILE, skill_mount, skill_tree, spawn_files_actor,
 };
 use super::*;
+use crate::NodeHandle;
 use compute_service::WorkspaceProvisioner as _;
+
+/// write `body` to `path` as an executable script, through a child shell
+/// rather than this process: a file this process holds open for writing is
+/// inherited by every child another test forks meanwhile, and executing it
+/// while such a child still holds the descriptor fails with ETXTBSY.
+fn install_script(path: &std::path::Path, body: &str) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 022 && cat > \"$0\" && chmod 755 \"$0\"")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child.stdin.take().unwrap().write_all(body.as_bytes())?;
+            child.wait()
+        })
+        .unwrap();
+    assert!(status.success(), "install {}", path.display());
+}
 
 const REPO: &str = "app";
 const BRANCH: &str = "agent/item-7";
@@ -125,23 +145,28 @@ impl Bed {
     }
 
     async fn provisioner(&self) -> NodedProvisioner {
-        let (handle, _rx, _hub) = NodeHandle::channel();
-        NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await, &self.runs_root)
-            .with_forge(Some(self.push_base()), NODE_IDENT)
+        let (handle, rx, _hub) = NodeHandle::channel();
+        spawn_files_actor(rx, Default::default(), false);
+        NodedProvisioner::new(
+            crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
+            &self.runs_root,
+        )
+        .with_forge(Some(self.push_base()), NODE_IDENT)
     }
 
-    /// a provisioner whose actor lane is SERVED (the plain one above drops its
-    /// receiver — fine for runs with no mounts, but a W6 checkout needs a node
-    /// on the other end). `reject_reads` fails the mount checkout mid-way. the
-    /// actor handle must outlive the provision, so it comes back with it.
+    /// A served actor with skill files. `reject_reads` fails their checkout
+    /// midway; session binds use the same actor lane as the plain provisioner.
     async fn skill_provisioner(
         &self,
         reject_reads: bool,
     ) -> (NodedProvisioner, tokio::task::JoinHandle<()>) {
         let (handle, rx, _hub) = NodeHandle::channel();
         let actor = spawn_files_actor(rx, skill_tree(), reject_reads);
-        let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await, &self.runs_root)
-            .with_forge(Some(self.push_base()), NODE_IDENT);
+        let prov = NodedProvisioner::new(
+            crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
+            &self.runs_root,
+        )
+        .with_forge(Some(self.push_base()), NODE_IDENT);
         (prov, actor)
     }
 
@@ -178,29 +203,21 @@ impl Bed {
             // the forge lane's session bind rides the same id as every other:
             // the one `runs` resolves (a forge item run is a chat run on the
             // item's channel), never the host-local `run_id` above.
-            consensus_run_id: Some(runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT)),
-            agent_id: Some(AGENT.into()),
-            agent_display_name: Some(AGENT_DISPLAY_NAME.into()),
+            agent: Some(compute_service::AgentExecution {
+                run_id: runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT),
+                attempt: 0,
+                agent_id: AGENT.into(),
+                display_name: AGENT_DISPLAY_NAME.into(),
+            }),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),
                 item_title: "Fix the flaky gate".into(),
                 commit: commit.into(),
                 branch: BRANCH.into(),
                 branch_born,
-                forge_push: true,
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
-    }
-
-    fn read_only_spec(&self, run_id: &str, commit: &str) -> WorkspaceSpec {
-        let mut spec = self.spec(run_id, commit, false);
-        let WorkspaceSource::Forge { forge_push, .. } = &mut spec.source else {
-            unreachable!()
-        };
-        *forge_push = false;
-        spec
     }
 }
 
@@ -224,11 +241,9 @@ fn the_probe_fails_loud_when_git_is_absent() {
 #[cfg(unix)]
 #[test]
 fn the_probe_rejects_git_without_the_runtime_rebase_options() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let tmp = tempfile::tempdir().unwrap();
     let shim = tmp.path().join("git-with-old-rebase");
-    std::fs::write(
+    install_script(
         &shim,
         "#!/bin/sh\n\
          for arg in \"$@\"; do\n\
@@ -240,9 +255,7 @@ fn the_probe_rejects_git_without_the_runtime_rebase_options() {
            esac\n\
          done\n\
          exec git \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let err = probe_host_git_with(shim.to_str().unwrap()).unwrap_err();
     assert!(err.contains("runtime-compatible git"), "{err}");
@@ -254,10 +267,13 @@ fn the_probe_rejects_git_without_the_runtime_rebase_options() {
 async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel();
-    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await, &bed.runs_root)
-        .with_forge_probed(Some(bed.push_base()), NODE_IDENT, || {
-            Err("git probe exploded".into())
-        });
+    let prov = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await,
+        &bed.runs_root,
+    )
+    .with_forge_probed(Some(bed.push_base()), NODE_IDENT, || {
+        Err("git probe exploded".into())
+    });
     // PERMANENT: every forge attempt fails with the construction-time reason.
     for run in ["s1:0", "s1:1"] {
         let err = provision_err(prov.provision(&bed.spec(run, &bed.head, false)).await);
@@ -277,8 +293,11 @@ async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
 async fn no_http_surface_means_a_clear_forge_provision_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel();
-    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await, &bed.runs_root)
-        .with_forge(None, NODE_IDENT);
+    let prov = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await,
+        &bed.runs_root,
+    )
+    .with_forge(None, NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no http surface"), "{err}");
 }
@@ -287,8 +306,11 @@ async fn no_http_surface_means_a_clear_forge_provision_error() {
 async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel(); // no with_forge_repo
-    let prov =
-        NodedProvisioner::new(crate::agent_provision::test_link(handle).await, &bed.runs_root).with_forge(Some(bed.push_base()), NODE_IDENT);
+    let prov = NodedProvisioner::new(
+        crate::agent_provision::test_link(handle).await,
+        &bed.runs_root,
+    )
+    .with_forge(Some(bed.push_base()), NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no forge repo base"), "{err}");
 }
@@ -321,6 +343,29 @@ fn the_push_base_rewrites_wildcard_binds_to_loopback() {
     assert_eq!(forge_push_base(None), None);
 }
 
+#[test]
+fn validate_coords_refuses_any_push_target_outside_agent_namespace() {
+    // #1836's second wall: even if the composer ever named a branch it does
+    // not own (a bug, or a corrupt envelope), the provisioner refuses it
+    // before a single git command runs.
+    let ok_commit = "a".repeat(40);
+    validate_coords("app", &ok_commit, "agent/item-7").expect("an agent-scoped branch is fine");
+    for outside in [
+        "dev",
+        "main",
+        "feature/x",
+        "agent",
+        "agent-item-7",
+        "/agent/x",
+    ] {
+        let err = validate_coords("app", &ok_commit, outside).unwrap_err();
+        assert!(
+            err.contains("agent/") || err.contains("not a safe branch name"),
+            "{outside:?} must be refused: {err}"
+        );
+    }
+}
+
 // ---- provision ------------------------------------------------------------
 
 #[tokio::test]
@@ -329,7 +374,8 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
     // clone must still materialize the pinned tree.
     let bed = bed();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -366,7 +412,7 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
     assert_eq!(
         git_stdout(&dir, &["remote"]),
         "",
-        "a push-granted clone has no configured path back to the canonical repo"
+        "a run's clone has no configured path back to the canonical repo"
     );
     assert_eq!(
         ws.env().get("DUCKTAPE_RUN_WORKSPACE"),
@@ -402,7 +448,8 @@ async fn provision_never_touches_shared_repo_refs() {
     set_ref(&repo, BRANCH, &stale);
 
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -428,7 +475,12 @@ async fn a_born_branch_is_forced_to_the_committed_tip_and_pushes_fast_forward() 
     set_ref(&repo, BRANCH, &drift);
 
     let spec = bed.spec("s2:0", &tip, true);
-    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
+    let ws = bed
+        .provisioner()
+        .await
+        .provision(&spec)
+        .await
+        .expect("provision");
     let dir = ws.workdir();
     assert_eq!(
         git_stdout(&dir, &["rev-parse", "HEAD"]),
@@ -490,7 +542,8 @@ async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -539,7 +592,8 @@ async fn a_missing_pinned_commit_fails_provision_before_any_worktree() {
     let bed = bed();
     let absent = "ab".repeat(20);
     let err = provision_err(
-        bed.provisioner().await
+        bed.provisioner()
+            .await
             .provision(&bed.spec("s1:0", &absent, false))
             .await,
     );
@@ -561,7 +615,6 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
         commit: bed.head.clone(),
         branch: BRANCH.into(),
         branch_born: false,
-        forge_push: true,
     };
     let err = provision_err(bed.provisioner().await.provision(&spec).await);
     assert!(
@@ -690,7 +743,7 @@ fn git_control_sanitization_rejects_nested_object_and_ref_symlinks() {
 fn attribution_addresses_round_trip_a_label_shaped_agent_id() {
     let longest = "x".repeat(63);
     for id in [AGENT, "qa-luna", "a", longest.as_str()] {
-        assert!(agent::validate_agent_id(id).is_ok(), "{id}");
+        assert!(runs::validate_agent_id(id).is_ok(), "{id}");
         let local = attribution_email_local_part(id);
         assert_eq!(local, id);
         assert!(local.len() <= 63, "{local}");
@@ -774,7 +827,8 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -815,24 +869,21 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_git_ignores_agent_installed_hooks_and_filters() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
     let dir = ws.workdir();
     let sentinel = dir.join("host-git-ran");
     let filter = dir.join("evil-filter.sh");
-    std::fs::write(
+    install_script(
         &filter,
-        format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
+    );
     run_git(
         &dir,
         &["config", "filter.evil.clean", &filter.display().to_string()],
@@ -841,12 +892,10 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
     .unwrap();
     std::fs::write(dir.join(".gitattributes"), "answer.md filter=evil\n").unwrap();
     let hook = dir.join(".git/hooks/pre-push");
-    std::fs::write(
+    install_script(
         &hook,
-        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+    );
     std::fs::write(dir.join("answer.md"), "safe work\n").unwrap();
 
     ws.commit("agent run s1:0", Some("Publish without host execution"))
@@ -860,11 +909,12 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
 }
 
 #[tokio::test]
-async fn a_push_granted_dirty_tree_pushes_with_agent_and_node_identity() {
+async fn a_dirty_tree_pushes_with_agent_and_node_identity() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -886,19 +936,20 @@ async fn a_push_granted_dirty_tree_pushes_with_agent_and_node_identity() {
 }
 
 #[tokio::test]
-async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
+async fn a_clean_tree_yields_no_changes_and_no_push() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
-        .provision(&bed.read_only_spec("s1:0", &bed.head))
+        .provisioner()
+        .await
+        .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
     let runtime = ws.workdir().join(provider_host::RUN_RUNTIME_DIR);
     assert_eq!(
         git_stdout(&ws.workdir(), &["remote"]),
         "",
-        "a read-only clone has no configured path back to the canonical repo"
+        "a run's clone has no configured path back to the canonical repo"
     );
     std::fs::create_dir_all(runtime.join("provider-config")).unwrap();
     std::fs::write(runtime.join("provider-config/auth.json"), "must-not-push").unwrap();
@@ -922,32 +973,12 @@ async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
 }
 
 #[tokio::test]
-async fn a_read_only_dirty_tree_is_rejected_without_moving_the_remote_ref() {
-    let bed = bed();
-    let bare = bed.snapshot_bare();
-    let ws = bed
-        .provisioner().await
-        .provision(&bed.read_only_spec("s1:0", &bed.head))
-        .await
-        .expect("provision");
-    std::fs::write(ws.workdir().join("answer.md"), "must stay local\n").unwrap();
-
-    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
-    assert!(err.contains("no forge_push grant"), "{err}");
-    assert_eq!(
-        ref_oid(&bare, BRANCH),
-        None,
-        "a read-only run must never create or move the remote work branch"
-    );
-    ws.cleanup().await;
-}
-
-#[tokio::test]
 async fn an_agent_created_commit_chain_is_pushed_without_rewriting_it() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1007,7 +1038,8 @@ async fn uncommitted_work_is_captured_on_top_of_the_agents_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1054,7 +1086,12 @@ async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
     // an EMPTY title is the "no usable forge title" case now that the field is
     // required: it fails the commit-message candidate and falls to the prose.
     *item_title = String::new();
-    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
+    let ws = bed
+        .provisioner()
+        .await
+        .provision(&spec)
+        .await
+        .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "real work\n").unwrap();
 
     let err = ws.commit("agent run s1:0", None).await.unwrap_err();
@@ -1072,7 +1109,8 @@ async fn an_agent_commit_cannot_spoof_git_identity_and_get_rewritten() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1101,7 +1139,8 @@ async fn agent_history_must_descend_from_the_pinned_forge_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1171,7 +1210,12 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let spec = bed.spec("s1:0", &bed.head, true);
-    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
+    let ws = bed
+        .provisioner()
+        .await
+        .provision(&spec)
+        .await
+        .expect("provision");
     let dir = ws.workdir();
     std::fs::write(dir.join("mine.txt"), "forked work\n").unwrap();
 
@@ -1214,7 +1258,8 @@ async fn a_concurrent_advance_preserves_agent_merge_topology_and_messages() {
     set_ref(&bare_repo, BRANCH, &rival);
 
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1304,7 +1349,8 @@ async fn an_identical_concurrent_patch_keeps_the_agent_attribution_commit() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1345,7 +1391,12 @@ async fn a_rebase_conflict_aborts_cleanly_and_degrades() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let spec = bed.spec("s1:0", &bed.head, true);
-    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
+    let ws = bed
+        .provisioner()
+        .await
+        .provision(&spec)
+        .await
+        .expect("provision");
     let dir = ws.workdir();
     std::fs::write(dir.join("readme.md"), "my conflicting edit\n").unwrap();
 
@@ -1387,14 +1438,11 @@ async fn a_remote_that_always_rejects_exhausts_the_bounded_retries() {
     // a pre-receive hook that logs every push attempt and declines it.
     let hook = bare.join("hooks").join("pre-receive");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    std::fs::write(&hook, "#!/bin/sh\necho x >> hook.log\nexit 1\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    install_script(&hook, "#!/bin/sh\necho x >> hook.log\nexit 1\n");
 
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1423,7 +1471,8 @@ async fn cleanup_removes_the_worktree_and_its_metadata_even_uncommitted() {
     // go quietly, metadata and all.
     let bed = bed();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1447,7 +1496,8 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner().await
+        .provisioner()
+        .await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1461,4 +1511,128 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
     // detached lane: the work branch lives only on the remote — the shared
     // repo never grew a local ref for it.
     assert_eq!(ref_oid(&bed.repo_dir, BRANCH), None);
+}
+
+// ---- push credential is resolved at push time, never latched at provision --
+
+/// a minimal smart-HTTP git remote that captures the `x-ducktape-admin-token`
+/// header presented on every `git-receive-pack` POST, into `captured`. It
+/// advertises an unborn repo (so any push is a plain create) and never
+/// advertises `report-status`, so a real `git push` neither needs nor reads a
+/// structured result body — only that a request reached it and what it
+/// carried. This stands in for the node's OWN `/forge/{repo}/…` lane
+/// (`git_http.rs`) without needing that lane's consensus actor behind it.
+async fn spawn_credential_capturing_remote(
+    captured: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) -> std::net::SocketAddr {
+    fn pkt_line(data: &str) -> Vec<u8> {
+        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+        out.extend_from_slice(data.as_bytes());
+        out
+    }
+
+    async fn advertise() -> impl axum::response::IntoResponse {
+        let mut body = pkt_line("# service=git-receive-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(&format!(
+            "{} capabilities^{{}}\0\n",
+            "0".repeat(40)
+        )));
+        body.extend_from_slice(b"0000");
+        (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-git-receive-pack-advertisement",
+            )],
+            body,
+        )
+    }
+    let receive = move |headers: axum::http::HeaderMap, _body: axum::body::Bytes| {
+        let captured = captured.clone();
+        async move {
+            let token = headers
+                .get(crate::admin::ADMIN_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            captured.lock().unwrap().push(token);
+            (
+                axum::http::StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                )],
+                b"0000".to_vec(),
+            )
+        }
+    };
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind a loopback test remote");
+    let address = listener.local_addr().expect("read the test remote address");
+    let app = axum::Router::new()
+        .route(
+            "/v1/submit",
+            axum::routing::post(|| async {
+                axum::Json(super::super::plane_tests::committed_block())
+            }),
+        )
+        .route(&format!("/{REPO}/info/refs"), axum::routing::get(advertise))
+        .route(
+            &format!("/{REPO}/git-receive-pack"),
+            axum::routing::post(receive),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    address
+}
+
+#[tokio::test]
+async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_token() {
+    let bed = bed();
+    let workspace = tempfile::tempdir().unwrap();
+    // T1: the credential this node's `admin.token` held when the run was
+    // provisioned.
+    let provision_time_token = crate::admin::mint_operator_token(workspace.path())
+        .expect("mint the provision-time credential");
+
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let remote = spawn_credential_capturing_remote(captured.clone()).await;
+
+    let link = NodeLink::new(format!("http://{remote}"))
+        .with_workspace_credential(workspace.path())
+        .with_forge_repo(bed.repo_base.clone());
+    let prov = NodedProvisioner::new(link, &bed.runs_root)
+        .with_forge(Some(format!("http://{remote}")), NODE_IDENT);
+
+    let ws = prov
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    std::fs::write(ws.workdir().join("answer.md"), "the work\n").unwrap();
+
+    // the node restarts mid-run: `admin.token` is re-minted (T1 is now dead).
+    let post_restart_token = crate::admin::mint_operator_token(workspace.path())
+        .expect("mint the post-restart credential");
+    assert_ne!(provision_time_token, post_restart_token);
+
+    // commit_blocking's push presents whatever the SAME NodeLink reads right
+    // now — never the value `provision` observed, because nothing captured
+    // it into an owned field.
+    let _ = ws.commit("agent run s1:0", None).await;
+
+    let presented = captured.lock().unwrap().clone();
+    assert!(
+        !presented.is_empty(),
+        "the fake remote never saw a receive-pack POST"
+    );
+    assert!(
+        presented
+            .iter()
+            .all(|t| t.as_deref() == Some(post_restart_token.as_str())),
+        "every push attempt must present the CURRENT credential, never the \
+         provision-time one: {presented:?}"
+    );
 }

@@ -1,14 +1,17 @@
-use super::{Origin, PageError, PageMsg, Pages};
+use super::{PageError, PageMsg, Pages, Party};
 
 impl Pages {
     /// apply one decoded [`PageMsg`] to the staged overlay. pure tree surgery
-    /// over per-block/-comment records, re-staged on success. errors abort the
-    /// block. `origin`/`now` are only consulted by the comment ops (author +
-    /// timestamp); block ops ignore them.
+    /// over per-block/-comment records. The caller restores its incoming staging
+    /// on error. `actor` is the canonical party the op is recorded under (the
+    /// current account, or the signing key of one that has not joined an
+    /// account): `CreatePage` records it as the page's author and the comment
+    /// ops record it on what they write; no op gates on a recorded author.
+    /// `now` is consulted only by the comment ops (their stored timestamps).
     pub(super) async fn apply(
         &mut self,
         msg: PageMsg,
-        origin: &Origin,
+        actor: &Party,
         now: u64,
     ) -> Result<(), PageError> {
         // no client-minted id may live in the reserved (NUL-prefixed) keyspace:
@@ -16,7 +19,11 @@ impl Pages {
         // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
         // storage touch — keeps a block/comment write from ever clobbering them.
         let named: Vec<&str> = match &msg {
-            PageMsg::CreatePage { page_id, .. } => vec![page_id.as_str()],
+            PageMsg::CreatePage {
+                page_id, blocks, ..
+            } => std::iter::once(page_id.as_str())
+                .chain(blocks.iter().map(|b| b.id.as_str()))
+                .collect(),
             PageMsg::InsertBlock { parent, block, .. } => vec![parent.as_str(), block.id.as_str()],
             PageMsg::UpdateText { block_id, .. }
             | PageMsg::SetSpanMark { block_id, .. }
@@ -59,11 +66,11 @@ impl Pages {
                 | PageMsg::DeleteComment { .. }
                 | PageMsg::ResolveThread { .. }
         ) {
-            return self.apply_comment_op(msg, origin, now).await;
+            return self.apply_comment_op(msg, actor, now).await;
         }
         if matches!(&msg, PageMsg::CreatePage { .. }) {
-            return self.apply_page_op(msg).await;
+            return self.apply_page_op(msg, actor).await;
         }
-        self.apply_block_op(msg).await
+        self.apply_block_op(msg, actor).await
     }
 }

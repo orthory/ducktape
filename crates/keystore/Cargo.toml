@@ -18,9 +18,6 @@ version.workspace = true
 # zero-dependency home resolver every surface shares, and nothing else. A GUI
 # can link this without a validator arriving behind it.
 [dependencies]
-# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
-# zero-dependency leaf so every reader of that root agrees about it.
-ducktape-home = { workspace = true }
 argon2 = { workspace = true }
 base64 = "0.22"
 # the 24-word recovery phrase a restore reads and a mint reveals.
@@ -29,6 +26,7 @@ chacha20poly1305 = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 rand = "0.8"
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

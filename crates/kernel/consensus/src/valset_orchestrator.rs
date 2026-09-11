@@ -231,7 +231,7 @@ where
     /// arms a cutover `cutover_delay` views out; the caller mirrors it into
     /// the ordered lane's discard ceiling. resident changes ride the same
     /// boundary because transport membership is epoch-scoped (per-epoch mesh
-    /// tracking + channel bank), and a respawn with an unchanged participant
+    /// tracking + the engine lanes' epoch tag), and a respawn with an unchanged participant
     /// set is safe: the boundary carry re-proposes accepted ops.
     pub fn observe_members(
         &mut self,

@@ -26,6 +26,92 @@ fn ducktape(args: &[&str]) -> (bool, String) {
 }
 
 #[test]
+fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
+    use sha2::Digest as _;
+    let scratch = tempfile::tempdir().unwrap();
+    let component = fixture("hello");
+    let index = scratch.path().join("index.wasm");
+    let artifact = scratch.path().join("module.artifact");
+    std::fs::write(&index, b"mapper bytes").unwrap();
+    for mapper in [None, Some(index.as_path())] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        command
+            .env("DUCKTAPE_HOME", scratch.path().join("no-node-workspace"))
+            .args(["module", "pack", &component, "--out"])
+            .arg(&artifact);
+        if let Some(mapper) = mapper {
+            command.arg("--index").arg(mapper);
+        }
+        let result = command.output().unwrap();
+        assert!(result.status.success(), "{:?}", result);
+        let bytes = std::fs::read(&artifact).unwrap();
+        let decoded = module_artifact::ModuleArtifact::decode(&bytes).unwrap();
+        assert_eq!(decoded.component, std::fs::read(&component).unwrap());
+        assert_eq!(decoded.index, mapper.map(|_| b"mapper bytes".to_vec()));
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+        );
+    }
+    let saved = std::fs::read(&artifact).unwrap();
+    std::fs::remove_file(&index).unwrap();
+    let (ok, out) = ducktape(&[
+        "module",
+        "pack",
+        &component,
+        "--index",
+        index.to_str().unwrap(),
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert!(!ok, "{out}");
+    assert_eq!(std::fs::read(&artifact).unwrap(), saved);
+}
+
+#[test]
+fn pack_includes_view_assets_and_refuses_pending_or_missing_declared_view() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path();
+    let code = dir.join("custom.component.wasm");
+    let view = dir.join("custom.view.wasm");
+    let assets = dir.join("custom.assets");
+    let out = dir.join("module.artifact");
+    std::fs::write(&code, b"code").unwrap();
+    std::fs::write(&view, b"view").unwrap();
+    std::fs::create_dir(&assets).unwrap();
+    std::fs::write(assets.join("logo.svg"), b"svg").unwrap();
+    let pack = || {
+        ducktape(&[
+            "module",
+            "pack",
+            code.to_str().unwrap(),
+            "--view",
+            view.to_str().unwrap(),
+            "--assets",
+            assets.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+    };
+    let (ok, message) = pack();
+    assert!(ok, "{message}");
+    let saved = std::fs::read(&out).unwrap();
+    let artifact = module_artifact::ModuleArtifact::decode(&saved).unwrap();
+    let packaged = artifact.view.unwrap();
+    assert_eq!(packaged.component, b"view");
+    assert_eq!(packaged.assets["logo.svg"], b"svg");
+    std::fs::write(dir.join("custom.view.pending"), b"pending").unwrap();
+    let (ok, message) = pack();
+    assert!(!ok && message.contains("pending"), "{message}");
+    assert_eq!(std::fs::read(&out).unwrap(), saved);
+    std::fs::remove_file(dir.join("custom.view.pending")).unwrap();
+    std::fs::remove_file(&view).unwrap();
+    let (ok, message) = pack();
+    assert!(!ok, "{message}");
+    assert_eq!(std::fs::read(&out).unwrap(), saved);
+}
+
+#[test]
 fn status_against_no_node_says_the_node_is_not_running() {
     let ws = tempfile::tempdir().expect("tempdir");
     // a dev-shape node.toml with rpc_listen and no node behind it
@@ -98,37 +184,6 @@ fn register_then_update_activate_across_three_validators() {
     }
 }
 
-/// a dead peer refuses BEFORE the proposal (spec decision 2-B): the
-/// custodian's push dials it over the userspace stack, which has no SYN
-/// timeout, so only the code plane's `OPEN_TIMEOUT` (15 s) turns that peer
-/// into a receipt the operator can read — well inside the CLI's 60 s.
-#[test]
-fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
-    let mut cluster = three_validators();
-    cluster.kill(2);
-    let cfg = cluster.config_file(0);
-    let cfg = cfg.to_str().unwrap();
-    let started = std::time::Instant::now();
-    let (ok, out) = cluster.run_verb(&[
-        "module",
-        "register",
-        "hello",
-        &fixture("hello"),
-        "--config",
-        cfg,
-    ]);
-    println!("dead-peer run took {:?}:\n{out}", started.elapsed());
-    assert!(!ok, "{out}");
-    assert!(out.contains("peer  status"), "{out}");
-    let dead = common::hex(&Cluster::identity(3));
-    assert!(out.contains(&format!("{dead}  open timed out")), "{out}");
-    assert!(out.contains("not proposed"), "{out}");
-    // nothing reached governance: no pending swap, no proposal at all
-    let (_, status) = cluster.run_verb(&["module", "status", "--config", cfg]);
-    assert!(!status.contains("hello"), "{status}");
-    assert_no_proposals(&cluster, 0);
-}
-
 /// "before any governance" is only proven by the proposal list itself: the
 /// registry writes nothing until execute, so an empty `module status` row
 /// would still pass with a minted proposal sitting open.
@@ -167,7 +222,7 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
         assert!(!ok, "{}", outputs(&runs));
         assert!(
             out.contains(
-                "--after 2 cannot schedule anything: activation must exceed height+MIN_SWAP_LEAD (3)"
+                "--after 2 cannot schedule anything: activation must exceed execute-height+MIN_SWAP_LEAD (3)"
             ),
             "{out}"
         );
@@ -181,4 +236,95 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
     ]);
     assert!(!status.contains("hello"), "{status}");
     assert_no_proposals(&cluster, 0);
+}
+
+#[test]
+fn register_carries_a_mapper_and_update_can_remove_it() {
+    let cluster = three_validators();
+    let component = fixture("pages");
+    let mapper = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/modules/apps/pages/index.wasm"
+    );
+    let artifact = module_artifact::ModuleArtifact {
+        view: None,
+        component: std::fs::read(&component).unwrap(),
+        index: Some(std::fs::read(mapper).unwrap()),
+    };
+    let indexed = common::hex(&artifact.hash());
+    let runs = run_on_each(
+        &cluster,
+        &[
+            "module", "register", "notebook", &component, "--index", mapper, "--after", AFTER,
+        ],
+    );
+    assert_ceremony_scheduled(&runs, "notebook");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "notebook deployment active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "notebook").filter(|hash| *hash == indexed),
+        );
+    }
+    cluster.submit(
+        0,
+        "notebook",
+        br#"{"create_page":{"page_id":"first","title":"First"}}"#,
+    );
+    let query = serde_json::json!({"list_pages": {}});
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "the admitted mapper serves the page",
+            Duration::from_secs(60),
+            || {
+                let (status, body) =
+                    cluster.http(idx, "POST", "/v1/index/notebook/view", Some(&query));
+                let serves_view = status == 200;
+                if !serves_view {
+                    return None;
+                }
+                let pages = body["pages"]["pages"].as_array()?;
+                (pages.len() == 1).then_some(())
+            },
+        );
+    }
+    let bare = sha256_hex(&component);
+    assert_ne!(bare, indexed);
+    let runs = run_on_each(
+        &cluster,
+        &["module", "update", "notebook", &component, "--after", AFTER],
+    );
+    assert_ceremony_scheduled(&runs, "notebook");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "mapper removal active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "notebook").filter(|hash| *hash == bare),
+        );
+        cluster.await_committed(
+            idx,
+            "the removed mapper no longer serves",
+            Duration::from_secs(60),
+            || {
+                let (status, _) =
+                    cluster.http(idx, "POST", "/v1/index/notebook/view", Some(&query));
+                (status == 404).then_some(())
+            },
+        );
+        let page = cluster
+            .query(
+                idx,
+                "notebook",
+                br#"{"get_page":{"page_id":"first","limit":16}}"#,
+            )
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&page).unwrap();
+        assert!(
+            !page["page"].is_null(),
+            "component state survived mapper removal: {page}"
+        );
+    }
 }

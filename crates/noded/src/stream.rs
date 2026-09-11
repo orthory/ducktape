@@ -36,6 +36,12 @@ pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// few run-output panes; far below this. beyond it, subscribes refuse
 /// per-topic.
 pub const MAX_TOPICS_PER_CONNECTION: usize = 64;
+/// the ws frame/message ceiling for `/v1/ws` — this surface is unauthenticated
+/// like the rest of the file, so tungstenite's 64 MiB default is 1000x more
+/// than any legitimate client message: a `Subscribe` at the topic cap above
+/// (64 names + a same-sized `resume` map) or one run-output publish
+/// ([`MAX_RUN_OUTPUT_LINE`], 16 KiB) both fit many times over inside this.
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 /// rows a files:watch catch-up may SCAN (not just emit) per wakeup — a
 /// stage-heavy history is mostly non-commit rows, and an unbounded back-scan
 /// would stall the session task; past this the topic lags to live instead.
@@ -325,6 +331,7 @@ pub struct StreamOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum StreamOriginKind {
     External,
+    Program,
     Module,
     System,
 }
@@ -337,8 +344,8 @@ fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
     let assigned: Option<serde_json::Value> = (!row.assigned.is_empty())
         .then(|| serde_json::from_slice(&row.assigned).ok())
         .flatten();
-    let assigned_hex = (!row.assigned.is_empty() && assigned.is_none())
-        .then(|| crate::hex_bytes(&row.assigned));
+    let assigned_hex =
+        (!row.assigned.is_empty() && assigned.is_none()).then(|| crate::hex_bytes(&row.assigned));
     StreamOpRow {
         height: row.height,
         seq: row.seq,
@@ -346,6 +353,7 @@ fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
         origin: StreamOrigin {
             kind: match row.origin.kind {
                 indexer::OriginKind::External => StreamOriginKind::External,
+                indexer::OriginKind::Program => StreamOriginKind::Program,
                 indexer::OriginKind::Module => StreamOriginKind::Module,
                 indexer::OriginKind::System => StreamOriginKind::System,
             },
@@ -419,7 +427,7 @@ pub enum RunStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockWake {
     /// the tip moved and nothing else. An idle chain nop-fills once per
-    /// block time (node.toml `block_time_ms`) and that filler appends no
+    /// block time (network.toml `block_time_ms`) and that filler appends no
     /// per-module op row, so every scan it used to trigger returned empty.
     TipOnly,
     /// op rows were appended under the subscribers.
@@ -569,7 +577,10 @@ impl StreamHub {
         self.term_commands.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
+    /// one subscription to the block wake. The ws sessions ride it, and so
+    /// does any node-local task that must re-read committed state once per
+    /// block WITHOUT sitting on the drain's select loop.
+    pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
         self.blocks.subscribe()
     }
 
@@ -697,6 +708,112 @@ impl Drop for LogRingWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the numbering that outlives a ring entry
+// ---------------------------------------------------------------------------
+
+/// how many evicted ids keep their numbering.
+///
+/// Basis: a record is one `u64`, a `Copy` mark and the id string — under a
+/// hundred bytes — while the ONE ring entry it stands in for holds up to
+/// [`RUN_OUTPUT_MAX_LINES`] lines or a quarter megabyte of scrollback. So the
+/// bound sits orders of magnitude above the entry caps it backs (32 runs, 16
+/// terminal sessions): every id a node plausibly touches keeps its numbering,
+/// and the cap is here only so a peer minting fresh ids cannot grow the map
+/// without end.
+const SEQ_MEMORY_MAX_IDS: usize = 2_048;
+
+/// the per-id numbering that survives a whole-entry eviction.
+///
+/// Every ring in this crate is bounded twice: by rows within an id, and by id
+/// count across the map. Shedding ROWS is the point — the bytes are
+/// observational. Shedding the id's COUNTERS with them is not: the next append
+/// to that still-live id would restart at seq 1, which every mirror peer
+/// refuses as out-of-order and every subscribed cursor sits above forever. So
+/// eviction hands the id's head here on the way out, a re-created entry
+/// continues numbering from it, and while no entry exists this is what the id
+/// reports as BOTH head and floor — with no rows left, everything up to the
+/// head really is gone, which is what turns a stale cursor into a `Lagged`
+/// frame instead of silence.
+pub(crate) struct SeqMemory<M> {
+    records: BTreeMap<String, SeqRecord<M>>,
+    touch: u64,
+}
+
+struct SeqRecord<M> {
+    /// the last seq the evicted entry stamped: its head, and — no rows having
+    /// survived — its floor.
+    head: u64,
+    mark: M,
+    remembered: u64,
+}
+
+impl<M> Default for SeqMemory<M> {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            touch: 0,
+        }
+    }
+}
+
+impl<M: Copy> SeqMemory<M> {
+    /// stash an id's numbering as its entry is dropped. Oldest-first eviction
+    /// past [`SEQ_MEMORY_MAX_IDS`], by the order records were remembered.
+    pub(crate) fn remember(&mut self, id: &str, head: u64, mark: M) {
+        self.touch += 1;
+        let remembered = self.touch;
+        self.records.insert(
+            id.to_string(),
+            SeqRecord {
+                head,
+                mark,
+                remembered,
+            },
+        );
+        while self.records.len() > SEQ_MEMORY_MAX_IDS {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .min_by_key(|(_, record)| record.remembered)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.records.remove(&oldest);
+        }
+    }
+
+    /// the head a re-created entry continues from, and the mark the evicted one
+    /// carried.
+    pub(crate) fn recall(&self, id: &str) -> Option<(u64, M)> {
+        self.records
+            .get(id)
+            .map(|record| (record.head, record.mark))
+    }
+
+    /// what an id with no entry reports as its head and floor. `0` — a cursor
+    /// of 0 is not behind — for an id this ring has never held.
+    pub(crate) fn head_of(&self, id: &str) -> u64 {
+        self.records.get(id).map_or(0, |record| record.head)
+    }
+
+    /// the entry owns the numbering again.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.remove(id);
+    }
+}
+
+/// where a subscriber's cursor actually lands on a ring: up to `floor`
+/// (everything at or below it was evicted) and down to `head` (a cursor above
+/// the last stamped seq belongs to numbering this ring no longer has — a
+/// restart, or an entry evicted and re-created). The catch-up path emits
+/// `Lagged` whenever this moves the cursor, which is what keeps an impossible
+/// cursor from waiting on rows that will never come.
+pub(crate) fn resume_within(after: u64, floor: u64, head: u64) -> u64 {
+    after.max(floor).min(head)
+}
+
 #[derive(Clone)]
 pub struct RunOutputRegistry {
     inner: Arc<Mutex<RunOutputInner>>,
@@ -719,14 +836,51 @@ struct RunOutputInner {
     version: u64,
     touch: u64,
     runs: BTreeMap<String, RunRing>,
+    /// the numbering (and origin) of runs whose whole ring the cap evicted —
+    /// see [`SeqMemory`]. A run that keeps printing after its ring was shed
+    /// continues its seq from here instead of restarting at 1.
+    memory: SeqMemory<RunOrigin>,
 }
 
-#[derive(Default)]
+impl RunOutputInner {
+    /// shed a ring's ROWS, never its numbering: the id's head and origin move
+    /// to [`Self::memory`], so a run that keeps printing after the cap dropped
+    /// its ring resumes its seq instead of restarting at 1.
+    fn evict(&mut self, id: &str) {
+        let Some(ring) = self.runs.remove(id) else {
+            return;
+        };
+        self.memory.remember(id, ring.next_seq, ring.origin);
+    }
+}
+
+/// who fed this ring its lines. A run this node hosts is never writable by a
+/// peer, and the cap's eviction never sacrifices one to make room for a peer's
+/// — see [`RunOutputRegistry::push`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunOrigin {
+    Local,
+    Remote,
+}
+
 struct RunRing {
+    origin: RunOrigin,
     next_seq: u64,
     floor_seq: u64,
     touched: u64,
     lines: VecDeque<(u64, RunStream, String)>,
+}
+
+impl RunRing {
+    fn new(origin: RunOrigin) -> Self {
+        Self {
+            origin,
+            next_seq: 0,
+            floor_seq: 0,
+            touched: 0,
+            lines: VecDeque::new(),
+        }
+    }
 }
 
 impl Default for RunOutputRegistry {
@@ -757,21 +911,89 @@ impl RunOutputRegistry {
     }
 
     pub fn append(&self, id: impl Into<String>, stream: RunStream, line: impl Into<String>) {
-        self.push(id.into(), stream, line.into(), true);
+        self.push(id.into(), stream, line.into(), RunOrigin::Local);
     }
 
     /// Add a line received from another node without broadcasting it again.
-    pub fn append_remote(&self, event: RunOutputEvent) {
-        self.push(event.id, event.stream, event.line, false);
+    /// Refused (`false`) when `event.id` names a run this node hosts locally,
+    /// or when admitting a never-seen remote id would have to evict a local
+    /// ring to fit under [`RUN_OUTPUT_MAX_RUNS`] — see [`Self::push`].
+    #[must_use]
+    pub fn append_remote(&self, event: RunOutputEvent) -> bool {
+        self.push(event.id, event.stream, event.line, RunOrigin::Remote)
     }
 
-    fn push(&self, id: String, stream: RunStream, line: String, publish: bool) {
+    /// whether `id` names a run this node hosts locally. Checked by the agent
+    /// data plane before it even spends a peer's remote-binding budget on the
+    /// id: unlike a term session's 16-hex random id, a run id is consensus
+    /// state — every member can learn every hosted run's id — so "unseen id"
+    /// is not a signal a peer could not have forged for a run it does not own.
+    pub fn is_local(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("run output lock poisoned")
+            .runs
+            .get(id)
+            .is_some_and(|ring| ring.origin == RunOrigin::Local)
+    }
+
+    /// `origin` decides who this line may come from and how the run-count cap
+    /// is enforced:
+    /// - `Local` (this node's own provider output): always admitted, and
+    ///   growing past [`RUN_OUTPUT_MAX_RUNS`] evicts the globally
+    ///   least-recently-touched OTHER ring, local or remote — this node's own
+    ///   work always wins a slot.
+    /// - `Remote` (a peer's line): refused outright against an existing
+    ///   `Local` ring — a peer never appends to, or evicts, a run this node
+    ///   hosts. A brand-new remote id at the cap evicts only the
+    ///   least-recently-touched REMOTE ring; with none to evict (every held
+    ///   ring is local), the line is refused rather than growing past the cap.
+    ///
+    /// Returns whether the line was admitted.
+    fn push(&self, id: String, stream: RunStream, line: String, origin: RunOrigin) -> bool {
         let mut inner = self.inner.lock().expect("run output lock poisoned");
+        let held = inner.runs.get(&id).map(|ring| ring.origin);
+        // the Local/Remote mark outlives the rows: a local run whose ring the
+        // cap shed is still a run this node hosts, and a peer may no more claim
+        // it after the eviction than before.
+        let known = held.or_else(|| inner.memory.recall(&id).map(|(_, mark)| mark));
+        // the cap counts RINGS, so only an id holding none can grow the map.
+        let needs_slot = held.is_none() && inner.runs.len() >= RUN_OUTPUT_MAX_RUNS;
+        match (origin, known) {
+            (RunOrigin::Remote, Some(RunOrigin::Local)) => return false,
+            (RunOrigin::Remote, _) if needs_slot => {
+                let victim = inner
+                    .runs
+                    .iter()
+                    .filter(|(_, ring)| ring.origin == RunOrigin::Remote)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone());
+                match victim {
+                    Some(victim) => inner.evict(&victim),
+                    None => return false,
+                }
+            }
+            _ => {}
+        }
+        // a re-created ring continues the evicted one's numbering; with every
+        // row gone, that head is also its floor.
+        let restored = held
+            .is_none()
+            .then(|| inner.memory.recall(&id))
+            .flatten()
+            .map(|(head, _)| head);
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
-        let ring = inner.runs.entry(id.clone()).or_default();
+        let ring = inner
+            .runs
+            .entry(id.clone())
+            .or_insert_with(|| RunRing::new(origin));
+        if let Some(head) = restored {
+            ring.next_seq = head;
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -781,23 +1003,29 @@ impl RunOutputRegistry {
                 ring.floor_seq = evicted;
             }
         }
-        while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
-            let Some(victim) = inner
-                .runs
-                .iter()
-                .filter(|(run_id, _)| *run_id != &id)
-                .min_by_key(|(_, ring)| ring.touched)
-                .map(|(run_id, _)| run_id.clone())
-            else {
-                break;
-            };
-            inner.runs.remove(&victim);
+        if origin == RunOrigin::Local {
+            while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
+                let Some(victim) = inner
+                    .runs
+                    .iter()
+                    .filter(|(run_id, _)| *run_id != &id)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone())
+                else {
+                    break;
+                };
+                inner.evict(&victim);
+            }
+        }
+        if restored.is_some() {
+            inner.memory.forget(&id);
         }
         drop(inner);
         let _ = self.watch.send(version);
-        if publish {
+        if origin == RunOrigin::Local {
             let _ = self.appends.send(RunOutputEvent { id, stream, line });
         }
+        true
     }
 
     pub fn read_after(
@@ -810,7 +1038,9 @@ impl RunOutputRegistry {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.runs.get_mut(id) else {
-            return (Vec::new(), 0);
+            // no ring, but the numbering may have outlived it: report the
+            // evicted head as the floor, since every row up to it is gone.
+            return (Vec::new(), inner.memory.head_of(id));
         };
         ring.touched = touch;
         let rows = ring
@@ -821,6 +1051,16 @@ impl RunOutputRegistry {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this run's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, id: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("run output lock poisoned");
+        let Some(ring) = inner.runs.get(id) else {
+            return inner.memory.head_of(id);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -950,7 +1190,13 @@ impl TopicState {
     }
 }
 
-pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
+/// Serve one ws connection.
+///
+/// `reader_of` is the ONE capability this socket may have been given before it
+/// existed: the dispatch id whose output ring the caller proved it created
+/// ([`admit_run_reader`]). It is set at the upgrade and never changes, so a
+/// connection cannot talk its way into another run's output mid-session.
+pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of: Option<String>) {
     let hub = handle.stream_hub();
     let mut block_rx = hub.subscribe_blocks();
     let mut log_rx = hub.log_ring().subscribe();
@@ -1024,7 +1270,8 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                                 handle_agent_event(&handle, attached.is_some(), event);
                             }
                             Ok(msg) => {
-                                let frames = handle_client_msg(&handle, &mut topics, msg);
+                                let frames =
+                                    handle_client_msg(&handle, &mut topics, reader_of.as_deref(), msg);
                                 if !send_frames(&mut socket, frames).await {
                                     return;
                                 }
@@ -1208,10 +1455,18 @@ fn take_service_link(
     let terminals = handle
         .terminals()
         .ok_or("terminal sessions are not enabled on this node")?;
-    terminals
-        .attach(token)
-        .ok_or("refused: present this node's service-link token, and only one agent service may attach")
+    terminals.attach(token).ok_or(
+        "refused: present this node's service-link token, and only one agent service may attach",
+    )
 }
+
+/// every `ducktape::term` refusal below that a CLIENT drives per frame (a held
+/// key, a resize, a command, a publisher hammering an unattached connection),
+/// latched by reason. Unlatched, any one of them repeats at whatever rate the
+/// client sends frames — ~30/s for a held key — and evicts the whole
+/// 4096-line ring in about two minutes. First occurrence, then every 100th,
+/// carrying `occurrences`; the counter is the diagnosis.
+static TERM_WARN: crate::log::Latch = crate::log::Latch::new(100);
 
 /// Apply one daemon-published event to the terminal plane, or drop it.
 ///
@@ -1220,19 +1475,25 @@ fn take_service_link(
 /// publishing one would be injecting into another member's terminal.
 fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service::wire::Event) {
     if !attached {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "unattached_publisher",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("unattached_publisher") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "unattached_publisher",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "no_terminal_plane",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     };
     terminals.on_event(event);
@@ -1241,6 +1502,7 @@ fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service:
 fn handle_client_msg(
     handle: &NodeHandle,
     topics: &mut BTreeMap<String, TopicState>,
+    reader_of: Option<&str>,
     msg: ClientMsg,
 ) -> Vec<ServerFrame> {
     match msg {
@@ -1248,7 +1510,14 @@ fn handle_client_msg(
             topics: requested,
             resume,
             token,
-        } => subscribe_topics(handle, topics, requested, &resume, token.as_deref()),
+        } => subscribe_topics(
+            handle,
+            topics,
+            requested,
+            &resume,
+            token.as_deref(),
+            reader_of,
+        ),
         ClientMsg::Unsubscribe { topics: requested } => {
             for topic in requested {
                 topics.remove(&topic);
@@ -1267,6 +1536,12 @@ fn handle_client_msg(
     }
 }
 
+/// every `ducktape::agent` refusal below, latched by reason: a compute daemon
+/// publishes one `RunOutput` frame per line of its run, so a malformed id or
+/// an oversized line repeats at the daemon's own output rate. First
+/// occurrence, then every 100th, carrying `occurrences`.
+static AGENT_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 /// Admit one published run-output line, or drop it with a named reason.
 ///
 /// The two checks are a trust boundary, not tidiness: see [`ClientMsg::RunOutput`].
@@ -1276,20 +1551,26 @@ fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: Strin
     let id_well_formed =
         id.len() == RUN_OUTPUT_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !id_well_formed {
-        tracing::warn!(
-            target: "ducktape::agent",
-            reason = "malformed_run_id",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("malformed_run_id") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                reason = "malformed_run_id",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     if line.len() > MAX_RUN_OUTPUT_LINE {
-        tracing::warn!(
-            target: "ducktape::agent",
-            bytes = line.len(),
-            reason = "run_output_line_too_long",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("run_output_line_too_long") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                bytes = line.len(),
+                reason = "run_output_line_too_long",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     hub.run_output().append(id, stream, line);
@@ -1327,15 +1608,28 @@ fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
 /// lane or a full channel drops the frame (never a panic); never logs the bytes.
 async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::SessionInputWire) {
     let Some(lane) = handle.session_lane() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_session_lane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_session_lane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_session_lane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     if lane
         .send(crate::SessionJob::Input { host, event })
         .await
         .is_err()
+        && let Some(occurrences) = TERM_WARN.hit("input_forward_failed")
     {
-        tracing::warn!(target: "ducktape::term", reason = "input_forward_failed", "term input dropped");
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "input_forward_failed",
+            occurrences,
+            "term input dropped"
+        );
     }
 }
 
@@ -1351,7 +1645,9 @@ async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::Sessio
 /// held-down key would otherwise mint one `warn` per repeat into the 4096-line
 /// ring — evicting the very context an operator opened the Logs tab to read,
 /// and doing it through the `logs` topic any ws caller may hold. The other three
-/// reasons here stay `warn`: each is once per frame class, not once per byte.
+/// reasons here stay `warn`, each once per frame class rather than once per
+/// byte — but a stuck client can still hold ANY of those frame classes down,
+/// so they go through [`TERM_WARN`] too.
 async fn handle_term_input(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
@@ -1377,27 +1673,58 @@ async fn handle_term_input(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // a live session has a mode; an unknown or already-ended one has none. Two
     // causes, two countable reasons — collapsing them would hide "the id is
     // stale" behind "you used the wrong lane".
     let Some(mode) = terminals.mode(session) else {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // raw keystrokes are the SINGLE-session path only. A shared session refuses
     // them so nothing bypasses its ordered command lane (drive it with
     // TermCommand).
     if mode != crate::term::SessionMode::Single {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("raw_input_on_shared") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "raw_input_on_shared",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     // decoded here purely to refuse a malformed frame at this boundary; the
     // daemon takes the base64 as-is, so the bytes never round-trip.
     if STANDARD.decode(data_b64).is_err() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("bad_base64") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "bad_base64",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     terminals.input(session, data_b64).await;
@@ -1431,13 +1758,28 @@ async fn handle_term_resize(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     };
     // the same no-op-on-unknown discipline as input: refuse here rather than
     // spending a link frame on a session that is already gone.
     if terminals.mode(session).is_none() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     }
     terminals.resize(session, cols, rows).await;
@@ -1462,7 +1804,14 @@ fn handle_term_command(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term command dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term command dropped"
+            );
+        }
         return;
     };
     terminals.enqueue_command(session, origin, text);
@@ -1474,7 +1823,25 @@ fn subscribe_topics(
     requested: Vec<String>,
     resume: &BTreeMap<String, String>,
     token: Option<&str>,
+    reader_of: Option<&str>,
 ) -> Vec<ServerFrame> {
+    // No caller ever legitimately needs more names in ONE message than the
+    // connection may ever hold: at most `MAX_TOPICS_PER_CONNECTION` states
+    // exist, so a request past it is either a mistake or a fan-out attempt
+    // (a 64 MiB frame naming millions of names, each turned into its own
+    // refusal `ServerFrame` before this used to look at the cap at all). Stop
+    // BEFORE the per-topic loop runs — one frame, sized by the request, not
+    // by `requested.len()`.
+    if requested.len() > MAX_TOPICS_PER_CONNECTION {
+        let requested_count = requested.len();
+        return vec![unavailable(
+            "",
+            format!(
+                "subscribe named {requested_count} topics, over the \
+                 {MAX_TOPICS_PER_CONNECTION}-topic connection cap; split the request"
+            ),
+        )];
+    }
     let store = handle.stream_index();
     // ONE constant-time compare per frame, not per topic: the secret is
     // connection-wide, so this is both the cheapest place to spend it and the
@@ -1492,7 +1859,13 @@ fn subscribe_topics(
             ));
             continue;
         }
-        match prepare_topic(&topic, holds_workspace_secret, resume.get(&topic), store.as_ref()) {
+        match prepare_topic(
+            &topic,
+            holds_workspace_secret,
+            reader_of,
+            resume.get(&topic),
+            store.as_ref(),
+        ) {
             Ok((state, lagged)) => {
                 accepted.insert(topic.clone(), state.cursor());
                 states.insert(topic, state);
@@ -1581,17 +1954,26 @@ enum Topic<'a> {
 
 /// what a caller must have proved to hold a topic handle.
 ///
-/// Two values and no more: the ws surface has exactly one piece of evidence
-/// about a caller — whether it can read this node's workspace — so a richer
-/// lattice would be names without a mechanism behind them.
+/// Every value here has a MECHANISM behind it — a name without one would be a
+/// lattice pretending to be a gate. The ws surface has two pieces of evidence
+/// about a caller: whether it can read this node's workspace, and, for a run's
+/// output only, whether it signed the upgrade as that run's creator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+enum Admission<'a> {
     /// nothing. The same bytes already leave this node over an HTTP route with
     /// no gate on it, so a check here would refuse an honest client and stop
     /// nobody.
     Public,
     /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]).
     Workspace,
+    /// ONE run's output ring: the workspace secret, or an upgrade signed by the
+    /// key that CREATED this dispatch (`?run=<id>`, admitted in
+    /// [`admit_run_reader`] before the socket exists).
+    ///
+    /// The id is carried in the value, not checked against a flag, because the
+    /// capability names one dispatch: a connection admitted for one run must not
+    /// read another's, and a `bool` could not say which.
+    Run(&'a str),
 }
 
 impl<'a> Topic<'a> {
@@ -1640,7 +2022,12 @@ impl<'a> Topic<'a> {
     /// The gated three all carry provider/member bytes with no unauthenticated
     /// HTTP twin at all: a pty's raw output, the command log whose `text`
     /// `crate::term` documents as able to carry secrets, and a run's stdout.
-    fn admission(&self) -> Admission {
+    ///
+    /// A run's stdout is the one of those three a caller can reach WITHOUT the
+    /// workspace, and only for a run it created: a remote app is the device that
+    /// asked for the run, and refusing it the progress of its own work made the
+    /// feature local-only. It is still not public — see [`Admission::Run`].
+    fn admission(self) -> Admission<'a> {
         match self {
             Self::Module(_) => Admission::Public,
             Self::FilesWatch => Admission::Public,
@@ -1648,7 +2035,7 @@ impl<'a> Topic<'a> {
             Self::Metrics => Admission::Public,
             Self::Peers => Admission::Public,
             Self::Status => Admission::Public,
-            Self::RunOutput(_) => Admission::Workspace,
+            Self::RunOutput(id) => Admission::Run(id),
             Self::TermCommand(_) => Admission::Workspace,
             Self::Term(_) => Admission::Workspace,
         }
@@ -1670,6 +2057,12 @@ enum TopicRefusal {
     UnknownModule,
     /// the family is workspace-gated and no matching secret was presented.
     NotAdmitted,
+    /// a run's output ring, asked for by a connection that neither holds the
+    /// workspace nor was admitted as this run's creator. Its own token because
+    /// it sends the caller somewhere else entirely — sign the upgrade — and a
+    /// count of these is a count of remote readers reaching for runs that are
+    /// not theirs.
+    NotThisRunsReader,
 }
 
 impl TopicRefusal {
@@ -1679,13 +2072,14 @@ impl TopicRefusal {
             Self::UnknownFamily => "unknown_topic",
             Self::UnknownModule => "unknown_module",
             Self::NotAdmitted => "topic_not_admitted",
+            Self::NotThisRunsReader => "not_this_runs_reader",
         }
     }
 
     fn code(self) -> StreamErrorCode {
         match self {
             Self::UnknownFamily | Self::UnknownModule => StreamErrorCode::UnknownTopic,
-            Self::NotAdmitted => StreamErrorCode::Forbidden,
+            Self::NotAdmitted | Self::NotThisRunsReader => StreamErrorCode::Forbidden,
         }
     }
 
@@ -1702,6 +2096,11 @@ impl TopicRefusal {
             Self::NotAdmitted => {
                 "this topic requires the node's service-link token — read it from \
                  the workspace and send it as `token` on the subscribe"
+            }
+            Self::NotThisRunsReader => {
+                "a run's output is for the device that hosts this node or the key \
+                 that created the run — present the service-link token, or open \
+                 the socket as `/v1/ws?run=<dispatch>` signed by that key"
             }
         }
     }
@@ -1728,6 +2127,94 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
     }
 }
 
+/// Is `requester` the key that signed this upgrade?
+///
+/// A chat run is created by a SIGNED FRAME the app submits, so the committed
+/// run's `requester` is `Origin::External(<that key>)` — the same bytes
+/// [`crate::signed_req::verify_signed_request`] hands back. The two are compared
+/// directly: no account lookup stands between them, and no authority is
+/// invented. The device that asked for the work may watch it.
+///
+/// NARROWER THAN CANCELLING ON PURPOSE. `runs`'s own rule
+/// (`admin.rs::controlled_dispatch_id`) also lets the agent's program controller
+/// stop a run; that arm needs an in-module `control_model` read this node cannot
+/// make, so it is left out. Leaving it out refuses a reader who could have been
+/// admitted; it admits nobody who could not.
+fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
+    matches!(requester, sdk::Origin::External(id) if id == key)
+}
+
+/// Admit a `/v1/ws?run=<dispatch>` upgrade as that run's creator, or answer the
+/// refusal to send instead.
+///
+/// Two steps, in this order, because the cheap one is the one that must not be
+/// skipped: the signature over `GET` + this exact path+query + an empty body
+/// (the data-plane trio, carried as headers so the proof never enters a query
+/// string or a log), then ONE committed `runs` read asking whether the key that
+/// signed it created this dispatch.
+///
+/// Decided BEFORE the socket exists, which is what keeps
+/// [`subscribe_topics`] synchronous: the committed read happens once per
+/// connection, never per subscribe frame.
+pub(crate) async fn admit_run_reader(
+    handle: &NodeHandle,
+    dispatch: &str,
+    headers: &axum::http::HeaderMap,
+    path_and_query: &str,
+) -> Result<(), axum::response::Response> {
+    let key = crate::signed_req::verify_signed_request(
+        handle,
+        &axum::http::Method::GET,
+        path_and_query,
+        headers,
+        b"",
+    )
+    .map_err(|refusal| crate::signed_req::refuse(path_and_query, refusal))?;
+    let pending = pending_runs(handle).await.map_err(|reason| {
+        crate::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &reason)
+    })?;
+    let created = pending
+        .iter()
+        .find(|run| run.dispatch_id == dispatch)
+        .is_some_and(|run| created_by(&run.requester, &key));
+    if !created {
+        // the same sentence the topic refusal carries, for the same reason: it
+        // names what to present and never what this node holds. A run that has
+        // already settled is indistinguishable from one that was never this
+        // caller's — both are "not yours to read", and saying which would
+        // answer a probe about runs the caller may not see.
+        tracing::debug!(
+            target: "ducktape::stream",
+            event = "run_output_upgrade_refused",
+            reason = TopicRefusal::NotThisRunsReader.reason(),
+            "refused a run-output upgrade"
+        );
+        return Err(crate::error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            TopicRefusal::NotThisRunsReader.detail(),
+        ));
+    }
+    Ok(())
+}
+
+/// every run `runs` has pending, as committed state.
+async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs::PendingRun>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(crate::NodeCommand::Query {
+            target: "runs".to_string(),
+            req: runs::encode_query(&runs::RunsQuery::PendingRuns),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    match runs::decode_reply(&bytes)? {
+        runs::RunsReply::PendingRuns(runs) => Ok(runs),
+        _ => Err("unexpected runs reply".to_string()),
+    }
+}
+
 /// Decide one requested topic: admit it (with its start cursor) or refuse it.
 ///
 /// A decide-fn as far as STATE goes — it inserts no handle, mutates nothing, and
@@ -1735,12 +2222,14 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
 /// one `debug` line, deliberately kept beside the decision so a refusal cannot
 /// be returned without being counted.
 ///
-/// `holds_workspace_secret` is the connection's ONE proved fact, compared once
-/// per subscribe frame by [`subscribe_topics`].
+/// `holds_workspace_secret` is the connection-wide secret compare, made once per
+/// subscribe frame by [`subscribe_topics`]; `reader_of` is the one dispatch this
+/// connection proved at its upgrade ([`admit_run_reader`]).
 #[allow(clippy::result_large_err)]
 fn prepare_topic(
     topic: &str,
     holds_workspace_secret: bool,
+    reader_of: Option<&str>,
     resume: Option<&String>,
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
@@ -1750,9 +2239,14 @@ fn prepare_topic(
     let admitted = match family.admission() {
         Admission::Public => true,
         Admission::Workspace => holds_workspace_secret,
+        Admission::Run(id) => holds_workspace_secret || reader_of == Some(id),
     };
     if !admitted {
-        return Err(refuse_topic(topic, TopicRefusal::NotAdmitted));
+        let refusal = match family {
+            Topic::RunOutput(_) => TopicRefusal::NotThisRunsReader,
+            _ => TopicRefusal::NotAdmitted,
+        };
+        return Err(refuse_topic(topic, refusal));
     }
     match family {
         Topic::Module(module) => prepare_module(topic, module, resume, store),
@@ -1775,7 +2269,7 @@ fn prepare_module(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == module) {
+    if !store.module_ids().iter().any(|id| id == module) {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, module, resume, store)?;
@@ -1795,7 +2289,7 @@ fn prepare_files_watch(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == "files") {
+    if !store.module_ids().iter().any(|id| id == "files") {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, "files", resume, store)?;
@@ -2213,12 +2707,17 @@ fn catch_up_run_output(
     runs: &RunOutputRegistry,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = runs.read_after(id, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = runs.resume_cursor(id, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2253,12 +2752,17 @@ fn catch_up_term(
     ring: &crate::term::TermRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2304,12 +2808,17 @@ fn catch_up_term_command(
     ring: &crate::term::TermCommandRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2551,7 +3060,10 @@ pub(crate) fn unix_millis() -> u64 {
 
 fn live_cursor(store: &indexer::IndexStore, module: &str) -> Result<String, indexer::Error> {
     let applied = store.applied_height(module)?;
-    Ok(format!("{}{:016x}/ffff", indexer::OP_PREFIX, applied))
+    // the end of that height: every real row at it is at or below the widest
+    // seq, so the next scan starts at the height above. built through
+    // `op_key` so the field width can never drift from the rows it pages.
+    Ok(indexer::op_key(applied, u32::MAX))
 }
 
 fn cursor_height(cursor: &str) -> Option<u64> {
@@ -2605,6 +3117,9 @@ mod tests {
     const NO_SECRET: bool = false;
     /// a caller whose presented secret matched.
     const HOLDS_SECRET: bool = true;
+    /// a connection admitted as no run's creator — every caller but a remote
+    /// app watching a run it asked for.
+    const NO_RUN: Option<&str> = None;
     /// the workspace secret a test node mints.
     const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
 
@@ -2682,7 +3197,7 @@ mod tests {
             })
             .expect("apply block");
 
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_files("files:watch", &mut cursor, &store);
         assert!(
             !result.drop_topic,
@@ -2707,18 +3222,18 @@ mod tests {
     fn module_catch_up_emits_rows_and_cursors() {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1}), json!({"two": 2})]);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert!(!result.drop_topic);
         assert_eq!(result.frames.len(), 2);
         match &result.frames[0] {
             ServerFrame::Event { cursor, op, .. } => {
-                assert_eq!(cursor, "op/0000000000000001/0000");
+                assert_eq!(cursor, "op/0000000000000001/00000000");
                 assert_eq!(op.payload, Some(json!({"one": 1})));
             }
             other => panic!("expected event, got {other:?}"),
         }
-        assert_eq!(cursor, "op/0000000000000001/0001");
+        assert_eq!(cursor, "op/0000000000000001/00000001");
     }
 
     /// A BLOCK THAT APPENDED NOTHING MUST NOT SEND ANYONE BACK TO THE STORE.
@@ -2763,13 +3278,13 @@ mod tests {
             .map(|i| json!({ "n": i }))
             .collect();
         apply_chat(&store, 1, payloads);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert_eq!(result.frames.len(), STREAM_CATCHUP_BUDGET + 1);
         assert!(
-            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffff")
+            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffffffff")
         );
-        assert_eq!(cursor, "op/0000000000000001/ffff");
+        assert_eq!(cursor, "op/0000000000000001/ffffffff");
     }
 
     #[test]
@@ -2777,9 +3292,9 @@ mod tests {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1})]);
         let (state, lagged) =
-            prepare_topic("module:chat", NO_SECRET, None, Some(&store)).expect("topic");
+            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, Some(&store)).expect("topic");
         assert!(lagged.is_none());
-        assert_eq!(state.cursor(), "op/0000000000000001/ffff");
+        assert_eq!(state.cursor(), "op/0000000000000001/ffffffff");
         let mut state = state;
         let result = catch_up_topic(
             "module:chat",
@@ -2797,20 +3312,21 @@ mod tests {
         let (state, lagged) = prepare_topic(
             "module:chat",
             NO_SECRET,
-            Some(&"op/0000000000000005/0000".to_string()),
+            NO_RUN,
+            Some(&"op/0000000000000005/00000000".to_string()),
             Some(&store),
         )
         .expect("topic");
-        assert_eq!(state.cursor(), "op/000000000000000a/ffff");
+        assert_eq!(state.cursor(), "op/000000000000000a/ffffffff");
         assert!(
-            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffff")
+            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffffffff")
         );
     }
 
     #[test]
     fn topic_refusals_are_per_topic() {
         assert!(matches!(
-            prepare_topic("module:chat", NO_SECRET, None, None),
+            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, None),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::Unavailable,
                 ..
@@ -2818,14 +3334,20 @@ mod tests {
         ));
         let (_dir, store) = temp_store(&["chat"]);
         assert!(matches!(
-            prepare_topic("module:nope", NO_SECRET, None, Some(&store)),
+            prepare_topic("module:nope", NO_SECRET, NO_RUN, None, Some(&store)),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::UnknownTopic,
                 ..
             })
         ));
         assert!(matches!(
-            prepare_topic("logs", NO_SECRET, Some(&"not-a-seq".to_string()), Some(&store)),
+            prepare_topic(
+                "logs",
+                NO_SECRET,
+                NO_RUN,
+                Some(&"not-a-seq".to_string()),
+                Some(&store)
+            ),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::BadCursor,
                 ..
@@ -2874,8 +3396,64 @@ mod tests {
             runs.append(format!("run-{i}"), RunStream::Stderr, "x");
         }
         let (rows, floor) = runs.read_after("active", 0, 1);
-        assert!(rows.is_empty());
-        assert_eq!(floor, 0);
+        assert!(rows.is_empty(), "the rows went with the ring");
+        assert_eq!(
+            floor,
+            (RUN_OUTPUT_MAX_LINES + 1) as u64,
+            "but the numbering did not: the floor still names what was dropped"
+        );
+    }
+
+    /// a run whose ring the cap shed while a pane was subscribed to it. The
+    /// pane's cursor sits at the old high-water; the run keeps printing. Before
+    /// the numbering survived eviction the ring restarted at 1, every new line
+    /// failed the `> cursor` filter, the floor read 0 so no `Lagged` fired, and
+    /// the pane sat frozen for the life of the connection.
+    #[test]
+    fn a_re_created_run_ring_lags_the_subscriber_instead_of_going_silent() {
+        let runs = RunOutputRegistry::default();
+        for i in 0..600 {
+            runs.append("active", RunStream::Stdout, format!("line-{i}"));
+        }
+        // the pane has consumed the first 500 lines.
+        let mut seq = 500;
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            runs.append(format!("run-{i}"), RunStream::Stderr, "x");
+        }
+        runs.append("active", RunStream::Stdout, "after the eviction");
+
+        let result = catch_up_run_output("run-output:active", "active", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "600"),
+            "the 100 lines evicted under the cursor are announced, not swallowed"
+        );
+        assert!(matches!(
+            result.frames.last(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "601"
+        ));
+        assert_eq!(seq, 601, "and the pane is live again on the new numbering");
+    }
+
+    /// the same blind spot with no eviction at all: a client resumes with a seq
+    /// it saved before a restart, so the cursor is above a fresh ring's head.
+    /// It must be rewound and told, never left waiting for seq 901.
+    #[test]
+    fn a_resume_cursor_above_the_head_lags_rather_than_waits() {
+        let runs = RunOutputRegistry::default();
+        let mut seq = 900;
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "0")
+        );
+        assert_eq!(seq, 0);
+
+        runs.append("fresh", RunStream::Stdout, "first");
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(matches!(
+            result.frames.first(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "1"
+        ));
+        assert_eq!(seq, 1);
     }
 
     #[test]
@@ -2885,18 +3463,68 @@ mod tests {
         runs.append("aa".repeat(32), RunStream::Stdout, "local");
         assert_eq!(appends.try_recv().unwrap().line, "local");
 
-        runs.append_remote(RunOutputEvent {
-            id: "aa".repeat(32),
+        // "bb"*32 is a run only a peer has ever named — a mirrored remote run,
+        // never one this node hosts.
+        assert!(runs.append_remote(RunOutputEvent {
+            id: "bb".repeat(32),
             stream: RunStream::Stderr,
             line: "remote".into(),
-        });
+        }));
         assert!(matches!(
             appends.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        let (rows, _) = runs.read_after(&"bb".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "remote");
+    }
+
+    #[test]
+    fn a_locally_hosted_run_is_never_writable_by_a_peer() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        assert!(runs.is_local(&"aa".repeat(32)));
+
+        assert!(!runs.append_remote(RunOutputEvent {
+            id: "aa".repeat(32),
+            stream: RunStream::Stderr,
+            line: "forged".into(),
+        }));
         let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].2, "remote");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the peer's line never entered the local ring"
+        );
+        assert_eq!(rows[0].2, "local");
+    }
+
+    #[test]
+    fn thirty_two_fabricated_remote_ids_never_evict_a_local_ring() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        // fill every other slot with local runs too, so the registry sits at
+        // the cap holding nothing but locally hosted rings.
+        for i in 0..RUN_OUTPUT_MAX_RUNS - 1 {
+            runs.append(format!("{i:064x}"), RunStream::Stdout, "x");
+        }
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            let forged = format!("{:064x}", i + 1_000);
+            assert!(
+                !runs.append_remote(RunOutputEvent {
+                    id: forged,
+                    stream: RunStream::Stdout,
+                    line: "flood".into(),
+                }),
+                "no remote ring exists to evict, so the flood is refused outright"
+            );
+        }
+        assert!(
+            runs.is_local(&"aa".repeat(32)),
+            "the local ring survives the flood"
+        );
+        let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2926,8 +3554,8 @@ mod tests {
     fn term_topic_subscribes_and_replays_as_event_tagged_chunks() {
         // any session id subscribes (the manager gates who may CREATE one);
         // a fresh subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) =
-            prepare_topic("term:abc", HOLDS_SECRET, None, None).expect("term topic subscribes");
+        let (state, lagged) = prepare_topic("term:abc", HOLDS_SECRET, NO_RUN, None, None)
+            .expect("term topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
 
@@ -2967,16 +3595,15 @@ mod tests {
     fn term_command_topic_subscribes_and_replays_the_ordered_attributed_log() {
         // any session id subscribes to its command log (like `term:`); a fresh
         // subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) =
-            prepare_topic("term-cmd:abc", HOLDS_SECRET, None, None)
-                .expect("term-cmd topic subscribes");
+        let (state, lagged) = prepare_topic("term-cmd:abc", HOLDS_SECRET, NO_RUN, None, None)
+            .expect("term-cmd topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
         assert!(matches!(state, TopicState::TermCommand { .. }));
 
         let ring = crate::term::TermCommandRing::default();
-        ring.append("s", "alice", "list files");
-        ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
+        let _ = ring.append("s", "alice", "list files");
+        let _ = ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
         let mut seq = 0u64;
         let result = catch_up_term_command("term-cmd:s", "s", &mut seq, &ring);
         assert!(!result.drop_topic);
@@ -3121,7 +3748,9 @@ mod tests {
             // `GET /v1/peers`, which this change does not touch.
             (Topic::Peers, Admission::Public),
             (Topic::Status, Admission::Public),
-            (Topic::RunOutput("r1"), Admission::Workspace),
+            // the workspace secret OR this run's creator, and the id travels
+            // with the decision so one run's reader is not every run's.
+            (Topic::RunOutput("r1"), Admission::Run("r1")),
             (Topic::TermCommand("s1"), Admission::Workspace),
             (Topic::Term("s1"), Admission::Workspace),
         ];
@@ -3140,17 +3769,14 @@ mod tests {
         assert_eq!(Topic::parse("term:s1"), Some(Topic::Term("s1")));
         // `term-cmd:` is its own family and never decodes as a `term:` session
         // named "cmd:s1" — the two prefixes diverge before the colon.
-        assert_eq!(
-            Topic::parse("term-cmd:s1"),
-            Some(Topic::TermCommand("s1"))
-        );
+        assert_eq!(Topic::parse("term-cmd:s1"), Some(Topic::TermCommand("s1")));
 
         // ... and a name no family owns parses to nothing, which is what makes
         // admission deny-by-default rather than a habit.
         for unknown in ["", "term", "logs2", "modules:chat", "files:watch2"] {
             assert_eq!(Topic::parse(unknown), None, "{unknown:?} owns no family");
             assert!(matches!(
-                prepare_topic(unknown, HOLDS_SECRET, None, None),
+                prepare_topic(unknown, HOLDS_SECRET, NO_RUN, None, None),
                 Err(ServerFrame::Error {
                     code: StreamErrorCode::UnknownTopic,
                     ..
@@ -3164,7 +3790,7 @@ mod tests {
     fn gated_families_refuse_a_caller_with_no_workspace_secret() {
         for gated in ["term:s1", "term-cmd:s1", "run-output:r1"] {
             let Err(ServerFrame::Error { code, detail, .. }) =
-                prepare_topic(gated, NO_SECRET, None, None)
+                prepare_topic(gated, NO_SECRET, NO_RUN, None, None)
             else {
                 panic!("{gated} must refuse a caller with no workspace secret");
             };
@@ -3179,11 +3805,171 @@ mod tests {
                 "a refusal must never carry the secret: {detail}"
             );
             // and it admits the same caller once the secret matches.
-            assert!(prepare_topic(gated, HOLDS_SECRET, None, None).is_ok());
+            assert!(prepare_topic(gated, HOLDS_SECRET, NO_RUN, None, None).is_ok());
         }
         // the public families need nothing, on the same call.
-        assert!(prepare_topic("logs", NO_SECRET, None, None).is_ok());
-        assert!(prepare_topic("metrics", NO_SECRET, None, None).is_ok());
+        assert!(prepare_topic("logs", NO_SECRET, NO_RUN, None, None).is_ok());
+        assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());
+    }
+
+    /// THE AUTHORITY RULE, stated over every origin a run can have.
+    ///
+    /// Only an external submitter — a device holding a key — can prove itself
+    /// over a signed upgrade at all. A run a program or the system created has no
+    /// key behind it, so no signature admits one, whatever it signs with.
+    #[test]
+    fn only_the_external_key_that_created_a_run_is_its_reader() {
+        let key = [7u8; 32];
+        assert!(created_by(&sdk::Origin::External(key.to_vec()), &key));
+        assert!(!created_by(&sdk::Origin::External(vec![9u8; 32]), &key));
+        assert!(!created_by(&sdk::Origin::External(Vec::new()), &key));
+        // a truncated prefix of the right key is a different key.
+        assert!(!created_by(
+            &sdk::Origin::External(key[..16].to_vec()),
+            &key
+        ));
+        assert!(!created_by(&sdk::Origin::Program(7), &key));
+        assert!(!created_by(&sdk::Origin::Module("runs".into()), &key));
+        assert!(!created_by(&sdk::Origin::System, &key));
+    }
+
+    /// THE WHOLE REMOTE ADMISSION, END TO END: a real signature over the real
+    /// path, against the committed pending set a real node would answer with.
+    ///
+    /// Four callers, one run. The creator is admitted. Another key, holding a
+    /// signature every bit as valid, is not — which is the point: the proof says
+    /// WHO, and the committed state says whether that who asked for this work. A
+    /// caller with no signature at all never reaches the read, and a dispatch the
+    /// pending set does not name is refused without saying so (a run that settled
+    /// and a run that was never yours are the same answer, or the refusal becomes
+    /// a probe).
+    #[tokio::test]
+    async fn only_the_key_that_created_a_run_is_admitted_to_its_output() {
+        use commonware_cryptography::Signer as _;
+        let creator = commonware_cryptography::ed25519::PrivateKey::from_seed(11);
+        let stranger = commonware_cryptography::ed25519::PrivateKey::from_seed(12);
+        let node_key = vec![0xab; 32];
+        let dispatch = "d".repeat(64);
+
+        let (mut handle, mut commands, _hub) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(node_key.clone());
+        // the committed answer, as `runs` would give it: one pending run, created
+        // by `creator`.
+        let pending = runs::PendingRun {
+            run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
+            dispatch_id: dispatch.clone(),
+            agent_id: "agent-1".into(),
+            channel_id: "channel-a".into(),
+            anchor_seq: 2,
+            thread_root: None,
+            job_id: None,
+            job_claim_height: 0,
+            requester: sdk::Origin::External(creator.public_key().as_ref().to_vec()),
+            created_at: 0,
+        };
+        let answers = tokio::spawn(async move {
+            while let Some(command) = commands.next().await {
+                let crate::NodeCommand::Query { reply, .. } = command else {
+                    continue;
+                };
+                let _ = reply.send(Ok(runs::encode_reply(&runs::RunsReply::PendingRuns(vec![
+                    pending.clone(),
+                ]))));
+            }
+        });
+
+        let path = format!("/v1/ws?run={dispatch}");
+        let signed = |signer: &commonware_cryptography::ed25519::PrivateKey, path: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in
+                ::node::signed_req::request_headers(signer, "GET", path, &node_key, b"")
+            {
+                headers.insert(name, value.parse().expect("a header value"));
+            }
+            headers
+        };
+
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&creator, &path), &path)
+                .await
+                .is_ok(),
+            "the key that created the run must be admitted to its output"
+        );
+        for (who, headers, path) in [
+            (
+                "a stranger's valid signature",
+                signed(&stranger, &path),
+                path.clone(),
+            ),
+            (
+                "no signature at all",
+                axum::http::HeaderMap::new(),
+                path.clone(),
+            ),
+            (
+                // the signature covers the path it was minted for, so asking for
+                // another run with it fails the verify, not the authority read.
+                "a signature minted for another run",
+                signed(&creator, "/v1/ws?run=elsewhere"),
+                path.clone(),
+            ),
+        ] {
+            assert!(
+                admit_run_reader(&handle, &dispatch, &headers, &path)
+                    .await
+                    .is_err(),
+                "{who} must be refused"
+            );
+        }
+        // and the creator's own proof does not reach a run the pending set does
+        // not name.
+        let other = "e".repeat(64);
+        let other_path = format!("/v1/ws?run={other}");
+        assert!(
+            admit_run_reader(&handle, &other, &signed(&creator, &other_path), &other_path)
+                .await
+                .is_err(),
+            "a dispatch this node holds no pending run for must be refused"
+        );
+        drop(handle);
+        answers.abort();
+    }
+
+    /// A RUN'S CREATOR READS ITS OWN RUN, AND NOTHING ELSE.
+    ///
+    /// The capability admitted at the upgrade names ONE dispatch. So a remote
+    /// app watching the run it asked for needs no workspace secret — and the
+    /// same connection asking for a second run, or for a pty, is refused exactly
+    /// as a stranger would be. A `bool` here would have handed the first remote
+    /// reader every run on the node.
+    #[test]
+    fn a_runs_creator_reads_that_run_and_no_other_gated_topic() {
+        let mine = Some("dispatch-a");
+        assert!(
+            prepare_topic("run-output:dispatch-a", NO_SECRET, mine, None, None).is_ok(),
+            "the run this connection proved must admit"
+        );
+        for someone_elses in [
+            "run-output:dispatch-b",
+            "run-output:",
+            "term:dispatch-a",
+            "term-cmd:dispatch-a",
+        ] {
+            let Err(ServerFrame::Error { code, .. }) =
+                prepare_topic(someone_elses, NO_SECRET, mine, None, None)
+            else {
+                panic!("{someone_elses} must refuse a connection admitted for dispatch-a");
+            };
+            assert_eq!(code, StreamErrorCode::Forbidden, "{someone_elses}");
+        }
+        // and the refusal sends a remote reader to the proof it can actually
+        // make, rather than to a workspace directory it does not have.
+        let Err(ServerFrame::Error { detail, .. }) =
+            prepare_topic("run-output:dispatch-b", NO_SECRET, mine, None, None)
+        else {
+            unreachable!("refused above");
+        };
+        assert!(detail.contains("?run="), "{detail}");
     }
 
     /// A wrong secret is exactly as good as no secret — the compare is the gate,
@@ -3199,6 +3985,7 @@ mod tests {
                 vec!["term:s1".into()],
                 &BTreeMap::new(),
                 presented,
+                NO_RUN,
             );
             assert!(states.is_empty(), "presented {presented:?} admitted a pty");
         }
@@ -3211,6 +3998,7 @@ mod tests {
             vec!["term:s1".into()],
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert!(states.is_empty(), "a node with no plane admits nobody");
 
@@ -3240,6 +4028,7 @@ mod tests {
                 vec!["term:s1".into()],
                 &BTreeMap::new(),
                 Some(presented),
+                NO_RUN,
             );
             assert!(
                 states.is_empty(),
@@ -3284,9 +4073,11 @@ mod tests {
         tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
                 match command {
-                    wire::Command::TermCreate(create) => daemon.on_event(wire::Event::TermCreated {
-                        session: create.session,
-                    }),
+                    wire::Command::TermCreate(create) => {
+                        daemon.on_event(wire::Event::TermCreated {
+                            session: create.session,
+                        })
+                    }
                     wire::Command::TermInput { data_b64, .. } => {
                         let _ = seen_tx.send(format!("input:{data_b64}")).await;
                     }
@@ -3294,6 +4085,15 @@ mod tests {
                         let _ = seen_tx.send(format!("resize:{cols}x{rows}")).await;
                     }
                     wire::Command::TermClose { .. } => {}
+                    // this fake daemon serves the PTY plane. The collaboration
+                    // commands ride the same link and are the pump's, which
+                    // these tests do not stand up — named rather than
+                    // wildcarded so a new pty command still fails the build.
+                    wire::Command::MsgBind(_)
+                    | wire::Command::MsgUnbind { .. }
+                    | wire::Command::MsgDeliver(_)
+                    | wire::Command::MsgTime { .. }
+                    | wire::Command::MsgReplay { .. } => {}
                 }
             }
         });
@@ -3322,6 +4122,7 @@ mod tests {
             vec![crate::term::topic(session)],
             &BTreeMap::new(),
             None,
+            NO_RUN,
         );
         let mut admitted = BTreeMap::new();
         subscribe_topics(
@@ -3330,6 +4131,7 @@ mod tests {
             vec![crate::term::topic(session)],
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         (unadmitted, admitted, refusals)
     }
@@ -3408,40 +4210,60 @@ mod tests {
     }
 
     #[test]
-    fn subscription_cap_refuses_new_topics_but_allows_recursoring() {
+    fn a_subscribe_at_the_cap_admits_all_and_still_allows_recursoring() {
         let handle = handle_with_secret();
         let mut states = BTreeMap::new();
-        let requested: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 1)
+        let at_cap: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION)
             .map(|i| format!("run-output:r{i}"))
             .collect();
         let frames = subscribe_topics(
             &handle,
             &mut states,
-            requested,
+            at_cap.clone(),
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
-        let refused = frames
-            .iter()
-            .filter(|f| {
-                matches!(
-                    f,
-                    ServerFrame::Error {
-                        code: StreamErrorCode::Unavailable,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(refused, 1, "exactly the over-cap topic refuses");
-        // re-subscribing an EXISTING topic at the cap re-cursors, never refuses.
+        assert!(
+            frames
+                .iter()
+                .all(|f| !matches!(f, ServerFrame::Error { .. })),
+            "every topic at exactly the cap must admit: {frames:?}"
+        );
+
+        // one more NEW topic on top of an already-full connection refuses the
+        // WHOLE message as one frame — never a per-topic fan-out — and leaves
+        // the held state untouched.
+        let mut over = at_cap.clone();
+        over.push("run-output:extra".into());
+        let refused = subscribe_topics(
+            &handle,
+            &mut states,
+            over,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+            NO_RUN,
+        );
+        assert_eq!(refused.len(), 1, "one summary refusal, not one per topic");
+        assert!(matches!(
+            refused[0],
+            ServerFrame::Error {
+                code: StreamErrorCode::Unavailable,
+                ..
+            }
+        ));
+        assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+
+        // re-subscribing exactly the EXISTING topics (at, not over, the cap)
+        // re-cursors, never refuses.
         let again = subscribe_topics(
             &handle,
             &mut states,
-            vec!["run-output:r0".into()],
+            at_cap,
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert!(
             again
@@ -3450,6 +4272,33 @@ mod tests {
             "re-subscribe at the cap must stay allowed: {again:?}"
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+    }
+
+    /// The amplification this fixes: a `Subscribe` naming far more topics than
+    /// the connection could ever hold used to walk the ENTIRE vector, pushing
+    /// one heap-allocating refusal frame per name (`stream.rs`, pre-fix). It
+    /// must now cost one frame regardless of how many names were sent.
+    #[test]
+    fn a_subscribe_far_over_the_topic_cap_never_fans_out_one_frame_per_topic() {
+        let handle = handle_with_secret();
+        let mut states = BTreeMap::new();
+        let huge: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 10_000)
+            .map(|i| format!("bogus:{i}"))
+            .collect();
+        let frames = subscribe_topics(
+            &handle,
+            &mut states,
+            huge,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+            NO_RUN,
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "one refusal for the whole message, not one per requested topic"
+        );
+        assert!(states.is_empty());
     }
 
     #[test]
@@ -3507,9 +4356,14 @@ mod tests {
         // metrics rides the exposition source, not the index — a daemon with
         // no index store still serves it, and a reconnect's stored cursor is
         // harmless.
-        let (state, lagged) =
-            prepare_topic("metrics", NO_SECRET, Some(&"1752000000000".to_string()), None)
-                .expect("topic");
+        let (state, lagged) = prepare_topic(
+            "metrics",
+            NO_SECRET,
+            NO_RUN,
+            Some(&"1752000000000".to_string()),
+            None,
+        )
+        .expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0", "a fresh subscribe never resumes");
     }
@@ -3522,7 +4376,8 @@ mod tests {
         handle
             .status_cell()
             .wire_exposition(|| "ducktape_blocks_total 5\n".to_string());
-        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -3571,7 +4426,7 @@ mod tests {
                 builds: Default::default(),
             });
 
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -3660,7 +4515,7 @@ mod tests {
     #[tokio::test]
     async fn peers_catch_up_drops_the_topic_when_no_exposition_is_wired() {
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(result.drop_topic, "an unanswerable topic must be dropped");
         assert!(matches!(
@@ -3721,7 +4576,10 @@ mod tests {
         let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
             panic!("a handle with no terminal plane has no link to give");
         };
-        assert!(refusal.contains("terminal sessions are not enabled"), "{refusal}");
+        assert!(
+            refusal.contains("terminal sessions are not enabled"),
+            "{refusal}"
+        );
     }
 
     #[tokio::test]
@@ -3729,7 +4587,8 @@ mod tests {
         // no exposition source (an embedder that registers no metrics) — the
         // topic drops with the same `unavailable` shape the http 503 carries.
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(result.drop_topic);
         assert!(matches!(

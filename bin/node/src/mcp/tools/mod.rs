@@ -1,18 +1,18 @@
 //! the tool table: one flat registry of every tool the plane exposes, split
 //! read / write because the two halves have genuinely different rules.
 //!
-//! - READ tools ([`read`]) are ungated except where the caps vocabulary already
-//!   names the resource (`forge_read` repos, `duckfs_read` prefixes).
-//! - WRITE tools ([`write`]) mirror `agent::KNOWN_ACTIONS` ONE-FOR-ONE. that is
-//!   the point: the tool plane grants an agent nothing its registered
-//!   `allowed_actions` did not already grant it, and there is exactly one
-//!   vocabulary of "what an agent may do" — the one consensus validates a
-//!   response's actions against.
+//! - READ tools ([`read`]) serve `whoami`, the operation catalog, one generic
+//!   `query` over a host-side table of read operations (whose floor is the
+//!   `query` operation: any module's own query, verbatim), and receipt lookup.
+//!   reads are not gated.
+//! - the ONE WRITE tool ([`write`]) carries a catalog envelope the runs module
+//!   decodes in consensus, whose floor is the `submit` operation: any module's
+//!   own message, verbatim, under the run's program account. there is exactly
+//!   one catalog of operations, owned by the module that executes them.
 //!
 //! a tool's `description` is not decoration: it is the entire interface the
-//! model has. it says what the tool reads or writes, and — for a write — which
-//! action name gates it, so a denied agent can tell its owner precisely which
-//! grant to widen.
+//! model has. it says what the tool reads or writes and where the catalog is,
+//! so a refused agent can read what the module could not accept.
 
 use serde_json::{Value, json};
 
@@ -53,6 +53,7 @@ pub fn list() -> Value {
         .map(|t| {
             json!({
                 "name": t.name,
+                "title": t.name.replacen("ducktape_", "ducktape::", 1),
                 "description": t.description,
                 "inputSchema": (t.schema)(),
             })
@@ -61,10 +62,9 @@ pub fn list() -> Value {
     json!({"tools": tools})
 }
 
-/// a JSON Schema object from `(name, type, required, description)` rows — the
-/// whole schema surface this plane needs. no nested objects, no arrays of
-/// objects: every tool here takes a flat bag of scalars, and keeping it that
-/// way is what lets the table stay a table.
+/// A JSON Schema object from `(name, type, required, description)` rows.
+/// Tools with structured arguments extend these scalar properties in their
+/// own schema builder.
 pub fn schema(props: &[(&str, &str, bool, &str)]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
@@ -102,15 +102,6 @@ pub fn opt_u64(args: &Value, name: &str) -> Option<u64> {
     args.get(name).and_then(Value::as_u64)
 }
 
-/// a required boolean argument.
-pub fn arg_bool(args: &Value, name: &str) -> Result<bool> {
-    args.get(name).and_then(Value::as_bool).ok_or_else(|| {
-        crate::mcp::node::NodeError::Rejected(format!(
-            "this tool needs a boolean {name:?} argument"
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,17 +131,21 @@ mod tests {
     }
 
     #[test]
-    fn every_write_tool_names_a_known_action_in_its_description() {
-        // the description is the model's only view of the gate. a write tool
-        // whose description does not name its action leaves a denied agent
-        // unable to say which grant it needs.
-        for t in write::tools() {
+    fn the_one_write_tool_points_at_the_catalog() {
+        // the description is the model's only view of the door. the write tool
+        // must send the model to the catalog that names each operation's
+        // schemas, and every live catalog operation must be reachable through it.
+        let [write] = write::tools().try_into().ok().expect("one write tool");
+        assert_eq!(write.name, "ducktape_action");
+        assert!(write.description.contains("ducktape_actions"));
+        for operation in runs::catalog(None) {
+            if !operation.lanes.contains(&runs::LaneKind::Live) {
+                continue;
+            }
             assert!(
-                agent::KNOWN_ACTIONS
-                    .iter()
-                    .any(|a| t.description.contains(a)),
-                "write tool {} names no known action in its description",
-                t.name
+                write.description.contains(&operation.name),
+                "the write tool does not name the live operation {}",
+                operation.name
             );
         }
     }

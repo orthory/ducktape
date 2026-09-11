@@ -48,6 +48,17 @@ const TRACKER_FILE: &str = ".tracker.bin";
 /// rewritten atomically at every commit, removed once nothing is outstanding.
 const PENDING_FILE: &str = ".pending.bin";
 
+/// the node-local, ADVISORY list of pending branches this node is stuck on
+/// (see [`refs::RepoState::stuck_branches`]) — one `<repo>\t<branch>` line
+/// each, rewritten with [`PENDING_FILE`].
+///
+/// it carries no consensus state, so unlike the pending map a missing or
+/// unreadable file is not fail-stop: it only leaves [`compact_repos`] as
+/// conservative as it was before. ponytail: a plain line list, because that
+/// is all a hint needs; give it a section in `.pending.bin` if it ever has to
+/// carry more than two names.
+const STUCK_FILE: &str = ".stuck.txt";
+
 /// the node-local snapshot memo. recovery checkpoints already persist the
 /// same bytes elsewhere; this copy exists only so reopening the git substrate
 /// does not re-pack an unchanged object closure on the validator's command
@@ -106,6 +117,24 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
 /// [`git::compact`] for the measured cost of letting them pile up).
 pub const COMPACT_PACK_LIMIT: usize = 50;
 
+/// the advisory stuck list as `repo -> branches`. an absent or unreadable file
+/// is an empty map — the hint is never authority.
+fn read_stuck(base: &std::path::Path) -> BTreeMap<String, BTreeSet<String>> {
+    let Ok(text) = std::fs::read_to_string(base.join(STUCK_FILE)) else {
+        return BTreeMap::new();
+    };
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((repo, branch)) = line.split_once('\t') else {
+            continue;
+        };
+        out.entry(repo.to_string())
+            .or_default()
+            .insert(branch.to_string());
+    }
+    out
+}
+
 /// collapse the packfiles every repo under `base` has accumulated, and return
 /// how many packs that reclaimed. the node's maintenance handle, with the same
 /// out-of-band standing as [`pending_digests`]: it never opens the module,
@@ -115,8 +144,14 @@ pub const COMPACT_PACK_LIMIT: usize = 50;
 /// on-disk refs run behind the committed heads, so the closure kept here is
 /// not the closure the repo is about to need. it compacts on a later tick,
 /// once the node's blob sweep has caught it up.
+///
+/// a STUCK branch (its pack is installed and the ref move was still refused —
+/// a push naming a head no pack closes) is not waiting for anything, and
+/// letting one disable a repo's compaction forever is how a single bad push
+/// costs that repo 1001 packs. those branches do not hold compaction back.
 pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, Error> {
     let pending = read_pending(base)?;
+    let stuck = read_stuck(base);
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -131,9 +166,11 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
             continue;
         };
         let is_repo = dir.join(".git").exists();
+        let no_branch_stuck = BTreeSet::new();
+        let stuck_here = stuck.get(name).unwrap_or(&no_branch_stuck);
         let waiting = pending
             .get(name)
-            .is_some_and(|branches| !branches.is_empty());
+            .is_some_and(|branches| branches.keys().any(|branch| !stuck_here.contains(branch)));
         if !is_repo || waiting {
             continue;
         }
@@ -296,6 +333,13 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
+    attribution_target: Option<String>,
+    /// this network's chain id — the wasm tenant's genesis-config twin
+    /// (`crate::guest`'s `shape().config`, #1773). empty for a native `Forge`
+    /// that never carries a push certificate (every unit test but the
+    /// pushcert ones); `with_chain_id` sets the real one. a certificate whose
+    /// nonce disagrees with it is refused in `push_principal`.
+    chain_id: String,
     /// the expensive per-repo pack payloads used to assemble snapshots.
     ///
     /// `snapshot()` packs the object closure of every branch head, and the
@@ -420,6 +464,8 @@ impl Forge {
                 staged_tracker: None,
             },
             chat_target: None,
+            attribution_target: None,
+            chain_id: String::new(),
             snapshot_cache: std::cell::RefCell::new(None),
         };
         let restored_cache = forge.restore_snapshot_cache();
@@ -432,6 +478,19 @@ impl Forge {
     /// opens no discussion channels.
     pub fn with_chat(mut self, target: impl Into<String>) -> Self {
         self.chat_target = Some(target.into());
+        self
+    }
+
+    /// publish source relationships in the same unit as the accepted mutation.
+    pub fn with_attribution(mut self, target: impl Into<String>) -> Self {
+        self.attribution_target = Some(target.into());
+        self
+    }
+
+    /// this network's chain id — the genesis-config parameter a push
+    /// certificate's nonce is checked against (`pushcert::signer`).
+    pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
+        self.chain_id = chain_id.into();
         self
     }
 
@@ -456,10 +515,39 @@ impl Forge {
         Ok(())
     }
 
+    /// atomically publish the advisory [`STUCK_FILE`], or remove it once no
+    /// branch is stuck. read only by [`compact_repos`].
+    fn persist_stuck(&self) -> Result<(), Error> {
+        let path = self.base.join(STUCK_FILE);
+        let mut out = String::new();
+        for (name, state) in &self.state.repos {
+            for branch in state.stuck_branches() {
+                out.push_str(name);
+                out.push('\t');
+                out.push_str(branch);
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Module(format!("forge: clear stuck file: {e}"))),
+            };
+        }
+        let tmp = self.base.join(".stuck.txt.tmp");
+        std::fs::write(&tmp, &out)
+            .map_err(|e| Error::Module(format!("forge: write stuck file: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Module(format!("forge: publish stuck file: {e}")))?;
+        Ok(())
+    }
+
     /// atomically persist the per-repo catch-up map to [`PENDING_FILE`], or
     /// remove the file once every branch has caught up — a stale file would
     /// re-adopt heads the ref cache has since overtaken.
     pub(crate) fn persist_pending(&self) -> Result<(), Error> {
+        self.persist_stuck()?;
         let path = self.base.join(PENDING_FILE);
         let outstanding: Vec<(&str, &refs::PendingMap)> = self
             .state
@@ -500,9 +588,11 @@ impl Forge {
             .map(|oid| oid.to_string())
     }
 
-    /// Resolve the browser's revision against the committed integration head.
-    /// Empty opens today's head; an explicit oid may be that head or a
-    /// bounded ancestor so one page stays pinned while `dev` fast-forwards.
+    /// Resolve the browser's revision against the committed branch heads.
+    /// Empty opens the integration head; an explicit oid may be any born
+    /// branch's head or a bounded ancestor of one, so a page stays pinned
+    /// while its branch moves on and every branch, merged or not, can be
+    /// read.
     fn browse_revision(
         &self,
         name: &str,
@@ -511,7 +601,7 @@ impl Forge {
         let Some(state) = self.state.repos.get(name) else {
             return Ok(None);
         };
-        let Some(head) = state
+        let Some(integration_head) = state
             .refs
             .get(INTEGRATION_BRANCH)
             .or_else(|| state.refs.get(MAIN_BRANCH))
@@ -520,19 +610,20 @@ impl Forge {
         else {
             return Ok(None);
         };
+        let heads: Vec<git2::Oid> = state.refs.values().copied().map(git2::Oid::from).collect();
         let repo = git::open(&self.base.join(name)).map_err(|error| {
             Error::Module(format!(
-                "forge: repo {name:?} integration head {head} is not materialized: {error}"
+                "forge: repo {name:?} integration head {integration_head} is not materialized: {error}"
             ))
         })?;
         let requested = match rev.is_empty() {
-            true => head,
+            true => integration_head,
             false => parse_browse_oid(rev)?.into(),
         };
-        let reachable = bounded_ancestor(&repo, head, requested)?;
+        let reachable = bounded_ancestor(&repo, &heads, requested)?;
         if !reachable {
             return Err(Error::Module(format!(
-                "forge: revision {requested} is not reachable from repo {name:?}'s integration head"
+                "forge: revision {requested} is not reachable from any branch of repo {name:?}"
             )));
         }
         Ok(Some((repo, requested)))
@@ -770,16 +861,19 @@ fn bounded_commit(repo: &git2::Repository, oid: git2::Oid) -> Result<git2::Commi
         .map_err(|error| Error::Module(error.to_string()))
 }
 
+/// Whether `requested` is one of `heads` or an ancestor of one within the
+/// browser's read bound; the walk from every head shares one bound, so a
+/// commit shared by several branches is read once.
 fn bounded_ancestor(
     repo: &git2::Repository,
-    head: git2::Oid,
+    heads: &[git2::Oid],
     requested: git2::Oid,
 ) -> Result<bool, Error> {
-    if head == requested {
+    if heads.contains(&requested) {
         return Ok(true);
     }
-    let mut pending = VecDeque::from([head]);
-    let mut scheduled = BTreeSet::from([head]);
+    let mut pending: VecDeque<git2::Oid> = heads.iter().copied().collect();
+    let mut scheduled: BTreeSet<git2::Oid> = heads.iter().copied().collect();
     let mut commit_bytes = 0usize;
     while let Some(oid) = pending.pop_front() {
         let (size, kind) = repo
@@ -808,7 +902,7 @@ fn bounded_ancestor(
             }
             if scheduled.len() >= MAX_BROWSE_COMMITS {
                 return Err(Error::Module(
-                    "forge: pinned revision is too far behind the integration head".into(),
+                    "forge: pinned revision is too far behind every branch head".into(),
                 ));
             }
             scheduled.insert(parent);
@@ -896,7 +990,13 @@ impl Module for Forge {
     /// execute never opens a Git repo.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         self.state
-            .apply(ctx, &msg.payload, self.chat_target.as_deref())
+            .apply(
+                ctx,
+                &msg.payload,
+                self.chat_target.as_deref(),
+                self.attribution_target.as_deref(),
+                &self.chain_id,
+            )
             .await
     }
 
@@ -1100,9 +1200,7 @@ impl Forge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::compose_state_root;
     use crate::{decode_reply, encode_msg, encode_query};
-    use identity::IdentityReply;
 
     use sdk_testkit::TestCtx;
 
@@ -1119,6 +1217,7 @@ mod tests {
             consensus_time,
             origin,
             me: "forge".into(),
+            cause: sdk::Cause::Direct,
         })
     }
 
@@ -1659,35 +1758,19 @@ mod tests {
         sdk::Origin::External(user_key(b))
     }
 
-    /// an `identity` query handler that answers EVERY key lookup with the same
-    /// account — i.e. whichever key asked, it is a member of `number`.
-    fn identity_of(number: u64) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
-        move |_req| {
-            Ok(identity::encode_reply(&IdentityReply::Account(Some(
-                identity::AccountView {
-                    number,
-                    name: "acct".into(),
-                    keys: Vec::new(),
-                    avatar: None,
-                    bio: None,
-                    updated_at: 0,
-                },
-            ))))
-        }
-    }
-
-    /// `git push --signed`: the certificate's SSH signer is the principal —
-    /// not the node that bridged the push — so a repo it births belongs to
-    /// the SIGNER, and neither the node's own unsigned push nor another SSH
-    /// key's signed one may move its `main`. A certificate authorizes exactly
-    /// the moves it lists, on the repo its nonce names, by the key it embeds.
+    /// `git push --signed`: the certificate's SSH signer is the party the
+    /// push is attributed to — not the node that bridged it. A certificate
+    /// authorizes exactly the moves it lists, on the repo its nonce names, by
+    /// the key it embeds.
     #[test]
     fn a_signed_push_speaks_for_its_ssh_signer() {
         use crate::pushcert;
         use keyscheme::sshsig::GIT_SSH_NS;
         use keyscheme::testkit::{ssh_key, sshsig};
         let base = tmp_base("signed-push");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chain_id("chain-a");
         let signed = |seed: u8, updates: Vec<RefUpdate>| {
             let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates);
             ForgeMsg::PushRefs {
@@ -1711,28 +1794,16 @@ mod tests {
             format!("{err:?}")
         };
         const ALICE: u8 = 5;
-        const BOB: u8 = 6;
 
-        // the node bridges alice's signed push: the repo is HERS.
+        // the node bridges alice's signed pushes.
         exec_commit(
             &mut forge,
             &mut ctx_at(1),
             &signed(ALICE, vec![main_to(None, 'a')]),
         );
-        // the node's own unsigned push (frame origin = its key) cannot move main…
-        let unsigned = ForgeMsg::PushRefs {
-            repo: "lab".into(),
-            updates: vec![main_to(Some('a'), 'b')],
-            pack_digest: Some(vec![9u8; 32]),
-            cert: None,
-        };
-        assert!(refused(&mut forge, 2, &unsigned).contains("only the owner"));
-        // …nor can bob's signed one; alice's does.
-        let by_bob = signed(BOB, vec![main_to(Some('a'), 'b')]);
-        assert!(refused(&mut forge, 3, &by_bob).contains("only the owner"));
         exec_commit(
             &mut forge,
-            &mut ctx_at(4),
+            &mut ctx_at(2),
             &signed(ALICE, vec![main_to(Some('a'), 'b')]),
         );
 
@@ -1750,6 +1821,22 @@ mod tests {
         };
         *repo = "other".into();
         assert!(refused(&mut forge, 6, &elsewhere).contains("nonce"));
+        // …on THIS chain: a certificate minted for a different ducktape
+        // network is refused, never trusted as this network's first
+        // certified push (#1773 — no more "pin whichever chain arrives
+        // first").
+        let updates = vec![main_to(Some('b'), 'c')];
+        let cert = pushcert::certificate(&pushcert::nonce("some-other-chain", "lab"), &updates);
+        let cross_chain = ForgeMsg::PushRefs {
+            repo: "lab".into(),
+            pack_digest: Some(vec![9u8; 32]),
+            cert: Some(PushCert {
+                sshsig: sshsig(&ssh_key(ALICE), GIT_SSH_NS, &cert),
+                cert,
+            }),
+            updates,
+        };
+        assert!(refused(&mut forge, 6, &cross_chain).contains("nonce"));
         // …by the key it embeds (a flipped key byte is someone else's blob).
         let mut forged = signed(ALICE, vec![main_to(Some('b'), 'c')]);
         let ForgeMsg::PushRefs {
@@ -1770,6 +1857,73 @@ mod tests {
         );
         let refused_stale = signed(ALICE, vec![main_to(Some('b'), 'd')]);
         assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
+    }
+
+    // #1773: forge learns its own chain id through the genesis-config seam
+    // (`crate::guest`'s `shape().config`, `noded::compose`'s
+    // `odb_genesis_config`), so `pushcert::signer` checks a certificate's
+    // nonce against it directly — no pinning off whichever chain the first
+    // cert-verified push happens to carry.
+    #[test]
+    fn a_certificate_from_a_different_chain_is_refused_even_on_an_unborn_repo() {
+        use crate::pushcert;
+        use keyscheme::sshsig::GIT_SSH_NS;
+        use keyscheme::testkit::{ssh_key, sshsig};
+        let base = tmp_base("cross-chain-replay");
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chain_id("home");
+        let signed = |chain: &str, repo: &str, seed: u8, updates: Vec<RefUpdate>| {
+            let cert = pushcert::certificate(&pushcert::nonce(chain, repo), &updates);
+            ForgeMsg::PushRefs {
+                repo: repo.into(),
+                pack_digest: Some(vec![9u8; 32]),
+                cert: Some(PushCert {
+                    sshsig: sshsig(&ssh_key(seed), GIT_SSH_NS, &cert),
+                    cert,
+                }),
+                updates,
+            }
+        };
+        let birth = |c: char| RefUpdate {
+            ref_name: "main".into(),
+            prev_oid: None,
+            new_oid: Some(oid(c).as_bytes().to_vec()),
+        };
+
+        // the network's own chain accepts a certified birth.
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(1),
+            &signed("home", "demo", 1, vec![birth('a')]),
+        );
+
+        // a certificate minted on a DIFFERENT chain, harvested and replayed
+        // to squat an as-yet-unborn repo name on THIS network, is refused —
+        // even though its nonce names the (unborn) repo correctly and the
+        // signature verifies. no "first push wins" residual gap: consensus
+        // checks the chain id it was seeded with from block one.
+        let err = exec(
+            &mut forge,
+            &mut ctx_at(2),
+            &signed("away", "stolen", 2, vec![birth('b')]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nonce"), "{err}");
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        assert!(
+            forge.read_head("stolen").is_none(),
+            "the refused birth claimed nothing"
+        );
+
+        // the home chain keeps working normally, on a different repo too.
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(3),
+            &signed("home", "other", 3, vec![birth('c')]),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1959,8 +2113,8 @@ mod tests {
         let digest = vec![9u8; 32];
 
         // seed a repo with release main, integration dev, and a feature branch
-        // (fabricated oids — packs never gate consensus). the birthing push
-        // pins user 2 as the owner, which is who merges onto `dev` below.
+        // (fabricated oids — packs never gate consensus). user 2 pushes it and
+        // merges onto `dev` below.
         let mut ctx = ctx_with_origin(1, user_origin(2));
         exec_commit(
             &mut forge,
@@ -2443,7 +2597,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rt);
     }
 
-    // ---- ownership ----------------------------------------------------------
+    // ---- pushes and merges --------------------------------------------------
 
     fn push(
         forge: &mut Forge,
@@ -2474,152 +2628,99 @@ mod tests {
         r
     }
 
-    // the CORE gate: the birthing push owns the repo, and only that owner may
-    // move `main`/`dev` afterwards. without it one signed op from any member
-    // wedges materialize on every node and stops the network snapshotting.
+    // ANY target accepts a merge from ANY member — a protected one included:
+    // a stranger, a reviewer, the member who pushed the repo. reviews are
+    // stored and shown and change nothing about who may merge.
     #[test]
-    fn only_the_birthing_owner_moves_a_protected_branch() {
-        let base = tmp_base("owner-protected");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let (a, b, c) = (oid('a'), oid('b'), oid('c'));
-
-        let mut owner = ctx_with_origin(1, user_origin(1));
-        push(&mut forge, &mut owner, "demo", "main", None, a).expect("the birth claims the repo");
-
-        let mut stranger = ctx_with_origin(2, user_origin(9));
-        let err = push(&mut forge, &mut stranger, "demo", "main", Some(a), b)
-            .expect_err("a stranger may not move main");
-        assert!(err.to_string().contains("only the owner"), "{err}");
-        assert_eq!(
-            forge.read_head("demo"),
-            Some(a.to_string()),
-            "the refused push moved nothing"
-        );
-
-        // dev is protected too, even unborn.
-        let err = push(&mut forge, &mut stranger, "demo", "dev", None, b)
-            .expect_err("a stranger may not birth dev either");
-        assert!(err.to_string().contains("only the owner"), "{err}");
-
-        // FEATURE branches stay open — the GitHub flow the dogfood loop needs.
-        push(&mut forge, &mut stranger, "demo", "agent/item-1", None, b)
-            .expect("any member force-pushes a feature branch");
-
-        // and the owner still moves main.
-        let mut owner = ctx_with_origin(3, user_origin(1));
-        push(&mut forge, &mut owner, "demo", "main", Some(a), c).expect("the owner moves main");
-        assert_eq!(forge.read_head("demo"), Some(c.to_string()));
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    // two keys of one association (a laptop key pushing, a phone key merging)
-    // collapse onto one account principal, so the human who pushed from the
-    // CLI can merge from the app.
-    #[test]
-    fn two_keys_of_one_account_share_the_owner() {
-        let base = tmp_base("owner-account");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let account = 7u64;
-        let laptop_key = vec![0xB0u8; 32];
-
-        let mut laptop = ctx_with_origin(1, sdk::Origin::External(laptop_key))
-            .on_query("identity", identity_of(account));
-        push(&mut forge, &mut laptop, "demo", "main", None, oid('a'))
-            .expect("the laptop key births the repo");
-
-        // a DIFFERENT key, same account -> same principal -> allowed.
-        let mut member =
-            ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account));
-        push(
-            &mut forge,
-            &mut member,
-            "demo",
-            "main",
-            Some(oid('a')),
-            oid('b'),
-        )
-        .expect("the same account's member key moves main");
-
-        // a key of NO account is its own principal -> refused.
-        let mut outsider = ctx_with_origin(3, user_origin(7)).on_query("identity", |_: &[u8]| {
-            Ok(identity::encode_reply(&IdentityReply::Account(None)))
-        });
-        let err = push(
-            &mut forge,
-            &mut outsider,
-            "demo",
-            "main",
-            Some(oid('b')),
-            oid('c'),
-        )
-        .expect_err("an account-less key is not the owner");
-        assert!(err.to_string().contains("only the owner"), "{err}");
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    // MergePr is the SECOND ref-move door: gating the push alone closes nothing.
-    #[test]
-    fn merging_onto_a_protected_target_is_owner_only() {
-        let base = tmp_base("owner-merge");
+    fn merging_onto_any_target_is_any_members() {
+        let base = tmp_base("any-merge");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let digest = vec![9u8; 32];
-        let mut owner = ctx_with_origin(1, user_origin(1));
-        exec_commit(
-            &mut forge,
-            &mut owner,
-            &ForgeMsg::PushRefs {
-                repo: "demo".into(),
-                updates: vec![
-                    RefUpdate {
-                        ref_name: "dev".into(),
-                        prev_oid: None,
-                        new_oid: Some(oid('a').as_bytes().to_vec()),
-                    },
-                    RefUpdate {
-                        ref_name: "feat".into(),
-                        prev_oid: None,
-                        new_oid: Some(oid('b').as_bytes().to_vec()),
-                    },
-                ],
-                pack_digest: Some(digest.clone()),
-                cert: None,
-            },
-        );
-        // any member may OPEN a PR onto dev — that is the door.
-        let mut stranger = ctx_with_origin(2, user_origin(9));
-        exec_commit(
-            &mut forge,
-            &mut stranger,
-            &ForgeMsg::OpenPr {
-                repo: "demo".into(),
-                title: "sneak".into(),
-                body: String::new(),
-                source_branch: "feat".into(),
-                target_branch: "dev".into(),
-            },
-        );
-        let merge = ForgeMsg::MergePr {
-            repo: "demo".into(),
+
+        // `one` merges onto the protected integration branch; the others onto
+        // a feature branch.
+        let target_of = |repo: &str| match repo {
+            "one" => "dev",
+            _ => "release",
+        };
+        let mut pusher = ctx_with_origin(1, user_origin(1));
+        for repo in ["one", "two", "three"] {
+            exec_commit(
+                &mut forge,
+                &mut pusher,
+                &ForgeMsg::PushRefs {
+                    repo: repo.into(),
+                    updates: vec![
+                        RefUpdate {
+                            ref_name: target_of(repo).into(),
+                            prev_oid: None,
+                            new_oid: Some(oid('a').as_bytes().to_vec()),
+                        },
+                        RefUpdate {
+                            ref_name: "feat".into(),
+                            prev_oid: None,
+                            new_oid: Some(oid('b').as_bytes().to_vec()),
+                        },
+                    ],
+                    pack_digest: Some(digest.clone()),
+                    cert: None,
+                },
+            );
+        }
+
+        let open_pr = |forge: &mut Forge, repo: &str, author: u8| {
+            let mut ctx = ctx_with_origin(2, user_origin(author));
+            exec_commit(
+                forge,
+                &mut ctx,
+                &ForgeMsg::OpenPr {
+                    repo: repo.into(),
+                    title: "fix it".into(),
+                    body: String::new(),
+                    source_branch: "feat".into(),
+                    target_branch: target_of(repo).into(),
+                },
+            );
+        };
+        let merge_of = |repo: &str| ForgeMsg::MergePr {
+            repo: repo.into(),
             number: 1,
             prev_target_oid: oid('a').to_string(),
             expected_source_oid: oid('b').to_string(),
             merge_oid: oid('c').to_string(),
             pack_digest: hex(&digest),
         };
-        let mut stranger = ctx_with_origin(3, user_origin(9));
-        let err = exec(&mut forge, &mut stranger, &merge).expect_err("a stranger may not merge");
-        assert!(err.to_string().contains("only the owner"), "{err}");
-        futures::executor::block_on(forge.abort_block()).unwrap();
 
-        let mut owner = ctx_with_origin(4, user_origin(1));
-        exec_commit(&mut forge, &mut owner, &merge);
-        assert_eq!(
-            forge.state.repos["demo"].refs["dev"],
-            oid('c'),
-            "the owner's merge lands"
+        // a stranger — not the author, not a reviewer, not the pusher — merges
+        // onto the protected branch.
+        open_pr(&mut forge, "one", 2);
+        let mut stranger = ctx_with_origin(3, user_origin(9));
+        exec_commit(&mut forge, &mut stranger, &merge_of("one"));
+        assert_eq!(forge.state.repos["one"].refs["dev"], oid('c'));
+
+        // a reviewer's review is stored, and the reviewer merges like anyone.
+        open_pr(&mut forge, "two", 2);
+        let mut reviewer = ctx_with_origin(4, user_origin(3));
+        exec_commit(
+            &mut forge,
+            &mut reviewer,
+            &ForgeMsg::SubmitReview {
+                repo: "two".into(),
+                number: 1,
+                verdict: ReviewVerdict::Approve,
+                body: "ship it".into(),
+                commit_oid: oid('b').to_string(),
+                comments: vec![],
+            },
         );
+        exec_commit(&mut forge, &mut reviewer, &merge_of("two"));
+        assert_eq!(forge.state.repos["two"].refs["release"], oid('c'));
+
+        // the member who pushed the repo merges too.
+        open_pr(&mut forge, "three", 2);
+        exec_commit(&mut forge, &mut pusher, &merge_of("three"));
+        assert_eq!(forge.state.repos["three"].refs["release"], oid('c'));
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2645,7 +2746,7 @@ mod tests {
         };
 
         // the pre-consensus probe and the system origin are refused; a MODULE
-        // is an authenticated principal and is not (see `author_from_origin`).
+        // is authenticated and is allowed as a tracker author.
         for origin in [sdk::Origin::External(Vec::new()), sdk::Origin::System] {
             let mut probe = ctx_with_origin(2, origin.clone());
             assert!(
@@ -2760,6 +2861,72 @@ mod tests {
         };
         assert_eq!(pinned.rev, first.to_string());
         assert_eq!(pinned.text, "pub fn one() {}\n");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every born branch is browsable at its own head, merged into the
+    /// integration branch or not: the code seat's branch selector pins the
+    /// browse to the picked branch's head. A commit no branch reaches is
+    /// still refused.
+    #[test]
+    fn code_queries_browse_any_born_branch_at_its_head() {
+        let base = tmp_base("browse-any-branch");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let repo = refs::open_or_init_repo(&base, "demo").unwrap();
+        let readme = repo.blob(b"readme\n").unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert("README.md", readme, 0o100644).unwrap();
+        let main_tree = repo.find_tree(root.write().unwrap()).unwrap();
+        let first = git::commit(&repo, &main_tree, None, "first", 1).unwrap();
+        let poem = repo.blob(b"a poem\n").unwrap();
+        let mut root = repo.treebuilder(Some(&main_tree)).unwrap();
+        root.insert("POEM.md", poem, 0o100644).unwrap();
+        let poem_tree = repo.find_tree(root.write().unwrap()).unwrap();
+        let first_commit = repo.find_commit(first).unwrap();
+        let on_branch = git::commit(&repo, &poem_tree, Some(&first_commit), "poem", 2).unwrap();
+        let stray = repo.blob(b"stray\n").unwrap();
+        let mut root = repo.treebuilder(Some(&main_tree)).unwrap();
+        root.insert("STRAY.md", stray, 0o100644).unwrap();
+        let stray_tree = repo.find_tree(root.write().unwrap()).unwrap();
+        let on_no_branch =
+            git::commit(&repo, &stray_tree, Some(&first_commit), "stray", 3).unwrap();
+        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), first).unwrap();
+        git::update_ref(&repo, &refs::full_ref("agent/poem"), on_branch).unwrap();
+        let state = forge.state.repos.entry("demo".into()).or_default();
+        state.refs.insert(MAIN_BRANCH.into(), first.into());
+        state.refs.insert("agent/poem".into(), on_branch.into());
+
+        let tree_at = |rev: git2::Oid| {
+            query_reply(
+                &forge,
+                ForgeQuery::Tree {
+                    repo: "demo".into(),
+                    rev: rev.to_string(),
+                    path: String::new(),
+                },
+            )
+        };
+        let ForgeReply::Tree(branch_root) = tree_at(on_branch).unwrap() else {
+            panic!("wrong branch tree reply")
+        };
+        assert_eq!(branch_root.rev, on_branch.to_string());
+        let names: Vec<_> = branch_root
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(names, ["POEM.md", "README.md"]);
+        // the shared ancestor answers from either branch
+        let ForgeReply::Tree(shared) = tree_at(first).unwrap() else {
+            panic!("wrong shared tree reply")
+        };
+        assert_eq!(shared.rev, first.to_string());
+        let refused = tree_at(on_no_branch).unwrap_err().to_string();
+        assert!(
+            refused.contains("not reachable from any branch"),
+            "{refused}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3031,42 +3198,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // an owner is consensus state: it must move root() on its own, or a joiner
-    // could install a snapshot naming any owner it liked.
-    #[test]
-    fn an_owner_alone_moves_the_root_and_survives_a_restart() {
-        let base = tmp_base("owner-root");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let mut tracker = Tracker::default();
-        assert!(tracker.is_empty());
-        tracker.claim_owner("demo", vec![4u8; 32]);
-        assert!(
-            !tracker.is_empty(),
-            "an owner alone makes the tracker non-empty"
-        );
-        assert_ne!(
-            compose_state_root(std::iter::empty(), &tracker),
-            StateRoot::ZERO,
-            "an owner alone moves the root"
-        );
-        assert_eq!(
-            Tracker::decode(&tracker.canonical_bytes()).unwrap(),
-            tracker,
-            "the owner round-trips through the canonical bytes"
-        );
-
-        let mut ctx = ctx_with_origin(1, user_origin(1));
-        push(&mut forge, &mut ctx, "demo", "main", None, oid('a')).unwrap();
-        drop(forge);
-        let reopened = Forge::init("forge", base.clone()).unwrap();
-        assert_eq!(
-            reopened.state.tracker.owner("demo"),
-            Some(user_key(1).as_slice()),
-            "the owner is re-adopted from the persisted tracker"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     /// installed packs under a repo — what compaction collapses.
     fn pack_count(repo_dir: &std::path::Path) -> usize {
         std::fs::read_dir(repo_dir.join(".git").join("objects").join("pack"))
@@ -3300,10 +3431,78 @@ mod tests {
         assert_eq!(norm_repo("").unwrap(), DEFAULT_REPO);
         assert_eq!(norm_repo("docs").unwrap(), "docs");
         assert_eq!(norm_repo("a.b_c-1").unwrap(), "a.b_c-1");
-        for bad in ["Docs", "a/b", "a b", ".", "..", "a\0b"] {
+        for bad in [
+            "Docs",
+            "a/b",
+            "a b",
+            ".",
+            "..",
+            "a\0b",
+            ".tracker.bin",
+            ".pending.bin",
+            ".stuck.txt",
+            ".snapshot-cache.bin",
+            ".hidden",
+        ] {
             assert!(norm_repo(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(norm_repo(&"a".repeat(65)).is_err(), "65 bytes too long");
         assert!(norm_repo(&"a".repeat(64)).is_ok(), "64 bytes ok");
+    }
+
+    // a repo named after forge's own dot-prefixed state file must never reach
+    // the stage: it would collide with `<base>/.tracker.bin` on disk and fail
+    // `commit_block` on every node forever. the first tracker write on "demo"
+    // puts `.tracker.bin` in the base dir; birthing a repo literally called
+    // ".tracker.bin" must be refused AT THE PushRefs STAGE (by norm_repo), so
+    // commit_block/publish_block never even sees it and stays Ok.
+    #[test]
+    fn repo_named_like_forges_own_state_file_is_refused_at_stage() {
+        let base = tmp_base("dotfile-collision");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+
+        let mut pusher = ctx_with_origin(1, user_origin(1));
+        push(&mut forge, &mut pusher, "demo", "main", None, oid('a')).expect("birthing demo");
+        exec_commit(
+            &mut forge,
+            &mut pusher,
+            &ForgeMsg::OpenIssue {
+                repo: "demo".into(),
+                title: "first tracker write".into(),
+                body: String::new(),
+            },
+        );
+        assert!(
+            base.join(".tracker.bin").is_file(),
+            "precondition: tracker persisted"
+        );
+
+        let mut attacker = ctx_with_origin(2, user_origin(2));
+        let err = push(
+            &mut forge,
+            &mut attacker,
+            ".tracker.bin",
+            "main",
+            None,
+            oid('b'),
+        )
+        .expect_err("a repo named after forge's own state file must be refused");
+        let _ = err;
+
+        // the node is NOT bricked: a normal publish_block still succeeds.
+        let mut pusher_again = ctx_with_origin(3, user_origin(1));
+        push(&mut forge, &mut pusher_again, "demo", "dev", None, oid('c'))
+            .expect("publish_block stays Ok after the refused push");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // forge::norm_repo is shared with the git smart-HTTP bridge (git_http.rs)
+    // — the same reject must hold there, since that route never touches
+    // consensus's own PushRefs staging.
+    #[test]
+    fn bridge_shares_norm_repo_and_refuses_the_same_dotfile_name() {
+        assert!(norm_repo(".tracker.bin").is_err());
+        assert!(norm_repo(".pending.bin").is_err());
     }
 }

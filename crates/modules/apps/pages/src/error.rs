@@ -57,20 +57,14 @@ pub(super) enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
-    // ── comments ──
-    /// a comment op arrived with an empty (pre-consensus) origin.
+    /// a block/page or comment op arrived with an empty (pre-consensus)
+    /// origin — the actor resolver rejects it before any op can
+    /// derive an author from it.
     EmptyOrigin,
-    /// an external or module origin was too large for bounded comment replies.
+    /// an external or module origin was too large for a bounded stored
+    /// author (a page's recorded author or a comment's).
     AuthorTooLarge,
-    /// an AddComment carried an empty `as_agent` id.
-    EmptyAgent,
-    /// an AddComment carried an `as_agent` id too large for bounded comment
-    /// query replies.
-    AgentIdTooLarge,
-    /// an AddComment carried `as_agent` under a non-module origin — only
-    /// genesis-trusted module code may attribute a comment to an agent.
-    AgentNeedsModuleOrigin,
-    /// resolve/append named a thread id not in the store.
+    // ── comments ──
     ThreadNotFound,
     /// edit/delete named a comment id not in the store (or a tombstone).
     CommentNotFound,
@@ -78,9 +72,6 @@ pub(super) enum PageError {
     DuplicateComment,
     /// an append named a target that differs from the thread's.
     TargetMismatch,
-    /// edit/delete of a comment by someone other than its stored `author`, or
-    /// a thread move by someone other than its stored `opener`.
-    NotAuthor,
     /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
     TextTooLarge,
     /// an AddComment thread_id/comment_id/target over its length cap —
@@ -91,6 +82,12 @@ pub(super) enum PageError {
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
     TooManyThreads,
+    /// the enumeration index already holds [`crate::MAX_PAGES`] pages.
+    TooManyPages,
+    /// a target's aggregate thread+comment work already sits at
+    /// [`MAX_COMMENT_WORK_PER_TARGET`] — the shared removal-work budget for
+    /// that target is spent, however many comments any single thread holds.
+    TooMuchCommentWork,
 }
 
 impl core::fmt::Display for PageError {
@@ -119,18 +116,18 @@ impl core::fmt::Display for PageError {
             PageError::ReservedId => "reserved block id",
             PageError::EmptyOrigin => "empty origin",
             PageError::AuthorTooLarge => "comment author is too large",
-            PageError::EmptyAgent => "empty as_agent",
-            PageError::AgentIdTooLarge => "as_agent is too large",
-            PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
             PageError::DuplicateComment => "duplicate comment id",
             PageError::TargetMismatch => "target mismatch",
-            PageError::NotAuthor => "not the comment author",
             PageError::TextTooLarge => "comment text too large",
             PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
+            PageError::TooManyPages => "too many pages",
+            PageError::TooMuchCommentWork => {
+                "target's comment/thread work exceeds the removal budget"
+            }
         };
         f.write_str(s)
     }

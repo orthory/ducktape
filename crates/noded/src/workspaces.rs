@@ -11,6 +11,7 @@
 //! drive the engine through [`ActorNodeApi`] over the actor lane — no self-dial.
 
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,12 +22,38 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
+use duckfs_client::index::DUCKFS_DIR;
 use serde::Deserialize;
 
 use crate::actor_api::ActorNodeApi;
 use crate::{NodeHandle, error_response};
 
 const MANAGED_WORKSPACE_ROOT: &str = "/shared/workspaces";
+
+/// the sidecar next to `.duckfs/index.json` that records who may commit this
+/// checkout — a noded-only fact, not a duckfs one, so it lives beside the
+/// index rather than growing [`duckfs_client::index::Index`]'s shared schema
+/// for a field only this RPC reads.
+const OWNER_FILE: &str = "owner";
+
+fn owner_path(dir: &FsPath) -> PathBuf {
+    dir.join(DUCKFS_DIR).join(OWNER_FILE)
+}
+
+/// stamp `dir` as created by `origin` — called once, right after the checkout
+/// that materializes `.duckfs`. best-effort is not an option here: a checkout
+/// with no recorded owner would let the FIRST committer after it silently
+/// claim it, so a write failure fails the whole create.
+fn write_owner(dir: &FsPath, origin: &[u8]) -> std::io::Result<()> {
+    std::fs::write(owner_path(dir), origin)
+}
+
+/// who created this workspace, or `None` if no owner was ever recorded (a
+/// workspace this build always writes one for — treated as unowned, not
+/// legacy-tolerated, so a missing file refuses rather than guesses).
+fn read_owner(dir: &FsPath) -> Option<Vec<u8>> {
+    std::fs::read(owner_path(dir)).ok()
+}
 
 /// per-workspace commit serialization. keyed by id, each value a mutex two
 /// commits on the same workspace contend on; disjoint workspaces never wait.
@@ -130,6 +157,7 @@ pub(crate) async fn create_workspace(
     Json(body): Json<CreateBody>,
 ) -> Response {
     let origin = crate::signed_req::acting_origin(signed.as_deref());
+    let owner = origin.clone();
     let Some(root) = handle.duckfs_workspaces.clone() else {
         return unconfigured();
     };
@@ -144,9 +172,16 @@ pub(crate) async fn create_workspace(
     let snapshot = body.snapshot;
     let result = tokio::task::spawn_blocking(move || {
         // a managed checkout records no node url — its commits ride the actor
-        // lane, never a stored http base.
+        // lane, never a stored http base. the owner is stamped right after,
+        // so a checkout that fails leaves no owner file behind either.
         let opts = CheckoutOptions::default();
-        checkout_with(&api, &dir, &prefix, snapshot.as_deref(), &opts)
+        match checkout_with(&api, &dir, &prefix, snapshot.as_deref(), &opts) {
+            Ok(index) => match write_owner(&dir, &owner) {
+                Ok(()) => Ok(index),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        }
     })
     .await;
     match result {
@@ -157,7 +192,7 @@ pub(crate) async fn create_workspace(
             "snapshot": index.base_snapshot,
         }))
         .into_response(),
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err.to_string()),
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace checkout task panicked",
@@ -190,6 +225,28 @@ pub(crate) async fn commit_workspace(
         return error_response(StatusCode::BAD_REQUEST, "invalid workspace id");
     }
     let dir = root.join(&id);
+    // a lock entry is minted per id below — only mint one for an id that
+    // names a real, currently-materialized checkout, or any signed member
+    // repeatedly posting fresh random ids grows WORKSPACE_LOCKS forever
+    // (delete_workspace, the only pruning path, is Operator-only).
+    if !dir.exists() {
+        return error_response(StatusCode::NOT_FOUND, "workspace not found");
+    }
+    // `signed` is `None` when the request presented the OPERATOR credential
+    // (the admin-token header) instead of a user signature — the Acting
+    // lane's gate has no other way past it with no `SignedBy` at all. But the
+    // gate ALSO inserts `SignedBy` for a signature by the operator's OWN key
+    // (`operator_key_matches`, the PoP `ducktape node log-filter` etc. use),
+    // so "is this the operator" is not just "is `signed` absent" — a signed
+    // caller must be either the workspace's creator or the operator, the same
+    // pair DELETE already admits.
+    if let Some(crate::SignedBy(acting)) = signed.as_deref() {
+        let is_owner = read_owner(&dir).is_some_and(|owner| owner == *acting);
+        let is_operator = crate::signed_req::operator_key_matches(&handle.admin, acting);
+        if !is_owner && !is_operator {
+            return error_response(StatusCode::FORBIDDEN, "workspace_not_owner");
+        }
+    }
     let api = ActorNodeApi::new(handle.clone(), origin);
     let lock = workspace_lock(&id);
     let message = body.message;
@@ -220,6 +277,11 @@ pub(crate) async fn commit_workspace(
 
 /// DELETE /v1/fs/workspaces/{id} — remove the managed checkout dir. idempotent:
 /// deleting an already-gone workspace is still `{ok:true}`.
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`), unlike the
+/// create and commit above. It takes no acting identity and `remove_dir_all`s
+/// any valid-slug dir under the managed root, so a key that proved only
+/// possession would be able to wipe another run's checkout.
 pub(crate) async fn delete_workspace(
     State(handle): State<NodeHandle>,
     Path(id): Path<String>,
@@ -251,5 +313,163 @@ pub(crate) async fn delete_workspace(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace delete task panicked",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Json;
+    use axum::extract::{Path as AxPath, State};
+
+    use super::*;
+
+    /// a commit against an id nobody ever created must 404 WITHOUT minting a
+    /// `WORKSPACE_LOCKS` entry — the only pruning path (`delete_workspace`) is
+    /// Operator-only, so a lock entry per unchecked id is unbounded growth any
+    /// signed member can trigger.
+    #[tokio::test]
+    async fn commit_on_a_nonexistent_workspace_404s_and_mints_no_lock() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "deadbeefcafef00d0000000000000001".to_string();
+
+        let resp = commit_workspace(
+            State(handle),
+            None,
+            AxPath(id.clone()),
+            Json(CommitWsBody {
+                message: String::new(),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !WORKSPACE_LOCKS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id),
+            "a nonexistent workspace must never mint a lock entry"
+        );
+    }
+
+    /// a manually materialized checkout: a real `.duckfs` dir with an owner
+    /// stamped, but no `index.json` — enough to exercise the ownership gate
+    /// without a full checkout/actor round trip (the gate must run BEFORE the
+    /// engine ever reads the index).
+    fn stamp_owned_dir(root: &std::path::Path, id: &str, owner: &[u8]) -> std::path::PathBuf {
+        let dir = root.join(id);
+        std::fs::create_dir_all(dir.join(DUCKFS_DIR)).unwrap();
+        write_owner(&dir, owner).unwrap();
+        dir
+    }
+
+    fn commit_as(
+        handle: crate::NodeHandle,
+        id: &str,
+        signed: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Response> {
+        commit_workspace(
+            State(handle),
+            signed.map(|key| axum::Extension(crate::SignedBy(key))),
+            AxPath(id.to_string()),
+            Json(CommitWsBody {
+                message: String::new(),
+            }),
+        )
+    }
+
+    /// run B's key must not commit run A's checkout: ids are not secret (the
+    /// managed root is world-readable), so possession of some other key on a
+    /// real id must still be refused — the exact hole #1810 found on COMMIT
+    /// after DELETE was already closed.
+    #[tokio::test]
+    async fn a_non_owner_signed_key_is_refused() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "aaaa000000000000000000000000000a";
+        let owner = b"run-a-key".to_vec();
+        stamp_owned_dir(root.path(), id, &owner);
+
+        let resp = commit_as(handle, id, Some(b"run-b-key".to_vec())).await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "workspace_not_owner");
+    }
+
+    /// a workspace with no recorded owner refuses every signed caller — fails
+    /// closed rather than treating an unstamped checkout as up for grabs.
+    #[tokio::test]
+    async fn a_missing_owner_file_refuses_every_signed_caller() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "bbbb000000000000000000000000000b";
+        std::fs::create_dir_all(root.path().join(id).join(DUCKFS_DIR)).unwrap();
+
+        let resp = commit_as(handle, id, Some(b"anybody".to_vec())).await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// the creator's own key clears the ownership gate — whatever it fails on
+    /// past that point (no real checkout was ever made here) is NOT 403.
+    #[tokio::test]
+    async fn the_owner_clears_the_gate() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "cccc000000000000000000000000000c";
+        let owner = b"run-a-key".to_vec();
+        stamp_owned_dir(root.path(), id, &owner);
+
+        let resp = commit_as(handle, id, Some(owner)).await;
+
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// the operator credential presents no `SignedBy` at all (the gate bypasses
+    /// the signature check for it) — the same bypass DELETE already gives the
+    /// operator, so it may commit ANY workspace regardless of who created it.
+    #[tokio::test]
+    async fn the_operator_credential_bypasses_the_ownership_gate() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "dddd000000000000000000000000000d";
+        stamp_owned_dir(root.path(), id, b"run-a-key");
+
+        let resp = commit_as(handle, id, None).await;
+
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// the operator's OWN key, signed rather than the admin-token header,
+    /// also clears the gate on a workspace it did not create: the gate
+    /// inserts `SignedBy` for THAT signature too (`operator_key_matches`), so
+    /// "is `signed` absent" is not the same test as "is this the operator".
+    #[tokio::test]
+    async fn an_operator_signed_key_bypasses_the_ownership_gate_too() {
+        let operator = commonware_cryptography::ed25519::PrivateKey::from_seed(4242);
+        use commonware_cryptography::Signer as _;
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_admin(crate::AdminConfig {
+            owner_key: Some(operator.public_key().as_ref().to_vec()),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "eeee000000000000000000000000000e";
+        stamp_owned_dir(root.path(), id, b"run-a-key");
+
+        let resp = commit_as(handle, id, Some(operator.public_key().as_ref().to_vec())).await;
+
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

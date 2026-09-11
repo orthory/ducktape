@@ -3,13 +3,19 @@ name = "guest-builder"
 edition.workspace = true
 version.workspace = true
 
-# the wasm packaging tool: synthesizes the ephemeral cdylib workspace for a
-# module crate (feature `guest`) and builds its componentized artifact, so no
-# per-module packaging crate is checked in and a module directory — in-tree or
-# out-of-tree — is the complete distributable unit. see `make wasm-modules`.
+# Builds an in-tree module's guest out of the platform repository at a
+# revision, through a synthesized cdylib workspace. See `make wasm-modules`.
 
 [dependencies]
 serde_json = { workspace = true }
+# the componentizer (src/lib.rs). every committed component came out of this
+# crate at this exact version: it writes the component's own sections and they
+# move between releases, so another version turns one cdylib into other bytes
+# and every module into another hash. pinned like the rust channel, moved only
+# with a `make wasm-modules` sweep committed as one change. the ONE place the
+# number is written: the Makefile reads this line for the `wasm-tools` CLI of
+# the same release (the view bundler drives it), and so does the guest image.
+wit-component = "=0.253.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

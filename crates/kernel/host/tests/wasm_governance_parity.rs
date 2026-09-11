@@ -19,7 +19,7 @@
 //! the deterministic tally read the valset sibling; account-share mode reads
 //! the identity sibling; and a PASSING proposal acts by EMITTING follow-up
 //! msgs the host drains in the same block — into valset (membership) and
-//! lifecycle (wasm code swaps). the wasm host carries the REAL NATIVE
+//! the modules registry (wasm code swaps). the wasm host carries the REAL NATIVE
 //! siblings, so every read resolves through the runtime's memoized replay and
 //! every follow-up re-publishes through the host ctx — including the
 //! UpdateModule flow proving a WASM governance can still drive the code
@@ -34,9 +34,9 @@ use governance::{
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{Identity, IdentityMsg, KeyScheme, account_principal};
-use lifecycle::{
-    Lifecycle, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode_reply,
-    encode_query as lifecycle_encode_query,
+use modules::{
+    Modules, ModulesQuery, ModulesReply, decode_reply as modules_decode_reply,
+    encode_query as modules_encode_query,
 };
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
@@ -100,7 +100,7 @@ fn wasm_governance(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 fn native_governance(store: Box<dyn sdk::MerkleStore>) -> Governance {
     Governance::new("governance", store, "valset", "identity")
         .with_invite_binding(INVITE)
-        .with_code_registry("lifecycle")
+        .with_code_registry("modules")
 }
 
 /// the native identity SIBLING over a MemStore double — the store backend is
@@ -115,7 +115,11 @@ fn native_identity() -> Identity {
 }
 
 async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     for v in validators {
         valset.seed(v.clone()).await.expect("seed valset");
     }
@@ -125,27 +129,28 @@ async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
 
 /// a code registry with one seeded tenant, so UpdateModule has a module to
 /// re-code (mirrors bin/node's genesis-seeded registry).
-async fn seeded_lifecycle() -> Lifecycle {
-    let mut lifecycle = Lifecycle::new(
-        "lifecycle",
+async fn seeded_registry() -> Modules {
+    let mut registry = Modules::new(
+        "modules",
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     );
-    lifecycle
+    registry
         .seed("hello", vec![0xAA; 32])
         .await
         .expect("seed stages");
-    lifecycle.finish_seed().await.expect("seed commits");
-    lifecycle
+    registry.finish_seed().await.expect("seed commits");
+    registry
 }
 
 /// the full native sibling set both hosts carry: valset (membership), identity
-/// (account shares), lifecycle (node upgrades + code swaps).
+/// (account shares), the modules registry (node upgrades + code swaps).
 async fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
     vec![
         Box::new(seeded_valset(validators).await),
         Box::new(native_identity()),
-        Box::new(seeded_lifecycle().await),
+        Box::new(seeded_registry().await),
     ]
 }
 
@@ -251,7 +256,7 @@ fn root_of(h: &Host) -> StateRoot {
     h.module_root("governance").expect("governance registered")
 }
 
-const SIBLING_IDS: [&str; 3] = ["valset", "lifecycle", "identity"];
+const SIBLING_IDS: [&str; 3] = ["valset", "modules", "identity"];
 
 /// the read matrix: the roster-served proposal listing, per-id gets (present
 /// and absent), redemption point reads (a spent nonce, an unspent one), and
@@ -530,7 +535,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     .await;
 
     // ---- UpdateModule: a WASM governance drives the CODE REGISTRY — the
-    // passing authorization emits LifecycleMsg::ScheduleSwap into the native lifecycle
+    // passing authorization emits ModulesMsg::ScheduleSwap into the native modules registry
     // sibling, scheduling a height-gated code swap for the "hello" tenant.
     roundtrip(
         &mut native,
@@ -543,7 +548,9 @@ async fn same_ops_inner(context: &deterministic::Context) {
             GovAction::UpdateModule {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
-                activation_height: 500,
+                // execute lands at height 16 below; 16 + 484 = 500, matching
+                // the pending.activation_height assertion further down.
+                activation_lead: 484,
                 code_hash: vec![0xBB; 32],
             },
             500,
@@ -582,20 +589,19 @@ async fn same_ops_inner(context: &deterministic::Context) {
         Origin::External(a_pub.clone()),
         execute("p-code"),
         true,
-        &["lifecycle"],
+        &["modules"],
     )
     .await;
     // decoded proof on BOTH hosts: the registry now carries the pending swap.
     for host in [&native, &wasm] {
         let reply = host
             .query(
-                "lifecycle",
-                &lifecycle_encode_query(&LifecycleQuery::ModuleStatus),
+                "modules",
+                &modules_encode_query(&ModulesQuery::ModuleStatus),
             )
             .await
-            .expect("lifecycle module status");
-        let LifecycleReply::ModuleStatus { modules } =
-            lifecycle_decode_reply(&reply).expect("decode")
+            .expect("modules registry status");
+        let ModulesReply::ModuleStatus { modules } = modules_decode_reply(&reply).expect("decode")
         else {
             panic!("expected Status reply");
         };
@@ -731,7 +737,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: String::new(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 32],
                 },
                 5,
@@ -745,7 +751,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 8],
                 },
                 5,

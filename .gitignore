@@ -1,7 +1,14 @@
 /target
+# a worktree's own cargo target dirs, when one is used instead of the shared
+# one (the views workspace is a separate workspace, and its wasm bundler is a
+# third target). Rooted, so nothing named `target-*` deeper in the tree is
+# swept by accident.
+/target-views
+/target-views-wasm
 # labs is a standalone workspace (excluded from the root), so its build output
 # lands outside the root-anchored /target above.
 /crates/labs/target
+/crates/views/target
 # The Ice test runner writes per-test artifacts
 # (screenshots + paint json) under the app crate's own target dir.
 /app/target/
@@ -29,6 +36,10 @@ package-lock.json
 
 # Session handoff notes — local working state, never committed.
 HANDOFF.md
+
+# Key material a node or wallet writes (identity.key, user.key) never enters
+# the tree, wherever a command was run from.
+*.key
 
 # wrangler local state (ops/auth-page)
 .wrangler/

@@ -9,6 +9,8 @@
 //! this proof pins that explicitly, unlike whole-state adapter ports whose root
 //! representations differ.
 
+use attribution::AttributionModule;
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use pages::{
@@ -16,13 +18,463 @@ use pages::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
-use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
-use tagging::TaggingModule;
+use statesync::qmdb::{QmdbStore, encode_qmdb_req, ops_request};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `pages` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const PAGES_WASM: &[u8] = include_bytes!("fixtures/pages.component.wasm");
+
+struct ResolutionParity {
+    native: Host,
+    wasm: Host,
+    height: u64,
+}
+
+impl ResolutionParity {
+    async fn new(context: &deterministic::Context) -> Self {
+        Self {
+            native: native_host(context).await,
+            wasm: wasm_host_(context).await,
+            height: 0,
+        }
+    }
+
+    async fn submit(&mut self, origin: Origin, msg: Msg) -> Vec<host::DispatchRecord> {
+        self.height += 1;
+        let context = BlockContext {
+            height: self.height,
+            consensus_time: 1_000 + self.height,
+            origin,
+        };
+        let native = self
+            .native
+            .submit_at(
+                BlockContext {
+                    origin: context.origin.clone(),
+                    ..context
+                },
+                msg.clone(),
+            )
+            .await
+            .unwrap();
+        let wasm = self.wasm.submit_at(context, msg).await.unwrap();
+        assert_eq!(native.dispatches, wasm.dispatches);
+        assert_eq!(self.native.module_roots(), self.wasm.module_roots());
+        native.dispatches
+    }
+
+    async fn page(&mut self, origin: Origin, msg: PageMsg) -> Vec<host::DispatchRecord> {
+        self.submit(origin, op(&msg)).await
+    }
+
+    async fn thread(&self, id: &str) -> pages::Thread {
+        let query = encode_query(&PageQuery::CommentThread {
+            thread_id: id.into(),
+        });
+        let bytes = self.native.query("pages", &query).await.unwrap();
+        assert_eq!(bytes, self.wasm.query("pages", &query).await.unwrap());
+        let pages::PageReply::CommentThread(Some(view)) = decode_reply(&bytes).unwrap() else {
+            panic!("thread")
+        };
+        let query = encode_query(&PageQuery::CommentThreadHead {
+            thread_id: id.into(),
+        });
+        let bytes = self.native.query("pages", &query).await.unwrap();
+        assert_eq!(bytes, self.wasm.query("pages", &query).await.unwrap());
+        assert_eq!(
+            decode_reply(&bytes).unwrap(),
+            pages::PageReply::CommentThreadHead(Some(pages::CommentThreadHead {
+                target: view.thread.target.clone(),
+                comment_count: view.thread.comment_ids.len() as u64,
+            }))
+        );
+        view.thread
+    }
+
+    async fn resolve(&mut self, origin: Origin, thread: &str, resolved: bool, actor: pages::Party) {
+        let relations = self.native.module_root("attribution");
+        let dispatches = self
+            .page(
+                origin,
+                PageMsg::ResolveThread {
+                    thread_id: thread.into(),
+                    resolved,
+                },
+            )
+            .await;
+        let dispatch = dispatches
+            .iter()
+            .find(|dispatch| dispatch.module == "pages")
+            .unwrap();
+        assert_eq!(
+            pages::decode_assigned(&dispatch.assigned).unwrap().actor,
+            actor
+        );
+        let thread = self.thread(thread).await;
+        assert_eq!(thread.resolved, resolved);
+        assert_eq!(thread.resolved_by, resolved.then_some(actor));
+        assert_eq!(self.native.module_root("attribution"), relations);
+    }
+
+    async fn identity(&mut self, origin: Origin, msg: identity::IdentityMsg) {
+        self.submit(
+            origin,
+            Msg {
+                target: "identity".into(),
+                payload: identity::encode_msg(&msg),
+            },
+        )
+        .await;
+    }
+
+    async fn found(&mut self, signer: &PrivateKey, name: &str) {
+        self.identity(
+            signed(signer),
+            identity::IdentityMsg::Create {
+                name: name.into(),
+                scheme: identity::KeyScheme::Ed25519,
+            },
+        )
+        .await;
+    }
+}
+
+fn signed(key: &PrivateKey) -> Origin {
+    Origin::External(key.public_key().as_ref().to_vec())
+}
+
+fn thread_comment(thread: &str, target: &str) -> PageMsg {
+    PageMsg::AddComment {
+        thread_id: thread.into(),
+        comment_id: format!("{thread}-comment"),
+        target: target.into(),
+        text: "Comment".into(),
+        mentions: vec![],
+        anchor: None,
+    }
+}
+
+#[test]
+fn compiled_thread_resolution_records_the_signers_canonical_actor() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = ResolutionParity::new(&context).await;
+        let (alice, bob, sibling, stranger) = (
+            PrivateKey::from_seed(1),
+            PrivateKey::from_seed(2),
+            PrivateKey::from_seed(3),
+            PrivateKey::from_seed(4),
+        );
+        // Threads opened before a key joins an account, and after, resolve
+        // under whatever party the signer canonically is at that height.
+        p.page(
+            signed(&bob),
+            PageMsg::CreatePage {
+                page_id: "old-opener-page".into(),
+                title: "Old opener".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        p.page(
+            signed(&alice),
+            thread_comment("old-opener", "old-opener-page"),
+        )
+        .await;
+        p.page(
+            signed(&alice),
+            PageMsg::CreatePage {
+                page_id: "old-editor-page".into(),
+                title: "Old editor".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        p.page(
+            signed(&bob),
+            thread_comment("old-editor", "old-editor-page"),
+        )
+        .await;
+        p.found(&alice, "Alice").await;
+        p.found(&bob, "Bob").await;
+        let sibling_key = sibling.public_key().as_ref().to_vec();
+        let expires_at = 10_000;
+        let preimage = identity::add_key_preimage(
+            "parity",
+            identity::KeyScheme::Ed25519,
+            &sibling_key,
+            0,
+            1,
+            expires_at,
+        );
+        p.identity(
+            signed(&sibling),
+            identity::IdentityMsg::AddKey {
+                scheme: identity::KeyScheme::Ed25519,
+                label: None,
+                authorizer: identity::Authorizer {
+                    key: alice.public_key().as_ref().to_vec(),
+                    account: 1,
+                    expires_at,
+                    proof: keyscheme::testkit::ed25519_proof(
+                        &alice,
+                        identity::IDENTITY_ADD_KEY_NS,
+                        &preimage,
+                    ),
+                },
+            },
+        )
+        .await;
+        for thread in ["old-opener", "old-editor"] {
+            p.resolve(signed(&sibling), thread, true, pages::Party::Account(1))
+                .await;
+            p.resolve(signed(&alice), thread, false, pages::Party::Account(1))
+                .await;
+        }
+        assert_eq!(
+            p.thread("old-opener").await.opener,
+            pages::Party::Key(alice.public_key().as_ref().to_vec())
+        );
+
+        // A key with no account resolves under itself; a sibling key under
+        // the account it joined, until that key is removed again.
+        p.page(
+            signed(&alice),
+            PageMsg::CreatePage {
+                page_id: "account-page".into(),
+                title: "Account page".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        p.page(
+            signed(&bob),
+            thread_comment("account-thread", "account-page"),
+        )
+        .await;
+        let stranger_key = pages::Party::Key(stranger.public_key().as_ref().to_vec());
+        p.resolve(signed(&stranger), "account-thread", true, stranger_key)
+            .await;
+        p.resolve(
+            signed(&sibling),
+            "account-thread",
+            false,
+            pages::Party::Account(1),
+        )
+        .await;
+        p.resolve(
+            signed(&bob),
+            "account-thread",
+            true,
+            pages::Party::Account(2),
+        )
+        .await;
+        p.identity(
+            signed(&alice),
+            identity::IdentityMsg::RemoveKey {
+                key: sibling_key.clone(),
+            },
+        )
+        .await;
+        p.resolve(
+            signed(&sibling),
+            "account-thread",
+            false,
+            pages::Party::Key(sibling_key),
+        )
+        .await;
+    });
+}
+
+/// A native executor fixture receives real identity/call completions. Calls
+/// below enter dispatch as this module and run only through the host queue's
+/// authenticated Program origin, never through a synthetic Program submit.
+struct ResolutionExecutor;
+
+#[async_trait::async_trait(?Send)]
+impl Module for ResolutionExecutor {
+    fn id(&self) -> ModuleId {
+        "resolution-executor".into()
+    }
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        match &ctx.env().origin {
+            Origin::Module(source) if source == "identity" => {
+                identity::authenticate_event(&ctx.env().origin, "identity", &msg.payload)
+                    .map_err(Error::Module)?;
+                Ok(())
+            }
+            Origin::Module(source) if source == "dispatch" => Ok(()),
+            _ => Err(Error::Module("unexpected executor input".into())),
+        }
+    }
+}
+
+impl ResolutionParity {
+    async fn program_call(&mut self, account: u64, msg: PageMsg) -> host::CallRecord {
+        self.submit(
+            Origin::Module("resolution-executor".into()),
+            Msg {
+                target: "dispatch".into(),
+                payload: dispatch::encode_msg(&dispatch::DispatchMsg::Call {
+                    invocation: format!("resolution-{}", self.height),
+                    step: 0,
+                    account,
+                    target: "pages".into(),
+                    payload: encode_msg(&msg),
+                }),
+            },
+        )
+        .await;
+        self.height += 1;
+        let context = BlockContext {
+            height: self.height,
+            consensus_time: 1_000 + self.height,
+            origin: Origin::System,
+        };
+        let native = self
+            .native
+            .submit_block(
+                BlockContext {
+                    origin: Origin::System,
+                    ..context
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        let wasm = self.wasm.submit_block(context, vec![]).await.unwrap();
+        assert_eq!(native.calls, wasm.calls);
+        assert_eq!(self.native.module_roots(), self.wasm.module_roots());
+        assert_eq!(native.calls.len(), 1);
+        let call = native.calls.into_iter().next().unwrap();
+        if let host::CallDisposition::Applied = call.disposition {
+            let dispatch = call
+                .dispatches
+                .iter()
+                .find(|dispatch| dispatch.module == "pages")
+                .unwrap();
+            assert_eq!(dispatch.origin, Origin::Program(account));
+            assert_eq!(
+                pages::decode_assigned(&dispatch.assigned).unwrap().actor,
+                pages::Party::Account(account)
+            );
+        }
+        call
+    }
+}
+
+#[test]
+fn compiled_thread_resolution_authenticates_queued_program_accounts() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = ResolutionParity::new(&context).await;
+        for host in [&mut p.native, &mut p.wasm] {
+            host.register(Box::new(ResolutionExecutor));
+            host.register(Box::new(dispatch::DispatchModule::new(
+                "dispatch",
+                "saga",
+                "identity",
+                Box::new(sdk_testkit::MemStore::new()),
+            )));
+        }
+        let (alice, bob) = (PrivateKey::from_seed(1), PrivateKey::from_seed(2));
+        p.found(&alice, "Alice").await;
+        p.found(&bob, "Bob").await;
+        for account in [3, 4] {
+            p.identity(
+                Origin::Module("resolution-executor".into()),
+                identity::IdentityMsg::CreateProgram {
+                    name: format!("program-{account}"),
+                    controller: 1,
+                    request: account,
+                },
+            )
+            .await;
+        }
+        p.page(
+            signed(&bob),
+            PageMsg::CreatePage {
+                page_id: "human-page".into(),
+                title: "Human".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        let created = p
+            .program_call(
+                3,
+                PageMsg::CreatePage {
+                    page_id: "program-page".into(),
+                    title: "Program".into(),
+                    blocks: Vec::new(),
+                },
+            )
+            .await;
+        assert_eq!(created.disposition, host::CallDisposition::Applied);
+        p.page(
+            signed(&bob),
+            thread_comment("program-editor", "program-page"),
+        )
+        .await;
+        let opened = p
+            .program_call(3, thread_comment("program-opener", "human-page"))
+            .await;
+        assert_eq!(opened.disposition, host::CallDisposition::Applied);
+        for thread in ["program-editor", "program-opener"] {
+            p.resolve(signed(&alice), thread, true, pages::Party::Account(1))
+                .await;
+            p.resolve(
+                Origin::Module("resolution-executor".into()),
+                thread,
+                false,
+                pages::Party::Module("resolution-executor".into()),
+            )
+            .await;
+            let operation = PageMsg::ResolveThread {
+                thread_id: thread.into(),
+                resolved: true,
+            };
+            let relation_root = p.native.module_root("attribution");
+            let resolved = p.program_call(4, operation.clone()).await;
+            assert_eq!(resolved.disposition, host::CallDisposition::Applied);
+            assert_eq!(
+                p.thread(thread).await.resolved_by,
+                Some(pages::Party::Account(4))
+            );
+            let reopened = p
+                .program_call(
+                    4,
+                    PageMsg::ResolveThread {
+                        thread_id: thread.into(),
+                        resolved: false,
+                    },
+                )
+                .await;
+            assert_eq!(reopened.disposition, host::CallDisposition::Applied);
+            assert_eq!(p.native.module_root("attribution"), relation_root);
+            let resolved = p.program_call(3, operation).await;
+            assert_eq!(resolved.disposition, host::CallDisposition::Applied);
+            assert_eq!(
+                p.thread(thread).await.resolved_by,
+                Some(pages::Party::Account(3))
+            );
+            assert_eq!(p.native.module_root("attribution"), relation_root);
+            let reopened = p
+                .program_call(
+                    3,
+                    PageMsg::ResolveThread {
+                        thread_id: thread.into(),
+                        resolved: false,
+                    },
+                )
+                .await;
+            assert_eq!(reopened.disposition, host::CallDisposition::Applied);
+            assert_eq!(p.thread(thread).await.resolved_by, None);
+        }
+    });
+}
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
 /// ids; the parity claim only needs them distinct and non-empty).
@@ -99,18 +551,27 @@ impl Module for QueryProbe {
 }
 
 /// a hook-style sink: accepts any payload, holds no state. registered in both
-/// hosts so pages' tagging follow-ups have somewhere realistic to land beside
-/// the REAL tagging module (see below) without shaping the claim.
+/// hosts so pages' attribution follow-ups have somewhere realistic to land beside
+/// the REAL attribution module (see below) without shaping the claim.
 async fn native_host(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("native_pages"), "pages").await;
     Host::genesis(vec![
-        Box::new(Pages::new("pages", Box::new(store)).with_tagging("tagging")),
+        Box::new(
+            Pages::new("pages", Box::new(store))
+                .with_attribution("attribution")
+                .with_identity("identity"),
+        ),
         // the production tag-report target, kept NATIVE in both hosts for
         // isolation: this proof is about the pages cutover, and an identical
-        // native tagging on both sides absorbs the emitted follow-ups
+        // native attribution on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(QueryProbe::new()),
@@ -122,12 +583,17 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("wasm_pages"), "pages").await;
     Host::genesis(vec![
         Box::new(
-            // NOTE: no `.with_tagging` here — the guest compiles the exact
-            // production builder chain (`Pages::new(..).with_tagging`) in.
+            // NOTE: no `.with_attribution` here — the guest compiles the exact
+            // production builder chain (`Pages::new(..).with_attribution`) in.
             WasmModule::with_store("pages", PAGES_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(QueryProbe::new()),
@@ -194,7 +660,8 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
 fn roots(h: &Host) -> (StateRoot, StateRoot) {
     (
         h.module_root("pages").expect("pages registered"),
-        h.module_root("tagging").expect("tagging registered"),
+        h.module_root("attribution")
+            .expect("attribution registered"),
     )
 }
 
@@ -217,7 +684,7 @@ fn same_ops_identical_roots_block_by_block() {
         assert!(wasm.block_durable_ids().contains("pages"));
 
         // every op family, one block each: tree edits, page nesting, the
-        // comment plane (which also emits the tagging follow-up), and subtree
+        // comment plane (which also emits the attribution follow-up), and subtree
         // removal. `moves` marks blocks that must change the pages root.
         let ops: Vec<(Vec<u8>, PageMsg)> = vec![
             (
@@ -225,6 +692,7 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 },
             ),
             (
@@ -244,7 +712,7 @@ fn same_ops_identical_roots_block_by_block() {
                 },
             ),
             (
-                bob.clone(),
+                alice.clone(),
                 PageMsg::UpdateText {
                     block_id: "b1".into(),
                     text: "first, edited".into(),
@@ -252,14 +720,14 @@ fn same_ops_identical_roots_block_by_block() {
                 },
             ),
             (
-                bob.clone(),
+                alice.clone(),
                 PageMsg::SetKind {
                     block_id: "b1".into(),
                     kind: BlockKind::Quote,
                 },
             ),
             (
-                bob.clone(),
+                alice.clone(),
                 PageMsg::SetChecked {
                     block_id: "b2".into(),
                     checked: true,
@@ -309,7 +777,7 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             // the comment plane: authorship derives from origin, the staged
             // thread is re-read in the SAME dispatch, and the accepted comment
-            // emits the tagging follow-up (dispatched in the same block).
+            // emits the attribution follow-up (dispatched in the same block).
             (
                 alice.clone(),
                 PageMsg::AddComment {
@@ -318,7 +786,6 @@ fn same_ops_identical_roots_block_by_block() {
                     target: "b1".into(),
                     text: "looks good".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 },
             ),
@@ -330,7 +797,6 @@ fn same_ops_identical_roots_block_by_block() {
                     target: "b1".into(),
                     text: "agreed".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 },
             ),
@@ -414,12 +880,7 @@ fn same_ops_identical_roots_block_by_block() {
             .await
             .expect("wasm target");
         assert_eq!(n_target, w_target, "resolver sync targets diverge");
-        let req = encode_qmdb_req(&QmdbSyncReq::Ops {
-            op_count: n_target.op_count,
-            start_loc: n_target.start,
-            max_ops: 64,
-            include_pinned: true,
-        });
+        let req = encode_qmdb_req(&ops_request(n_target.op_count, n_target.start, 64));
         assert_eq!(
             native
                 .serve_sync("pages", &req)
@@ -443,7 +904,7 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
             "pages",
             Box::new(QmdbStore::init(context.child("rev_native"), "pages").await),
         )
-        .with_tagging("tagging");
+        .with_attribution("attribution").with_identity("identity");
         let mut wasm = WasmModule::with_store(
             "pages",
             PAGES_WASM,
@@ -476,7 +937,7 @@ fn rejections_match_and_leave_no_trace() {
     deterministic::Runner::default().start(|context| async move {
         let mut native = native_host(&context).await;
         let mut wasm = wasm_host_(&context).await;
-        let (alice, bob) = (key(0xA1), key(0xB2));
+        let alice = key(0xA1);
 
         for host in [&mut native, &mut wasm] {
             host.submit_at(
@@ -484,6 +945,7 @@ fn rejections_match_and_leave_no_trace() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 }),
             )
             .await
@@ -518,7 +980,6 @@ fn rejections_match_and_leave_no_trace() {
                     target: "b1".into(),
                     text: "looks good".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 }),
             )
@@ -582,28 +1043,10 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "comment not found",
             ),
-            // THE OPENER GATE, proven in the compiled component and not just
-            // natively: it reads `env().origin`, the one authorization input
-            // that crosses the WIT boundary, so a gate keyed on it is exactly
-            // the kind that can compile, review as correct, and be inert
-            // inside the guest.
-            //
-            // alice opened t1, so bob may not re-home it — and an ungated move
-            // was the aiming device for `RemoveBlock`'s comment purge: put a
-            // stranger's thread on a throwaway block, remove the block, and
-            // their comments are hard-deleted past `DeleteComment`'s own
-            // author check.
-            (
-                bob.clone(),
-                PageMsg::MoveCommentThread {
-                    thread_id: "t1".into(),
-                    target: "b2".into(),
-                    anchor: None,
-                },
-                "not the comment author",
-            ),
-            // and the pre-consensus empty external origin never passes as a
-            // real user here, exactly as on the four sibling comment ops.
+            // the pre-consensus empty external origin never passes as a real
+            // user here, exactly as on the four sibling comment ops. It reads
+            // `env().origin`, the one authorization input that crosses the
+            // WIT boundary, so it is proven in the compiled component too.
             (
                 Vec::new(),
                 PageMsg::MoveCommentThread {
@@ -673,6 +1116,7 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 }),
             ),
             (
@@ -702,7 +1146,6 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     target: "b1".into(),
                     text: "mid-block".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 }),
             ),

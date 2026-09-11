@@ -5,7 +5,6 @@ state
   settings_key_state = ""
   // Full local user key used by the channel membership post gate.
   settings_user_key = ""
-  settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
 
   account_exists = false
@@ -15,19 +14,20 @@ state
   account_bio = ""
   account_keys:i64 = 0
   account_generation:i64 = 0
-  account_name_draft = ""
   account_renaming = false
   // The account's key associations, as the settings card lists them.
   account_key_rows:[AccountKeyRow] = []
   // One identity op in flight (create / mint / join / remove) — the buttons
   // wait on it the way Rename waits on `account_renaming`.
   account_busy = false
-  account_create_draft = ""
-  // "Add a device": the other device's pasted public key + a label, and the
-  // ticket minted for it (shown until the next op clears it).
-  account_key_draft = ""
-  account_key_label_draft = ""
+  // "Add a device": the ticket minted for the other device's pasted key
+  // (shown until the next op clears it).
   account_ticket = ""
+  // THE DRAFTS ARE THE SETTINGS VIEW'S. What the app owes it is which of
+  // them a committed op consumed: the count moves once per op and the scope
+  // names the drafts (`name`, `keys`, `label`, `account`).
+  settings_drafts_cleared:i64 = 0
+  settings_drafts_scope = ""
   // The console's "no account on this network" banner, dismissable for the
   // session; and the Settings card's reading of a QR ceremony (phase is
   // `working | show_qr | done | failed`, "" for none).
@@ -36,8 +36,6 @@ state
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-  // "Join with a ticket": a ticket another device minted for THIS key.
-  account_join_draft = ""
 
   node_log_timeline:NodeLogTimelineState = node_log_timeline_state()
   node_log_filter = ""

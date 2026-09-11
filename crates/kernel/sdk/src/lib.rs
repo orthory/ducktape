@@ -33,6 +33,9 @@ pub mod hash;
 pub mod staged_store;
 pub mod wire;
 
+use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
+
 pub use staged_store::{StagedStore, store_key};
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
@@ -42,7 +45,7 @@ pub const ROOT_LEN: usize = 32;
 
 /// a module's authenticated commitment to its entire state: a qmdb merkle root,
 /// or forge's git HEAD oid. opaque to the host; only compared and re-hashed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct StateRoot(pub [u8; ROOT_LEN]);
 
 impl StateRoot {
@@ -114,7 +117,7 @@ pub type ModuleId = String;
 /// re-dispatched by the host as a FOLLOW-UP op after the current `execute`
 /// returns — never a reentrant mutating call. payload bytes are typed later via
 /// per-module crate-root wire types; the host treats them opaquely.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Msg {
     pub target: ModuleId,
     pub payload: Vec<u8>,
@@ -126,10 +129,68 @@ pub struct Msg {
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// hard cap on a dispatch's assigned stamp ([`Ctx::set_assigned`]) — the
-/// module-assigned values of one applied op (a sequence, a revision), carried
-/// into the derived-tier op feed. a stamp is a handful of scalars, never a
-/// data lane; an oversized stamp is a deterministic rejection of the op.
-pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
+/// module-assigned values of one applied op, carried into the derived-tier
+/// op feed. Besides counters, this can include the canonical identities of
+/// every reference in a 64 KiB source record. The original payload carries
+/// the body; an oversized stamp is a deterministic rejection, never a
+/// truncation. Call admission reserves this budget inside its record limit.
+pub const MAX_ASSIGNED_BYTES: usize = 64 * 1024;
+
+/// A dispatch declaration shared by native and Wasm execution. Oversized
+/// values are discarded and cannot be replaced by a later valid declaration.
+#[derive(Default)]
+pub enum Declared {
+    #[default]
+    Nothing,
+    Value(Vec<u8>),
+    Oversized {
+        len: usize,
+        cap: usize,
+    },
+}
+
+impl Declared {
+    /// Retain the last value, or the first oversized declaration.
+    pub fn declare(&mut self, bytes: Vec<u8>, cap: usize) {
+        if let Declared::Oversized { .. } = self {
+            return;
+        }
+        if bytes.len() > cap {
+            *self = Declared::Oversized {
+                len: bytes.len(),
+                cap,
+            };
+            return;
+        }
+        *self = Declared::Value(bytes);
+    }
+
+    /// Validate after execution succeeds; module errors take precedence.
+    pub fn into_value(self, what: &str) -> Result<Option<Vec<u8>>, Error> {
+        match self {
+            Declared::Nothing => Ok(None),
+            Declared::Value(bytes) => Ok(Some(bytes)),
+            Declared::Oversized { len, cap } => {
+                Err(Error::Module(format!("{what} exceeds cap ({len} > {cap})")))
+            }
+        }
+    }
+}
+
+/// items one source's outbound queue hands the host per block — the per-QUEUE
+/// batch bound every generic queue source (dispatch's mailbox and call queue,
+/// the attribution plane's deliveries) reports its head under, and the host
+/// holds each to. it bounds one queue's batch, never the block's work as a
+/// whole: the remainder stays queued and the next block reads again.
+pub const MAX_DELIVERIES_PER_BLOCK: usize = 32;
+
+/// the largest value the backing qmdb journal codec decodes — the storage
+/// invariant every store-backed module's records live under. a record staged
+/// above it would commit and then be unreadable by the store's own op codec
+/// (and unsyncable), so a module validates each encoded record against this
+/// before staging it. declared here so the store and the modules over it name
+/// the one bound; `statesync::qmdb` builds its op read-config from it.
+pub const MAX_STORE_VALUE_BYTES: usize = 1 << 20;
 
 /// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
 /// (handed to the effectful node layer) and never re-enters as a follow-up. one
@@ -137,20 +198,37 @@ pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
 /// seam, which try-decodes each event and claims the ones that request
 /// off-consensus work (a worker's result returns as an ORDINARY submitted op —
 /// the oracle-as-op pattern).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Event {
     pub source: ModuleId,
     pub payload: Vec<u8>,
 }
 
+/// the account id every module shares: monotonic from 1, assigned by the
+/// identity module. `0` is never an account. lives here (not in identity's
+/// interface) because [`Origin::Program`] names one, and the origin is the
+/// one type every module reads.
+pub type AccountNumber = u64;
+
 /// who triggered the current dispatch. varies across follow-ups: the root op is
-/// `External`/`System`; an emitted follow-up is `Module(emitter_id)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `External`/`System`; an emitted follow-up is `Module(emitter_id)`; a call a
+/// module queued on behalf of a program account it executes runs as
+/// `Program(account)`.
+///
+/// a program account number is an IDENTITY, never a credential: it signs
+/// nothing, and a module gets no privilege from carrying one. the host proves
+/// the account is live and executed by the requesting module before a call
+/// unit runs (identity's `Control::Program` binding), so a module that sees
+/// `Program(n)` may attribute the op to account `n` exactly as it attributes
+/// an `External` op to the key's account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub enum Origin {
     /// an external submitter, identified by (e.g.) an ed25519 id.
     External(Vec<u8>),
     /// a module that emitted this as a follow-up.
     Module(ModuleId),
+    /// a program account acting through a host-run call unit.
+    Program(AccountNumber),
     /// genesis / system-internal.
     System,
 }
@@ -159,14 +237,17 @@ impl Origin {
     /// the cross-module ACTOR STRING convention (inbox source, jobs
     /// submitter/worker, files owner): a module id verbatim, `"ext:"` +
     /// lowercase hex of an external submitter's id bytes, or the literal
-    /// `"system"`. the `ext:` prefix is actor DOMAIN SEPARATION — a module
-    /// whose id happens to be pure hex can never collide with an external
-    /// key's hex. empty external bytes render as `"ext:"`; callers that must
-    /// reject an unauthenticated empty submitter check before calling.
+    /// `"system"`, or `"acct:"` + the decimal account number of a program
+    /// account. the `ext:` / `acct:` prefixes are actor DOMAIN SEPARATION — a
+    /// module whose id happens to be pure hex or pure digits can never collide
+    /// with an external key's hex or an account number. empty external bytes
+    /// render as `"ext:"`; callers that must reject an unauthenticated empty
+    /// submitter check before calling.
     pub fn actor_string(&self) -> String {
         use core::fmt::Write as _;
         match self {
             Origin::Module(id) => id.clone(),
+            Origin::Program(account) => format!("acct:{account}"),
             Origin::External(bytes) => {
                 let mut out = String::with_capacity(4 + bytes.len() * 2);
                 out.push_str("ext:");
@@ -190,17 +271,15 @@ pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
 }
 
 /// the field separator inside composite module keys (dispatch keys and saga
-/// ids, tagging scope keys): the ASCII unit separator. rejected inside a
+/// ids, attribution source keys): the ASCII unit separator. rejected inside a
 /// caller-chosen id by [`validate_id`] so a crafted id can never forge another
 /// composite key.
 pub const KEY_SEP: char = '\x1f';
 
 /// validate a caller-chosen id: non-empty, within `max_bytes`, and free of the
 /// reserved [`KEY_SEP`] — the shared guard for keys that compose with
-/// [`KEY_SEP`]. shared by dispatch and tagging. NOT agent's `validate_agent_id`,
-/// which is a deliberately separate DNS-label admission rule (an agent id must
-/// round-trip as `<id>@agents.duck`), kept distinct so neither rule can
-/// silently move the other.
+/// [`KEY_SEP`]. Modules with a narrower identifier vocabulary, such as runs'
+/// model slugs, apply their own admission rule as well.
 pub fn validate_id(field: &str, value: &str, max_bytes: usize) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::Module(format!("{field} must be non-empty")));
@@ -236,9 +315,127 @@ pub fn verify_snapshot_root(actual: StateRoot, expected: StateRoot) -> Result<()
     Ok(())
 }
 
+// ============================================================================
+// causal context — what a dispatch descends from
+// ============================================================================
+//
+// domain: every dispatch is either a ROOT (an op somebody submitted, or a
+// host injection) or a link in a CHAIN the host runs on a module's behalf:
+// a queued call, the delivery of a queued item, or the completion of a call
+// back to its requester. a chain remembers where it started (its root) and
+// its latest link (the hop). the host sets the context; a module reads it
+// and may record it beside what it writes, so a later reader can tell which
+// call or delivery produced a record — the attribution plane's `cause`.
+
+/// the identity of one call a module queued, namespaced by the module that
+/// queued it: `(requester, invocation, step)`. immutable once queued — the
+/// same id re-queued with a different payload, target, account or cause is
+/// a rejected replay, not an update.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+pub struct CallId {
+    /// the module that queued the call (the one its completion returns to).
+    pub requester: ModuleId,
+    /// the requester's own name for the run this call belongs to.
+    pub invocation: String,
+    /// the call's ordinal within `invocation`.
+    pub step: u64,
+}
+
+/// one item in a source module's outbound queue: the source's id plus the
+/// item's queue number. the number is SOURCE-GLOBAL — one numbering across
+/// every target the source ever delivers to, monotonic, never reused, even
+/// after the queue drains — so `(source, item)` is the item's identity
+/// everywhere it is named (a cause, a journal, a dedup key). a source that
+/// numbered per target would let two items look identical here; the host
+/// contract forbids it.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+pub struct ItemRef {
+    pub source: ModuleId,
+    pub item: u64,
+}
+
+/// where a causal chain started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum Root {
+    /// a queued item delivered by the host (a saga result reaching its
+    /// receiver, say) that itself descended from nothing.
+    Item(ItemRef),
+    /// a call queued from a `Direct` dispatch.
+    Call(CallId),
+    /// one record of a source's own change log (the attribution plane's
+    /// `Change.seq`) that several deliveries fan out from: every subscriber's
+    /// delivery of that change carries its own [`ItemRef`] and this one root.
+    Change { source: ModuleId, seq: u64 },
+}
+
+/// the latest link of a causal chain — what the host ran THIS dispatch as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum Hop {
+    /// the delivery of a queued item to its target.
+    Delivery(ItemRef),
+    /// the execution of a queued call at its target.
+    Call(CallId),
+    /// the completion of a call reaching its requester.
+    Completion(CallId),
+}
+
+/// the causal context of one dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum Cause {
+    /// a submitted op or a host injection: the start of any chain.
+    Direct,
+    /// a link the host ran on a module's behalf.
+    Chain { root: Root, hop: Hop },
+}
+
+impl Cause {
+    /// the root a call queued under this context inherits: a chain keeps its
+    /// root; a direct dispatch's call becomes a root of its own.
+    pub fn root_for_call(&self, id: &CallId) -> Root {
+        match self {
+            Cause::Direct => Root::Call(id.clone()),
+            Cause::Chain { root, .. } => root.clone(),
+        }
+    }
+
+    /// the root a queued item delivered under this context inherits: a chain
+    /// keeps its root; a direct dispatch's item becomes a root of its own.
+    pub fn root_for_item(&self, item: &ItemRef) -> Root {
+        match self {
+            Cause::Direct => Root::Item(item.clone()),
+            Cause::Chain { root, .. } => root.clone(),
+        }
+    }
+}
+
 /// the deterministic environment handed to `execute`. block-constant fields
 /// (`height`, `consensus_time`) are identical across every dispatch in one
-/// `submit`; `origin` and `me` vary per dispatch. NOT wall clock, NOT per-node.
+/// `submit`; `origin`, `me` and `cause` vary per dispatch. NOT wall clock, NOT
+/// per-node.
 #[derive(Clone, Debug)]
 pub struct Env {
     /// block / consensus round.
@@ -249,6 +446,69 @@ pub struct Env {
     pub origin: Origin,
     /// the module being dispatched.
     pub me: ModuleId,
+    /// what THIS dispatch descends from. a follow-up inherits its emitter's.
+    pub cause: Cause,
+}
+
+// ============================================================================
+// outbound queues — a source module's deliveries and their acknowledgment
+// ============================================================================
+//
+// domain: a source module (dispatch, today) keeps a COMMITTED queue of items
+// addressed to other modules. the host, between blocks, reads the queue head,
+// runs each item's delivery at its target in an isolated unit, and reports
+// the outcome back to the source with one acknowledgment the source retires
+// the item with. the ack envelope is the host's, not the source's: the host
+// cannot encode a source-specific message, so every source finalizes through
+// this one shape.
+
+/// one queued item as a source reports it to the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct PendingItem {
+    /// the source's queue number for this item: source-global, monotonic,
+    /// never reused (see [`ItemRef`]). the head batch a source reports is
+    /// strictly ascending in it.
+    pub item: u64,
+    /// the module the item is delivered to.
+    pub target: ModuleId,
+    /// the delivery payload, verbatim.
+    pub payload: Vec<u8>,
+    /// the causal context the delivery runs under.
+    pub cause: Cause,
+}
+
+/// how a delivery ended, as the host reports it to the source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum DeliveryOutcome {
+    /// the target applied the item; its writes commit in the same unit as
+    /// this acknowledgment.
+    Applied,
+    /// the target rejected the item deterministically; nothing of it
+    /// committed.
+    Failed { reason: String },
+    /// the source could not record the real outcome (its acknowledgment of
+    /// `Applied` or `Failed` rejected), so the target's writes were rolled
+    /// back and the item is retired with this fixed marker instead.
+    Unrepresentable,
+}
+
+/// the host's acknowledgment of one delivery, addressed to the source that
+/// queued the item. `item` alone identifies the item (source-global numbering,
+/// see [`ItemRef`]); `target` is the correlation check — the source refuses
+/// an acknowledgment naming a target other than the one it queued the item
+/// for, so a misrouted ack can never retire the wrong item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct Ack {
+    pub item: u64,
+    pub target: ModuleId,
+    pub outcome: DeliveryOutcome,
+}
+
+pub fn encode_ack(ack: &Ack) -> Vec<u8> {
+    wire::encode(ack)
+}
+pub fn decode_ack(bytes: &[u8]) -> Result<Ack, String> {
+    wire::decode(bytes)
 }
 
 /// a resolver-backed module's committed sync target at one boundary.
@@ -260,7 +520,7 @@ pub struct ResolverSyncTarget {
 }
 
 /// errors surfaced through the system api.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub enum Error {
     /// dispatch / query targeted a module that is not registered.
     UnknownModule(ModuleId),
@@ -358,8 +618,22 @@ pub trait Ctx {
 /// commitment, and the byte-level sync serve surface.
 #[async_trait::async_trait(?Send)]
 pub trait MerkleStore {
-    /// read one hashed key from COMMITTED state.
+    /// Read one hashed key from this store's current view. A guest adapter
+    /// includes the host's block overlay; a durable store exposes committed state.
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// Warm reads of these keys without changing the view or returning values.
+    /// Native stores may ignore this hint. Guest stores resolve the keys together
+    /// so traversing a known frontier does not replay the guest once per record.
+    async fn prefetch(&self, _keys: &[[u8; ROOT_LEN]]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Read the state frozen at the preceding block boundary, bypassing any
+    /// host overlay. Durable stores already expose this view through `get`.
+    async fn get_committed(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        self.get(key).await
+    }
 
     /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
     /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
@@ -390,7 +664,7 @@ pub trait MerkleStore {
 /// `query` routing), which would make a `Send` future impossible anyway.
 #[async_trait::async_trait(?Send)]
 pub trait Module {
-    /// this module's genesis-assigned id (e.g. "documents", "forge").
+    /// this module's assigned id (e.g. "documents", "forge").
     fn id(&self) -> ModuleId;
 
     /// the module's current authenticated root. called by the host to fold into
@@ -455,6 +729,46 @@ pub trait Module {
     /// the dispatch entry point. async, but every `.await` MUST be on a
     /// deterministic resource (own qmdb state, a query) — NEVER a network/effect.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error>;
+
+    /// the head of this module's COMMITTED outbound queue, in delivery order —
+    /// what the host delivers between blocks, each item in its own unit. read
+    /// from committed state only (never a staged overlay): the host asks at a
+    /// block boundary, and the answer must be the same on every validator. a
+    /// read or decode failure is an error, never an empty queue — the host
+    /// fails closed rather than silently skipping work. the default has no
+    /// queue.
+    async fn pending_items(&self) -> Result<Vec<PendingItem>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// retire one queued item with the host's acknowledgment of its delivery.
+    /// runs like `execute` (staged writes, committed or aborted with the
+    /// delivery unit). the source must be able to record EVERY outcome the
+    /// host can report for an item it queued: an ack that rejects rolls the
+    /// whole delivery back. the default rejects — a module without a queue is
+    /// never acknowledged.
+    async fn acknowledge(&mut self, _ctx: &mut dyn Ctx, ack: &Ack) -> Result<(), Error> {
+        Err(Error::Module(format!(
+            "module has no outbound queue to acknowledge item {} for {}",
+            ack.item, ack.target
+        )))
+    }
+
+    /// Initialize a newly installed module from caller-supplied parameters.
+    /// The same hook runs for initial membership and later admission; reopen
+    /// and code replacement preserve state and do not initialize it again.
+    /// Initialization must be idempotent: a refused admission boundary or an
+    /// interrupted genesis composition can retry against its prepared store.
+    async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Flush an adapter's operation-local writes into the host's block overlay.
+    /// Modules with block-finalization logic override this to flush writes only:
+    /// the guest's finalization export invokes `commit_block` once per block.
+    async fn flush_operation(&mut self) -> Result<(), Error> {
+        self.commit_block().await
+    }
 
     /// read-only projection serving other modules' [`Ctx::query`]. async, so a
     /// qmdb-backed module can serve a real read (`self.db.get(..).await`). defaults
@@ -539,27 +853,34 @@ pub trait Module {
         None
     }
 
-    /// this module's currently-running CODE identity: the 32-byte content hash
-    /// (sha256) of the component bytes it will execute, or `None` for a native
-    /// module whose code IS the node binary (nothing to hot-swap). the host
-    /// reconciles this against the code registry's committed active hash to
-    /// decide whether a boundary swap is needed — a cheap hash compare, so it
-    /// re-instantiates a component only on an actual change, never every block.
-    /// NEVER a consensus input: code is invisible to `root()` (state, not code,
-    /// composes the root-hash), so this is per-node realization bookkeeping only.
+    /// SHA-256 of the running deployment (component plus optional mapper).
+    /// The host binds this alongside the module's state root into the global
+    /// root, so a checkpoint authenticates the code needed to reopen it.
+    /// Native test harness modules return `None`.
     fn code_hash(&self) -> Option<Vec<u8>> {
         None
     }
 
-    /// hot-swap this module's executable CODE in place, KEEPING its host-owned
-    /// state — the live-update primitive. the host calls this at a code-registry
-    /// activation boundary AFTER it has fetched the out-of-band component bytes
-    /// and verified `sha256(bytes)` equals the consensus-committed hash; because
-    /// durable state is untouched, `root()` is unchanged and the root-hash stays
-    /// continuous across the swap. the default is unsupported — only the wasm
-    /// runtime module overrides it (a native module cannot swap its code).
-    fn swap_code(&mut self, _component_bytes: &[u8]) -> Result<(), Error> {
+    /// The optional mapper belonging to the currently running deployment.
+    /// The host exposes it to the derived tier at the same activation boundary
+    /// as the consensus component. It never executes inside consensus.
+    fn index_guest(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Compile and validate a replacement without changing the running module.
+    /// The returned action installs it infallibly, preserving host-owned state.
+    /// Dropping the action cancels the replacement. This lets the host prepare
+    /// every swap before applying any part of an activation boundary.
+    fn prepare_swap(&mut self, _artifact_bytes: &[u8]) -> Result<Box<dyn FnOnce() + '_>, Error> {
         Err(Error::SwapUnsupported)
+    }
+
+    /// Replace the deployment at a clean block boundary. State stays intact;
+    /// the host's global root changes because it also binds the deployment hash.
+    fn swap_code(&mut self, artifact_bytes: &[u8]) -> Result<(), Error> {
+        self.prepare_swap(artifact_bytes)?();
+        Ok(())
     }
 }
 
@@ -575,7 +896,69 @@ mod tests {
             "ext:ab01ff"
         );
         assert_eq!(Origin::External(Vec::new()).actor_string(), "ext:");
+        assert_eq!(Origin::Program(42).actor_string(), "acct:42");
         assert_eq!(Origin::System.actor_string(), "system");
+    }
+
+    /// a chain keeps its root across every hop; a direct dispatch's call or
+    /// item starts a chain of its own.
+    #[test]
+    fn cause_roots_inherit_along_a_chain() {
+        let call = CallId {
+            requester: "probe".into(),
+            invocation: "run-1".into(),
+            step: 0,
+        };
+        let item = ItemRef {
+            source: "dispatch".into(),
+            item: 7,
+        };
+        assert_eq!(Cause::Direct.root_for_call(&call), Root::Call(call.clone()));
+        assert_eq!(Cause::Direct.root_for_item(&item), Root::Item(item.clone()));
+        let chain = Cause::Chain {
+            root: Root::Item(item.clone()),
+            hop: Hop::Completion(call.clone()),
+        };
+        assert_eq!(chain.root_for_call(&call), Root::Item(item.clone()));
+        assert_eq!(chain.root_for_item(&item), Root::Item(item));
+    }
+
+    /// the ack envelope and the causal types round-trip through both codecs
+    /// a module may persist them with.
+    #[test]
+    fn ack_and_cause_round_trip_both_codecs() {
+        let ack = Ack {
+            item: 3,
+            target: "probe".into(),
+            outcome: DeliveryOutcome::Failed {
+                reason: "no".into(),
+            },
+        };
+        assert_eq!(decode_ack(&encode_ack(&ack)).unwrap(), ack);
+        let cause = Cause::Chain {
+            root: Root::Call(CallId {
+                requester: "probe".into(),
+                invocation: "run-1".into(),
+                step: 2,
+            }),
+            hop: Hop::Delivery(ItemRef {
+                source: "dispatch".into(),
+                item: 9,
+            }),
+        };
+        let borshed = borsh::to_vec(&cause).unwrap();
+        assert_eq!(borsh::from_slice::<Cause>(&borshed).unwrap(), cause);
+        let json = wire::encode(&cause);
+        assert_eq!(wire::decode::<Cause>(&json).unwrap(), cause);
+        for origin in [
+            Origin::External(vec![1, 2]),
+            Origin::Module("chat".into()),
+            Origin::Program(5),
+            Origin::System,
+        ] {
+            let bytes = borsh::to_vec(&origin).unwrap();
+            assert_eq!(borsh::from_slice::<Origin>(&bytes).unwrap(), origin);
+        }
     }
 
     #[test]

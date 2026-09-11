@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # make dev-clear — stop the background node and services left by `make dev`.
 #
-# This is the non-destructive twin of demo-clear: it preserves the workspace,
-# registry entry, module state, wallets, and airlock credential store. It also
+# This is the non-destructive twin of demo-clear: it preserves the workspace —
+# its module state, wallets, guest, executors and airlock credential store. It also
 # leaves the foreground desktop app and the separate `make demo-app` server
 # alone. Every process is selected by BOTH its ducktape node/service command
 # shape and this exact workspace path before it may receive a signal.
@@ -16,7 +16,7 @@ case "$ID" in
     ;;
 esac
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
+WSDIR="$DUCK/$ID"
 
 log(){ printf '\033[36m[dev-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -25,6 +25,19 @@ die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 # `reason` is a snake_case token, so `[^"]*` is exact for it; the `error`
 # sentence would truncate at an escaped quote, which is fine for a log line.
 json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
+# The loopback of a node.toml `http_listen`'s address family, port kept. This
+# script dials its OWN node from this box, and the bind is a wildcard by
+# default (`0.0.0.0`, or `[::]`) that no client can dial as written — the same
+# rewrite every co-located process applies (`workspace_config::http_base_of`).
+# The operator credential presented below is honored only from a loopback peer.
+loopback_base(){
+  local port="${1##*:}" host="${1%:*}"
+  case "$host" in
+    \[*) printf '[::1]:%s' "$port" ;;
+    *) printf '127.0.0.1:%s' "$port" ;;
+  esac
+}
 
 # Candidate discovery is a `pgrep -f` sweep for the workspace path: nothing
 # writes a pidfile, so the sweep is what finds a node left by a seed or an older
@@ -89,7 +102,7 @@ if [ -n "$(node_pids)" ]; then
     # it away is what made a refusal indistinguishable from a stop. The token is
     # printed verbatim — one invented here greps to nothing.
     RESPONSE="$(curl -s -m 2 -w '\n%{http_code}' \
-      -X POST "http://$LISTEN/v1/admin/shutdown" \
+      -X POST "http://$(loopback_base "$LISTEN")/v1/admin/shutdown" \
       -H "x-ducktape-admin-token: $(<"$WSDIR/admin.token")" 2>/dev/null)"
     CODE="${RESPONSE##*$'\n'}"
     BODY="${RESPONSE%$'\n'*}"

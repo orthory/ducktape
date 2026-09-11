@@ -1,31 +1,9 @@
 use super::*;
 
 #[test]
-fn the_stored_tab_list_forgets_pages_that_are_gone() {
-    let pages = ["welcome", "runbook"]
-        .into_iter()
-        .map(|id| PageItem {
-            id: id.into(),
-            title: String::new(),
-            parent: String::new(),
-            prefix: String::new(),
-            child_count: 0,
-        })
-        .collect::<Vec<_>>();
-    let stored = ["welcome", "deleted-1", "runbook", "deleted-2"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    // `doc_tab_rows` already hides a dead tab when it draws; this is what keeps
-    // the PERSISTED list — and the count Settings reads off it — honest.
-    assert_eq!(
-        doc_tabs_pruned(stored, pages.clone()),
-        ["welcome", "runbook"]
-    );
-    assert!(doc_tabs_pruned(Vec::new(), pages).is_empty());
-
-    // An unnamed principal gets a bare plate, never a `?` — that glyph in the
-    // rail's corner reads as HELP, not as "nobody has named this account".
+fn an_unnamed_principal_gets_a_bare_plate() {
+    // Never a `?` — that glyph in the rail's corner reads as HELP, not as
+    // "nobody has named this account".
     assert_eq!(initial_of(""), "");
     assert_eq!(initial_of("   "), "");
     assert_eq!(initial_of("quackbot"), "Q");
@@ -261,6 +239,7 @@ fn block_moves_follow_visible_sibling_order() {
         id: id.into(),
         parent: parent.map(str::to_string),
         page: "page".into(),
+        author: pages::Party::System,
         kind,
         text: id.into(),
         marks: Vec::new(),
@@ -308,6 +287,7 @@ fn block_moves_follow_visible_sibling_order() {
 /// green. This is the test that goes red.
 #[tokio::test(flavor = "current_thread")]
 async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let op = |msg: &PageMsg| ducktape_rpc::StreamOp {
         height: 9,
         seq: 0,
@@ -377,6 +357,7 @@ async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
 fn a_page_search_hit_names_the_page_it_came_from() {
     let row = |page_id: &str, text: &str| pages::index::PageBlockRow {
         block_id: format!("block-{text}"),
+        author: pages::Party::System,
         page_id: page_id.into(),
         parent: Some(page_id.into()),
         kind: BlockKind::Paragraph,
@@ -420,28 +401,30 @@ fn a_page_search_hit_names_the_page_it_came_from() {
     assert_eq!(hits[0].kind, "Text");
 
     // THE CALL SITES. A pure join proves nothing about what the surfaces
-    // render, and the Explorer's double print lived at ITS call site.
-    const SEARCH: &str = include_str!("../search.rs");
-    let page_arm = SEARCH
+    // render, and the Explorer's double print lived at ITS call site — which
+    // is the Explorer view's own crate now: it reads the index row itself and
+    // joins the titles for the same reason this one does.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let page_arm = EXPLORER
         .split("kind: \"page\".into(),")
         .nth(1)
         .expect("the page hit arm")
-        .split("}));")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        page_arm.contains("title: hit.page_title,") && page_arm.contains("snippet: hit.text,"),
+        page_arm.contains("titles") && page_arm.contains("snippet: text(&hit[\"text\"]),"),
         "the Explorer heads a page hit with its page and keeps the block text as the snippet"
     );
     assert!(
-        !page_arm.contains("title: hit.text"),
+        !page_arm.contains("title: text(&hit[\"text\"])"),
         "titling the row with the block text is what printed the same sentence twice"
     );
 
     // The palette and the pages search panel render the same hit type; #997's
     // lesson is that a fix at one surface leaves the siblings broken.
     const PALETTE: &str = include_str!("../../ui/screens/overlays.ice");
-    const PANEL: &str = include_str!("../../ui/components/pages.ice");
+    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.ice");
     assert!(
         PALETTE.contains("text hit.page_title"),
         "the palette's page hit names its page"
@@ -714,6 +697,7 @@ async fn a_wait_that_gave_up_leaves_the_next_read_still_owing_it() {
 /// the resync extern's argument list.
 #[tokio::test(flavor = "current_thread")]
 async fn an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     use std::sync::atomic::Ordering::SeqCst;
     let (origin, served) = node_scripting_its_fold_watermark(vec![Some("12:0")]).await;
     let rpc = rpc_client(&origin).expect("stub client");

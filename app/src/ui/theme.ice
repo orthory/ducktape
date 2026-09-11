@@ -19,6 +19,8 @@ recipe icon_action for button
   @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50 focus-visible:border-ring
 
 theme contract AppTheme
+  document_ink
+  document_selection
   bg
   surface
   fg
@@ -85,7 +87,6 @@ theme contract AppTheme
   danger_zone_bg
   danger_solid
   danger_solid_hover
-  danger_label
   ink_hover
   strong_ink
   caption
@@ -150,6 +151,8 @@ theme contract AppTheme
 // Surfaces first, then the lines that separate them, then the ink ramp, then
 // the functional layers.
 palette app for AppTheme
+  document_ink #3a3833
+  document_selection #d4d2ca
   bg         #fdfdfb
   surface    #ffffff
   fg         #2c2b27
@@ -218,7 +221,6 @@ palette app for AppTheme
   danger_zone_bg #fdf6f4
   danger_solid #a35248
   danger_solid_hover #8f463d
-  danger_label #c79a8a
   // INK — body copy forward, each step fades one notch further back.
   ink_hover #322f28
   strong_ink #3a3934
@@ -330,6 +332,8 @@ palette app for AppTheme
 // (they were tuned as signals, not surfaces), and every `fg/N` composite in
 // the screens adapts automatically because `fg` itself flips.
 palette app_dark for AppTheme
+  document_ink #d4d2ca
+  document_selection #45443c
   bg         #1b1a16
   surface    #22211d
   fg         #e8e6df
@@ -398,7 +402,6 @@ palette app_dark for AppTheme
   danger_zone_bg #2a1d1b
   danger_solid #c25a4f
   danger_solid_hover #d3685c
-  danger_label #8a5a4d
   // INK — the ramp fades toward the surface, mirroring the light order.
   ink_hover #f4f2ea
   strong_ink #dcdad2

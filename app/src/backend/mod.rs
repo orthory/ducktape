@@ -25,30 +25,22 @@ use zeroize::Zeroizing;
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
     CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatSpan, append_thread_page, author_display, author_name, bounded_chat_window,
-    bounded_thread_window, chat_message, contains_pending_message, mark_message_groups,
-    merge_landing_messages, merge_message_send_result, merge_pending_messages,
-    merge_thread_refresh, parse_message_with_members, rollback_pending_message, short_label,
+    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, append_thread_page,
+    author_display, bounded_chat_window, bounded_thread_window, chat_message,
+    contains_pending_message, handle_char, mark_message_groups, merge_landing_messages,
+    merge_message_send_result, merge_pending_messages, merge_thread_refresh,
+    rollback_pending_message, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{THREAD_HOT_WINDOW_LIMIT, paragraph_blocks};
-// forge's client view model, same arrangement: the tracker rows, the item
-// pane (reviews + merge-box tallies), and the op-refresh classification.
-pub use ::forge::client::{
-    ForgeRefresh, ItemRow as ForgeItem, ReviewCommentRow as ForgeReviewComment,
-    ReviewRow as ForgeReview,
-};
-pub use inbox::client::{BellDelta, BellItem, apply_bell_items as fold_bell_items};
+pub use ::chat::client::{BoundAccount, THREAD_HOT_WINDOW_LIMIT, author_name, paragraph_blocks};
+pub use inbox::client::{BellDelta, BellItem};
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
-/// The voting window a membership proposal opens with, in consensus seconds —
-/// the same value the CLI's membership ceremony uses.
-const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
 /// One index view page fills the entire bounded render window. Timeline roots
 /// have their own index keyspace, so this is always one RPC regardless of how
 /// many thread replies sit between roots.
@@ -132,7 +124,7 @@ pub struct LiveThreadData {
     pub messages: Vec<ChatMessage>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -147,7 +139,7 @@ pub struct ChatSearchData {
     pub hits: Vec<ChatSearchHit>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageItem {
     pub id: String,
     pub title: String,
@@ -184,7 +176,7 @@ pub struct PagesData {
     pub commented_block_hits: Vec<String>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageCommentThread {
     pub id: String,
     /// The block (or page) id the thread anchors to — the wire always carried
@@ -196,7 +188,7 @@ pub struct PageCommentThread {
     pub comment_count: i64,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageComment {
     pub id: String,
     pub ordinal: i64,
@@ -227,7 +219,7 @@ pub struct BlockCommentData {
     pub has_more: bool,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageSearchHit {
     pub page_id: String,
     /// The title of the page the block lives in. The index's hit row carries
@@ -326,8 +318,6 @@ pub struct LiveUpdate {
     pub chat: Vec<ChatDelta>,
     pub pages: PagesDelta,
     pub bell: BellDelta,
-    /// one committed forge op's invalidation scope (`kind == LiveKind::Forge`).
-    pub forge: ForgeRefresh,
     /// Subscription backpressure, not UI state. The next socket publication
     /// cannot be read until the generated app message carrying this token has
     /// finished its update and all of its clones have been dropped.
@@ -378,15 +368,16 @@ impl Default for LiveUpdate {
             chat: Vec::new(),
             pages: PagesDelta::default(),
             bell: BellDelta::default(),
-            forge: ForgeRefresh::default(),
             permit: LivePermit::default(),
         }
     }
 }
 
 mod agent;
+mod app_dirs;
 mod bell;
 mod chat;
+mod chat_live;
 mod document;
 mod duck_uri;
 mod explorer;
@@ -396,6 +387,7 @@ mod live;
 mod load;
 mod model;
 mod node;
+mod notify;
 mod picture;
 mod roster;
 mod rpc;
@@ -403,10 +395,15 @@ mod search;
 mod shell;
 mod storage;
 mod style;
+mod view_artifact;
+pub mod view_source;
 
 pub use agent::*;
+pub use app_dirs::app_log_path;
+pub(crate) use app_dirs::cache_dir;
 pub use bell::*;
 pub use chat::*;
+pub use chat_live::*;
 pub use document::*;
 pub use duck_uri::*;
 pub use explorer::*;
@@ -416,6 +413,7 @@ pub use live::*;
 pub use load::*;
 pub use model::*;
 pub use node::*;
+pub use notify::*;
 pub use picture::*;
 pub use roster::*;
 pub use rpc::*;

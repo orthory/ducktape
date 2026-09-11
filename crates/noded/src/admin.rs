@@ -355,9 +355,11 @@ async fn resolve_owner(
             OwnerResolve::Owned(view.keys.into_iter().map(|key| key.pubkey).collect())
         }
         Ok(identity::IdentityReply::Account(None)) => OwnerResolve::NoOwner,
-        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
-            OwnerResolve::Unavailable
-        }
+        Ok(
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_),
+        ) => OwnerResolve::Unavailable,
         Err(_) => OwnerResolve::Unavailable,
     }
 }

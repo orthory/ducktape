@@ -1,7 +1,8 @@
 // EVERY BOOT OPENS THE LAUNCH WINDOW — sign in, pick a network, and only
 // then does a console window exist. `onboarding_opened` (handlers/
 // onboarding.ice) loads the hub state and appearance once the window is up;
-// `connect` runs only after a pick, from `console_opened`.
+// `connect` runs only after a pick, from `network_entered`, and the console
+// window opens on its answer (`workspace_connected`).
 on mount
   task window open onboarding -> onboarding_opened _
 
@@ -30,6 +31,13 @@ on set_appearance_dark
 
 on appearance_saved(_written)
 
+// The banner preference, the same arrangement: pin the reading, persist it
+// last, and treat a failed write as costing the NEXT boot's default.
+on desktop_notifications_loaded(enabled)
+  desktop_notifications = enabled
+
+on desktop_notifications_saved(_written)
+
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
 // that lived here collapsed to identity calls and is gone. Typed drafts
@@ -37,6 +45,13 @@ on appearance_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
@@ -48,7 +63,6 @@ on reconnect
   invalidate lane=block_threads
   invalidate lane=block_comments
   invalidate lane=live_resync
-  invalidate lane=files_preview
   invalidate lane=page_autosave
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   hydration_generation = hydration_generation + 1
@@ -61,6 +75,8 @@ on reconnect
   dm_rows = []
   messages = []
   has_older_history = false
+  // A reconnect mounts a fresh timeline at its tail — see `state/chat.ice`.
+  chat_at_tail = true
   // The history lane was invalidated above, so its old socket and button state
   // end together even when that socket would never have answered.
   history_loading = false
@@ -83,8 +99,6 @@ on reconnect
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -102,7 +116,6 @@ on reconnect
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
   pages = []
-  doc_tabs = []
   blocks = []
   active_page = ""
   active_page_title = ""
@@ -126,14 +139,15 @@ on reconnect
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_editor = editor("")
+  page_text = installed_page_text(page_text, true, "")
+  page_cursor_line = 0
   page_saved_text = ""
   buffer_page = ""
   page_refusal = ""
   block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
-  // The DRAFT survives, like `chat_search_draft` above — a typed-but-never-
-  // submitted query produced nothing this reset needs to discard, and this
+  // The DRAFT survives — it is the chat view's own now, and a typed-but-never-
+  // submitted query produced nothing this reset needs to discard; this
   // handler's doctrine is that typed drafts live through a reconnect. The
   // ANSWER does not: hits, flag and query go together, and the emptied query
   // is what keeps the zero-hit plate from reading the emptied list as a
@@ -146,6 +160,17 @@ on reconnect
   palette_search_phase = SearchPhase.idle
   error = ""
   status = "Connecting…"
+  bell_marking = false
+  bell_error = ""
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  invalidate lane=bell_load
+  invalidate lane=bell_context
+  bell_items = []
+  bell_presentations = []
+  bell_unread = 0
+  bell_read_through = 0
+  bell_clear_through = 0
   connect_generation = connect_generation + 1
   run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
@@ -154,12 +179,14 @@ on workspace_connected(next)
   return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
-  network_name = network_label(account_name, connected_rpc)
+  network_name = network_label(network_chain_id, connected_rpc)
   status = next.status
   block_height = next.height
   channels = next.channels
+  // The chain this list was learned from — see `live_resynced`.
+  chat_chain_id = network_chain_id
   channel_reads = initial_channel_reads(next.channels, channel_reads)
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
@@ -167,7 +194,12 @@ on workspace_connected(next)
   // `chat_hit_loaded`.
   history_view = false
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // THE SERVER'S `has_more`, ALONE. The `|| history_has_older(messages)` that
+  // used to ride here read "the oldest loaded root has seq > 1", and root
+  // sequences have holes (a thread reply consumes one without becoming a
+  // root), so it stood true at the real beginning of every busy channel and
+  // pinned "Load older messages" on forever.
+  has_older_history = next.has_older_history
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   // THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S by construction now:
@@ -176,7 +208,7 @@ on workspace_connected(next)
   // (ducktape-ui#697).
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -192,6 +224,7 @@ on workspace_connected(next)
   huddle_channel = huddle.channel
   huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
+  composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, active_channel), channel_members)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
@@ -208,50 +241,55 @@ on workspace_connected(next)
   mutation_phase = MutationPhase.idle
   hydration_retry_attempt = 0
   error = ""
-  explorer_generation = explorer_generation + 1
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  gov_generation = gov_generation + 1
-  agents_generation = agents_generation + 1
+  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. A run
+  // opened on the previous network, still named under the new one, is
+  // exactly the confusion the scope fences exist to prevent — so the open
+  // run goes, and with it the badge the last network's view reported.
+  agents_open_run = ""
+  agents_live = false
   account_generation = account_generation + 1
-  forge_generation = forge_generation + 1
-  forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   dm_peers_generation = dm_peers_generation + 1
-  // Shell may have stayed selected while the endpoint reconnected. Refresh
-  // its device-local credential names here; tab selection alone will not fire
-  // again after the console comes back online.
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = shell_tab == ShellTab.shell
   parallel
-    run replace lane=doc_tabs_load load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
-    run replace lane=bell_load load_bell(connected_rpc) -> bell_loaded _ | bell_failed _
-    run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-    run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
-    run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     flow
       from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
       try request -> done request
       done -> peers_load_selected _
-    run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
-    run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
-    flow
-      from done load_request(shell_tab == ShellTab.shell, connected_rpc, "", shell_credentials_generation)
-      try request -> done request
-      done -> shell_credentials_load_selected _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
+    // the console, if a door is waiting for one: dispatched after the state
+    // above has landed, so the window's first draw is the workspace it
+    // opens onto (a handler match must be a handler's last statement)
+    flow
+      from done true
+      done -> console_entry_answered()
+
+// A DOOR'S CONNECT OPENS THE CONSOLE, onto the workspace and views now in
+// hand; a reconnect's answers into the console that is up, and a windowless
+// daemon's opens nothing — the tray is the way back in.
+on console_entry_answered
+  match console_entry
+    ConsoleEntry.entering
+      console_entry = ConsoleEntry.idle
+      task window open console -> console_opened _
+    ConsoleEntry.idle
+      // nothing to open; an arm carries at least one statement
+      console_entry = ConsoleEntry.idle
 
 on live_updated(next)
   status = next.status
   block_height = keep_i64(next.height >= 0, next.height, block_height)
+  // a height that moved is a block: every view reading the feed is told
+  views_live_serial = view_block_hit(block_height, views_live_serial)
   // A publication has one closed kind and runs one arm. In particular, only
   // the chat arm even evaluates the wide, by-value chat fold arguments.
   match next.kind
@@ -262,12 +300,9 @@ on live_updated(next)
     LiveKind.ready
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
-      forge_generation = forge_generation + 1
-      parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.chat
-      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
       channels = folded_chat.channels
       messages = folded_chat.messages
       has_older_history = folded_chat.has_older_history
@@ -281,6 +316,7 @@ on live_updated(next)
       thread_message_action = folded_chat.thread_message_action
       thread_edit_draft = folded_chat.thread_edit_draft
       channel_members = folded_chat.channel_members
+      composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, active_channel), channel_members)
       channel_reads = folded_chat.channel_reads
       rooms = folded_chat.rooms
       dm_rows = folded_chat.dm_rows
@@ -289,14 +325,18 @@ on live_updated(next)
       active_channel_archived = folded_chat.active_channel_archived
       active_channel_members_only = folded_chat.active_channel_members_only
       post_refusal = folded_chat.post_refusal
-      forge_discussion = folded_chat.forge_discussion
       return if !folded_chat.refresh_chat
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
       run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.bell
-      bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
-      bell_items = apply_bell(bell_items, next.bell)
+      bell_read_through = keep_i64(next.bell.kind == "read" && next.bell.up_to_seq > bell_read_through, next.bell.up_to_seq, bell_read_through)
+      bell_clear_through = keep_i64(next.bell.kind == "cleared" && next.bell.up_to_seq > bell_clear_through, next.bell.up_to_seq, bell_clear_through)
+      bell_items = merge_bell_loaded(apply_bell(bell_items, next.bell), [], bell_read_through, bell_clear_through)
+      bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
+      bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, [])
+      return if next.bell.kind != "delivered"
+      run replace lane=bell_context load_bell_presentations(connected_rpc, bell_missing_items(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations)) -> bell_context_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     LiveKind.pages
       // Text deltas fold locally. Structural deltas fold what they can, then
       // resync Pages once; no chat, bell, forge, or plane reducer participates.
@@ -306,32 +346,27 @@ on live_updated(next)
       blocks = apply_page_text(blocks, next.pages)
       block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
       active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-      let folded_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
-      page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+      let observed = current_page_document(network_chain_id, buffer_page, page_text)
+      page_text = observed.text
+      let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+      page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
       page_saved_text = folded_saved
       return if !next.load_pages
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
       run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(false, true), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-    LiveKind.forge
-      forge_generation = forge_generation + 1
-      run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.plane
+      // a module view holding an `rpc.live` subscription on this plane is
+      // told first; the serial moving is what draws it
+      views_live_serial = view_live_hit(next.module, views_live_serial)
       members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
-      gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
       account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
       dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
-      agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
-      fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
       parallel
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
           try request -> done request
           done -> members_load_selected _
-        flow
-          from done load_request(plane_live_hit(next.kind, next.module, "governance"), connected_rpc, "", gov_generation)
-          try request -> done request
-          done -> governance_load_selected _
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", account_generation)
           try request -> done request
@@ -340,26 +375,34 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
           try request -> done request
           done -> dm_peers_load_selected _
+        // An identity op moves the name directory, and every chat label on
+        // screen is rendered through it — so the chat plane is re-read the
+        // way a resync reads it, names first.
         flow
-          from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
           try request -> done request
-          done -> agents_load_selected _
-        flow
-          from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-          try request -> done request
-          done -> files_list_selected _
+          done -> names_moved_selected _
     LiveKind.resync
-      return if !next.load_chat && !next.load_pages && !forge_live_hit(next.kind, next.module)
-      hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
-      hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
-      forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
-      parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+      // A replay the stream could not fold: every module view holding an
+      // `rpc.live` subscription on the plane it names re-reads first.
+      views_live_serial = view_live_hit(next.module, views_live_serial)
+      return if !next.load_chat && !next.load_pages
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on live_resynced(next)
   return if next.generation != hydration_generation
   hydration_retry_attempt = 0
+  // HAS THE NETWORK ITSELF MOVED UNDER THIS CONSOLE? A workspace switch keeps
+  // the endpoint (the node comes back on the same loopback port), so nothing
+  // reconnects: the websocket drops, resyncs, and every fold below only ever
+  // ADDS — which is how the previous workspace's `#general` went on standing in
+  // the sidebar of a network that has no such room, clickable, with nothing
+  // behind it. `network_chain_id` is the node's own pushed status document
+  // (`node_status_pushed`), so this costs no round trip; `chat_chain_id` is the
+  // chain the rows on screen were learned from.
+  let chain_left_behind = chain_moved(chat_chain_id, network_chain_id)
   // FOLD, DO NOT REPLACE — the same rule `chat_updated` states, for the same
   // reason. This read left the node several queries ago, and `channel_reads` is
   // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
@@ -368,13 +411,9 @@ on live_resynced(next)
   // message. `upsert_channel_rows` — which `keep_channels` runs BEHIND its
   // loaded pick, so a plane-only resync never pays for the fold — keeps
   // `head_seq` monotonic and keeps a row the answer does not carry at all: a
-  // channel created while it was in flight.
-  //
-  // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
-  // or an archive folded during the round trip is overwritten here. That one
-  // self-heals — the next chat-carrying resync re-reads the renamed row — where
-  // the badge did not, which is why only the cursor's invariant is enforced.
-  channels = keep_channels(next.chat_loaded, next.channels, channels)
+  // channel created while it was in flight. Across a chain there is no such
+  // race to protect and no such row to keep, and the answer replaces outright.
+  channels = keep_channels(next.chat_loaded, chain_left_behind, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
   // it is still the window's own answer. `load_chat_data` replies with the
@@ -388,12 +427,20 @@ on live_resynced(next)
   // a merge across a gap leaves a hole nothing can page in. It takes
   // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
   // resyncs are plane-only, and the merge is a full copy of the window.
-  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel)
+  messages = resynced_messages(next.chat_loaded, chain_left_behind, next.messages, messages, active_channel, next.active_channel)
+  // The rows on screen now belong to the chain this answer came from.
+  chat_chain_id = keep_str(next.chat_loaded && !empty(network_chain_id), network_chain_id, chat_chain_id)
   // A resync that replaced the window left the banner describing rows that are
   // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
   // the window and keeps the banner with it.
   history_view = history_view && !next.chat_loaded
-  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || history_has_older(messages), has_older_history)
+  // TWO SERVER ANSWERS, NEVER A LOCAL GUESS. This reply's `has_more` describes
+  // the floor of the CANONICAL TAIL PAGE, and `resynced_messages` above may have
+  // spliced that page onto older pages the reader had loaded — whose own floor
+  // the last `history_loaded` already answered for. So the two are OR'd, and the
+  // reader at the true beginning of a channel (both false) keeps her button
+  // down, which is the whole point of taking the index's word for it.
+  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || has_older_history, has_older_history)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
   // this is the one dropper that must ask. Conditional, not a flat clear: a
   // same-channel resync leaves a legitimate page in flight, and `history_loaded`
@@ -407,13 +454,11 @@ on live_resynced(next)
   // that room (ducktape-ui#698). The plate is instance state now, so the
   // rescue has to say WHICH plate; a publication sits mid-handler, so the
   // guards below it still run.
-  slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing) at composer_scope(connected_rpc, active_channel)
+  composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing)
   selected_message_rev = message_seq_after_failure(selected_message_rev, MutationPhase.message_edit, selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, MutationPhase.message_edit, selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, MutationPhase.message_edit, selected_message_seq <= 0)
   channel_settings_open = channel_settings_open && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
-  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   // The line below zeroes the seq when the root was deleted or the room
@@ -442,7 +487,7 @@ on live_resynced(next)
   // today's `active_channel`), so `chat_loaded` alone still blanks him.
   // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
   // window, and the landing it names re-derives the peer itself.
-  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, account_number, active_channel), active_dm_peer)
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, dm_peers, active_channel), active_dm_peer)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
@@ -477,7 +522,7 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
@@ -537,8 +582,10 @@ on live_resynced(next)
   // canonical text only replaces the buffer when the editor is CLEAN and the
   // text actually differs — a rebuilt `Content` throws the cursor to the
   // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
-  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let resynced_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+  page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
   page_saved_text = resynced_saved
   // The buffer's own page follows the buffer, and only when this resync
   // actually carried page news AND the buffer moved with it.
@@ -555,7 +602,7 @@ on live_resynced(next)
   // came from the node. Claiming that as the new page's buffer hands
   // `page_autosave_tick` a fabricated document it is willing to write: the
   // page would be overwritten with a blank one it never loaded.
-  let resynced_buffer_is_clean = editor_text(page_editor) == page_saved_text
+  let resynced_buffer_is_clean = page_text == page_saved_text
   buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   // THE RECOVERY'S TERMINAL. `mutation_failed` parks the lock at "recovering"
   // for a write the node COMMITTED and then failed to read back, and launches
@@ -643,18 +690,22 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(_cause)
 
 on select_shell_tab(next)
+  let staying_on_settings = shell_tab == ShellTab.settings && next == ShellTab.settings
+  let keeping_authentication = staying_on_settings && !empty(account_ceremony_phase)
+  return if keeping_authentication
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   // A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)` from
   // the seat that is already active, and Settings' rows emit their own tab
   // while the reader is on it — so the retires below have to ask, or one click
   // on the tab you are already looking at destroys an inline edit in progress.
   let moved = shell_tab != next
   shell_tab = next
-  // A credential read belongs to the Shell visit that issued it. Bump on
-  // EVERY move, including the chat/pages early return below, so a late reply
-  // cannot repaint a screen the reader already left.
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = connected && shell_tab == ShellTab.shell
-  has_older_history = history_has_older(messages)
   // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
   // `live_updated`'s tab gate: the cursor stood still while the pane was
   // unmounted, so this is where the room she is coming back to is caught up —
@@ -671,7 +722,7 @@ on select_shell_tab(next)
   unread_boundary = keep_i64(chat_tab_arrivals, channel_last_read(channel_reads, chat_tab_channel), unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
   // these surfaces is mounted under an arm of `match tab`. Left set, an armed
@@ -691,9 +742,7 @@ on select_shell_tab(next)
   thread_selected_rev = keep_i64(moved, 0, thread_selected_rev)
   thread_message_action = close_message_action(moved, thread_message_action)
   thread_edit_draft = keep_str(moved, "", thread_edit_draft)
-  forge_repo_menu = forge_repo_menu && !moved
   page_delete_armed = page_delete_armed && !moved
-  fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
@@ -703,22 +752,8 @@ on select_shell_tab(next)
   error = ""
   return if !connected
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
-  explorer_generation = explorer_generation + 1
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  gov_generation = gov_generation + 1
-  // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
-  // `run replace lane=agents_load` aborts work still running on the lane, but
-  // it cannot retract a completion the runtime has ALREADY queued — and an
-  // unconditional bump here is what makes `agents_loaded` reject exactly that
-  // completion, throwing away a live-plane read that had already answered. The
-  // Forge seat's dot is drawn off those rows on EVERY tab, so opening the
-  // destination pane does not pay the loss back: it waits for the next `agent`
-  // or `runs` op, which for a run that just started is the moment it ends.
-  agents_generation = keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation + 1, agents_generation)
   account_generation = account_generation + 1
-  forge_generation = forge_generation + 1
-  forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
   // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
   // other loader here draws only its own tab, so a bump that discards a
   // still-flying CONNECT load is re-earned the moment that tab is opened. The
@@ -730,32 +765,14 @@ on select_shell_tab(next)
   // on every members-only room.
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
-  explorer_loading = shell_tab == ShellTab.explorer
-  fs_loading = shell_tab == ShellTab.files
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
   parallel
     flow
-      from done load_request(shell_tab == ShellTab.explorer, connected_rpc, "", explorer_generation)
-      try request -> done request
-      done -> explorer_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-      try request -> done request
-      done -> files_list_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, "", fs_generation)
-      try request -> done request
-      done -> files_history_selected _
-    flow
       from done load_request(tab_reads_plane(shell_tab, "members"), connected_rpc, "", members_generation)
       try request -> done request
       done -> members_load_selected _
-    flow
-      from done load_request(tab_reads_plane(shell_tab, "governance"), connected_rpc, "", gov_generation)
-      try request -> done request
-      done -> governance_load_selected _
     flow
       from done load_request(shell_tab == ShellTab.settings, connected_rpc, "", settings_generation)
       try request -> done request
@@ -765,53 +782,18 @@ on select_shell_tab(next)
       try request -> done request
       done -> peers_load_selected _
     flow
-      from done load_request(tab_reads_plane(shell_tab, "agents"), connected_rpc, "", agents_generation)
-      try request -> done request
-      done -> agents_load_selected _
-    flow
       from done load_request(tab_reads_plane(shell_tab, "account"), connected_rpc, "", account_generation)
       try request -> done request
       done -> account_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.forge, connected_rpc, "", forge_generation)
-      try request -> done request
-      done -> forge_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.shell, connected_rpc, "", shell_credentials_generation)
-      try request -> done request
-      done -> shell_credentials_load_selected _
 
 // Conditional effects are selected one update before launch. The selector's
 // optional `try` emits no message when false. A newer intent, tab, or network
 // can land before the selected message, so each destination rejects an
 // obsolete request before it starts the normal compiler `run replace` lane.
-on explorer_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != explorer_generation
-  let unmounted = shell_tab != ShellTab.explorer
-  return if obsolete_request || unmounted
-  run replace lane=explorer_load load_explorer(request.rpc, request.generation) -> explorer_loaded _ | explorer_failed _
-
-on files_list_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_list files_ls(request.rpc, request.key, request.generation) -> fs_listed _ | fs_failed _
-
-on files_history_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_history files_history(request.rpc, request.generation) -> fs_history_loaded _ | fs_failed _
-
 on members_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != members_generation
   return if obsolete_request
   run replace lane=members_load load_members(request.rpc, request.generation) -> members_loaded _ | members_failed _
-
-on governance_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != gov_generation
-  return if obsolete_request
-  run replace lane=governance_load load_governance(request.rpc, request.generation) -> governance_loaded _ | governance_failed _
 
 on settings_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != settings_generation
@@ -825,11 +807,6 @@ on peers_load_selected(request)
   return if obsolete_request || unmounted
   run replace lane=peers_load load_peers(request.rpc, request.generation) -> peers_loaded _ | peers_failed _
 
-on agents_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != agents_generation
-  return if obsolete_request
-  run replace lane=agents_load load_agents(request.rpc, request.generation) -> agents_loaded _ | agents_failed _
-
 on account_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != account_generation
   return if obsolete_request
@@ -840,19 +817,12 @@ on dm_peers_load_selected(request)
   return if obsolete_request
   run replace lane=dm_peers_load load_dm_peers(request.rpc, request.generation) -> dm_peers_loaded _ | dm_peers_failed _
 
-on forge_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation
-  let unmounted = shell_tab != ShellTab.forge
-  return if obsolete_request || unmounted
-  run replace lane=forge_load load_forge(request.rpc, request.generation) -> forge_loaded _ | forge_list_failed _
-
-on shell_credentials_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != shell_credentials_generation
-  let unmounted = shell_tab != ShellTab.shell
-  return if obsolete_request || unmounted
-  parallel
-    run replace lane=shell_credentials load_agent_credentials(request.rpc, request.generation) -> shell_credentials_loaded _ | shell_credentials_failed _
-    run replace lane=shell_host_nodes load_agent_host_nodes(request.rpc, request.generation) -> shell_host_nodes_loaded _ | shell_host_nodes_failed _
+on names_moved_selected(request)
+  let obsolete_request = request.rpc != connected_rpc || request.generation != hydration_generation
+  return if obsolete_request
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
@@ -869,13 +839,6 @@ on wall_tick
 // Node's expensive streams stay scoped to the operator pane that renders them.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
-  // A LIVE SESSION IS WATCHED WHEREVER THE OPERATOR IS. This used to be gated
-  // on the Shell tab being open AND its terminal surface being the one on
-  // screen, so a session that exited while the operator read the transcript
-  // kept its "running" dot lit until they navigated back. The session outlives
-  // the view — the pty is owned by `shell_terminal`, not by the widget — so the
-  // notice that says it ended has to as well.
-  agent_terminal_events(shell_terminal) when (connected && shell_terminal_running) -> shell_terminal_notice _
   // THE CALL SESSION IS THIS SUBSCRIPTION. Joining a huddle flips
   // `huddle_joined` and the media leg connects; leaving (or disconnecting)
   // stops the subscription, the stream drops, and the websocket + audio
@@ -915,19 +878,36 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)) -> global_key_pressed _
-  // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
-  // a focused widget CONSUMED — Home in a text field, an arrow in an open
-  // list — but it is only half the arbitration: iced's single-line input drops
-  // Up/Down uncaptured, so the router itself refuses the arrows and every key
-  // under an open overlay (`content_scroll_step`). Ungated on purpose: the
-  // launch and huddle windows mount no content pane, and a scroll operation
-  // whose target is not on screen is a no-op.
-  keyboard press status=ignored -> content_scroll_key _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed)) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
-  // A daemon outlives its windows, so process exit is an explicit decision:
-  // when the LAST tracked window closes, leave.
+  // A daemon outlives its windows: a close just unregisters the slot (below).
+  // The process leaves only when someone says so — the tray's Quit, or ⌘Q.
   window closed with-id -> window_was_closed _
+  // ⌘Q AND ⌘W, WITHOUT TAXING EVERY KEYSTROKE. macOS binds both through an app
+  // menu this app does not have, so it reads them itself. A key-press
+  // subscription publishes a proxied message and an unconditional iced rebuild
+  // for EVERY key it sees (the cost the `status=ignored` note above is about),
+  // so an always-on route just to catch two chords would double what typing
+  // costs. The modifier stream is the cheap half — it fires only when a
+  // modifier goes down or up — so it arms the expensive half, and the press
+  // route exists only while ⌘ is actually held. It carries no `connected` term
+  // on purpose: both chords have to work on the launch window too.
+  keyboard modifiers -> modifier_state_changed _
+  keyboard press status=ignored when cmd_held -> command_chord_pressed _
+  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself AND by the tab it
+  // belongs to. A reader with nothing selected has no such route at all —
+  // which is why this is not an arm on the quit/close chord, whose route is
+  // armed by ⌘ alone and so runs on every screen. The tab term is the same
+  // rule applied twice: a range left standing in chat must not tax a keystroke
+  // typed in Pages, Forge or the console. `status=ignored` keeps a focused
+  // field's own copy.
+  keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
+  // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
+  // console, the last opened) would close a window nobody was looking at.
+  // The pair is also "is anyone looking at this app": the desktop notifier
+  // banners a mention only for a reader who is elsewhere.
+  window focused with-id -> window_focused _
+  window unfocused with-id -> window_unfocused _
   run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
@@ -947,39 +927,162 @@ subscribe
   // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
   // gate is the budget: leaving the tab stops the encode at the source.
   run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _
+  // THE AGENT RUNS IN FLIGHT, for the NODE rather than for a room. A room
+  // switch is not a lifecycle event at all — `encode_chat_props` picks this
+  // room's rows out of the node's set on the way to the view — so the only
+  // thing this lane is anchored to is the CONNECTION.
+  //
+  // ALL THREE IDENTITIES RIDE IN, because the endpoint is not one. A workspace
+  // switch brings the node back on the same loopback port (`live_resynced`
+  // calls the same trap `chain_left_behind`), so `connected_rpc` alone would
+  // have kept a reading of the chain she left. The subscription is keyed on its
+  // arguments, so a chain change or a reconnect tears the old reading down; the
+  // reading carries them back out, so one still in flight is refused by
+  // `live_agents_stale` instead of overwriting the new connection's rows.
+  //
+  // Gated on `connected` ALONE, not on the chat tab: a run she started and
+  // walked away from must still be running under its anchor when she comes
+  // back, and the poll is one bounded `runs` read every two seconds.
+  // KEYED ON THE SEAT TOO (`signer_key`). A remote device's entitlement to a
+  // run's output IS its seated key, and a Settings unlock or lock moves that
+  // seat in place — no endpoint, chain or connect attempt changes with it. Left
+  // out, a device that unlocked after connecting would say "progress
+  // unavailable" for the life of the connection, and a key SWITCH would leave
+  // the previous key's reading on screen.
+  run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
-  // The page document's autosave: the editor's edits never pass through a
-  // handler, so the gate IS the dirty test — the tick only exists while the
-  // buffer has drifted from the last text known written.
-  every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
+  // Poll the hydrated page even while the app mirror looks clean: a guest
+  // replacement may preserve edits whose old-instance notification is refused.
+  // The handler reads the canonical document before its dirty/no-op check.
+  every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick
 
-// The daemon's exit rule: closing a window unregisters it, and the process
-// leaves with the last one. The handoff paths (`console_opened`,
-// `onboarding_reopened`) close their predecessor AFTER the successor is
-// registered, so this never fires with a survivor still tracked.
-// The huddle window is deliberately NOT in the survivor guard: closing it is a
-// dock, not an exit, and a lone huddle window must never keep the daemon alive
-// after its console is gone.
+// CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
+// This unregisters the slot the closed window held; on a Mac the daemon goes
+// on in the status item with no window at all, the way a menu-bar app does,
+// and leaving is an explicit act — the tray's "Quit Ducktape" or ⌘Q
+// (`command_chord_pressed`) — never the side effect of a red button. Off macOS
+// there is no status item, so a window is the only handle on the process and
+// the last close leaves; `last_window_closed_exits` is the one place that
+// decides. The handoff paths (`console_opened`, `onboarding_reopened`) close
+// their predecessor after the successor is registered, so a handoff never
+// counts as the last close.
 on window_was_closed(id)
+  let closed_welcome = onboarding_win == some(id) && hub_step == HubStep.account
+  let closed_account = console_win == some(id)
+  let retirement = ceremony_retirement(closed_welcome, closed_account)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
-  return if (onboarding_win != none) || (console_win != none)
-  exit
+  let leaving = last_window_closed_exits(console_win, onboarding_win)
+  match retirement
+    CeremonyRetirement.welcome
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      ceremony_detail = ""
+      ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.account
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.keep
+      return if !leaving
+      exit
 
-// THE STATUS ITEM'S MENU. The daemon leaves with its last tracked window
-// (above), so one of the two is always there to raise; `window_target` on
-// the untracked slot names a fresh id, and focusing a window that does not
-// exist is a no-op.
+// THE STATUS ITEM'S MENU. Since a close no longer ends the process, a
+// connected network can have nothing tracked — an ordinary state, not "never
+// signed in". `window_target` on an untracked slot names a fresh id whose
+// focus is a no-op, so a raise-only row would do nothing with both slots
+// empty; but the LAUNCH window is the wrong way to fill them when a network
+// is open, because it re-runs `hub_state()` and resets `hub_step` to the
+// picker (#1782) — the console reconnects from `rpc` instead, the same as a
+// fresh pick. One predicate, one branch.
 on tray_open
-  parallel
-    task window focus target=window_target(console_win)
-    task window focus target=window_target(onboarding_win)
+  let window_tracked = console_win != none || onboarding_win != none
+  let opening = tray_open_action(connected, window_tracked)
+  match opening
+    TrayOpen.launch
+      task window open onboarding -> onboarding_opened _
+    TrayOpen.console
+      flow
+        from done true
+        done -> network_entered()
+    TrayOpen.raise
+      parallel
+        task window focus target=window_target(console_win)
+        task window focus target=window_target(onboarding_win)
 
 on tray_quit
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
   exit
+
+// ⌘ IS HELD OR IT IS NOT. The whole of this state, set from the one event that
+// knows it — it exists to arm the key-press route above, and nothing reads it
+// for anything else.
+on modifier_state_changed(mods)
+  cmd_held = command_held(mods)
+  shift_held = shift_held(mods)
+
+// THE LAUNCH WINDOW'S OWN CHROME. It is undecorated (app.ice), so the rail at
+// the top of `HubColumn` carries what the OS strip used to: a press anywhere
+// along it hands the drag to the window server, and the × closes the window.
+// Closing is not quitting — `window_was_closed` only unregisters it, and the
+// status item is still there to open another.
+on drag_launch_window
+  task window drag
+
+on close_launch_window
+  task window close target=window_target(onboarding_win)
+
+// WHICH WINDOW HAS FOCUS. Read by ⌘W, and told to the desktop notifier as
+// "a window of this app has focus" — the fact that decides whether a
+// mention is already on screen or worth a banner, on every host alike.
+on window_focused(id)
+  focused_win = some(id)
+  task note_window_focus(true) -> window_focus_noted
+
+on window_unfocused(id)
+  focused_win = without_window(focused_win, id)
+  task note_window_focus(focused_win != none) -> window_focus_noted
+
+on window_focus_noted
+
+// THE COMMAND CHORDS, ON ONE DISPATCH. The classification is one pure extern
+// so ⌘Q and ⌘W are answered in a single place, and this branches once on what
+// it says. The route that delivers the press is armed by `cmd_held`, so an
+// ordinary keystroke never reaches here at all.
+on command_chord_pressed(event)
+  let chord = command_chord(event.key, event.physical_key, event.modifiers)
+  match chord
+    CommandChord.quit
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      exit
+    CommandChord.close_window
+      task window close target=window_target(focused_win)
+    // ⌘ plus any other key is not ours. The route is armed by the modifier
+    // alone, so this is the ORDINARY case — every ⌘C, ⌘V and ⌘A lands here —
+    // and the arm exists because the match is exhaustive on purpose: a chord
+    // added to the enum has to be routed before this file compiles again.
+    CommandChord.ignored
+      return if true
 
 // The rest of the menu is the console's: the bell, a tab, a key. With no
 // console there is nothing to show them in, so each returns rather than
@@ -1053,6 +1156,7 @@ on mutation_failed(cause)
   mutation_phase = mutation_failure_phase(cause.committed)
   channel_draft = restore_draft(channel_draft, pending_channel, cause.committed)
   page_draft = restore_draft(page_draft, pending_page, cause.committed)
+  pages_seed_rev = pages_seed_rev + 1
   pending_channel = ""
   pending_page = ""
   error = cause.message
@@ -1095,11 +1199,27 @@ on connect_failed(cause)
   // two interleaved retry series 5.2s and 10.8s apart, summing to one 16s cap.
   return if cause.generation != connect_generation
   hydration_generation = hydration_generation + 1
+  bell_marking = false
+  bell_error = ""
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  invalidate lane=bell_load
+  invalidate lane=bell_context
+  bell_items = []
+  bell_presentations = []
+  bell_unread = 0
+  bell_read_through = 0
+  bell_clear_through = 0
   connect_generation = connect_generation + 1
   hydration_retry_attempt = hydration_retry_attempt + 1
   loading = false
   status = "Offline"
   error = cause.message
+  // A DOOR'S FAILURE SHOWS WHERE THE READER IS: the launch window, whose
+  // doors reopen with it (`hub_busy`) while the retry below goes on — a pick
+  // pressed meanwhile abandons this chain by its generation, and a retry that
+  // lands opens the console like the first attempt would have.
+  onboarding_error = keep_str(console_entry == ConsoleEntry.entering, cause.message, onboarding_error)
   run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 // ONE LOAD FAILED; THE CONNECTION DID NOT SAY ANYTHING. This is the failed arm

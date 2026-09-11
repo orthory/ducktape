@@ -23,10 +23,13 @@
 //! compiled natively and unit-tested against a plain map. the wasm shell
 //! (`src/index_guest.rs`, feature `index-guest`) wires it into the engine.
 
-use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
+use index_guest::{Fail, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
-use crate::{JobStatus, JobsMsg, TaskMsg, TaskStatus, WorkMsg, decode_work_msg};
+use crate::{
+    ATTEMPTS_EXHAUSTED_RESULT, JobStatus, JobsMsg, MAX_ATTEMPTS, MAX_LEASE_VIEWS, MIN_LEASE_VIEWS,
+    Party, TaskMsg, TaskStatus, WorkAssigned, WorkMsg, decode_assigned, decode_work_msg,
+};
 
 /// default page size for by-status listing (the cap is the scan clamp).
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -49,6 +52,7 @@ pub struct TaskRow {
     pub status: TaskStatus,
     /// the origin id that created the task (display-grade).
     pub created_by: String,
+    pub owner: Party,
     pub created_height: u64,
     pub created_at: u64,
     pub updated_height: u64,
@@ -61,7 +65,8 @@ pub struct JobRow {
     pub job_id: String,
     pub kind: String,
     pub spec: String,
-    /// rendered submitter: `user:{id}`, `module:{id}`, or `system`.
+    /// Rendered canonical submitter: `acct:{number}`, `ext:{hex}`,
+    /// `module:{id}`, or `system`.
     pub submitter: String,
     pub status: JobStatus,
     /// total number of successful claims over this job's life.
@@ -72,6 +77,7 @@ pub struct JobRow {
     /// the reported outcome, once terminal via `Finalize`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<JobResultRow>,
+    pub comments: Vec<crate::JobComment>,
     pub created_height: u64,
     pub created_at: u64,
     pub updated_height: u64,
@@ -102,9 +108,6 @@ pub struct JobCountsRow {
     pub cancelled: u64,
 }
 
-/// tasks' view requests, externally tagged:
-/// `{"by_status": {"status": "open", "after": "...", "limit": 50}}` or
-/// `{"task": {"task_id": "..."}}`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TasksViewQuery {
@@ -183,13 +186,32 @@ fn job_count_key(status: &JobStatus) -> String {
     format!("jobcnt/{}", job_status_key(status))
 }
 
-/// rendered origin for job rows: the submitter/worker identity.
-fn render_origin(origin: &OriginTag) -> String {
-    let id = origin.id.as_deref().unwrap_or_default();
-    match origin.kind {
-        OriginKind::Module => format!("module:{id}"),
-        OriginKind::External => format!("user:{id}"),
-        OriginKind::System => "system".to_string(),
+fn assigned_party(op: &OpRow) -> Result<Party, Fail> {
+    let assigned =
+        decode_assigned(&op.assigned).map_err(|error| Fail::new(FAIL_OP_DECODE, error))?;
+    match assigned {
+        WorkAssigned::Task { .. } => {
+            Err(Fail::new(FAIL_OP_DECODE, "task stamp on a job operation"))
+        }
+        WorkAssigned::Job { actor } => Ok(actor),
+    }
+}
+
+fn task_parties(op: &OpRow) -> Result<(Party, Party), Fail> {
+    let assigned =
+        decode_assigned(&op.assigned).map_err(|error| Fail::new(FAIL_OP_DECODE, error))?;
+    let WorkAssigned::Task { actor, owner } = assigned else {
+        return Err(Fail::new(FAIL_OP_DECODE, "job stamp on a task operation"));
+    };
+    Ok((actor, owner))
+}
+
+fn render_party(party: &Party) -> String {
+    match party {
+        Party::Account(account) => format!("acct:{account}"),
+        Party::Key(key) => sdk::Origin::External(key.clone()).actor_string(),
+        Party::Module(module) => format!("module:{module}"),
+        Party::System => "system".into(),
     }
 }
 
@@ -236,19 +258,27 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
 fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, Fail> {
     let mut out = Writes::new();
     match msg {
-        TaskMsg::CreateTask { task_id, title } => put_row(
-            &mut out,
-            &TaskRow {
-                task_id,
-                title,
-                status: TaskStatus::Open,
-                created_by: op.origin.id.clone().unwrap_or_default(),
-                created_height: op.height,
-                created_at: op.time,
-                updated_height: op.height,
-                updated_at: op.time,
-            },
-        )?,
+        TaskMsg::CreateTask {
+            task_id,
+            title,
+            owner: _,
+        } => {
+            let (actor, owner) = task_parties(op)?;
+            put_row(
+                &mut out,
+                &TaskRow {
+                    task_id,
+                    title,
+                    status: TaskStatus::Open,
+                    created_by: render_party(&actor),
+                    owner,
+                    created_height: op.height,
+                    created_at: op.time,
+                    updated_height: op.height,
+                    updated_at: op.time,
+                },
+            )?
+        }
         TaskMsg::UpdateStatus { task_id, status } => {
             // absent row == the task predates this index; nothing to move.
             let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
@@ -261,6 +291,15 @@ fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, 
             row.updated_at = op.time;
             put_row(&mut out, &row)?;
         }
+        TaskMsg::DeleteTask { task_id } => {
+            // absent row == the task predates this index; nothing to remove.
+            let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
+                return Ok(out);
+            };
+            let row = decode_row(&bytes)?;
+            index_guest::delete(&mut out, by_status_key(&row.status, &task_id));
+            index_guest::delete(&mut out, task_key(&task_id));
+        }
     }
     Ok(out)
 }
@@ -272,8 +311,7 @@ fn decode_job_row(bytes: &[u8]) -> Result<JobRow, Fail> {
 /// stage the two entries one job row materializes to — point lookup +
 /// status partition.
 fn put_job_row(out: &mut Writes, row: &JobRow) -> Result<(), Fail> {
-    let bytes =
-        serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+    let bytes = serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
     index_guest::put(out, job_key(&row.job_id), bytes.clone());
     index_guest::put(out, job_by_status_key(&row.status, &row.job_id), bytes);
     Ok(())
@@ -336,16 +374,36 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
         }
     };
     match msg {
+        JobsMsg::Comment {
+            job_id,
+            comment_id,
+            text,
+            ..
+        } => {
+            let Some(mut row) = load(&job_id)? else {
+                return Ok(out);
+            };
+            row.comments.push(crate::JobComment {
+                id: comment_id,
+                author: assigned_party(op)?,
+                text,
+                height: op.height,
+            });
+            row.updated_height = op.height;
+            row.updated_at = op.time;
+            put_job_row(&mut out, &row)?;
+        }
         JobsMsg::Submit { job_id, kind, spec } => {
             let row = JobRow {
                 job_id,
                 kind,
                 spec,
-                submitter: render_origin(&op.origin),
+                submitter: render_party(&assigned_party(op)?),
                 status: JobStatus::Pending,
                 attempt: 0,
                 claim: None,
                 result: None,
+                comments: Vec::new(),
                 created_height: op.height,
                 created_at: op.time,
                 updated_height: op.height,
@@ -363,9 +421,9 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             };
             row.attempt += 1;
             row.claim = Some(JobClaimRow {
-                worker: render_origin(&op.origin),
+                worker: render_party(&assigned_party(op)?),
                 claimed_at_height: op.height,
-                lease_views,
+                lease_views: lease_views.clamp(MIN_LEASE_VIEWS, MAX_LEASE_VIEWS),
             });
             transition_job(read, &mut out, row, JobStatus::Processing, op)?;
         }
@@ -379,15 +437,41 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             };
             row.result = Some(JobResultRow { ok, payload });
             row.claim = None;
-            let to = if ok { JobStatus::Done } else { JobStatus::Failed };
+            let to = if ok {
+                JobStatus::Done
+            } else {
+                JobStatus::Failed
+            };
             transition_job(read, &mut out, row, to, op)?;
         }
-        JobsMsg::Release { job_id } | JobsMsg::Reclaim { job_id } => {
+        JobsMsg::Release { job_id } => {
             let Some(mut row) = load(&job_id)? else {
                 return Ok(out);
             };
             row.claim = None;
             transition_job(read, &mut out, row, JobStatus::Pending, op)?;
+        }
+        JobsMsg::Reclaim { job_id } => {
+            let Some(mut row) = load(&job_id)? else {
+                return Ok(out);
+            };
+            // an applied reclaim has TWO outcomes in the board, and the fold
+            // mirrors the board's own decision over the SAME constant: below
+            // MAX_ATTEMPTS the job requeues; at it the board gives up, fails
+            // the job with `ATTEMPTS_EXHAUSTED_RESULT`, and keeps the claim
+            // for the record. folding both as Pending would list a
+            // permanently failed job as claimable forever.
+            let attempts_exhausted = row.attempt >= MAX_ATTEMPTS;
+            if attempts_exhausted {
+                row.result = Some(JobResultRow {
+                    ok: false,
+                    payload: ATTEMPTS_EXHAUSTED_RESULT.to_string(),
+                });
+                transition_job(read, &mut out, row, JobStatus::Failed, op)?;
+            } else {
+                row.claim = None;
+                transition_job(read, &mut out, row, JobStatus::Pending, op)?;
+            }
         }
         JobsMsg::Cancel { job_id } => {
             let Some(row) = load(&job_id)? else {
@@ -456,7 +540,9 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             let page = read.scan_page(
                 prefix.as_bytes(),
                 after.as_deref().map(str::as_bytes),
-                limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_JOB_LIST_LIMIT),
+                limit
+                    .unwrap_or(DEFAULT_LIST_LIMIT)
+                    .clamp(1, MAX_JOB_LIST_LIMIT),
             );
             let mut jobs = Vec::with_capacity(page.entries.len());
             for (_key, value) in &page.entries {
@@ -499,7 +585,10 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_task_msg(msg),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&WorkAssigned::Task {
+                actor: Party::Account(1),
+                owner: Party::Account(1),
+            }),
         }
     }
 
@@ -514,6 +603,31 @@ mod tests {
     }
 
     #[test]
+    fn task_index_preserves_module_creator_and_assigned_account_owner() {
+        let message = TaskMsg::CreateTask {
+            task_id: "delegated".into(),
+            title: "Work".into(),
+            owner: Some(9),
+        };
+        let mut operation = op(1, &message);
+        operation.origin = OriginTag::module("automations");
+        operation.assigned = crate::encode_assigned(&WorkAssigned::Task {
+            actor: Party::Module("automations".into()),
+            owner: Party::Account(9),
+        });
+        let mut map = BTreeMap::new();
+        let writes = fold_op(&operation, &map).unwrap();
+        apply_to_map(&mut map, writes);
+        let TasksViewReply::Task(Some(row)) =
+            view(&map, serde_json::json!({"task": {"task_id": "delegated"}}))
+        else {
+            panic!("task row");
+        };
+        assert_eq!(row.created_by, "module:automations");
+        assert_eq!(row.owner, Party::Account(9));
+    }
+
+    #[test]
     fn create_lists_open_and_status_moves_partitions() {
         let mut map = BTreeMap::new();
         fold(
@@ -522,6 +636,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship the indexer".into(),
+                owner: None,
             },
         );
         fold(
@@ -530,6 +645,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t2".into(),
                 title: "write the spec".into(),
+                owner: None,
             },
         );
 
@@ -539,7 +655,7 @@ mod tests {
             panic!("wrong reply shape")
         };
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].created_by, "jess");
+        assert_eq!(tasks[0].created_by, "acct:1");
 
         fold(
             &mut map,
@@ -578,6 +694,7 @@ mod tests {
                 &TaskMsg::CreateTask {
                     task_id: format!("t{i}"),
                     title: format!("task {i}"),
+                    owner: None,
                 },
             );
         }
@@ -618,15 +735,22 @@ mod tests {
             height,
             seq: 0,
             time: 1_000 + height,
-            origin,
+            origin: origin.clone(),
             payload: crate::encode_work_msg(&WorkMsg::Job(msg.clone())),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&WorkAssigned::Job {
+                actor: match origin.kind {
+                    index_guest::OriginKind::Module => Party::Module(origin.id.unwrap()),
+                    index_guest::OriginKind::System => Party::System,
+                    index_guest::OriginKind::Program | index_guest::OriginKind::External => {
+                        Party::Account(1)
+                    }
+                },
+            }),
         }
     }
 
     fn fold_job_msg(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, height: u64, msg: &JobsMsg) {
-        let writes =
-            fold_op(&job_op(height, OriginTag::module("runs"), msg), map).expect("fold");
+        let writes = fold_op(&job_op(height, OriginTag::module("runs"), msg), map).expect("fold");
         apply_to_map(map, writes);
     }
 
@@ -643,6 +767,42 @@ mod tests {
             panic!("wrong reply shape")
         };
         jobs
+    }
+
+    #[test]
+    fn job_comments_fold_with_attribution_without_moving_status_counts() {
+        let mut map = BTreeMap::new();
+        fold_job_msg(
+            &mut map,
+            1,
+            &JobsMsg::Submit {
+                job_id: "j".into(),
+                kind: "build".into(),
+                spec: "spec".into(),
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            2,
+            &JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "j".into(),
+                comment_id: "c".into(),
+                text: "Working".into(),
+            },
+        );
+        let rows = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}));
+        assert_eq!(
+            rows[0].comments,
+            vec![crate::JobComment {
+                id: "c".into(),
+                author: Party::Module("runs".into()),
+                text: "Working".into(),
+                height: 2
+            }]
+        );
+        assert_eq!(rows[0].updated_height, 2);
+        assert_eq!(counts(&map).pending, 1);
     }
 
     #[test]
@@ -694,7 +854,7 @@ mod tests {
         assert_eq!(processing[0].attempt, 1);
         assert_eq!(
             processing[0].claim.as_ref().map(|c| c.lease_views),
-            Some(8)
+            Some(MIN_LEASE_VIEWS)
         );
 
         fold_job_msg(
@@ -712,7 +872,13 @@ mod tests {
         assert!(done[0].claim.is_none(), "a finalized job sheds its claim");
         assert_eq!(done[0].result.as_ref().map(|r| r.ok), Some(true));
 
-        fold_job_msg(&mut map, 5, &JobsMsg::Prune { job_id: "j1".into() });
+        fold_job_msg(
+            &mut map,
+            5,
+            &JobsMsg::Prune {
+                job_id: "j1".into(),
+            },
+        );
         assert_eq!(counts(&map).done, 0);
         assert!(jobs(&map, serde_json::json!({"jobs": {}})).len() == 1);
 
@@ -725,7 +891,13 @@ mod tests {
                 lease_views: 4,
             },
         );
-        fold_job_msg(&mut map, 7, &JobsMsg::Release { job_id: "j2".into() });
+        fold_job_msg(
+            &mut map,
+            7,
+            &JobsMsg::Release {
+                job_id: "j2".into(),
+            },
+        );
         let counted = counts(&map);
         assert_eq!((counted.pending, counted.processing), (1, 0));
         let all = jobs(&map, serde_json::json!({"jobs": {}}));
@@ -792,6 +964,90 @@ mod tests {
         };
         assert!(jobs.is_empty(), "job-000 is build/, filtered from the page");
         assert!(has_more, "the cursor keeps going past the filtered page");
+    }
+
+    /// the board requeues an expired reclaim until MAX_ATTEMPTS and FAILS the
+    /// job on the one after that; the fold has to make the same call, or the
+    /// dead job stays listed under pending and the census over-counts forever.
+    #[test]
+    fn reclaim_requeues_until_attempts_are_exhausted_then_fails() {
+        let mut map = BTreeMap::new();
+        fold_job_msg(
+            &mut map,
+            1,
+            &JobsMsg::Submit {
+                job_id: "j1".into(),
+                kind: "build/wasm".into(),
+                spec: "{}".into(),
+            },
+        );
+
+        // the reclaim guard reads the attempt count a CLAIM bumped, so the
+        // first MAX_ATTEMPTS - 1 rounds requeue and the MAX_ATTEMPTS'th fails.
+        for round in 0..MAX_ATTEMPTS - 1 {
+            fold_job_msg(
+                &mut map,
+                2 + round * 2,
+                &JobsMsg::Claim {
+                    job_id: "j1".into(),
+                    lease_views: 10,
+                },
+            );
+            fold_job_msg(
+                &mut map,
+                3 + round * 2,
+                &JobsMsg::Reclaim {
+                    job_id: "j1".into(),
+                },
+            );
+            let pending = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}));
+            assert_eq!(pending.len(), 1, "requeued after reclaim {}", round + 1);
+            assert_eq!(pending[0].attempt, round + 1);
+            assert!(pending[0].claim.is_none(), "a requeue sheds its claim");
+        }
+        assert_eq!(counts(&map).pending, 1);
+
+        // the MAX_ATTEMPTS'th claim exhausts them, so its reclaim FAILS the job.
+        fold_job_msg(
+            &mut map,
+            100,
+            &JobsMsg::Claim {
+                job_id: "j1".into(),
+                lease_views: 10,
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            101,
+            &JobsMsg::Reclaim {
+                job_id: "j1".into(),
+            },
+        );
+
+        let counted = counts(&map);
+        assert_eq!(
+            (counted.pending, counted.processing, counted.failed),
+            (0, 0, 1),
+            "the census moves to failed, not back to pending"
+        );
+        assert!(
+            jobs(&map, serde_json::json!({"jobs": {"status": "pending"}})).is_empty(),
+            "a dead job is never listed as claimable"
+        );
+        let failed = jobs(&map, serde_json::json!({"jobs": {"status": "failed"}}));
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].attempt, MAX_ATTEMPTS);
+        assert_eq!(
+            failed[0].result,
+            Some(JobResultRow {
+                ok: false,
+                payload: ATTEMPTS_EXHAUSTED_RESULT.to_string(),
+            })
+        );
+        assert!(
+            failed[0].claim.is_some(),
+            "the board keeps the claim on an exhausted job, for the record"
+        );
     }
 
     #[test]

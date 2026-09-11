@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Quota, Spawner, Supervisor};
@@ -21,9 +21,9 @@ use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::join_gate;
-use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
+use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
 use crate::sync::catchup::derive_pending_boot;
-use crate::sync::serve::{SyncStateRequest, drive_sync_request};
+use crate::sync::serve::{drive_sync_request, SyncStateRequest};
 use crate::{overlay_book, voice};
 use futures::StreamExt as _;
 use statesync::SyncServer;
@@ -34,8 +34,7 @@ pub(super) struct PreWiring {
     pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    pub(super) bank_base: u64,
-    pub(super) channel_bank: super::LaneBank,
+    pub(super) lanes: crate::mesh_lanes::EngineLanes,
     pub(super) sync_tx: super::MeshSender,
     pub(super) sync_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
@@ -58,12 +57,14 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    pub(super) channel_bank: super::LaneBank,
+    pub(super) lanes: crate::mesh_lanes::EngineLanes,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
+    /// the send half of that seam, for this node's own root divergence watch.
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     /// unix seconds of the last served state-sync request — the drain reads it
     /// to defer oplog pruning while a syncer is actively pulling (the sync
     /// retention lease, see sync/serve.rs).
@@ -100,8 +101,7 @@ pub(super) async fn finish(
     mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     mesh_window: crate::mesh_window::MeshWindowTracker,
     mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    bank_base: u64,
-    mut channel_bank: super::LaneBank,
+    lanes: crate::mesh_lanes::EngineLanes,
     sync_tx: super::MeshSender,
     sync_rx: super::MeshReceiver,
     relay_rx: super::MeshReceiver,
@@ -143,18 +143,6 @@ pub(super) async fn finish(
     // the tracker's monotonic bookkeeping travels through — the old
     // index-keyed re-track at the resume epoch was a duplicate commonware
     // silently warn-dropped ("peer set already exists").
-    if !channel_bank.covers(resume_epoch) {
-        tracing::error!(
-            target: "ducktape::node",
-            node = %label,
-            epoch = resume_epoch,
-            bank_base,
-            bank_end = bank_base + EPOCH_CHANNEL_BANK,
-            "FATAL: recovered epoch outside the pre-registered channel bank"
-        );
-        std::process::exit(1);
-    }
-    channel_bank.blackhole_below(resume_epoch, context);
     let pending_boot = recovery_manifest_for_resume
         .zip(resumed.as_ref())
         .and_then(|(manifest, rec)| derive_pending_boot(manifest, rec));
@@ -191,6 +179,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
     } = wire_serve_lanes(
         context,
@@ -235,11 +224,12 @@ pub(super) async fn finish(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        channel_bank,
+        lanes,
         gateway_book,
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
         relay_ingress,
     }
@@ -253,6 +243,10 @@ pub(super) struct ServeLanes {
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
+    /// the SEND half of the same seam, for a node-local reader: the root
+    /// divergence watch asks this node for its own tip coordinates exactly as
+    /// a peer would (see `sync::divergence`).
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -323,6 +317,7 @@ pub(super) fn wire_serve_lanes(
         blob_proof,
     );
     let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watch_state_tx = sync_state_tx.clone();
     let state_tx = sync_state_tx;
     let sync_lease_serve = sync_lease.clone();
     let mut sync_tx = sync_tx;
@@ -342,6 +337,10 @@ pub(super) fn wire_serve_lanes(
             // (nothing) to both parties. these paths are peer-drivable and a
             // blocked joiner retries forever, so they latch instead of flooding.
             static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+            // the co-client demux's own drops latch on their OWN keys: a peer
+            // can drive these, and sharing REFUSED's counter would let them
+            // starve a genuine refusal of its stride-100 print.
+            static COCLIENT_DROP: noded::log::Latch = noded::log::Latch::new(100);
             while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
@@ -359,19 +358,66 @@ pub(super) fn wire_serve_lanes(
                 };
                 // OUR blob-fetch answers ride the same authed envelope with
                 // ZEROED auth fields (the transport authenticates replies):
-                // complete the pending waiter by id BEFORE the proof gate
-                // below, which would otherwise drop them. a malformed body
-                // on a matched id drops the waiter — that fetch times out
-                // and rotates, never misreads as a peer's request.
-                if let Some(waiter) = blob_pending
+                // complete the pending waiter BEFORE the proof gate below,
+                // which would otherwise drop them. a malformed body on a
+                // matched id drops the waiter — that fetch times out and
+                // rotates, never misreads as a peer's request.
+                //
+                // the id ALONE never completes a waiter: the frame must also
+                // come from the peer the request was addressed to. `TipCoords`
+                // is the one lane here whose whole value is WHO answered, and
+                // it carries no proof, so a third party that guessed an id
+                // could otherwise speak for a co-validator.
+                let addressed_to = blob_pending
                     .lock()
                     .expect("pending blob lock")
-                    .remove(&rpc_id)
-                {
-                    if let Ok(resp) = statesync::decode_response(body) {
-                        let _ = waiter.send(resp);
+                    .get(&rpc_id)
+                    .map(|fetch| fetch.peer.clone());
+                let unsigned = requester.iter().all(|b| *b == 0) && proof.iter().all(|b| *b == 0);
+                match blob_fetch::classify_coclient_frame(
+                    rpc_id,
+                    &peer,
+                    addressed_to.as_ref(),
+                    unsigned,
+                ) {
+                    blob_fetch::CoClientVerdict::PeerRequest => {}
+                    blob_fetch::CoClientVerdict::Response => {
+                        let waiter = blob_pending
+                            .lock()
+                            .expect("pending blob lock")
+                            .remove(&rpc_id);
+                        if let (Some(waiter), Ok(resp)) = (waiter, statesync::decode_response(body))
+                        {
+                            let _ = waiter.reply.send(resp);
+                        }
+                        continue; // ours — never a request to serve.
                     }
-                    continue; // ours — never a request to serve.
+                    blob_fetch::CoClientVerdict::PeerMismatch => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("coclient_peer_mismatch") {
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "coclient_peer_mismatch",
+                                attempts,
+                                "co-client reply dropped — it came from a peer this \
+                                 request was not addressed to"
+                            );
+                        }
+                        continue;
+                    }
+                    blob_fetch::CoClientVerdict::LateReply => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("late_reply") {
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "late_reply",
+                                attempts,
+                                "co-client reply dropped — it arrived after its \
+                                 request had already timed out"
+                            );
+                        }
+                        continue;
+                    }
                 }
                 // FAIL-CLOSED. a transport-key standing gate is
                 // IMPOSSIBLE at this seam: a pre-admission joiner and an
@@ -493,11 +539,17 @@ pub(super) fn wire_serve_lanes(
                     req => {
                         // renew the sync retention lease: this node is
                         // actively serving a syncer, so the drain defers
-                        // oplog pruning until the lease lapses.
-                        sync_lease_serve.store(
-                            crate::sync::serve::unix_now_secs(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        // oplog pruning until the lease lapses. only the
+                        // state-bearing lanes renew it (see
+                        // `sync::serve::renews_sync_lease`) — the
+                        // coordinates-only TipCoords poll and the
+                        // never-pruned IndexOps backfill must not.
+                        if crate::sync::serve::renews_sync_lease(&req) {
+                            sync_lease_serve.store(
+                                crate::sync::serve::unix_now_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
@@ -522,6 +574,7 @@ pub(super) fn wire_serve_lanes(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx: watch_state_tx,
         sync_lease,
     }
 }
@@ -616,51 +669,21 @@ pub(super) async fn wire(
     }
     mesh_window.track_new(&mut mesh_oracle, &mesh_book, &boot_window);
 
-    // lanes for epochs BELOW the resume epoch are registered and
-    // black-holed (the sync-only arm's exact trick): a lagging peer still
-    // gossips there, and an unregistered channel is a protocol violation
-    // that would kill its connection — cutting off the very fetch lane it
-    // needs to catch up.
-    for epoch in 0..initial_resume_epoch {
-        let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-        for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
-            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context
-                .child(label)
-                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-        }
-    }
-
-    // pre-register the epoch channel bank from the RESUME epoch up
-    // (registration is only possible before network.start(); every
-    // respawned engine needs fresh channels). each slot holds epoch
-    // (bank_base + i)'s (vote, certificate, resolver, payload, fetch)
-    // pairs until that epoch's engine claims them. a restart therefore
-    // re-arms the full window — EPOCH_CHANNEL_BANK bounds membership
-    // changes per process RUN, not per network lifetime.
-    let bank_base = initial_resume_epoch;
-    let channel_bank = super::LaneBank::new(
-        bank_base,
-        (0..EPOCH_CHANNEL_BANK)
-            .map(|i| {
-                let (vote, cert, res, payload, fetch) = engine_channels(bank_base + i);
-                super::LaneSlot::Banked((
-                    network.register(vote, quota, MAX_BACKLOG),
-                    network.register(cert, quota, MAX_BACKLOG),
-                    network.register(res, quota, MAX_BACKLOG),
-                    network.register(payload, quota, MAX_BACKLOG),
-                    network.register(fetch, quota, MAX_BACKLOG),
-                ))
-            })
-            .collect(),
-    );
-    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+    // the FIVE fixed engine lanes, registered once (registration is only
+    // possible before network.start()). Every engine this process ever spawns
+    // runs over these same five: each frame carries its epoch, and the demux
+    // routes it to whichever engine is seated. Nothing is delivered until the
+    // first `EpochSpawner::spawn` seats one — until then the demux drops,
+    // which is what a lagging peer's gossip needs (an unregistered channel is
+    // a protocol violation that would kill its connection, cutting off the
+    // very fetch lane it needs to catch up).
+    let lanes = crate::mesh_lanes::EngineLanes::register(context, &mut network, quota);
+    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the submit-relay lane: a resident-standing node ships its own
     // signed frame here; this validator takes custody and answers on
     // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
     // the ingress select arm and the drain-resolution/expiry code.
-    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
 
     // the voice + video hub: huddle media between members. one per-use data
     // plane per service: media rides the OVERLAY — audio+control on
@@ -716,8 +739,7 @@ pub(super) async fn wire(
     // runs only when `wireguard_listen` is configured, on its OWN
     // plain-tokio OS thread (the app-surface split exactly), talking to
     // the mesh through the two pump tasks below.
-    let (reach_p2p_tx, mut reach_p2p_rx) =
-        network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+    let (reach_p2p_tx, mut reach_p2p_rx) = network.register(CHANNEL_REACHABILITY, quota);
     // the join GATE's two connectors between the intro doorbell (the plane's
     // thread) and the validator run loop: verified gate requests
     // forward in over the channel; resolved outcomes ride back through the
@@ -819,8 +841,7 @@ pub(super) async fn wire(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        bank_base,
-        channel_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_tx,

@@ -1,8 +1,7 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
-    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
-    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
-    PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES,
+    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Party, Thread, ThreadView, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -13,30 +12,14 @@ const THREAD_PREFIX: &str = "\u{0}ct:";
 const COMMENT_PREFIX: &str = "\u{0}cc:";
 const TARGET_INDEX_PREFIX: &str = "\u{0}ci:";
 
-fn thread_key(id: &str) -> String {
+pub(super) fn thread_key(id: &str) -> String {
     format!("{THREAD_PREFIX}{id}")
 }
-fn comment_key(id: &str) -> String {
+pub(super) fn comment_key(id: &str) -> String {
     format!("{COMMENT_PREFIX}{id}")
 }
-fn target_index_key(target: &str) -> String {
+pub(super) fn target_index_key(target: &str) -> String {
     format!("{TARGET_INDEX_PREFIX}{target}")
-}
-
-/// derive the comment author from the dispatch origin (mirrors chat). the
-/// pre-consensus default `Origin::External(vec![])` must never pass as a real
-/// user.
-fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
-    match origin {
-        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
-        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
-            Err(PageError::AuthorTooLarge)
-        }
-        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
-        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
-        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
-        Origin::System => Ok(AuthorRef::System),
-    }
 }
 
 impl Pages {
@@ -81,6 +64,22 @@ impl Pages {
         }
     }
 
+    /// the aggregate thread+comment work `preflight_subtree_removal` (store.rs)
+    /// would charge THIS target's owning block: one unit per thread plus one
+    /// per comment across every thread anchored here. `AddComment` caps this
+    /// at [`MAX_COMMENT_WORK_PER_TARGET`] before staging a new thread or reply,
+    /// so the removal budget can never be exhausted by comments alone.
+    async fn comment_work_for_target(&self, target: &str) -> Result<usize, PageError> {
+        let thread_ids = self.load_target_index(target).await?;
+        let mut work = thread_ids.len();
+        for thread_id in &thread_ids {
+            if let Some(thread) = self.load_thread(thread_id).await? {
+                work += thread.comment_ids.len();
+            }
+        }
+        Ok(work)
+    }
+
     fn stage_target_index(&mut self, target: &str, ids: &[String]) -> Result<(), PageError> {
         if ids.is_empty() {
             self.delete_block(&target_index_key(target));
@@ -118,17 +117,9 @@ impl Pages {
     /// to `target` — called when the target block/page is deleted so comment
     /// records never dangle in the reserved keyspace with no reachable target.
     ///
-    /// deliberately NOT author-gated, and that is the module's rule rather
-    /// than an omission: this is an IMPLICIT mutation, a consequence of
-    /// removing the block, and it rides that block op's own authority. A page
-    /// tree here has no owning principal — every block op admits any origin —
-    /// so a per-comment check would only make a block undeletable once anyone
-    /// else commented on it, while adding no authority the module has
-    /// anywhere. What bounds the purge is aim, not permission: it reaches
-    /// exactly the threads anchored to the subtree being removed, which is why
-    /// [`Pages::apply_comment_op`]'s `MoveCommentThread` must stay
-    /// opener-gated — that op is the only way to aim it at a thread that was
-    /// never on your block. Same rule as [`Self::rebase_comment_anchors`].
+    /// an IMPLICIT mutation, a consequence of removing the block. What bounds
+    /// the purge is aim: it reaches exactly the threads anchored to the
+    /// subtree being removed. Same rule as [`Self::rebase_comment_anchors`].
     pub(super) async fn purge_comments_for_target(
         &mut self,
         target: &str,
@@ -150,9 +141,8 @@ impl Pages {
     }
 
     /// Keep selection anchors attached while a block's text shifts. Implicit
-    /// like the purge above, so ungated for the same reason: it is a
-    /// consequence of an edit to the block and rides that block op's
-    /// authority. This is linear in threads on one target (hard-capped at
+    /// like the purge above: a consequence of an edit to the block. This is
+    /// linear in threads on one target (hard-capped at
     /// 1024); shard the target index only if real documents make that hotspot
     /// measurable.
     pub(super) async fn rebase_comment_anchors(
@@ -179,7 +169,7 @@ impl Pages {
     pub(super) async fn apply_comment_op(
         &mut self,
         msg: PageMsg,
-        origin: &Origin,
+        actor: &Party,
         now: u64,
     ) -> Result<(), PageError> {
         match msg {
@@ -189,8 +179,7 @@ impl Pages {
                 target,
                 text,
                 anchor,
-                mentions: _,
-                as_agent,
+                mentions,
             } => {
                 // bound the client-minted ids BEFORE staging: they drive the
                 // size of the shared derived blocks (the target index and the
@@ -210,26 +199,7 @@ impl Pages {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                // `as_agent` refines a MODULE origin into an individual agent
-                // author (chat's refine pattern): modules are genesis-trusted
-                // code, so the module half stays origin-derived and
-                // spoof-proof; an external or system submitter claiming an
-                // agent identity is rejected outright.
-                let author = match as_agent {
-                    None => author_from_origin(origin)?,
-                    Some(agent_id) => {
-                        if agent_id.is_empty() {
-                            return Err(PageError::EmptyAgent);
-                        }
-                        if agent_id.len() > MAX_COMMENT_AGENT_ID_BYTES {
-                            return Err(PageError::AgentIdTooLarge);
-                        }
-                        match author_from_origin(origin)? {
-                            AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
-                            _ => return Err(PageError::AgentNeedsModuleOrigin),
-                        }
-                    }
-                };
+                let author = actor.clone();
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }
@@ -241,11 +211,17 @@ impl Pages {
                         if thread.comment_ids.len() >= MAX_COMMENTS_PER_THREAD {
                             return Err(PageError::TooManyComments);
                         }
+                        if self.comment_work_for_target(&target).await? + 1
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
+                        }
                         let comment = Comment {
                             id: comment_id.clone(),
                             thread_id: thread_id.clone(),
                             author,
                             text,
+                            mentions: mentions.clone(),
                             created_at: now,
                             edited_at: None,
                             deleted: false,
@@ -255,25 +231,35 @@ impl Pages {
                         self.store_thread(&thread)
                     }
                     None => {
-                        if let Some(anchor) = &anchor {
-                            let block = self
-                                .load_block(&target)
-                                .await
-                                .map_err(|_| PageError::Corrupt)?
-                                .ok_or(PageError::BlockNotFound)?;
-                            if !valid_range(&block.text, anchor.start, anchor.end) {
-                                return Err(PageError::InvalidTextRange);
-                            }
+                        // the new-thread target must be a real block, anchor
+                        // or not — otherwise a thread can be squatted on an
+                        // id that never becomes a block, and no purge can
+                        // ever reach it (RemoveBlock needs the block to load).
+                        let block = self
+                            .load_block(&target)
+                            .await
+                            .map_err(|_| PageError::Corrupt)?
+                            .ok_or(PageError::BlockNotFound)?;
+                        if let Some(anchor) = &anchor
+                            && !valid_range(&block.text, anchor.start, anchor.end)
+                        {
+                            return Err(PageError::InvalidTextRange);
                         }
                         let mut ids = self.load_target_index(&target).await?;
                         if ids.len() >= MAX_THREADS_PER_TARGET {
                             return Err(PageError::TooManyThreads);
+                        }
+                        if self.comment_work_for_target(&target).await? + 2
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
                         }
                         let comment = Comment {
                             id: comment_id.clone(),
                             thread_id: thread_id.clone(),
                             author: author.clone(),
                             text,
+                            mentions: mentions.clone(),
                             created_at: now,
                             edited_at: None,
                             deleted: false,
@@ -303,23 +289,10 @@ impl Pages {
                 target,
                 anchor,
             } => {
-                // WHO first, then WHAT: an explicit re-home rewrites the
-                // anchor its OPENER placed, so it carries the same
-                // stored-author rule as `EditComment`/`DeleteComment` — and
-                // `author_from_origin` refuses the empty (pre-consensus)
-                // origin here exactly as it does on its four siblings.
-                // Ungated, this was also the aiming device for the comment
-                // purge: re-home a stranger's thread onto a throwaway block,
-                // `RemoveBlock` it, and their comments are hard-deleted past
-                // the very author check `DeleteComment` enforces.
-                let author = author_from_origin(origin)?;
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
-                if thread.opener != author {
-                    return Err(PageError::NotAuthor);
-                }
                 if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(&target) {
                     return Err(PageError::IdTooLarge);
                 }
@@ -352,12 +325,13 @@ impl Pages {
                 self.store_thread(&thread)
             }
             PageMsg::EditComment {
-                comment_id, text, ..
+                comment_id,
+                text,
+                mentions,
             } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = author_from_origin(origin)?;
                 let mut c = self
                     .load_comment(&comment_id)
                     .await?
@@ -365,15 +339,12 @@ impl Pages {
                 if c.deleted {
                     return Err(PageError::CommentNotFound);
                 }
-                if c.author != author {
-                    return Err(PageError::NotAuthor);
-                }
                 c.text = text;
+                c.mentions = mentions;
                 c.edited_at = Some(now);
                 self.store_comment(&c)
             }
             PageMsg::DeleteComment { comment_id } => {
-                let author = author_from_origin(origin)?;
                 let mut c = self
                     .load_comment(&comment_id)
                     .await?
@@ -381,11 +352,9 @@ impl Pages {
                 if c.deleted {
                     return Ok(()); // idempotent
                 }
-                if c.author != author {
-                    return Err(PageError::NotAuthor);
-                }
                 c.deleted = true;
                 c.text = String::new();
+                c.mentions.clear();
                 let thread_id = c.thread_id.clone();
                 self.store_comment(&c)?;
                 // if no live comments remain, remove the whole thread.
@@ -416,7 +385,9 @@ impl Pages {
                 thread_id,
                 resolved,
             } => {
-                let author = author_from_origin(origin)?;
+                // Whoever resolves or reopens a thread is recorded as having
+                // done so.
+                let author = actor.clone();
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?

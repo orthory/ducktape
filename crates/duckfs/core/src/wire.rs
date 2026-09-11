@@ -58,6 +58,14 @@ pub const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 pub const STAGING_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
 pub const STAGING_TTL_BLOCKS: u64 = 4096;
 pub const MAX_PINS: usize = 1024;
+/// one owner's share of [`MAX_PINS`] — the pin-table analogue of
+/// [`MAX_STAGING_ENTRIES_PER_OWNER`]. without it, one owner can fill the whole
+/// global table (a permanent gc root each), refusing every other member's pin
+/// and — since staging quota is reclaimed at commit — parking unbounded bytes
+/// out of gc forever via {stage → commit → pin head} loops. 1024 / 32 = 32,
+/// mirroring the staging table's ratio (65_536 / 4096 = 16) at a size that
+/// still leaves room for many owners.
+pub const MAX_PINS_PER_OWNER: usize = MAX_PINS / 32;
 /// the global staging-table entry ceiling — [`MAX_PINS`] × 64 = 65_536. it is a
 /// consensus constant shared by BOTH the canonical decode and the execute path:
 /// [`decode_refs`](crate::state::decode_refs) rejects any refs image whose
@@ -145,7 +153,7 @@ pub enum FilesMsg {
         snapshot: DigestHex,
         name: String,
     },
-    /// owner-gated: only the pin's creator (or system) may unpin.
+    /// any authority removes any pin by name; the pin's owner is attribution.
     Unpin {
         name: String,
     },
@@ -271,7 +279,7 @@ pub struct SnapshotInfo {
     pub id: DigestHex,
     pub parent: Option<DigestHex>,
     pub root_tree: DigestHex,
-    pub author: String,
+    pub author: crate::Actor,
     pub height: u64,
     pub consensus_time: u64,
     pub message: String,
@@ -335,6 +343,33 @@ pub enum FilesReply {
     HasChunks {
         present: Vec<bool>,
     },
+}
+
+/// The actual result of an accepted write, declared in the dispatch receipt.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FilesWriteOutput {
+    pub actor: crate::Actor,
+    pub source_revision: u64,
+    pub outcome: WriteOutcome,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcome {
+    PutBlob { chunk: DigestHex },
+    Commit { snapshot: DigestHex },
+    Pin { snapshot: DigestHex, name: String },
+    Unpin { name: String },
+    Watch { prefix: String, module_id: String },
+    Unwatch { prefix: String, module_id: String },
+}
+
+pub fn encode_write_output(output: &FilesWriteOutput) -> Vec<u8> {
+    serde_json::to_vec(output).expect("files write output serializes")
+}
+
+pub fn decode_write_output(bytes: &[u8]) -> Result<FilesWriteOutput, String> {
+    serde_json::from_slice(bytes).map_err(|error| format!("files write output: {error}"))
 }
 
 // ---- off-block object fetch (state sync / self-heal lane) ----

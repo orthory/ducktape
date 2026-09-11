@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use provider_host::RunContext;
+use provider_host::{OperatorCredential, RunContext};
 use serde::{Deserialize, Serialize};
 
 use crate::workspace_source::WorkspaceSource;
@@ -31,18 +31,22 @@ use crate::workspace_source::WorkspaceSource;
 pub struct PortablePlan {
     pub source: WorkspaceSource,
     /// the run's CONSENSUS id, verbatim from the (required) envelope field —
-    /// see [`WorkspaceSpec::consensus_run_id`]. always present: a run the
+    /// see [`WorkspaceSpec::agent`]. always present: a run the
     /// session lane cannot name is a run whose mid-run writes silently vanish.
     pub consensus_run_id: String,
     pub sink: Sink,
     pub skills: Vec<RoMount>,
     /// committed registry name, carried to the Forge commit boundary.
     pub agent_display_name: String,
-    /// whether the agent's `duckfs_read` caps cover the global skill library —
-    /// see [`WorkspaceSpec::library_readable`]. `false` on an envelope composed
-    /// before the field existed: the conservative default, since the paragraph it
-    /// gates is only useful to an agent that can act on it.
-    pub library_readable: bool,
+}
+
+/// Committed model identity and the exact host execution attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExecution {
+    pub run_id: String,
+    pub attempt: u32,
+    pub agent_id: String,
+    pub display_name: String,
 }
 
 /// what the pool hands the provisioner for one run.
@@ -54,35 +58,16 @@ pub struct WorkspaceSpec {
     /// carries the attempt on purpose (a re-lease spawns a new attempt while
     /// the old one may still be running, and the two must never share a
     /// checkout dir). hashing it resolves nothing in consensus — the id a run
-    /// is named by there is [`Self::consensus_run_id`].
+    /// is named by there is [`Self::agent`].
     pub run_id: String,
-    /// the id `runs` resolves the run by — the key of its pending map, and the
-    /// run the agent session lane binds to. carried from the composer through
-    /// the envelope (a REQUIRED field) because the host cannot derive it (see
-    /// [`Self::run_id`]). `None` ONLY on a RECEIPT-ONLY spec, which carries
-    /// source coords alone and names no run; every EXECUTION spec the pool
-    /// builds has it, and `session::open` degrades to the read-only plane if it
-    /// somehow does not.
-    pub consensus_run_id: Option<String>,
-    pub agent_id: Option<String>,
-    /// the committed registry display name (Forge authorship / attribution).
-    /// `None` ONLY on a receipt-only spec; every execution spec carries it.
-    pub agent_display_name: Option<String>,
+    /// Present for agent execution; receipt-only materialization has no identity.
+    pub agent: Option<AgentExecution>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
     /// W6 skill/instruction ro subtrees — the plan's C4 skill mounts,
     /// verbatim.
     pub ro_mounts: Vec<RoMount>,
-    /// whether the agent may READ the global skill library
-    /// (`agent::SKILL_LIBRARY_PREFIX`): a plain-data echo of the committed
-    /// `duckfs_read` grant, decided in consensus by the composer and carried
-    /// across the reachability wall like every other plan field.
-    ///
-    /// the provisioner hands it to [`crate::assemble_context_doc`], which emits
-    /// the library paragraph only when it is `true` — an agent without the grant
-    /// is never pointed at a prefix the MCP tool plane would refuse it.
-    pub library_readable: bool,
 }
 
 /// a read-only mount the provisioner materializes beside the rw source (W6) —
@@ -241,6 +226,12 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn context_doc(&self) -> Option<String> {
         None
     }
+    /// the node's operator credential the run's node lane lends to every
+    /// forge push → `ctx.operator_credential`. `None` (the default, for an
+    /// embedder with no node) refuses every push.
+    fn operator_credential(&self) -> Option<OperatorCredential> {
+        None
+    }
     /// commit ONLY the rw source; `audit_message` is host-only receipt context
     /// while `proposal` is the agent-authored Git message. Implementations must
     /// never turn the audit string into public Git history.
@@ -259,13 +250,14 @@ pub type SharedProvisioner = Arc<dyn WorkspaceProvisioner>;
 
 /// the ONE place a materialized workspace is bound onto the run context: the
 /// mount becomes the child's cwd, its env is layered additively, its tool bin
-/// dirs feed `PATH`, and its assembled soul rides into the run — capability-host
+/// dirs feed `PATH`, and its assembled soul rides into the run — the provider
 /// decides the door (the executor's auto-load path, or the stdin prompt).
 pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.workdir_override = Some(ws.workdir());
     ctx.env.extend(ws.env());
     ctx.path_entries = ws.path_entries();
     ctx.context_doc = ws.context_doc();
+    ctx.operator_credential = ws.operator_credential();
 }
 
 // ---- runner result ----------------------------------------------------------
@@ -428,7 +420,7 @@ fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
 /// parse used for effects. Validation remains the workspace commit boundary's
 /// job; this seam preserves the proposed subject and body verbatim.
 pub fn commit_message_from_response_text(text: &str) -> Option<String> {
-    serde_json::from_value::<agent::AgentResponse>(parse_response_value(text)?)
+    serde_json::from_value::<runs::AgentResponse>(parse_response_value(text)?)
         .ok()?
         .commit_message
 }
@@ -541,34 +533,37 @@ mod tests {
     fn spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
-            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
-            agent_id: Some("bot".into()),
-            agent_display_name: Some("Bot".into()),
+            agent: Some(AgentExecution {
+                run_id: CONSENSUS_RUN_ID.into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
     }
 
     fn forge_spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
-            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
-            agent_id: Some("bot".into()),
-            agent_display_name: Some("Bot".into()),
+            agent: Some(AgentExecution {
+                run_id: CONSENSUS_RUN_ID.into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
                 item_title: "Fix the gate".into(),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: true,
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
     }
 

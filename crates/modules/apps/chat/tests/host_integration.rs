@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use chat::Chat;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_event,
-    decode_reply, encode_msg, encode_query,
+    Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, Party, PostPolicy, decode_event, decode_reply,
+    encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, Host};
@@ -153,7 +153,6 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("hello")],
                 thread: None,
-                as_agent: None,
             }),
         )
         .await
@@ -173,7 +172,7 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
         };
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].seq, 1);
-        assert_eq!(messages[0].head.author, AuthorRef::User(vec![1; 32]));
+        assert_eq!(messages[0].head.author, Party::Key(vec![1; 32]));
         assert_eq!(messages[0].head.blocks, vec![Block::paragraph("hello")]);
     });
 }
@@ -194,7 +193,6 @@ fn host_rolls_back_failed_chat_blocks() {
                     message_id: "m1".into(),
                     blocks: vec![Block::paragraph("hello")],
                     thread: None,
-                    as_agent: None,
                 }),
             )
             .await
@@ -264,7 +262,6 @@ fn hook_notifications_commit_atomically_with_the_post() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("notify me")],
                 thread: None,
-                as_agent: None,
             }),
         )
         .await
@@ -278,7 +275,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
                     channel_id: "general".into(),
                     seq: 1,
                     thread_root: None,
-                    author: AuthorRef::User(vec![1; 32]),
+                    author: Party::Key(vec![1; 32]),
                     mentions: Vec::new(),
                 }
             );
@@ -307,7 +304,6 @@ fn hook_notifications_commit_atomically_with_the_post() {
                     message_id: "m2".into(),
                     blocks: vec![Block::paragraph("this must vanish")],
                     thread: None,
-                    as_agent: None,
                 }),
             )
             .await

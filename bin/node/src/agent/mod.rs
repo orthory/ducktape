@@ -95,10 +95,16 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
     // child of this process spawned kill_on_drop, so a death that ran no code
     // still takes its guests with it.
 
-    let providers = agent_service::discover(&node_key, backend, &grant.display_id())?;
+    let providers = agent_service::discover(
+        &node_key,
+        &workspace_config::capability_dir(&service.workspace),
+        backend,
+        &grant.display_id(),
+    )?;
     let offered = providers.capabilities().len();
 
     let (events, event_rx) = tokio::sync::mpsc::channel(link::EVENT_LANE);
+    let events_for_collab = events.clone();
     let sessions = Arc::new(agent_service::Sessions::new(
         providers,
         provider_host::execution_node_id(&node_key),
@@ -106,11 +112,23 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
         events,
     ));
 
+    // the collaboration delivery plane, beside the terminal one and sharing
+    // its event lane — but NOT its lifetime. A pty dies with the link that
+    // made it; a binding names a provider session this daemon did not start
+    // and must not end, so nothing about a disconnect reaches this plane.
+    //
+    // A daemon whose outbox will not open serves no messaging rather than
+    // serving it without a durable record — the record is what makes a crash
+    // reportable instead of replayable, so running without one is worse than
+    // not running it.
+    let deliveries = collab_plane(&service, events_for_collab).await;
+
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
         capabilities = offered,
         cap = agent_service::MAX_TERM_SESSIONS,
+        messaging = deliveries.is_some(),
         "agent daemon serving"
     );
 
@@ -120,7 +138,7 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
     // and its container is taken down by the teardown below rather than left
     // running under a service that is about to go.
     tokio::select! {
-        () = link::attach(ws_url(&http_base), workspace, sessions, event_rx) => {}
+        () = link::attach(ws_url(&http_base), workspace, sessions, deliveries, event_rx) => {}
         () = stop => {}
     }
     // Nothing to tear down. Every live run's VMM is a child of this process
@@ -132,6 +150,112 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
         "agent daemon stopped"
     );
     Ok(())
+}
+
+/// build the collaboration delivery plane, or serve without one.
+///
+/// `None` is an operational state, not a failure to start: a daemon whose
+/// outbox will not open still serves terminals, and answers no binding at all
+/// rather than answering one it cannot record. The node hears about it either
+/// way — a bind simply gets no reply, exactly as it does from a node with no
+/// daemon attached.
+async fn collab_plane(
+    service: &config::ServiceConfig,
+    events: tokio::sync::mpsc::Sender<agent_service::wire::Event>,
+) -> Option<Arc<agent_service::messaging::Deliveries>> {
+    // the receipt address is best-effort by design. Without it every Claude
+    // delivery settles `DeliveryUnknown` — degraded, and honest, which is the
+    // right trade against reclaiming an address that may belong to a live
+    // session.
+    let receipts =
+        match agent_service::messaging::claude::Receipts::bind(&claude_sockets_dir()).await {
+            Ok(receipts) => Some(receipts),
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "no_receipt_address",
+                    %error,
+                    "provider holds and refusals will not be observable; deliveries settle unknown"
+                );
+                None
+            }
+        };
+    let plane = agent_service::messaging::Deliveries::open(
+        &service.storage_dir.join("collab"),
+        // the chain id, which is what this network IS. A directory that has
+        // been pointed at a second network holds a delivery record whose
+        // conversation ids and sequences belong to the first, and reading it
+        // would answer a fresh message from another network's history.
+        &service.chain_id,
+        service.storage_dir.join("attachments.json"),
+        claude_registry()?,
+        std::path::PathBuf::from("codex"),
+        receipts,
+        events,
+    )
+    .await;
+    match plane {
+        Ok(plane) => Some(Arc::new(plane)),
+        Err(error) => {
+            tracing::error!(
+                target: "ducktape::collab",
+                reason = "outbox_unavailable",
+                %error,
+                "serving without messaging: a delivery record that cannot be written \
+                 makes a crash replayable instead of reportable"
+            );
+            None
+        }
+    }
+}
+
+/// where Claude publishes its session registry: `$CLAUDE_CONFIG_DIR/sessions`,
+/// or `$HOME/.claude/sessions`.
+fn claude_registry() -> Option<std::path::PathBuf> {
+    let home = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+    };
+    Some(home.join("sessions"))
+}
+
+/// where Claude Code binds a session's inbox on this host, by its own rule —
+/// and so where this daemon binds the address a recipient answers verdicts
+/// to: a reply address beside the session's own socket is one a session
+/// answers without further checks. The rule: `$XDG_RUNTIME_DIR`, else the
+/// temp dir (`$TMPDIR`, `$TMP`, `$TEMP`, else `/tmp`), plus `cc-socks`; and
+/// when a socket path there would not fit a socket address,
+/// `/tmp/cc-socks-<uid>` instead. Every input is an environment fact, so the
+/// answer is the same rule on every host rather than a host's own case.
+fn claude_sockets_dir() -> std::path::PathBuf {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let temp_dir = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .find_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    // SAFETY: `getuid` reads the calling process's real uid and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    claude_sockets_dir_from(runtime_dir.as_deref(), &temp_dir, std::process::id(), uid)
+}
+
+/// The longest socket path Claude Code binds under the default directory;
+/// past it the per-user directory under `/tmp` is used. A unix socket
+/// address holds 104 bytes on macOS, NUL included.
+const SOCKET_PATH_BYTES: usize = 103;
+
+fn claude_sockets_dir_from(
+    runtime_dir: Option<&std::path::Path>,
+    temp_dir: &std::path::Path,
+    pid: u32,
+    uid: u32,
+) -> std::path::PathBuf {
+    let default = runtime_dir.unwrap_or(temp_dir).join("cc-socks");
+    let socket_fits = default.join(format!("{pid}.sock")).as_os_str().len() <= SOCKET_PATH_BYTES;
+    if socket_fits {
+        return default;
+    }
+    std::path::PathBuf::from(format!("/tmp/cc-socks-{uid}"))
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.
@@ -157,6 +281,33 @@ mod tests {
         assert_eq!(
             ws_url("http://127.0.0.1:8844/"),
             "ws://127.0.0.1:8844/v1/ws"
+        );
+    }
+
+    /// The receipt address goes where Claude Code puts a session's own
+    /// socket on this host: the runtime dir where there is one, the temp
+    /// dir where there is not, and the per-user `/tmp` directory when a
+    /// socket path under the temp dir would not fit a socket address.
+    #[test]
+    fn the_receipt_address_sits_where_claude_code_binds_its_own() {
+        use std::path::Path;
+        assert_eq!(
+            claude_sockets_dir_from(Some(Path::new("/run/user/1000")), Path::new("/tmp"), 4242, 1000),
+            Path::new("/run/user/1000/cc-socks")
+        );
+        assert_eq!(
+            claude_sockets_dir_from(
+                None,
+                Path::new("/var/folders/9k/1kcv0c8s6xz2c9b1f4s7x0y40000gn/T/"),
+                4242,
+                501
+            ),
+            Path::new("/var/folders/9k/1kcv0c8s6xz2c9b1f4s7x0y40000gn/T/cc-socks")
+        );
+        let deep = format!("/{}", "d".repeat(SOCKET_PATH_BYTES));
+        assert_eq!(
+            claude_sockets_dir_from(None, Path::new(&deep), 4242, 501),
+            Path::new("/tmp/cc-socks-501")
         );
     }
 

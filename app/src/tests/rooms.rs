@@ -42,8 +42,8 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             "chat_updated",
             "choose_channel",
             "choose_dm",
-            "console_opened",
             "live_resynced",
+            "network_entered",
             "open_chat_search_hit",
             "reconnect",
             "workspace_connected",
@@ -60,7 +60,7 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         "open_chat_search_hit",
         "create_channel_submit",
         "reconnect",
-        "console_opened",
+        "network_entered",
     ] {
         let body = HANDLERS
             .split(&format!("\non {launch}"))
@@ -171,15 +171,18 @@ fn the_composers_are_out_of_reach_of_every_handler() {
         );
     }
 
-    const SCREEN: &str = include_str!("../ui/screens/chat.ice");
+    const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
     for (mount, key) in [
-        ("ChatComposer #composer(", "composer_scope(endpoint,"),
-        ("ChatComposer #reply_composer(", "thread_scope(endpoint,"),
+        ("#composer", "extern chat_composer(composer_scope(endpoint,"),
+        (
+            "#reply_composer",
+            "extern chat_composer(thread_scope(endpoint,",
+        ),
     ] {
         let line = SCREEN
             .lines()
-            .map(str::trim_start)
-            .find(|line| line.starts_with(mount))
+            .map(str::trim)
+            .find(|line| line.ends_with(mount))
             .unwrap_or_else(|| panic!("`{mount}` is mounted"));
         assert!(
             line.contains(key),
@@ -204,6 +207,18 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.account_number = me.into();
+    // THE DIRECTORY IS WHAT SAYS A ROOM IS A DM — `load_dm_peers` stamps each
+    // row's `channel_id` from the account number IT resolved, and all three DM
+    // decisions read that one field. A fixture that only sets `account_number`
+    // is a console whose account load has not landed, which is exactly the state
+    // that used to scatter DMs into the room list.
+    app.dm_peers = vec![backend::DmPeer {
+        key: peer.into(),
+        name: "Peer".into(),
+        initials: "P".into(),
+        is_agent: false,
+        channel_id: dm.clone(),
+    }];
     app.active_dm_peer = peer.into();
     app.active_channel = dm.clone();
 
@@ -279,9 +294,10 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     );
     app.loading = false;
 
-    // a key in no account derives no DM id, so it holds no DM — the same
-    // answer `chat_sidebar_rooms` gives when `me` is empty
-    app.account_number = String::new();
+    // A DIRECTORY THAT RESOLVED NO ACCOUNT OF OURS carries no channel id, so it
+    // claims no room — the same answer `chat_sidebar_rooms` gives, from the same
+    // field, which is the point of there being only one derivation.
+    app.dm_peers[0].channel_id = String::new();
     app.active_dm_peer = peer.into();
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
         &dm,
@@ -309,7 +325,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 /// header above it printed one — two readings of one room, on screen together.
 #[test]
 fn the_dm_header_takes_the_slack_the_channel_title_would() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(screen.contains(
         "if !empty(active_dm.name)\n                    box w=fill clip=true\n                      DmHeader peer=active_dm"
     ));
@@ -322,7 +338,7 @@ fn the_dm_header_takes_the_slack_the_channel_title_would() {
     assert!(!screen.contains("if !empty(active_dm_peer)"));
 }
 
-// Opening a (possibly different) network through the console handoff clears
+// Entering a (possibly different) network through the doors' landing clears
 // every reading and draft of the previous one — and the in-flight huddle —
 // while the KEY password survives: it unlocks this device's user.key, not an
 // endpoint.
@@ -337,34 +353,25 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.message_action = MessageAction::Editing;
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
-    app.page_editor = compose("node a page body");
+    app.page_text = ("node a page body").to_string();
     app.page_saved_text = "node a page body".into();
     app.block_comments_open = true;
     app.block_comments_target = "same-id".into();
     app.block_comment_draft = "node a comment".into();
     app.page_search_draft = "node a search".into();
-    app.forge_list_phase = ForgePhase::Ready;
-    app.forge_repo = "same-repo".into();
-    app.forge_repo_phase = ForgePhase::Ready;
-    app.forge_item_number = 1;
-    app.forge_item_phase = ForgePhase::Ready;
-    app.forge_review_draft = "node a review".into();
+    app.forge_link = "duck://forge/core/pull/1".into();
+    app.forge_note_pending = "op-a".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
     // AND A COMPOSER WITH WORDS IN IT, typed against node A. A channel id is a
     // user-chosen string, so both networks can hold a `#general` — the key
     // carries the ENDPOINT for exactly that reason (ducktape-ui#697), and the
     // assertions below drive both halves of the promise.
-    let node_a_composer = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &node_a_composer,
-        ComposerKind::Message,
-        "node a draft",
-    );
-    assert_eq!(composer_text(&app, &node_a_composer), "node a draft");
+    let node_a_composer = composer_scope(&app);
+    type_into(&node_a_composer, "node a draft");
+    assert_eq!(composer_text(&node_a_composer), "node a draft");
 
-    let _ = app.__update(__DucktapeMessage::ConsoleOpened(iced::window::Id::unique()));
+    let _ = app.__update(__DucktapeMessage::NetworkEntered);
 
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");
@@ -381,31 +388,26 @@ fn opening_a_network_clears_the_previous_networks_state() {
     // instance — and node A's words are still under node A's key, which is
     // the half a `message_drafts = []` clear used to get wrong by throwing
     // them away instead.
-    let node_b_composer = composer_scope(&mut app);
+    let node_b_composer = composer_scope(&app);
     assert_ne!(
         node_b_composer, node_a_composer,
         "the endpoint is in the key, so #general on node B is not #general on \
          node A"
     );
     assert!(
-        composer_text(&app, &node_b_composer).is_empty(),
+        composer_text(&node_b_composer).is_empty(),
         "a draft typed on node A is not node B's to hand back"
     );
     assert_eq!(
-        composer_text(&app, &node_a_composer),
+        composer_text(&node_a_composer),
         "node a draft",
         "and it is still node A's, waiting where it was typed"
     );
     assert!(app.page_search_draft.is_empty());
-    assert_eq!(app.forge_list_phase, ForgePhase::Idle);
-    assert!(app.forge_repo.is_empty());
-    assert_eq!(app.forge_repo_phase, ForgePhase::Idle);
-    assert_eq!(app.forge_item_number, 0);
-    assert_eq!(app.forge_item_phase, ForgePhase::Idle);
-    assert!(app.forge_review_draft.is_empty());
-    // The tree lives in ForgeCodeBrowser component state now: a network
-    // switch closes the console content and mounted-lifetime pruning drops
-    // the instance — there is no app field left to reset.
+    // The forge screen is the Forge VIEW's: what the app clears is the link
+    // it last routed there, which named node A, and the note it had in flight.
+    assert!(app.forge_link.is_empty());
+    assert!(app.forge_note_pending.is_empty());
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 
@@ -451,13 +453,13 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_messages = vec![message(7, "the root", false)];
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "half a reply");
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "half a reply");
 
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(app.channel_settings_open, "the drawer opened");
     assert_eq!(
-        composer_text(&app, &rail),
+        composer_text(&rail),
         "half a reply",
         "the drawer does not discard a reply in progress"
     );
@@ -471,13 +473,14 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     // Closing it gives the rail back exactly as it was.
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(!app.channel_settings_open);
-    assert_eq!(composer_text(&app, &rail), "half a reply");
+    assert_eq!(composer_text(&rail), "half a reply");
     assert_eq!(app.active_thread_seq, 7);
 
     // The screen is what hides the rail while the drawer is up — the handler
     // never needed to.
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
-        SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"),
+        screen.contains("if active_thread_seq > 0 && !channel_settings_open"),
         "the rail is drawn under the drawer's own gate"
     );
     let chat = inlined(include_str!("../ui/handlers/chat.ice"));
@@ -998,7 +1001,9 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
 fn unread_indicators_are_wired_client_local_only() {
     // Sidebar badge: ChannelButton takes an `unread` flag and paints the
     // brand treatment + dot when set.
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     assert!(components.contains(
         "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)"
     ));
@@ -1014,7 +1019,7 @@ fn unread_indicators_are_wired_client_local_only() {
         "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=display @text-fg"
     ));
 
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     // The prepared row owns the scalar. No list-taking extern runs in either
     // sidebar loop.
     assert!(screen.contains(
@@ -1068,7 +1073,11 @@ fn unread_indicators_are_wired_client_local_only() {
         assert!(lifecycle.contains(gate), "{gate}");
     }
     let live = inlined(include_str!("../backend/live.rs"));
-    assert!(lifecycle.contains("history_view, shell_tab == ShellTab.chat, unread_boundary"));
+    assert!(
+        lifecycle.contains(
+            "history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary"
+        )
+    );
     assert!(live.contains("let reads_live_tail = !history_view && chat_visible"));
     assert!(live.contains("if reads_live_tail"));
 
@@ -1076,4 +1085,183 @@ fn unread_indicators_are_wired_client_local_only() {
     let backend_ice = inlined(include_str!("../ui/extern/backend.ice"));
     assert!(!backend_ice.contains("read_cursor"));
     assert!(!backend_ice.contains("mark_read(rpc"));
+}
+
+/// A DM RECORD IS A NETWORK-VISIBLE CHANNEL ROW, so a DM between two OTHER
+/// people arrives in this device's channel list like any room — and, being in
+/// no peer's `channel_id`, it used to fall through the directory exclusion and
+/// draw under CHANNELS with a `#` glyph and that person's name, right beside
+/// their real DIRECT row. It reads as "clicking a DM created a channel".
+///
+/// Mine belong in DIRECT and theirs belong nowhere on my screen, so no derived
+/// two-party id is ever a CHANNELS row. A channel a person deliberately NAMED
+/// `dm-standup` is not one of those and stays listed — the test pins the shape
+/// rule, not a `dm-` prefix.
+#[test]
+fn another_members_dm_is_not_a_channel_of_mine() {
+    let channel = |id: &str| backend::ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        archived: false,
+        members_only: false,
+        huddle_count: 0,
+        head_seq: 4,
+    };
+    // the live network's shape: me(1) ↔ orthory(2), me(1) ↔ orthory-ops(3),
+    // and orthory(2) ↔ orthory-ops(3) — the last one none of my business.
+    let mine = backend::dm_channel_id("1".into(), "2".into());
+    let also_mine = backend::dm_channel_id("1".into(), "3".into());
+    let theirs = backend::dm_channel_id("2".into(), "3".into());
+
+    let rooms = backend::chat_sidebar_rooms(
+        vec![
+            channel("general"),
+            channel("dm-standup"),
+            channel(&mine),
+            channel(&also_mine),
+            channel(&theirs),
+        ],
+        vec![
+            backend::DmPeer {
+                key: "2".into(),
+                name: "orthory".into(),
+                initials: "O".into(),
+                is_agent: false,
+                channel_id: mine.clone(),
+            },
+            backend::DmPeer {
+                key: "3".into(),
+                name: "orthory-ops".into(),
+                initials: "O".into(),
+                is_agent: false,
+                channel_id: also_mine.clone(),
+            },
+        ],
+        Vec::new(),
+    );
+
+    let listed: Vec<&str> = rooms.iter().map(|row| row.channel.id.as_str()).collect();
+    assert_eq!(
+        listed,
+        ["general", "dm-standup"],
+        "no derived DM id is a CHANNELS row — not mine, and not theirs"
+    );
+}
+
+/// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
+/// pending set, and the reading is stamped with the connection it was taken over
+/// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
+/// would assign its emptiness and blank the cards the current connection just
+/// installed, until the next two-second poll put them back.
+///
+/// Pinned as statements, not as a substring: the comment above that handler
+/// NAMES the blanking it refuses to do, and a `contains` over the arm would read
+/// the prose as the code.
+#[test]
+fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
+    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
+    let arm = chat
+        .split_once("on live_agents_event(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("it ends")
+        .0;
+    let statements: Vec<&str> = arm
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && !line.is_empty())
+        .collect();
+    assert_eq!(
+        statements,
+        [
+            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)",
+            "live_agents = next.rows",
+        ],
+        "the guard RETURNS, and it stands before the only assignment"
+    );
+
+    // ALL FOUR IDENTITIES REACH THE LANE, or the guard above cannot ask. The
+    // endpoint is the weakest of them: a workspace switch brings the node back
+    // on the same loopback port, which is the same trap `live_resynced` names
+    // `chain_left_behind`. The seat is the one that does not move with the
+    // connection at all — see the seams pinned below.
+    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
+    let lane: Vec<&str> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run chat_live_agents("))
+        .collect();
+    assert_eq!(
+        lane,
+        [
+            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _"
+        ],
+        "one lane, for the node, keyed on the whole connection AND the seat"
+    );
+
+    // EVERY SEAM THAT MOVES THE SEAT WRITES `signer_key`, or the lane is keyed
+    // on a lie. A Settings unlock and lock change what this device may read and
+    // bump NO `connect_generation` (`node.ice` SettingsIntent.unlock/.lock), so
+    // a missed seam here is a device that never recovers from a lock — or one
+    // that keeps the previous key's output after a switch.
+    let node = inlined(include_str!("../ui/handlers/node.ice"));
+    let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
+    for (file, source, seam) in [
+        // seated: the handler that fires when a key is opened carries its pubkey
+        ("node.ice", &node, "on settings_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on phrase_confirmed(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_restored(pubkey)"),
+    ] {
+        let arm = source
+            .split_once(seam)
+            .unwrap_or_else(|| panic!("{file} must still carry `{seam}`"))
+            .1
+            .split_once("\non ")
+            .expect("the handler ends")
+            .0;
+        assert!(
+            arm.contains("signer_key = pubkey"),
+            "{file}: `{seam}` seats a key without naming it — the live agent \
+             lane keys on `signer_key`"
+        );
+        // AND DROPS THE ROWS IN THE SAME ARM. Re-keying the lane only fences
+        // what arrives next, and the new lane's first notice waits on a `runs`
+        // query — so a seam that moves the seat without clearing leaves the
+        // previous key's private output on screen for as long as that query
+        // takes, or forever if it never answers.
+        assert!(
+            arm.contains("live_agents = []"),
+            "{file}: `{seam}` moves the seat and leaves the previous key's rows \
+             on screen until a fresh notice arrives"
+        );
+    }
+    // and the teardown clears it, in the arm that retires the signer.
+    let lock = node
+        .split_once("SettingsIntent.lock")
+        .expect("the Lock intent")
+        .1
+        .split_once("    SettingsIntent.")
+        .expect("the next intent")
+        .0;
+    assert!(
+        lock.contains("signer_key = \"\"")
+            && lock.contains("live_agents = []")
+            && lock.contains("lock_signer()"),
+        "node.ice: the arm that retires the signer must clear `signer_key` and \
+         the rows it could read: {lock}"
+    );
+    assert!(
+        onboarding.contains("signer_key = \"\""),
+        "onboarding.ice: leaving a network must clear the seat it was taken in"
+    );
+
+    // AND NO ROOM OWES IT ANYTHING. Eight handlers move `active_channel`; the
+    // room is chosen in `encode_chat_props`, so none of them may carry a
+    // per-room launch or teardown for this lane.
+    assert!(
+        !chat.contains("lane=live_agents"),
+        "a per-room lane is back, and five of the eight movers will forget it"
+    );
 }

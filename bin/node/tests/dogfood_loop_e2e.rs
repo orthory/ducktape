@@ -1,50 +1,14 @@
-//! the agent dogfooding loop (M1), end to end on REAL `ducktape`
-//! validators: issue mention → forge-workspace run → PR, then the PR channel as
-//! a SESSION.
+//! Real-validator agent loop: issue mention, sandboxed work, host commit and
+//! push, program-authored progress and final replies, then a Forge PR.
 //!
-//!   1. a repo is born by its first push; an issue opens (item #1, hidden
-//!      channel `forge:<repo>:1`); the agent is registered with forge caps
-//!      and the channel is watched.
-//!   2. mentioning the agent runs the provider INSIDE a real git clone of the
-//!      repo, detached at the pinned dev tip; the host commits + pushes branch
-//!      `agent/item-1` through consensus and the PR sink opens a PR whose
-//!      title is the bound Forge issue title.
-//!   3. re-mentioning in the PR's OWN channel forks the branch TIP: a second
-//!      commit lands on the SAME branch (parent = the first), and the
-//!      duplicate guard opens NO second PR.
+//! The scripted provider calls `ducktape_action` (`reply`) through the real MCP server
+//! inside Firecracker. It records the MCP receipt and its detached Git HEAD
+//! in the workspace; the test reads both from the host-pushed commit.
+//! Subsequent runs in the PR channel prove branch continuation and PR reuse.
+//! Host-side concurrent push/rebase behavior is covered by the provisioner's
+//! `forge_tests` suite.
 //!
-//! ## a run is sandboxed, and that changed what this test can see
-//!
-//! The provider executes INSIDE a container now, so this suite needs a
-//! `[sandbox]` table (without one every compute daemon exits at boot — the
-//! reason this file spent weeks passing nothing) and its script cannot touch a
-//! host path: the fixture directory does not exist in the run's mount
-//! namespace. The evidence moved onto the one surface that DOES cross the
-//! boundary — the run workspace itself, which is a bind mount the host then
-//! commits and pushes. Each run writes [`HEAD_FILE`], and the test reads it back
-//! out of committed git history, which is a stronger claim than the old
-//! host-side trace log: it is signed into the branch the run produced.
-//!
-//! `.git/HEAD` is read with `cat`, not `git rev-parse`: a detached HEAD holds
-//! the raw oid, so the whole proof (WHICH commit, and that it is DETACHED) is
-//! one file read, and the image stays a 4 MB busybox instead of something
-//! carrying a git client.
-//!
-//! ## what this file no longer covers, and why
-//!
-//! It used to end with an ordering proof: the provider script itself advanced
-//! the work branch through the node's loopback forge remote, so the host's push
-//! rejected and the provisioner had to rebase. A run's container has no route
-//! to its own node — the egress firewall allows this run's broker port and
-//! nothing else — so a provider CANNOT race a push any more, and a scenario
-//! that cannot happen is not a regression this suite can hold. The property
-//! itself is covered where it lives, against the provisioner:
-//! `crates/noded/src/agent_provision/forge_tests.rs`'s
-//! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the
-//! merge-preserving and author-preservation variants beside it).
-//!
-//! run alone (cluster e2es flake under parallel load):
-//!   cargo test -p node-bin --test dogfood_loop_e2e -- --nocapture
+//! Run alone: cargo test -p node-bin --test dogfood_loop_e2e -- --nocapture
 
 mod common;
 
@@ -52,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
-use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
-use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
+use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
+use runs::ModelMsg;
+use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
@@ -67,6 +31,8 @@ const ROUND_TRIP: Duration = Duration::from_secs(120);
 /// workspace, so it rides the run's own commit into the branch — readable from
 /// any node, forever, instead of from a host path the container cannot see.
 const HEAD_FILE: &str = ".dogfood-run";
+const MCP_FILE: &str = ".dogfood-mcp";
+const PROGRESS: &str = "Working on the requested change";
 /// the neutral guest cwd every sandboxed run gets
 /// (`sandbox_host::guest_paths::GUEST_WORKSPACE`), which is the point: the
 /// operator's real layout never reaches the workload.
@@ -81,20 +47,19 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 
 /// one script-backed provider standing in for a coding agent.
 ///
-/// It runs INSIDE the run's microVM, so `sh`, `cat` and `printf` are the whole
-/// of its dependencies and its only writable surface is the workspace it was
-/// handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
-/// and answers on stdout.
+/// It runs inside the microVM and calls the real `ducktape mcp` tool through
+/// the scoped action tunnel before returning its final result. Its writable
+/// surface is the workspace it was handed. It records `pwd|HEAD` into
+/// [`HEAD_FILE`], which the host commits, and answers on stdout.
 ///
 /// The behaviour rides the spec's ARGV, not a staged `provider.sh`: a microVM
 /// mounts nothing from the host, so an executor a node lends has to already be
-/// in the guest rootfs. A host script arrives as
+/// in the executor image. A host script arrives as
 /// `execve /opt/duck/bin/provider.sh` and exit 126.
 struct DogfoodProvider {
     tag: String,
     spec_dir: PathBuf,
-    env_var: String,
-    bin: PathBuf,
+    executors: PathBuf,
 }
 
 impl DogfoodProvider {
@@ -103,7 +68,7 @@ impl DogfoodProvider {
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
         let tag = "quack-dogfood";
-        let env_var = "DUCKTAPE_TEST_QUACK_DOGFOOD_BIN".to_string();
+        let executors = common::script_executor_dir(&dir);
         std::fs::write(
             spec_dir.join(format!("{tag}.toml")),
             format!(
@@ -112,8 +77,7 @@ impl DogfoodProvider {
                  tag = \"{tag}\"\n\
                  description = \"dogfood e2e script executor\"\n\
                  [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
+                 bin = \"sh\"\n\
                  [invoke]\n\
                  args = {}\n\
                  prompt = \"stdin\"\n\
@@ -127,13 +91,11 @@ impl DogfoodProvider {
         Self {
             tag: tag.into(),
             spec_dir,
-            env_var,
-            // resolved by basename to /opt/duck/bin/sh inside the guest
-            bin: PathBuf::from("/bin/sh"),
+            executors,
         }
     }
 
-    /// Everything this executor needs of its image: `sh`, `cat`, `printf`.
+    /// The shell posts live progress through the same MCP tool exposed to models.
     ///
     /// `.git/HEAD` is read RAW rather than through `git rev-parse`. The run
     /// workspace is a self-contained clone (`.git` rides the workspace image),
@@ -142,53 +104,49 @@ impl DogfoodProvider {
     /// detached: a branch checkout would hold `ref: refs/…` instead, and the
     /// assertions below would name it.
     fn argv() -> String {
-        format!(
-            r#"["-c", "set -e; cat > /dev/null; printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}; printf '%s\\n' '{REPLY_TITLE}'"]"#
-        )
+        let requests = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"ducktape_action","arguments":{
+                    "operation":"reply",
+                    "input":{"content":[{"type":"text","text":PROGRESS}]},
+                    "request_id":"progress"
+                }
+            }}),
+        ]
+        .map(|request| request.to_string())
+        .join("\n");
+        let script = format!(
+            "set -e\ncat > /dev/null\nprintf '%s\\n' '{requests}' | ducktape mcp > {MCP_FILE}\nprintf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\nprintf '%s\\n' '{REPLY_TITLE}'"
+        );
+        serde_json::to_string(&["-c", &script]).expect("provider argv")
     }
 
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (self.env_var.clone(), self.bin.display().to_string()),
-        ]
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
 }
 
 /// the `pwd|HEAD` [`HEAD_FILE`] the run at `commit` committed, read out of a
 /// clone of the branch — committed evidence, from a node that executed nothing.
 fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
+    let responses = git_stdout(checkout, &["show", &format!("{commit}:{MCP_FILE}")]);
+    let reply = responses
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP response"))
+        .find(|response| response["id"] == 1)
+        .expect("the VM called ducktape_action");
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    assert!(reply.get("error").is_none(), "{reply}");
     let line = git_stdout(checkout, &["show", &format!("{commit}:{HEAD_FILE}")]);
     let (cwd, head) = line
         .split_once('|')
         .unwrap_or_else(|| panic!("{HEAD_FILE} at {commit} is `pwd|HEAD`, got {line:?}"));
     (cwd.to_string(), head.to_string())
-}
-
-/// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
-fn hermetic_env(root: &Path, name: &str) -> Vec<(String, String)> {
-    let empty = root.join(name).join("specs");
-    std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
 }
 
 fn boot(cluster: &mut Cluster) {
@@ -237,15 +195,13 @@ fn post_mention(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) 
                 Span::plain("hey "),
                 Span {
                     text: format!("@{AGENT_ID}"),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: AGENT_ID.into(),
-                    })],
+                    marks: vec![Mark::Mention(Party::Account(common::model_account(
+                        cluster, idx, AGENT_ID,
+                    )))],
                 },
                 Span::plain(" do the dogfood thing"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     );
 }
@@ -299,10 +255,44 @@ fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64
     )
 }
 
-fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
-    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
-        find_message(cluster, idx, channel, &format!("agent/{run_id}")).map(|(_, text)| text)
-    })
+fn wait_for_reply(
+    cluster: &Cluster,
+    idx: usize,
+    channel: &str,
+    run_id: &str,
+    anchor: u64,
+) -> String {
+    let message = |id: String| {
+        cluster.await_committed(idx, "the agent thread reply to post", ROUND_TRIP, || {
+            let bytes = cluster.query(
+                idx,
+                "chat",
+                &chat::encode_query(&ChatQuery::Message {
+                    message_id: id.clone(),
+                }),
+            )?;
+            let ChatReply::Message(message) = chat::decode_reply(&bytes).ok()? else {
+                return None;
+            };
+            message
+        })
+    };
+    let progress = message(runs::post_message_id(run_id, "s0"));
+    let reply = message(runs::reply_message_id(run_id));
+    let account = common::model_account(cluster, idx, AGENT_ID);
+    for post in [&progress, &reply] {
+        assert_eq!(post.channel_id, channel);
+        assert_eq!(post.head.thread, Some(anchor));
+        assert_eq!(post.head.author, Party::Account(account));
+        assert_eq!(post.head.origin, sdk::Origin::Program(account));
+    }
+    assert!(
+        progress.seq < reply.seq,
+        "live progress precedes the final result"
+    );
+    assert_eq!(progress.head.blocks, vec![Block::paragraph(PROGRESS)]);
+    assert_eq!(reply.head.blocks, vec![Block::paragraph(REPLY_TITLE)]);
+    REPLY_TITLE.into()
 }
 
 /// the committed tip of `branch` in the dogfood repo, from ListRefs.
@@ -350,7 +340,7 @@ fn tracker_item(cluster: &Cluster, idx: usize, number: u64) -> Option<forge::Ite
     }
 }
 
-/// this run's entry in the delivered-runs ring (Task 5's receipt lane).
+/// this run's entry in the terminal-runs ring.
 fn run_record(cluster: &Cluster, idx: usize, run_id: &str) -> Option<RunRecord> {
     let reply = cluster.query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))?;
     match runs::decode_reply(&reply).ok()? {
@@ -433,18 +423,18 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
+fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session() {
     if skip_unless_sandboxed(
-        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+        "issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session",
     )
     .is_some()
     {
         return;
     }
     // the fixture seeds and inspects the repo with the HOST git; the run inside
-    // the container needs none.
+    // the microVM needs none.
     if nettest::skip_without(
-        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+        "issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session",
         nettest::missing_tool("git"),
     )
     .is_some()
@@ -468,18 +458,14 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     // any (the grant); the compute daemon needs both and refuses to boot without
     // the table. Appended LAST — nothing may follow a toml table header.
     cluster.extra_toml.extend(sandbox_toml());
-    cluster.env[0] = [
-        hermetic_env(fixtures.path(), "node0"),
-        vec![runs_root_env.clone()],
-    ]
-    .concat();
-    cluster.env[1] = [
-        provider.env(),
-        hide_builtins(fixtures.path(), "node1"),
-        vec![runs_root_env.clone()],
-    ]
-    .concat();
-    cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
+    // an EMPTY stage keeps nodes 0 and 2 out of provider discovery (see
+    // dispatch_e2e).
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(provider.sandbox());
+    cluster.sandbox[2] = Some(SandboxStage::default());
+    cluster.env[0] = vec![runs_root_env.clone()];
+    cluster.env[1] = vec![runs_root_env.clone()];
+    cluster.env[2] = vec![runs_root_env];
     boot(&mut cluster);
 
     // node 1 is the tag's ONLY provider, so every lease lands there.
@@ -524,57 +510,46 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     assert_eq!(issue_channel, format!("forge:{REPO}:1"));
 
     // ---- the agent (no prompt pin — a persona is a curated `Always` skill now,
-    //      and this leg needs none; forge caps naming the repo LITERALLY) and the
-    //      watch that arms the trigger (atomic tagging subscribe, P2).
+    //      and this leg needs none) and the program binding that receives
+    //      source-owned attribution.
+    let program_account = common::provision_model_program(&cluster, 0, AGENT_ID);
     cluster.submit(
         0,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: AGENT_ID.into(),
-            display_name: AGENT_ID.into(),
-            capability: provider.tag.clone(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            caps: Some(ResourceCaps {
-                forge_read: vec![REPO.into()],
-                forge_push: vec![REPO.into()],
-                ..Default::default()
-            }),
-            skills: None,
+        "runs",
+        &runs::encode_msg(&RunsMsg::ConfigureModel {
+            operation: ModelMsg::RegisterModel {
+                account: program_account,
+                agent_id: AGENT_ID.into(),
+                display_name: AGENT_ID.into(),
+                capability: provider.tag.clone(),
+                recipe_hash: None,
+                skills: None,
+            },
         }),
     );
-    let watch = |channel: &str| {
-        cluster.submit(
-            0,
-            "runs",
-            &runs::encode_msg(&RunsMsg::WatchChannel {
-                channel_id: channel.into(),
-                policy: TurnPolicy::Mention,
-            }),
-        );
-        let channel = channel.to_string();
-        cluster.await_committed(0, "the channel watch to commit", FINALIZE, || {
-            let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
-            match runs::decode_reply(&reply) {
-                Ok(RunsReply::Watches(w)) => {
-                    w.iter().any(|v| v.channel_id == channel).then_some(())
-                }
-                _ => None,
-            }
-        });
-    };
-    watch(&issue_channel);
+    assert_eq!(
+        common::model_account(&cluster, 0, AGENT_ID),
+        program_account
+    );
 
     // ---- run 1: issue mention → worktree at the pinned dev tip → branch
     //      `agent/item-1` born → a PR titled by the bound Forge issue.
     post_mention(&cluster, 0, &issue_channel, "m1");
-    let run_1 = runs::run_id_for(
+    let run_1 = common::attributed_run_id(
+        &cluster,
+        0,
         &issue_channel,
         seq_of(&cluster, 0, &issue_channel, "m1"),
         AGENT_ID,
     );
     assert_eq!(
-        wait_for_reply(&cluster, 0, &issue_channel, &run_1),
+        wait_for_reply(
+            &cluster,
+            0,
+            &issue_channel,
+            &run_1,
+            seq_of(&cluster, 0, &issue_channel, "m1")
+        ),
         REPLY_TITLE,
         "run 1 replies in the issue channel"
     );
@@ -605,67 +580,153 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let pr_channel = pr.channel_id.clone();
     assert_eq!(pr_channel, format!("forge:{REPO}:{pr_number}"));
 
-    // the delivered-runs ring carries the receipt: branch@commit + PR number.
-    let record = cluster.await_committed(0, "run 1 in the delivered-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_1)
+    // The run settles before the program's PR receipt is committed. Wait for
+    // that receipt, even when the forge PR itself is already visible.
+    let record = cluster.await_committed(0, "run 1 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_1).filter(|record| record.pr.is_some())
     });
-    assert_eq!(record.outcome, RunOutcome::Delivered);
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 1 is clean: {record:?}");
     assert_eq!(
         record.output_ref.as_deref(),
         Some(format!("{WORK_BRANCH}@{run1_oid}").as_str())
     );
-    assert_eq!(record.pr_number, Some(pr_number));
+    assert_eq!(
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: pr_number
+        })
+    );
 
-    // ---- run 2: the PR channel IS the session — re-mention forks the branch
-    //      TIP, lands a second commit on the SAME branch, opens NO second PR.
-    watch(&pr_channel);
+    // ---- run 2: the PR item owns a separate work branch. It forks the PR's
+    //      source tip and requests review INTO that branch instead of writing
+    //      directly to the source branch chosen by the PR's author.
+    let pr_work_branch = format!("agent/item-{pr_number}");
     post_mention(&cluster, 0, &pr_channel, "m2");
-    let run_2 = runs::run_id_for(
+    let run_2 = common::attributed_run_id(
+        &cluster,
+        0,
         &pr_channel,
         seq_of(&cluster, 0, &pr_channel, "m2"),
         AGENT_ID,
     );
     assert_eq!(
-        wait_for_reply(&cluster, 0, &pr_channel, &run_2),
+        wait_for_reply(
+            &cluster,
+            0,
+            &pr_channel,
+            &run_2,
+            seq_of(&cluster, 0, &pr_channel, "m2")
+        ),
         REPLY_TITLE,
         "run 2 replies in the PR channel"
     );
 
-    let run2_oid = cluster.await_committed(0, "the branch tip to advance", FINALIZE, || {
-        branch_tip(&cluster, 0, WORK_BRANCH).filter(|tip| *tip != run1_oid)
+    let run2_oid = cluster.await_committed(0, "the PR work branch to be born", FINALIZE, || {
+        branch_tip(&cluster, 0, &pr_work_branch)
     });
-    // parent chain, proven from a node that executed nothing: run2 → run1 →
-    // seed — the objects fanned out with the refs.
+    assert_ne!(run2_oid, run1_oid, "the PR run pushed a new commit");
+    assert_eq!(
+        branch_tip(&cluster, 0, WORK_BRANCH).as_deref(),
+        Some(run1_oid.as_str()),
+        "the PR's source branch is unchanged"
+    );
+    let child_pr = cluster.await_committed(0, "the child PR to open", FINALIZE, || {
+        tracker_items(&cluster, 0)
+            .into_iter()
+            .filter(|item| item.kind == forge::ItemKind::Pr)
+            .filter_map(|item| tracker_item(&cluster, 0, item.number))
+            .find(|item| item.source_branch.as_deref() == Some(pr_work_branch.as_str()))
+    });
+    let child_pr_number = child_pr.summary.number;
+    assert_ne!(child_pr_number, pr_number);
+    assert_eq!(child_pr.summary.state, forge::ItemState::Open);
+    assert_eq!(child_pr.summary.title, ISSUE_TITLE);
+    assert_eq!(child_pr.target_branch.as_deref(), Some(WORK_BRANCH));
+    let record = cluster.await_committed(0, "run 2 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_2).filter(|record| record.pr.is_some())
+    });
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
+    assert!(!record.degraded, "run 2 is clean: {record:?}");
+    assert_eq!(
+        record.output_ref.as_deref(),
+        Some(format!("{pr_work_branch}@{run2_oid}").as_str())
+    );
+    assert_eq!(
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: child_pr_number
+        })
+    );
+
+    // ---- run 3: the SAME PR channel continues its own born work branch,
+    //      preserving the first PR's source and reusing the child PR.
+    post_mention(&cluster, 0, &pr_channel, "m3");
+    let run_3 = common::attributed_run_id(
+        &cluster,
+        0,
+        &pr_channel,
+        seq_of(&cluster, 0, &pr_channel, "m3"),
+        AGENT_ID,
+    );
+    assert_eq!(
+        wait_for_reply(
+            &cluster,
+            0,
+            &pr_channel,
+            &run_3,
+            seq_of(&cluster, 0, &pr_channel, "m3")
+        ),
+        REPLY_TITLE,
+        "run 3 replies in the same PR channel"
+    );
+    let run3_oid = cluster.await_committed(0, "the PR work branch to advance", FINALIZE, || {
+        branch_tip(&cluster, 0, &pr_work_branch).filter(|tip| *tip != run2_oid)
+    });
+    assert_eq!(
+        branch_tip(&cluster, 0, WORK_BRANCH).as_deref(),
+        Some(run1_oid.as_str()),
+        "continuing the PR session leaves its source branch unchanged"
+    );
+
+    // Parent chain, proven from a node that executed nothing:
+    // run3 → run2 → run1 → seed. The objects fanned out with the refs.
     let checkout = tempfile::tempdir().expect("git checkout parent");
     let clone_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[2]);
-    let dest = checkout.path().join("after-run2");
+    let dest = checkout.path().join("after-run3");
     git_ok(
         checkout.path(),
         &[
             "clone",
             "--quiet",
             "--branch",
-            WORK_BRANCH,
+            &pr_work_branch,
             &clone_url,
             dest.to_str().unwrap(),
         ],
     );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run2_oid);
+    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
     assert_eq!(
         git_stdout(&dest, &["rev-parse", "HEAD^"]),
+        run2_oid,
+        "run 3 continues the PR session from run 2's commit"
+    );
+    assert_eq!(
+        git_stdout(&dest, &["rev-parse", "HEAD~2"]),
         run1_oid,
         "run 2's parent is run 1's commit"
     );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), dev_tip);
+    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~3"]), dev_tip);
 
     // What each run SAW, read out of the commit it produced: the sandboxed
     // neutral cwd, and a detached `.git/HEAD` naming the commit it forked. Run 1
-    // forks the pinned dev tip; run 2 forks the branch TIP, which is what makes
-    // the PR channel a session rather than a second independent run.
+    // forks dev; run 2 forks the PR source; run 3 forks its OWN branch tip.
     for (commit, pinned_at, which) in [
         (&run1_oid, &dev_tip, "run 1"),
         (&run2_oid, &run1_oid, "run 2"),
+        (&run3_oid, &run2_oid, "run 3"),
     ] {
         let (cwd, head) = run_evidence(&dest, commit);
         assert_eq!(cwd, GUEST_WORKDIR, "{which} ran at the neutral sandbox cwd");
@@ -678,21 +739,24 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
 
     assert_eq!(
         open_pr_count(&cluster, 0),
-        1,
-        "the duplicate guard opened NO second PR"
+        2,
+        "the duplicate guard reuses the child PR for the continued session"
     );
-    let record = cluster.await_committed(0, "run 2 in the delivered-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_2)
+    let record = cluster.await_committed(0, "run 3 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_3).filter(|record| record.pr.is_some())
     });
-    assert_eq!(record.outcome, RunOutcome::Delivered);
-    assert!(!record.degraded, "run 2 is clean: {record:?}");
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
+    assert!(!record.degraded, "run 3 is clean: {record:?}");
     assert_eq!(
         record.output_ref.as_deref(),
-        Some(format!("{WORK_BRANCH}@{run2_oid}").as_str())
+        Some(format!("{pr_work_branch}@{run3_oid}").as_str())
     );
     assert_eq!(
-        record.pr_number,
-        Some(pr_number),
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: child_pr_number
+        }),
         "the ring names the UPDATED PR"
     );
 }

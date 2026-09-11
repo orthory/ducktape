@@ -4,33 +4,40 @@
 on account_loaded(next)
   return if next.generation != account_generation
   account_exists = next.exists
+  // SETTINGS' READING ONLY. The DM derivation does NOT hang off this field any
+  // more: `load_dm_peers` resolves the account number it needs for itself and
+  // stamps each row's `channel_id`, and all three DM decisions read that one id
+  // — so a late or failed account load can no longer scatter DMs into the room
+  // list.
+  bell_marking = bell_marking && account_number == next.number
+  bell_items = bell_account_items(bell_items, account_number, next.number)
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, next.number, settings_user_key), bell_presentations, [])
+  bell_unread = bell_unread_count(bell_items, next.number, settings_user_key)
+  bell_error = ""
+  bell_read_through = keep_i64(account_number == next.number, bell_read_through, 0)
+  bell_clear_through = keep_i64(account_number == next.number, bell_clear_through, 0)
+  invalidate lane=bell_context
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  bell_marking = false
   account_number = next.number
-  // The account NUMBER is chat's `me` for DM derivation (both ends of one DM
-  // hash the same pair of numbers), so the rooms mirror moves with it.
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   account_name = next.name
-  // The label's fallback chain ends at the account name — refresh the mirror
-  // now that it arrived (the workspace/chain_id cases win and are unchanged).
-  network_name = network_label(account_name, connected_rpc)
   account_bio = next.bio
   account_keys = next.keys
   account_key_rows = next.key_rows
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation next.number _ | bell_failed connect_generation next.number _
 
 on account_failed(cause)
   return if cause.generation != account_generation
 
-on account_name_draft_changed(next)
-  account_name_draft = next
-
-on account_rename_submit
-  return if !connected || !account_exists || account_renaming || empty(trim(account_name_draft))
-  account_renaming = true
-  error = ""
-  run every set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
-
+// THE SETTINGS VIEW SENT THE OP (`settings_view_event`, handlers/node.ice);
+// what lands here is its answer. A committed op tells the view which drafts
+// it consumed — the rename its name, a mint the key pair, a re-read every
+// draft the card offers — so the view clears those and only those.
 on account_renamed(_result)
   account_renaming = false
-  account_name_draft = ""
+  settings_drafts_cleared = settings_drafts_cleared + 1
+  settings_drafts_scope = "name"
   account_generation = account_generation + 1
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 
@@ -38,79 +45,13 @@ on account_rename_failed(cause)
   account_renaming = false
   error = cause.message
 
-// THE FOUR IDENTITY OPS — found, mint a ticket, join with one, remove a key.
-// Each is one user-signed frame (the CLI's `ducktape account` verbs, in the
-// app), and every committed one lands in `account_changed`: the account
-// picture moved, so it is re-read under a fresh generation.
-on account_create_draft_changed(next)
-  account_create_draft = next
-
-// FOUNDING FROM THE CONSOLE — the door for a device that passed the welcome
-// step's passkey enrolment by. It runs no recovery ceremony of its own
-// because the key it signs with cannot exist without one: the launch window
-// seals a minted key only after its 24 words are read back
-// (`handlers/onboarding.ice`), and the only other ways to hold one are a
-// restore, which IS 24 words typed in, and `ducktape wallet new`, which
-// prints them.
-on account_create_submit
-  return if !connected || account_exists || account_busy || empty(password) || empty(trim(account_create_draft))
-  account_busy = true
-  error = ""
-  run every create_account(connected_rpc, password, trim(account_create_draft)) -> account_changed _ | account_op_failed _
-
-on account_key_draft_changed(next)
-  account_key_draft = next
-
-on account_key_label_draft_changed(next)
-  account_key_label_draft = next
-
-// A ticket is chain-scoped, so it carries the chain id the status stream
-// named (`network_chain_id`); the backend refuses to mint before one landed.
-on account_key_add_submit
-  return if !connected || !account_exists || account_busy || empty(password) || empty(trim(account_key_draft))
-  account_busy = true
-  error = ""
-  account_ticket = ""
-  run every mint_key_ticket(connected_rpc, password, network_chain_id, trim(account_key_draft), trim(account_key_label_draft)) -> account_ticket_minted _ | account_op_failed _
-
 // Minting commits nothing: the ticket is shown to copy, the drafts it
 // consumed clear, and the account is re-read only when the OTHER device joins.
 on account_ticket_minted(ticket)
   account_busy = false
   account_ticket = ticket
-  account_key_draft = ""
-  account_key_label_draft = ""
-
-on account_join_draft_changed(next)
-  account_join_draft = next
-
-// Joining is the one op a key OUTSIDE every account performs, so it is not
-// gated on `account_exists`; a key already on an account is refused by the
-// module ("key already belongs to an account").
-on account_key_join_submit
-  return if !connected || account_busy || empty(password) || empty(trim(account_join_draft))
-  account_busy = true
-  error = ""
-  run every join_with_ticket(connected_rpc, password, trim(account_join_draft)) -> account_changed _ | account_op_failed _
-
-// BROWSER CEREMONIES. Each opens the auth page and blocks on its answer;
-// `account_busy` holds the card until the page answers or the backend gives
-// up. The label draft names the new key, exactly as it names a pasted one.
-//
-// A passkey is registered FROM THE PHONE by default: the stream hands back
-// the QR the card shows, and `done`/`failed` close it. The desktop browser
-// path is the button beside it.
-on account_passkey_submit
-  return if !connected || !account_exists || account_busy || empty(password)
-  account_busy = true
-  error = ""
-  stream replace lane=account_ceremony add_passkey_by_qr(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_ceremony_stepped _
-
-on account_passkey_desktop
-  return if !connected || !account_exists || account_busy || empty(password)
-  account_busy = true
-  error = ""
-  run every register_passkey(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_changed _ | account_op_failed _
+  settings_drafts_cleared = settings_drafts_cleared + 1
+  settings_drafts_scope = "keys"
 
 // `done` is `account_changed`'s body inlined (a handler cannot call a
 // handler): the account picture moved, so it is re-read under a fresh
@@ -126,7 +67,8 @@ on account_ceremony_stepped(next)
       account_ceremony_phase = ""
       account_ceremony_qr = ""
       account_busy = false
-      account_key_label_draft = ""
+      settings_drafts_cleared = settings_drafts_cleared + 1
+      settings_drafts_scope = "label"
       account_generation = account_generation + 1
       run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     CeremonyPhase.failed
@@ -139,91 +81,63 @@ on account_ceremony_stepped(next)
     CeremonyPhase.working
       error = ""
 
-on account_ceremony_cancel
-  invalidate lane=account_ceremony
-  account_busy = false
+// Every committed identity op lands here: the account picture moved, so it
+// is re-read under a fresh generation, and every draft the card offers goes
+// with it — a ticket left on screen after its device joined is a stale blob
+// that looks like a secret.
+on account_changed(_result)
   account_ceremony_phase = ""
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-
-on account_wallet_submit
-  return if !connected || !account_exists || account_busy || empty(password)
-  account_busy = true
-  error = ""
-  run every link_wallet(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_changed _ | account_op_failed _
-
-// Logging in is the other op a key OUTSIDE every account performs: a passkey
-// registered on a member device consents, in the browser, to admitting this one.
-on account_login_submit
-  return if !connected || account_exists || account_busy || empty(password)
-  account_busy = true
-  error = ""
-  run every login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
-
-on account_key_remove(pubkey)
-  return if !connected || !account_exists || account_busy || empty(password) || account_keys <= 1
-  account_busy = true
-  error = ""
-  run every remove_account_key(connected_rpc, password, pubkey) -> account_changed _ | account_op_failed _
-
-on account_changed(_result)
   account_busy = false
-  account_create_draft = ""
-  account_join_draft = ""
-  account_key_draft = ""
-  account_key_label_draft = ""
   account_ticket = ""
+  settings_drafts_cleared = settings_drafts_cleared + 1
+  settings_drafts_scope = "account"
   account_generation = account_generation + 1
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 
 on account_op_failed(cause)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   account_busy = false
   error = cause.message
 
-on agents_loaded(next)
-  return if next.generation != agents_generation
-  agents_answered = true
-  agents_rows = next.agents
+// THE RUN PANEL, ON ONE RUN. Every door that opens a run — the runs list, a
+// chat hint's "View run", the run chip on a message a run posted, a bell, a
+// duck://run link — comes through here: the agents tab and the run named,
+// which the session push carries to the view. The journal itself is the
+// view's own read. An empty id closes the panel.
+on open_run_panel(dispatch_id)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
+  // Same tab-move rule as `select_shell_tab`; uniform on purpose, so no door
+  // has to prove which tab it was pressed on before trusting the retire.
+  shell_tab = ShellTab.agents
+  agents_open_run = dispatch_id
+  agents_opened = agents_opened + 1
 
-on agents_failed(cause)
-  return if cause.generation != agents_generation
-  agents_answered = true
+// The Approvals view speaks the kernel contract: its reads and writes go
+// through the kernel, and the one event it hands the app is the tab badge.
+on governance_view_event(event)
+  return if event.kind != "badge"
+  gov_open = event_int(event, "count")
 
-on governance_loaded(next)
-  return if next.generation != gov_generation
-  gov_answered = true
-  gov_rows = next.proposals
-
-on governance_failed(cause)
-  return if cause.generation != gov_generation
-  gov_answered = true
-
-on gov_vote(proposal_id, approve)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run every governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
-
-on gov_execute(proposal_id)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run every governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
-
-// The quorum-gated membership actions the roster detail panel offers. They
-// share `gov_voting` with vote/execute: one governance write is in flight.
-on gov_propose(action, target_key)
-  return if !connected || !empty(gov_voting)
-  gov_voting = target_key
-  run every governance_propose(connected_rpc, password, action, gov_voting) -> gov_acted _ | gov_act_failed _
-
-on gov_acted(_result)
-  gov_voting = ""
-  gov_generation = gov_generation + 1
-  run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
-
-on gov_act_failed(cause)
-  gov_voting = ""
-  error = cause.message
+// What the Members view asks of the app. It speaks the kernel contract for
+// everything it reads and signs; the clipboard is the one OS door left, and
+// it is the same act as `copy_to_clipboard`.
+on members_view_event(event)
+  return if !connected || event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 on members_loaded(next)
   return if next.generation != members_generation
@@ -240,24 +154,43 @@ on dm_peers_loaded(next)
   dm_peers = next.peers
   // The directory decides which channels are DMs and who the header names, so
   // both mirrors move with it — see state/chat.ice's `rooms` note.
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
 
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation
 
-// The invite modal is pure view state — minting is a separate, explicit act.
-// Pause or resume an agent. The payload is the DESIRED state and it is named
-// for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
-// roster's Pause control passes `true` and its Resume control passes `false`;
-// a row wired from `agent.status` would have to invert. The registry is the
-// authority on whether the signing owner may apply the requested state.
-on agent_set_status(agent_id, paused)
+// What the Agents view still asks of the app. Its reads and its own writes
+// go through the kernel; what is left is whether any of its agents is
+// working (the rail's pulse), the ONE write it cannot sign — a registration
+// first provisions the agent's program account and binds the runs module's
+// own composed program — and two navigations.
+on agents_view_event(event)
   return if !connected
-  run every set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _
+  match agents_intent(event)
+    AgentsIntent.badge
+      agents_live = event_int(event, "count") > 0
+    AgentsIntent.register
+      run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.open_run
+      flow
+        from done event_text(event, "dispatch_id")
+        done -> open_run_panel _
+    // A CHIP IS A LINK. The run panel's places carry duck:// addresses, and
+    // the open plane in `handlers/chat.ice` is the one place a link becomes
+    // navigation, whichever tab it was pressed on.
+    AgentsIntent.open_link
+      flow
+        from done event_text(event, "url")
+        done -> open_message_link _
 
+// A committed agent write lands here: an agent's pause from the Members
+// record, or a registration from the Agents view. The pause payload is the
+// DESIRED state and it is named for the backend parameter it becomes:
+// `true` PAUSES, `false` resumes. The registry is the authority on whether
+// the signing owner may apply either. The register itself is the Agents
+// view's to re-read: the block the write lands in reaches it through
+// `rpc.live`.
 on agent_status_set(_result)
-  agents_generation = agents_generation + 1
   error = ""
-  run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _

@@ -374,9 +374,42 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
             "message_id": message_id,
             "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
-            "as_agent": null,
         }
     })
+}
+
+/// Provision the model's real keyless account and its program under the first
+/// account in a fresh scenario. The caller submits all three operations as the
+/// same 32-byte controller key.
+pub fn model_setup(agent_id: &str, capability: &str) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("identity", create("model-controller")),
+        (
+            "agent",
+            serde_json::json!({ "provision": {
+                "name": agent_id,
+                "program": runs::model_program(agent_id),
+            }}),
+        ),
+        (
+            "runs",
+            serde_json::json!({ "configure_model": { "operation": { "register_model": {
+                "account": 2,
+                "agent_id": agent_id,
+                "display_name": agent_id,
+                "capability": capability,
+            }}}}),
+        ),
+    ]
+}
+
+pub fn found_account(sim: &Sim, name: &str, seed: u64) -> String {
+    use commonware_cryptography::Signer as _;
+    let origin = key_origin(&commonware_cryptography::ed25519::PrivateKey::from_seed(
+        seed,
+    ));
+    sim.submit_ok("identity", create(name), Some(&origin));
+    origin
 }
 
 /// the sim's identity chain id — the composer's `Bindings { chain_id: "local" }`
@@ -408,13 +441,15 @@ pub fn create(name: &str) -> serde_json::Value {
     serde_json::to_value(identity::testkit::create(name)).expect("Create serializes")
 }
 
-/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into ed25519
-/// `member`'s account, consented to at `generation` on the sim's chain. the
-/// consent is single-use: acceptance advances `new_key`'s generation.
+/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into `account`,
+/// ed25519 `member`'s, consented to at `generation` on the sim's chain. the
+/// consent is single-use (acceptance advances `new_key`'s generation) and
+/// dies at [`CONSENT_EXPIRES`].
 pub fn add_ed25519_key(
     member: &commonware_cryptography::ed25519::PrivateKey,
     new_key: &[u8],
     generation: u64,
+    account: u64,
 ) -> serde_json::Value {
     serde_json::to_value(identity::testkit::add_ed25519_key(
         member,
@@ -422,6 +457,14 @@ pub fn add_ed25519_key(
         new_key,
         generation,
         None,
+        account,
+        CONSENT_EXPIRES,
     ))
     .expect("AddKey serializes")
 }
+
+/// the expiry every sim consent carries: the sim's logical clock is
+/// `SIM_EPOCH_MS + height * SIM_BLOCK_MS`, so this is 500 blocks past its
+/// epoch — past every height a sim test drives, inside
+/// `identity::MAX_CONSENT_TTL` of each.
+pub const CONSENT_EXPIRES: u64 = simnode::SIM_EPOCH_MS + 500 * simnode::SIM_BLOCK_MS;

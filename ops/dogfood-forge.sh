@@ -17,9 +17,9 @@
 #
 # Resolution of the node's forge base URL, in order:
 #   1. $DUCKTAPE_DEV_FORGE_URL           — explicit base, e.g. http://127.0.0.1:8844
-#   2. the ACTIVE workspace's http_listen — <home>/registry.json (.active)
-#                                            -> <home>/workspaces/<active>/node.toml
-#      where <home> is $DUCKTAPE_HOME when set, else ~/.ducktape
+#   2. the ONE workspace under the ducktape home — <home>/<dir>/node.toml's
+#      http_listen, where <home> is $DUCKTAPE_HOME when set, else ~/.ducktape;
+#      with several workspaces there is no default, name the node explicitly
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
 #
 # Env knobs:
@@ -55,44 +55,53 @@ SRC_REF="${SRC_REF:-}"
 log() { printf '\033[36m[dogfood]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[dogfood]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# The workspaces under the ducktape home ($DUCKTAPE_HOME when set, else
+# ~/.ducktape): every directory holding a network.toml — the same listing
+# `ducktape node list` and the app read. One node.toml path per line.
+workspace_tomls() {
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}" dir
+  for dir in "$duck"/*/; do
+    [ -f "$dir/network.toml" ] && [ -f "$dir/node.toml" ] && printf '%s\n' "${dir%/}/node.toml"
+  done
+}
+
+http_listen_of() {
+  sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
 resolve_base_url() {
   if [ -n "${DUCKTAPE_DEV_FORGE_URL:-}" ]; then
     printf '%s' "${DUCKTAPE_DEV_FORGE_URL%/}"
     return
   fi
-  # the operator root every other reader resolves: $DUCKTAPE_HOME when set,
-  # else ~/.ducktape. A node started under an override keeps its registry
-  # there, and reading $HOME's instead dies with "no node selected" beside it.
-  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-  local reg="$duck/registry.json"
-  if [ -f "$reg" ]; then
-    local active
-    active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
-    if [ -n "$active" ]; then
-      local toml="$duck/workspaces/$active/node.toml"
-      if [ -f "$toml" ]; then
-        local listen
-        listen=$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toml" | head -1)
-        if [ -n "$listen" ]; then
-          printf 'http://%s' "$listen"
-          return
-        fi
-      fi
-    fi
-  fi
-  die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL or start an active workspace"
+  local tomls listen
+  tomls="$(workspace_tomls)"
+  case "$(printf '%s\n' "$tomls" | grep -c .)" in
+    1) listen="$(http_listen_of "$tomls")"
+       if [ -n "$listen" ]; then
+         printf 'http://%s' "$listen"
+         return
+       fi ;;
+  esac
+  die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL, or keep exactly one workspace under the ducktape home"
 }
 
-# The workspace behind the resolved node, when there is one — the directory
-# holding the operator credential this script's pushes present.
+# The workspace behind the resolved node, when this box holds one — the
+# directory holding the operator credential this script's pushes present.
+# Matched on the port the node serves: `http_listen` is a wildcard bind by
+# default, which the base url never spells.
 resolve_workspace() {
-  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-  local reg="$duck/registry.json"
-  [ -f "$reg" ] || return 0
-  local active
-  active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
-  [ -n "$active" ] || return 0
-  printf '%s' "$duck/workspaces/$active"
+  local toml listen
+  while read -r toml; do
+    [ -n "$toml" ] || continue
+    listen="$(http_listen_of "$toml")"
+    if [ -n "$listen" ] && [ "${listen##*:}" = "${BASE_URL##*:}" ]; then
+      printf '%s' "$(dirname "$toml")"
+      return
+    fi
+  done <<EOF
+$(workspace_tomls)
+EOF
 }
 
 BASE_URL="$(resolve_base_url)"

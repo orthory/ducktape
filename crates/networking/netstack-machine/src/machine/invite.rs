@@ -93,16 +93,49 @@ impl Driver {
             return Err(INVITE_PEERS_FULL.into());
         }
         let allowed_ips = self.overlay.identity_allowed_ips(identity);
+        let config = PeerTunnelConfig {
+            wireguard_public_key,
+            // the intro datagram's observed source — always concrete.
+            endpoint: Some(endpoint),
+            allowed_ips,
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
+        };
+        // a byte-identical re-intro (same key, same observed endpoint, same
+        // allowed-ips) changes nothing on the interface: refresh the
+        // join-window clock and settle the reply without paying for another
+        // synchronous WgApply — that push is what stalls the whole command
+        // loop (record gossip, ViewTick, Nudge, every other intro) for its
+        // duration, so a replay of the same intro must be free.
+        let unchanged = self
+            .invite_peers
+            .get(&identity)
+            .is_some_and(|existing| existing.config == config);
+        if unchanged {
+            self.invite_peers.insert(
+                identity,
+                InvitePeer {
+                    config,
+                    installed_at_ms: now_ms,
+                },
+            );
+            match cont {
+                WgCont::InviteInstall { token, peer } => {
+                    self.finish_invite_install(token, peer, Ok(()))
+                }
+                WgCont::InviteBootstrap {
+                    token,
+                    peer,
+                    endpoint,
+                    intro,
+                } => self.finish_invite_bootstrap(token, peer, endpoint, intro, Ok(())),
+                _ => unreachable!("begin_invite_tunnel is only ever driven by an invite command"),
+            }
+            return Ok(());
+        }
         self.invite_peers.insert(
             identity,
             InvitePeer {
-                config: PeerTunnelConfig {
-                    wireguard_public_key,
-                    // the intro datagram's observed source — always concrete.
-                    endpoint: Some(endpoint),
-                    allowed_ips,
-                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
-                },
+                config,
                 installed_at_ms: now_ms,
             },
         );

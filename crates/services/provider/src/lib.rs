@@ -31,8 +31,8 @@
 //! to parse their output is all described by TOML capability specs (see
 //! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
-//! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `<ducktape home>/capabilities`). adding an executor — or retuning a built-in's
+//! path as operator-provided specs under the workspace's `capabilities/`
+//! dir. adding an executor — or retuning a built-in's
 //! flags, including which model it runs — is a config change on the
 //! operator's machine, never a code change here. dispatch is by EXPLICIT
 //! capability tag: [`ProviderSet::resolve`] takes the tag a job names,
@@ -66,6 +66,33 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// "has this pid disappeared yet", and the waits it drives are bounded by their
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// mirrors [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs)
+/// without depending on it (a host-crate → consensus-module edge). This is
+/// the cap `compute::provision::assemble_runner_result` already truncates a
+/// run's parsed answer to, WITH a note, before it can land — a run that
+/// finishes with an oversized answer already completes today, just trimmed.
+const RECORDED_RESULT_CAP_BYTES: usize = 256 * 1024;
+/// hard cap on a run's accumulated stdout, checked as each chunk arrives.
+/// Deliberately NOT [`RECORDED_RESULT_CAP_BYTES`] itself: that cap is
+/// enforced downstream with truncation-plus-a-note, so a run whose full
+/// answer is a few hundred KiB over it still succeeds today. Killing the run
+/// at the same size would turn "completes, truncated" into "fails outright"
+/// for those runs — this cap exists only to stop UNBOUNDED accumulation from
+/// a firehose, not to enforce the result size, so it sits an order of
+/// magnitude above it. `codex`'s `jsonl-events` output in particular streams
+/// one JSON object per tool call/patch/diff for the whole turn, not just the
+/// final answer, and can legitimately run to several hundred KiB on an
+/// ordinary tool-calling turn. Past this line the run is TERMINATED outright
+/// — never truncated, since a truncated JSON/JSONL blob would parse into
+/// garbage and land as the run's answer.
+const MAX_RUN_OUTPUT_BYTES: usize = 16 * RECORDED_RESULT_CAP_BYTES; // 4 MiB
+/// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
+/// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
+/// ever leaves this function, and only on the failure path — so a few KiB of
+/// trailing context is ample; unlike stdout this is a rolling tail, not a
+/// termination trigger.
+const MAX_RUN_STDERR_BYTES: usize = 16 * 1024;
 
 /// the ownership tag a provider set stamps on the runs it creates. Its VALUE
 /// names the owning service instance, so a compute daemon and an agent daemon
@@ -175,9 +202,11 @@ mod interactive;
 // below — resolve through this crate.
 pub(crate) use sandbox_host::sandbox;
 #[cfg(unix)]
-pub use sandbox_host::{GuestAsset, GuestLayout, tap_egress_nftables};
+pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
+mod egress_proxy;
+mod read_lane;
 mod spec;
 mod variants;
 #[cfg(unix)]
@@ -188,7 +217,10 @@ pub use interactive::InteractiveSession;
 /// signal `ensure` rebuilds the guest image from.
 pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
-pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
+pub use spec::{
+    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource,
+    SpecSet,
+};
 
 /// canonical label-safe identity for the node executing a provider run.
 pub fn execution_node_id(identity: &[u8]) -> String {
@@ -252,6 +284,50 @@ impl PartialEq for RunCancellation {
 
 impl Eq for RunCancellation {}
 
+/// This node's operator credential as a run's node lane lends it. Read fresh
+/// on every use, because the node re-mints it each boot; never handed to the
+/// guest — the lane attaches it to the guest's forge pushes itself, so a push
+/// proves itself with the node's authority rather than with a signing key the
+/// guest never holds.
+#[derive(Clone)]
+pub struct OperatorCredential {
+    header: &'static str,
+    read: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+impl OperatorCredential {
+    /// `header` is the request header the node's operator routes read the
+    /// credential from; `read` answers its current value, or `None` when this
+    /// node has none to lend.
+    pub fn new(
+        header: &'static str,
+        read: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            header,
+            read: Arc::new(read),
+        }
+    }
+
+    /// the header name the credential travels under.
+    pub fn header_name(&self) -> &'static str {
+        self.header
+    }
+
+    /// the credential as of now.
+    pub fn value(&self) -> Option<String> {
+        (self.read)()
+    }
+}
+
+impl std::fmt::Debug for OperatorCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorCredential")
+            .field("header", &self.header)
+            .finish_non_exhaustive()
+    }
+}
+
 /// per-run, host-local context riding beside the prompt: which agent is
 /// running. populated by the worker from the run envelope; a run with no agent
 /// identity uses [`RunContext::default`]. NEVER consensus data — providers only
@@ -308,6 +384,10 @@ pub struct RunContext {
     /// consensus data; the resolver builds it host-side from committed state
     /// before the provider spawns.
     pub airlock: Option<broker::AirlockConfig>,
+    /// this node's operator credential for the run's node lane to lend to an
+    /// admitted forge push. `None` (an embedder with no node behind it) refuses
+    /// every push at the lane. Never consensus data, never guest env.
+    pub operator_credential: Option<OperatorCredential>,
 }
 
 /// which child stream produced one live output line.
@@ -344,7 +424,7 @@ pub struct ProviderOutput {
 
 /// optional live-tail callback for provider output. The run context is passed
 /// beside each line so embedders can key their own per-run registry with the
-/// host-local identity available to capability-host.
+/// host-local identity available to the provider.
 pub type OutputSink = Arc<dyn Fn(&RunContext, OutputLine) + Send + Sync>;
 
 /// a machine-local executor for one capability tag. implementations do real
@@ -699,7 +779,7 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
         stdio: GuestStdio,
-    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo), String> {
+    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo, GuestLanes), String> {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
@@ -717,6 +797,19 @@ impl CliProvider {
         };
 
         let mut envs = self.sandbox_env(ctx, auth)?;
+        // the run's node entry is its OWN read lane, not the node's
+        // listener: this binds it and repoints `DUCKTAPE_NODE` at it, so what
+        // gets tunnelled below is the lane's port. It lives exactly as long as
+        // the returned value, which the run holds beside its VM.
+        let read_lane = read_lane::ReadLane::start(
+            &mut envs,
+            ctx.agent_id.clone(),
+            ctx.operator_credential.clone(),
+        )
+        .await?;
+        // the run's way off this host: an egress proxy on its own tunnel,
+        // named to the guest through the proxy env every http client reads.
+        let egress = egress_proxy::EgressProxy::start(&mut envs).await?;
         // wired HERE, before the env is translated and frozen into the
         // manifest — the name is the warning: it rewrites `envs`.
         let tunnel_ports = wire_guest_tunnels(
@@ -785,10 +878,19 @@ impl CliProvider {
         let vcpus = vm_cores(&ctx.limits)?;
         let mem_mib = vm_mem_mib(&ctx.limits)?;
 
+        // BEFORE any directory exists: deriving the executors image stats the
+        // operator's executors directory and rebuilds it, and it refuses a
+        // foreign binary there on every single run. Creating the run's scratch
+        // first left one directory pair per refusal, unbounded.
+        let executors = sandbox_host::executor_image::ensure(executors)?;
+
         // ONE slot for both directories, drawn per boot: they are two halves of
-        // the same run's scratch and are removed together when the VM drops.
+        // the same run's scratch and are removed together when the VM drops —
+        // and until the VM exists, these guards are what removes them.
         let slot = run_slot();
-        let run_dir = microvm_run_dir(&slot)?;
+        let run_scratch = microvm_run_dir(&slot)?;
+        let socket_scratch = microvm_socket_dir(&slot)?;
+        let run_dir = run_scratch.path();
         let vm_config = firecracker_api::VmConfig {
             vmm,
             kernel: kernel.clone(),
@@ -797,22 +899,20 @@ impl CliProvider {
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
-            // Derived here, per boot, rather than at discovery: an operator who
-            // installs a CLI mid-life expects the next run to have it, and the
-            // check is two stats when the image is already current.
-            executors: sandbox_host::executor_image::ensure(executors)?,
+            // Derived above, per boot, rather than at discovery: an operator
+            // who installs a CLI mid-life expects the next run to have it, and
+            // the check is two stats when the image is already current.
+            executors,
             vcpus,
             mem_mib,
-            vsock_uds: microvm_socket(&slot)?,
+            vsock_uds: socket_scratch.path().join(MICROVM_SOCKET_NAME),
             // no tap: the guest has no NIC, so its whole reach is the vsock
-            // tunnels above. That is no longer the same as "no egress" — those
-            // tunnels now carry this node's ENTIRE http listener, not just the
-            // broker, and `/v1/gateway/proxy` on it dispatches a
-            // `GatewayJob::Http` over the overlay to a publisher node. Its only
-            // gate (`gateway_http::gateway_api_origin_allowed`) is a header
-            // check a plain `curl` passes by sending no headers, so a run CAN
-            // reach off this host. See [`wire_guest_tunnels`] for the full
-            // reach and the open question of narrowing it (#1317).
+            // tunnels above. That is not the same as "no egress" — the node
+            // tunnel's read lane passes `/v1/gateway/proxy`, which dispatches a
+            // `GatewayJob::Http` over the overlay to a publisher node, and its
+            // only gate (`gateway_http::gateway_api_origin_allowed`) is a
+            // header check a plain `curl` passes by sending no headers. See
+            // [`wire_guest_tunnels`] for the full reach.
             tap: None,
         };
 
@@ -825,7 +925,22 @@ impl CliProvider {
             pty: stdio == GuestStdio::Pty,
         };
 
-        microvm::MicroVm::boot(&run_dir, &workdir, &assets, &vm_config, &manifest).await
+        // every error path out of `boot` leaves both directories to the guards,
+        // which drop with this `?`.
+        let booted =
+            microvm::MicroVm::boot(run_dir, &workdir, &assets, &vm_config, &manifest).await?;
+        // the VM's own `Drop` removes them from here.
+        run_scratch.disarm();
+        socket_scratch.disarm();
+        let (vm, io) = booted;
+        Ok((
+            vm,
+            io,
+            GuestLanes {
+                _read_lane: read_lane,
+                _egress: egress,
+            },
+        ))
     }
 
     /// the env carried into a sandbox.
@@ -951,17 +1066,37 @@ impl CliProvider {
                     )
                 })?
                 .join(file),
-            Some(ContextLocation::WorkspaceParent(file)) => workdir
-                .parent()
-                .ok_or_else(|| {
+            // Namespaced under the run's own slug (`workdir`'s basename), NOT
+            // written directly at `workdir.parent()`: that parent is the node-wide
+            // runs root shared by every run of this tag, so two runs alive at once
+            // would write the SAME path and each overwrite the other's soul (#1692).
+            // The slug is already this run's unique identity — it IS the workdir's
+            // name — so keying on it costs no new randomness and stays stable
+            // across the two calls (`assemble_assets_for_run` and `deliver_context`)
+            // that must agree on this path for one run.
+            //
+            // The guest never sees this host detail: `stage_whole` copies a file
+            // asset by its OWN BASENAME to the asset image root, so the CLI still
+            // finds it at `../<file>` relative to its workdir regardless of which
+            // host directory it was staged from.
+            Some(ContextLocation::WorkspaceParent(file)) => {
+                let parent = workdir.parent().ok_or_else(|| {
                     format!(
                         "{}: context.path names the parent of the run's workdir, but \
                          {} has none",
                         self.spec.tag,
                         workdir.display()
                     )
-                })?
-                .join(file),
+                })?;
+                let slug = workdir.file_name().ok_or_else(|| {
+                    format!(
+                        "{}: run workdir {} has no name to key its context document by",
+                        self.spec.tag,
+                        workdir.display()
+                    )
+                })?;
+                parent.join(RUN_RUNTIME_DIR).join(slug).join(file)
+            }
         };
         Ok(Some(dir))
     }
@@ -1106,9 +1241,9 @@ impl CliProvider {
     /// - The child never runs on the host. `[sandbox] runtime` is
     ///   `firecracker` and there is no second arm, so the blast radius of
     ///   "trusted" is a guest this run booted and destroys.
-    /// - That sandbox has a private netns and an egress allowlist (broker +
-    ///   node RPC + public), so a project hook reaches nothing the run was not
-    ///   already given.
+    /// - The guest gets no tap device at all — its whole reach is the vsock
+    ///   tunnels (broker + node RPC + public, see [`wire_guest_tunnels`]), so a
+    ///   project hook reaches nothing the run was not already given.
     /// - `$HOME` is never mounted (D7): the config home the trust decision is
     ///   written into IS this run's, drawn per run and deleted with it.
     /// - Above all, the process being asked is an agent already executing
@@ -1517,13 +1652,15 @@ fn guest_argv(bin: &Path, args: &[String], layout: &GuestLayout) -> Vec<String> 
 /// whole 9.1 GB of it and died with `No space left on device` — with the node's
 /// memory as the thing consumed. Only the socket belongs there; see
 /// [`microvm_socket`].
-fn microvm_run_dir(slot: &str) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("dt-vm-{slot}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
-    Ok(dir)
+fn microvm_run_dir(slot: &str) -> Result<microvm::ScratchDir, String> {
+    microvm::ScratchDir::create(std::env::temp_dir().join(format!("dt-vm-{slot}")))
 }
 
-/// the run's vsock socket path, which is the ONE thing that must be short.
+/// the leaf the guest dials, inside [`microvm_socket_dir`]. Firecracker appends
+/// `_<port>` to it.
+const MICROVM_SOCKET_NAME: &str = "v.sock";
+
+/// the run's vsock socket directory, which is the ONE thing that must be short.
 ///
 /// A unix socket path is capped near 108 bytes (`SUN_LEN`), and Firecracker
 /// appends `_<port>` to it. `XDG_RUNTIME_DIR` is the shortest per-user
@@ -1531,14 +1668,14 @@ fn microvm_run_dir(slot: &str) -> Result<PathBuf, String> {
 /// long home blows straight through the cap, and the failure is
 /// `path must be shorter than SUN_LEN` at bind time — after the images have
 /// already been built.
-fn microvm_socket(slot: &str) -> Result<PathBuf, String> {
+///
+/// It is a tmpfs, so a leaked directory here is the node's own RAM: the
+/// returned guard is what makes a refused run cost nothing.
+fn microvm_socket_dir(slot: &str) -> Result<microvm::ScratchDir, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("dt-vm-{slot}"));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create socket dir {}: {e}", dir.display()))?;
-    Ok(dir.join("v.sock"))
+    microvm::ScratchDir::create(base.join(format!("dt-vm-{slot}")))
 }
 
 /// this run's directory name, DRAWN FRESH — never derived from the run's
@@ -1595,15 +1732,18 @@ fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
 
 /// removes a run's context document on drop — every exit path (success, error,
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
-/// it sits beside the checkout, where nothing else would ever clean it up, and a
-/// stale soul left there would silently join the NEXT run whose checkout lands in
-/// the same parent. a `config-home:` doc needs no guard of its own: it is inside
-/// the run's [`RunHome`], which removes the whole directory when the run ends.
+/// it sits beside the checkout, in this run's own slug-named directory under
+/// `RUN_RUNTIME_DIR` (see [`Provider::context_target`]), where nothing else
+/// would ever clean it up. Removing the whole directory rather than just the
+/// file means the slug directory itself does not linger empty. a `config-home:`
+/// doc needs no guard of its own: it is inside the run's [`RunHome`], which
+/// removes the whole directory when the run ends.
 struct ContextGuard(PathBuf);
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.0) {
+        let dir = self.0.parent().unwrap_or(&self.0);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
             // Its twin, `RunHome::drop`, has always been a `tracing::warn` —
             // this one printed to raw stderr, which reaches neither the app's
             // Logs tab nor `RUST_LOG`.
@@ -1638,41 +1778,61 @@ impl Drop for ContextGuard {
 /// away rather than leave the run half-planed — writes landing over the
 /// run-action lane while every read dies on the guest's own loopback.
 ///
-/// **The node entry is a whole http listener, not a read lane.** The VM has no
-/// NIC, so these tunnels ARE the guest's attack surface. Reachable from any
-/// process in the guest, with no credential:
+/// **The node entry is this run's read lane, not the node's listener.** The VM
+/// has no NIC, so these tunnels ARE the guest's attack surface — and the node
+/// end of them terminates in [`read_lane::ReadLane`], a loopback proxy bound to
+/// THIS run, which refuses `/v1/ws` outright (see that module). What is
+/// reachable from any process in the guest, with no credential:
 /// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
-///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
+///   `/v1/blocks`, `/v1/index/*`, `/metrics`, the `/v1/files/*` duckfs reads;
 /// * `/v1/submit/frame` — self-authenticating: the frame's own signature IS
 ///   its origin, so a guest with no key can put nothing through it;
 /// * `/v1/services/hello`, volatile presence that ages out on its own TTL;
-/// * `/v1/ws` — no credential of any kind, and it carries the `logs` topic, so
-///   a guest can read this operator's log ring;
 /// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
 ///   over the overlay to a publisher node, and its only gate,
 ///   `gateway_http::gateway_api_origin_allowed`, is a header check a native
 ///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
 ///
 /// Out of reach: every other port and every other address on this host (no
-/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and
-/// EVERY MUTATING `/v1` ROUTE — `/v1/submit`, `/v1/invite`, the duckfs writes,
-/// the object facade's PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`
-/// and `/v1/log-filter` all want either a per-request user signature or this
-/// node's operator credential (`noded::signed_req`), and a run's env is an
-/// allowlist that carries neither. The forge's `git-receive-pack` takes the
-/// same two proofs in git's own shapes — a `git push --signed` certificate or
-/// that operator credential in a header — and a guest can present neither.
+/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and the
+/// NODE-LEVEL mutations — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`
+/// and `DELETE /v1/fs/workspaces/{id}` — which take either this node's
+/// operator credential (a 0600 file in a workspace the guest has no path to)
+/// or a signature by the key the node knows as its operator's
+/// (`noded::signed_req`), and a run's env carries neither. The forge's
+/// `git-receive-pack` takes the same two proofs in git's own shapes — a
+/// `git push --signed` certificate or that operator credential in a header —
+/// and a guest can present neither ITSELF: the lane presents the operator
+/// credential on the guest's behalf for every push (a fetch needs no proof).
 ///
-/// Narrowing the READS to a scoped lane is the open half of #1317, and this
-/// function is the one place such a lane would replace.
+/// Off the host altogether, the guest has one more tunnel: its egress proxy
+/// ([`egress_proxy`]), named through `HTTP_PROXY`/`HTTPS_PROXY`, which dials
+/// the network for it and refuses to dial this host.
+///
+/// **In reach, on purpose:** the MODULE-BOUND mutations — `/v1/submit`, the
+/// duckfs writes, the object facade's PUT/DELETE, `POST /v1/fs/workspaces` and
+/// its commit. Those take a per-request signature by ANY key, because the
+/// verified key becomes the op's `Origin::External` and the module's
+/// `check_authority` is what decides. A guest can mint a keypair and sign, and
+/// what it can then do is exactly what that key is authorized to do on-chain —
+/// which for a fresh key is nothing.
+///
+/// The gateway egress above is what remains: a run's own credential-less reach
+/// off this host, gated only by a header check.
 fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
     let mut ports = Vec::new();
     ports.extend(broker_base.and_then(url_port));
     if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
         ports.extend(url_port(run_action));
     }
-    // three distinct listeners on one host, so three distinct ports: nothing to
-    // dedup, and a duplicate would be a bug upstream rather than a collision to
+    if let Some((_, proxy)) = envs
+        .iter()
+        .find(|(key, _)| key == egress_proxy::HTTPS_PROXY_ENV)
+    {
+        ports.extend(url_port(proxy));
+    }
+    // distinct listeners on one host, so distinct ports: nothing to dedup,
+    // and a duplicate would be a bug upstream rather than a collision to
     // absorb here.
     ports.extend(aim_node_at_guest(envs));
     ports
@@ -1855,9 +2015,13 @@ async fn wait_leader_exit_unreaped(pid: u32, label: &str) {
             Err(error) => {
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] observe unreaped {label} exit \
-                         (attempt {failures}): {error}"
+                    tracing::warn!(
+                        target: "ducktape::provider",
+                        reason = "leader_exit_unobserved",
+                        %label,
+                        attempts = failures,
+                        %error,
+                        "failed to observe whether the process leader exited"
                     );
                 }
             }
@@ -1872,7 +2036,14 @@ async fn wait_process_group_gone(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(160) {
-            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "process_group_lingering",
+                %label,
+                group,
+                attempts = observations,
+                "waiting for the process group to disappear"
+            );
         }
         tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
     }
@@ -1884,7 +2055,14 @@ fn wait_process_group_gone_blocking(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(400) {
-            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "process_group_lingering",
+                %label,
+                group,
+                attempts = observations,
+                "waiting for the process group to disappear"
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1901,9 +2079,13 @@ async fn wait_tokio_child_fail_closed(
             Err(error) => {
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] wait/reap {label} failed \
-                         (attempt {failures}): {error}"
+                    tracing::warn!(
+                        target: "ducktape::provider",
+                        reason = "child_wait_failed",
+                        %label,
+                        attempts = failures,
+                        %error,
+                        "failed to wait on the child process"
                     );
                 }
                 tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
@@ -1971,12 +2153,19 @@ async fn terminate_child(
     if let Some(group) = process_group
         && let Err(error) = signal_process_group(group, libc::SIGTERM)
     {
-        eprintln!("[capability-host] SIGTERM provider process group {group}: {error}");
+        tracing::warn!(
+            target: "ducktape::provider",
+            reason = "sigterm_failed",
+            group,
+            %error,
+            "failed to SIGTERM the provider process group"
+        );
     }
 
     #[cfg(unix)]
     {
         if let Some(group) = process_group {
+            let mut observe_failures = 0u64;
             loop {
                 match leader_exited_unreaped(group) {
                     Ok(true) => {
@@ -1990,8 +2179,12 @@ async fn terminate_child(
                     Ok(false) if tokio::time::Instant::now() < deadline => {}
                     Ok(false) => {
                         if let Err(error) = signal_process_group(group, libc::SIGKILL) {
-                            eprintln!(
-                                "[capability-host] SIGKILL provider process group {group}: {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "sigkill_failed",
+                                group,
+                                %error,
+                                "failed to SIGKILL the provider process group"
                             );
                         }
                         let _ = child.start_kill();
@@ -2000,9 +2193,17 @@ async fn terminate_child(
                     Err(error) => {
                         // ECHILD or an unreadable wait state makes ownership
                         // unverifiable. Retain the reservation fail-closed.
-                        eprintln!(
-                            "[capability-host] observe cancelled provider leader {group}: {error}"
-                        );
+                        observe_failures += 1;
+                        if observe_failures == 1 || observe_failures.is_multiple_of(16) {
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "leader_observe_failed",
+                                group,
+                                attempts = observe_failures,
+                                %error,
+                                "failed to observe the cancelled provider leader"
+                            );
+                        }
                     }
                 }
                 tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
@@ -2073,9 +2274,13 @@ impl GroupChild {
                     Err(error) => {
                         inspect_failures += 1;
                         if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] inspect setup child before kill \
-                                 (attempt {inspect_failures}): {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "inspect_setup_child_failed",
+                                group,
+                                attempts = inspect_failures,
+                                %error,
+                                "failed to inspect the setup child before killing it"
                             );
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2090,9 +2295,13 @@ impl GroupChild {
                     Err(error) => {
                         wait_failures += 1;
                         if wait_failures == 1 || wait_failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] reap killed setup child \
-                                 (attempt {wait_failures}): {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "reap_setup_child_failed",
+                                group,
+                                attempts = wait_failures,
+                                %error,
+                                "failed to reap the killed setup child"
                             );
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2132,9 +2341,12 @@ impl GroupChild {
                 Err(error) => {
                     inspect_failures += 1;
                     if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] inspect setup child before kill \
-                             (attempt {inspect_failures}): {error}"
+                        tracing::warn!(
+                            target: "ducktape::provider",
+                            reason = "inspect_setup_child_failed",
+                            attempts = inspect_failures,
+                            %error,
+                            "failed to inspect the setup child before killing it"
                         );
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -2157,9 +2369,12 @@ impl GroupChild {
                 Err(error) => {
                     wait_failures += 1;
                     if wait_failures == 1 || wait_failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] reap killed setup child \
-                             (attempt {wait_failures}): {error}"
+                        tracing::warn!(
+                            target: "ducktape::provider",
+                            reason = "reap_setup_child_failed",
+                            attempts = wait_failures,
+                            %error,
+                            "failed to reap the killed setup child"
                         );
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -2268,7 +2483,9 @@ impl Drop for LiveChild {
 /// identically.
 enum RunControl {
     Local(LiveChild),
-    MicroVm(MicroVmHandle),
+    /// boxed: the handle carries the VM, its io pump and the guest's tunnels,
+    /// and a run holds exactly one of these.
+    MicroVm(Box<MicroVmHandle>),
 }
 
 /// a running microVM: the VMM child, the guest's exit channel, the background
@@ -2284,6 +2501,17 @@ struct MicroVmHandle {
     pump: Option<tokio::task::JoinHandle<()>>,
     /// the HOST directory the run's workspace image is walked back into.
     workdir: PathBuf,
+    /// held for the VM's lifetime: the guest's node lane and egress proxy,
+    /// which must not outlive the guest they answer.
+    _lanes: GuestLanes,
+}
+
+/// the host ends of a guest's tunnels that this crate itself terminates: the
+/// node lane behind `DUCKTAPE_NODE`, and the egress proxy behind
+/// `HTTPS_PROXY`. Each lives exactly as long as the run holding it.
+pub(crate) struct GuestLanes {
+    _read_lane: Option<read_lane::ReadLane>,
+    _egress: egress_proxy::EgressProxy,
 }
 
 impl RunControl {
@@ -2352,8 +2580,8 @@ impl RunControl {
         match self {
             RunControl::Local(_) => Ok(()),
             RunControl::MicroVm(handle) => {
-                let workdir = handle.workdir.clone();
-                handle.vm.collect(&workdir).await
+                let handle = *handle;
+                handle.vm.collect(&handle.workdir).await
             }
         }
     }
@@ -2417,6 +2645,16 @@ fn flush_pending_line(
     );
 }
 
+/// append `chunk` to `buf`, keeping only the last `cap` bytes: a bounded
+/// rolling tail rather than a truncation trigger. Used for stderr, which is
+/// never the run's answer and only ever surfaces as [`excerpt`]'s short slice.
+fn push_bounded_tail(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    buf.extend_from_slice(chunk);
+    if buf.len() > cap {
+        buf.drain(..buf.len() - cap);
+    }
+}
+
 fn effective_provider_deadline(
     last_activity: tokio::time::Instant,
     idle: Duration,
@@ -2473,19 +2711,20 @@ impl CliProvider {
             RunControl,
         ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io) = self
+            let (vm, io, lanes) = self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
                 .await?;
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
                 Box::new(io.stderr),
-                RunControl::MicroVm(MicroVmHandle {
+                RunControl::MicroVm(Box::new(MicroVmHandle {
                     vm,
                     exit: Some(io.exit),
                     pump: Some(io.pump),
                     workdir: workdir.to_path_buf(),
-                }),
+                    _lanes: lanes,
+                })),
             )
         } else {
             let mut command = self.prepared_command(args, workdir, ctx, &auth)?;
@@ -2576,6 +2815,25 @@ impl CliProvider {
                         out_bytes.extend_from_slice(&obuf[..n]);
                         forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
+                        if out_bytes.len() > MAX_RUN_OUTPUT_BYTES {
+                            if let Some(invocation) = &broker_invocation {
+                                invocation.revoke();
+                            }
+                            control.terminate().await;
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "output_cap_exceeded",
+                                bin = %self.bin.display(),
+                                bytes = out_bytes.len(),
+                                cap = MAX_RUN_OUTPUT_BYTES,
+                                "run stdout exceeded the output cap (child killed)"
+                            );
+                            return Err(format!(
+                                "{} stdout exceeded the {MAX_RUN_OUTPUT_BYTES}-byte output cap \
+                                 (child killed): output_cap_exceeded",
+                                self.bin.display()
+                            ));
+                        }
                     }
                     Err(e) => {
                         if let Some(invocation) = &broker_invocation {
@@ -2594,7 +2852,7 @@ impl CliProvider {
                         flush_pending_line(&mut err_pending, OutputStream::Stderr, &output_sink, ctx);
                     }
                     Ok(n) => {
-                        err_bytes.extend_from_slice(&ebuf[..n]);
+                        push_bounded_tail(&mut err_bytes, &ebuf[..n], MAX_RUN_STDERR_BYTES);
                         forward_lines(&mut err_pending, &ebuf[..n], OutputStream::Stderr, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
                     }
@@ -3014,11 +3272,10 @@ fn excerpt(s: &str) -> String {
 
 /// load this host's capability specs and probe for their binaries.
 ///
-/// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
-/// (explicitly set and missing = hard error — the operator asked for a dir
-/// that is not there) or `<ducktape home>/capabilities` when it exists. a broken
-/// spec is a hard `Err`: an operator config error fails the boot loudly, it
-/// does not silently drop an executor.
+/// spec sources: the embedded built-ins, then the workspace's `capability_dir`
+/// when it exists (an absent dir is a node offering only the built-ins). a
+/// broken spec is a hard `Err`: an operator config error fails the boot
+/// loudly, it does not silently drop an executor.
 ///
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.
@@ -3040,11 +3297,14 @@ type ExecutorLookup<'a> = (Option<OsString>, &'a dyn Fn(&str) -> Option<OsString
 
 pub fn discover(
     node_identity: &[u8],
+    capability_dir: &Path,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
     managed_owner: &str,
 ) -> Result<ProviderSet, String> {
-    let specs = SpecSet::load(operator_spec_dir().as_deref())?;
+    // the workspace's operator specs, when the workspace has any: an absent
+    // directory is a node offering only the built-in specs, not an error.
+    let specs = SpecSet::load(capability_dir.is_dir().then_some(capability_dir))?;
     let _executing_node = execution_node_id(node_identity);
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
@@ -3074,24 +3334,6 @@ pub fn discover(
         backend,
         managed_owner,
     ))
-}
-
-/// the operator spec dir: an explicit `$DUCKTAPE_CAPABILITY_DIR` is returned
-/// even if absent (so the load errors loudly), the default location only when
-/// it actually exists (absent default = simply no operator specs).
-///
-/// the default hangs off [`ducktape_home::root`] — the same root that gives
-/// this node its keys, workspaces, executors and guest images. a node run
-/// under `DUCKTAPE_HOME=/srv/duck` must not find all of those there and then
-/// read its operator specs out of `$HOME`. that resolver is a zero-dependency
-/// leaf crate, so linking it costs this crate's light consumers — agent-service
-/// and compute-service — nothing at all.
-fn operator_spec_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("DUCKTAPE_CAPABILITY_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let dir = ducktape_home::root().ok()?.join("capabilities");
-    dir.is_dir().then_some(dir)
 }
 
 /// the parameterized core of [`discover`]: specs in, providers out, all env
@@ -3272,10 +3514,8 @@ mod tests {
     /// a per-test scratch dir under the system temp root; unique by pid +
     /// test name so parallel tests never collide.
     fn scratch(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "capability-host-test-{}-{test}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("provider-host-test-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -3299,6 +3539,14 @@ mod tests {
         None
     }
 
+    /// a workspace capability directory that does not exist: `discover`
+    /// then announces the built-in specs only, which is what every test
+    /// here wants (the crate is executor-agnostic; the tests never name an
+    /// operator spec).
+    fn no_specs() -> PathBuf {
+        scratch("no-operator-specs").join("capabilities")
+    }
+
     /// the microVM backend a hardware test uses, from the artifacts
     /// `ops/build-guest-rootfs.sh` produces.
     ///
@@ -3310,20 +3558,16 @@ mod tests {
         firecracker_backend_with(installed_executor_dir())
     }
 
-    /// this operator's own executors directory: `$DUCKTAPE_EXECUTOR_DIR`, else
-    /// `<ducktape home>/executors` — resolved through [`ducktape_home::root`],
-    /// which is what a real node resolves it through too.
+    /// the executors directory a hardware test lends its guest:
+    /// `$DUCKTAPE_EXECUTOR_DIR`, a workspace's `executors/` on the box running
+    /// the hardware lane. A test-harness variable, not the product's — a node
+    /// resolves its executors from its workspace and reads no env for them.
+    /// Unset, an empty directory: the test announces nothing and skips.
     fn installed_executor_dir() -> PathBuf {
         match std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => home_for_tests().join("executors"),
+            None => executors_of("no-installed-executors", &[]),
         }
-    }
-
-    /// the operator root a hardware test's artifacts sit under. `expect`
-    /// because a run with neither variable set has nowhere to look for them.
-    fn home_for_tests() -> PathBuf {
-        ducktape_home::root().expect("the test env resolves an operator root")
     }
 
     /// the live backend with an explicit executors directory — the one whose
@@ -3342,13 +3586,14 @@ mod tests {
         )
     }
 
-    /// the guest images the rootfs builder wrote: `$DUCKTAPE_GUEST_DIR` when a
-    /// hardware run points this at a build tree, else `<ducktape home>/guest`
-    /// — the same default the builder and the `[sandbox]` table use.
+    /// the guest images the rootfs builder wrote: `$DUCKTAPE_GUEST_DIR`, a
+    /// workspace's `guest/` on the box running the hardware lane. A
+    /// test-harness variable like `DUCKTAPE_EXECUTOR_DIR` above. Unset, a
+    /// directory holding no images: `probe()` refuses and the test skips.
     fn live_backend(vmm: sandbox_host::Vmm, executors: PathBuf) -> SandboxBackend {
         let dir = match std::env::var_os("DUCKTAPE_GUEST_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => home_for_tests().join("guest"),
+            None => scratch("no-guest-images").join("guest"),
         };
         SandboxBackend::MicroVm {
             vmm,
@@ -3389,9 +3634,15 @@ mod tests {
     fn a_microvm_node_announces_its_guest_and_never_the_host_path() {
         let empty = scratch("announce-empty").join("executors");
         std::fs::create_dir_all(&empty).expect("executors dir");
-        let announced = discover(b"n", None, firecracker_backend_with(empty), "test")
-            .expect("discover")
-            .capabilities();
+        let announced = discover(
+            b"n",
+            &no_specs(),
+            None,
+            firecracker_backend_with(empty),
+            "test",
+        )
+        .expect("discover")
+        .capabilities();
         assert!(
             announced.is_empty(),
             "an empty executors directory announces nothing, whatever is on PATH: {announced:?}"
@@ -3406,9 +3657,15 @@ mod tests {
         for name in ["codex", "codex-code-mode-host"] {
             std::fs::copy("/bin/true", installed.join(name)).expect("copy");
         }
-        let announced = discover(b"n", None, firecracker_backend_with(installed), "test")
-            .expect("discover")
-            .capabilities();
+        let announced = discover(
+            b"n",
+            &no_specs(),
+            None,
+            firecracker_backend_with(installed),
+            "test",
+        )
+        .expect("discover")
+        .capabilities();
         assert!(
             announced.iter().any(|tag| tag == "codex"),
             "an installed executor bundle is announced: {announced:?}"
@@ -3577,12 +3834,17 @@ format = "text"
     #[tokio::test]
     async fn a_workspace_parent_context_spec_writes_the_soul_beside_the_checkout_and_cleans_it_up()
     {
-        // the doc lands at the parent of the run's checkout — where the CLI's own
-        // convention finds it, OUTSIDE the tree `commit` scans, and layered UNDER
-        // a repository's own instructions file rather than overwriting it.
+        // the doc lands under a slug-named directory beside the run's checkout —
+        // still OUTSIDE the tree `commit` scans, layered UNDER a repository's own
+        // instructions file, and namespaced per run (#1692) rather than at the
+        // shared parent every run of this tag lands in.
         let root = scratch("soul-parent");
         // the mock CLI prints the delivered file, a separator, then its stdin.
-        let script = fake_cli(&root, "soul.sh", "cat ../SOUL.md; echo ---; cat");
+        let script = fake_cli(
+            &root,
+            "soul.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/checkout/SOUL.md; echo ---; cat"),
+        );
         let provider = sh_provider(
             spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
             script,
@@ -3604,9 +3866,65 @@ format = "text"
         // and the file is gone: it lives outside the workdir, where nothing else
         // would ever clean it up and a stale soul would join the next run.
         assert!(
-            !root.join("SOUL.md").exists(),
-            "the context doc is removed when the run ends"
+            !root.join(RUN_RUNTIME_DIR).join("checkout").exists(),
+            "the context doc's per-run directory is removed when the run ends"
         );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_workspace_parent_runs_never_share_a_soul() {
+        // #1692: two runs of the same tag share `workdir.parent()` — the node's
+        // whole runs root — so a shared host path for the context doc would let
+        // whichever run writes second clobber the first's soul before either
+        // child reads it, and whichever run's guard drops first delete it out
+        // from under the other. Namespacing the doc under each run's own slug
+        // (see `Provider::context_target`) means neither happens.
+        let root = scratch("soul-parent-concurrent");
+        let script_a = fake_cli(
+            &root,
+            "soul-a.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/run-a/SOUL.md; echo ---; cat"),
+        );
+        let script_b = fake_cli(
+            &root,
+            "soul-b.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/run-b/SOUL.md; echo ---; cat"),
+        );
+        let provider_a = sh_provider(
+            spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
+            script_a,
+            "soul-parent-concurrent-scratch-a",
+        );
+        let provider_b = sh_provider(
+            spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
+            script_b,
+            "soul-parent-concurrent-scratch-b",
+        );
+        let ctx_a = RunContext {
+            workdir_override: Some(root.join("run-a")),
+            context_doc: Some("# soul A\n".to_string()),
+            ..RunContext::default()
+        };
+        let ctx_b = RunContext {
+            workdir_override: Some(root.join("run-b")),
+            context_doc: Some("# soul B\n".to_string()),
+            ..RunContext::default()
+        };
+
+        // both runs execute concurrently, sharing `root` as their workdir parent —
+        // exactly the shape #1692 describes.
+        let (out_a, out_b) = tokio::join!(
+            provider_a.run("PROMPT-A", &ctx_a),
+            provider_b.run("PROMPT-B", &ctx_b),
+        );
+
+        // each child saw ITS OWN soul, never the other's.
+        assert_eq!(out_a.expect("run A succeeds"), "# soul A\n---\nPROMPT-A");
+        assert_eq!(out_b.expect("run B succeeds"), "# soul B\n---\nPROMPT-B");
+        // and one run's guard dropping did not remove the other's still-live
+        // per-run directory.
+        assert!(!root.join(RUN_RUNTIME_DIR).join("run-a").exists());
+        assert!(!root.join(RUN_RUNTIME_DIR).join("run-b").exists());
     }
 
     #[tokio::test]
@@ -4471,17 +4789,17 @@ format = "text"
         assert_eq!(set.capabilities(), vec!["myllm"]);
     }
 
-    /// This crate never resolves the operator root itself.
+    /// This crate never resolves an operator root itself.
     ///
     /// A source-parsing lint over every `src/*.rs` because the SHAPE is the
-    /// property and the seam reads process env, which this crate's discovery
-    /// path deliberately injects rather than mutates. Re-derive the root here
-    /// and a node under `DUCKTAPE_HOME=/srv/duck` finds its keys, workspaces,
-    /// executors and images there while reading its capability specs out of
-    /// `$HOME` — silently, since an absent default dir just means "no operator
-    /// specs". `ducktape_home::root()` is the answer and costs nothing to
-    /// link. The needles carry their own quotes, so the escaped spellings on
-    /// these lines are not themselves hits.
+    /// property: the capability directory is the WORKSPACE's
+    /// (`<workspace>/capabilities`), handed to [`discover`] by the daemon that
+    /// knows which workspace it serves. Re-derive a root here and a node
+    /// under `DUCKTAPE_HOME=/srv/duck` finds its keys, executors and images
+    /// in its workspace while reading its capability specs out of `$HOME` —
+    /// silently, since an absent dir just means "no operator specs". The
+    /// needles carry their own quotes, so the escaped spellings on these
+    /// lines are not themselves hits.
     #[test]
     fn operator_spec_root_is_never_resolved_in_this_crate() {
         const OVERRIDE_NEEDLE: &str = "\"DUCKTAPE_HOME\"";
@@ -4504,8 +4822,8 @@ format = "text"
         }
         assert!(
             offenders.is_empty(),
-            "these files resolve the operator root themselves instead of \
-             asking ducktape_home::root() for it: {offenders:?}"
+            "these files resolve an operator root themselves; the capability directory is \
+             the caller's workspace to name (`discover` takes it): {offenders:?}"
         );
     }
 
@@ -4925,6 +5243,40 @@ printf '{"type":"turn.completed"}\n'"#,
     }
 
     #[tokio::test]
+    async fn a_run_writing_past_the_output_cap_is_terminated_not_truncated() {
+        // a continuously-writing guest must be TERMINATED at the cap, never
+        // truncated and parsed anyway — a truncated JSON/JSONL blob would
+        // otherwise land as the run's "answer". idle stays generous (5s) so
+        // the output cap fires first, not the idle/hard timeout.
+        let dir = scratch("output-cap");
+        let bin = fake_cli(
+            &dir,
+            "firehose",
+            // a 100_000-byte chunk per iteration (no per-byte forking) clears
+            // the 4 MiB cap in ~42 writes rather than thousands of small ones.
+            "cat > /dev/null\n\
+             big=$(printf '%0100000d' 0)\n\
+             while true; do printf '%s' \"$big\"; done",
+        );
+        let p = mock_provider("firehose", "text", bin, "output-cap-wd")
+            .with_timeout(Duration::from_secs(10));
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
+        assert!(
+            err.contains("output_cap_exceeded"),
+            "names the outcome: {err}"
+        );
+    }
+
+    #[test]
+    fn push_bounded_tail_keeps_the_last_bytes_only() {
+        let mut buf = Vec::new();
+        push_bounded_tail(&mut buf, b"0123456789", 4);
+        assert_eq!(buf, b"6789", "oldest bytes drop first");
+        push_bounded_tail(&mut buf, b"ABC", 4);
+        assert_eq!(buf, b"9ABC", "the tail keeps rolling as more arrives");
+    }
+
+    #[tokio::test]
     async fn a_prompt_larger_than_the_pipe_buffer_does_not_deadlock() {
         let dir = scratch("big-prompt");
         // the fake streams output BEFORE draining stdin — the deadlock shape a
@@ -5102,6 +5454,7 @@ printf '%s\n' "$PATH"
             limits: BTreeMap::new(),
             context_doc: None,
             airlock: None,
+            operator_credential: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();
@@ -5293,17 +5646,84 @@ printf '%s\n' "$PATH"
 
         for slot in &slots {
             assert_eq!(slot.len(), 16, "the slot is 16 hex chars: {slot}");
-            let socket = microvm_socket(slot).expect("socket path");
-            let dialled = format!("{}_{}", socket.display(), 1024);
+            let socket_dir = microvm_socket_dir(slot).expect("socket dir");
+            let dialled = format!(
+                "{}_{}",
+                socket_dir.path().join(MICROVM_SOCKET_NAME).display(),
+                1024
+            );
             assert!(
                 dialled.len() < 108,
                 "the guest dials {dialled} ({} bytes), past SUN_LEN",
                 dialled.len()
             );
-            if let Some(dir) = socket.parent() {
-                let _ = std::fs::remove_dir_all(dir);
-            }
+            // dropping the guard removes it, which is the property the next
+            // test pins.
         }
+    }
+
+    /// Nothing is created before the run can be REFUSED.
+    ///
+    /// `executor_image::ensure` refuses a foreign binary in the operator's
+    /// executors directory on every single run, and it used to run after both
+    /// of the run's directories existed — so a node in that state leaked a
+    /// directory pair per refused attempt, one of them on a tmpfs. A source
+    /// lint because the seam needs `/dev/kvm` and the guest artifacts: what is
+    /// checkable is the order.
+    #[test]
+    fn the_executors_image_is_derived_before_any_scratch_exists() {
+        let src = include_str!("lib.rs");
+        let (body, _) = src
+            .split_once("microvm::MicroVm::boot(")
+            .expect("the microVM boot call");
+        let (_, body) = body
+            .rsplit_once("async fn microvm_boot(")
+            .expect("microvm_boot");
+        let ensure = body
+            .find("executor_image::ensure(")
+            .expect("microvm_boot derives the executors image");
+        let scratch = body
+            .find("microvm_run_dir(")
+            .expect("microvm_boot creates the run directory");
+        assert!(
+            ensure < scratch,
+            "a refusal from executor_image::ensure must cost no directory"
+        );
+    }
+
+    /// A refused run leaves neither of its directories behind — the whole
+    /// point of handing both to guards.
+    #[test]
+    fn a_refused_run_leaves_neither_directory() {
+        let slot = run_slot();
+        let (run_dir, socket_dir) = {
+            let run = microvm_run_dir(&slot).expect("run dir");
+            let socket = microvm_socket_dir(&slot).expect("socket dir");
+            assert!(run.path().is_dir() && socket.path().is_dir());
+            // #1693: the run directory (holding manifest.bin and the run's
+            // workspace/asset images once boot writes them) must not be
+            // world- or group-readable — a bare `create_dir_all` under a
+            // normal umask lands 0755.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(run.path())
+                    .expect("run dir metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} is readable by group/other: {mode:o}",
+                    run.path().display()
+                );
+            }
+            (run.path().to_path_buf(), socket.path().to_path_buf())
+            // both guards drop here, as they do on every `?` in `microvm_boot`
+            // before the VM exists.
+        };
+        assert!(!run_dir.exists(), "{} survived", run_dir.display());
+        assert!(!socket_dir.exists(), "{} survived", socket_dir.display());
     }
 
     /// The production shape end to end: the operator's OWN installed CLI, in an
@@ -5428,6 +5848,121 @@ format = "text"
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// one of this host's off-loopback addresses, or `None` when it has none:
+    /// the route a connected UDP socket picks (connecting sends nothing) names
+    /// the address the kernel would speak from.
+    fn off_loopback_address() -> Option<std::net::Ipv4Addr> {
+        let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        // TEST-NET-1: a destination that exists only to pick the route.
+        probe.connect("192.0.2.1:9").ok()?;
+        match probe.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(ip) if egress_proxy::off_host(std::net::IpAddr::V4(ip)) => {
+                Some(ip)
+            }
+            _ => None,
+        }
+    }
+
+    /// LIVE: the guest's way off this host is the egress proxy on its own
+    /// tunnel. A responder bound on one of this host's off-loopback addresses
+    /// (which the proxy admits) answers a guest `curl` through `$HTTPS_PROXY`
+    /// twice — absolute-form, then through CONNECT — and the link-local
+    /// metadata address is refused, because the proxy never dials this host
+    /// or anything beside it. The guest has no network device: every byte of this went over
+    /// the vsock tunnel `wire_guest_tunnels` opened for the proxy.
+    ///
+    /// `#[ignore]`: needs `/dev/kvm`, the guest artifacts, and an off-loopback
+    /// address on this host.
+    ///   DUCKTAPE_GUEST_DIR=… cargo test -p provider-host --lib -- --ignored \
+    ///     --nocapture firecracker_egress
+    #[tokio::test]
+    #[ignore = "live: needs /dev/kvm, a built guest rootfs and an off-loopback address"]
+    async fn firecracker_egress_proxy_relays_off_host_and_refuses_this_host() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let backend = firecracker_backend_with(executors_of("firecracker-egress-bin", &["sh"]));
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
+            return;
+        }
+        let Some(lan) = off_loopback_address() else {
+            eprintln!("skipping: this host has no off-loopback address");
+            return;
+        };
+        let responder = tokio::net::TcpListener::bind((lan, 0))
+            .await
+            .expect("bind the responder on an off-loopback address");
+        let port = responder.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = responder.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = stream.read(&mut head).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\negress-ok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let root = scratch("firecracker-egress");
+        let workdir = root.join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+        // the three legs: absolute-form through the proxy, CONNECT through the
+        // proxy (`-p`), and the link-local metadata address beside this host,
+        // which the proxy refuses. (The host's own loopback is not a leg: the
+        // proxy names it in NO_PROXY so the guest's node lane and broker stay
+        // direct, and curl honours that by not asking the proxy at all.)
+        let script = format!(
+            "cat >/dev/null; \
+             a=$(curl -s --proxy $HTTPS_PROXY http://{lan}:{port}/); \
+             b=$(curl -s -p --proxy $HTTPS_PROXY http://{lan}:{port}/); \
+             c=$(curl -s -o /dev/null -w %{{http_code}} --proxy $HTTPS_PROXY http://169.254.169.254/); \
+             printf %s_%s_%s $a $b $c"
+        );
+        let spec = CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "egress-smoke"
+[detect]
+bin = "sh"
+[invoke]
+args = ["-c", "{script}"]
+prompt = "stdin"
+[output]
+format = "text"
+"#
+            ),
+            "test",
+        )
+        .unwrap();
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/bin/sh"), backend);
+        let ctx = RunContext {
+            workdir_override: Some(workdir),
+            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            executing_node: Some(execution_node_id(b"egress-smoke")),
+            ..RunContext::default()
+        };
+
+        let answer = provider
+            .run("egress-prompt", &ctx)
+            .await
+            .expect("real sandbox provider cycle");
+        eprintln!("--- microVM egress answer: {answer:?} ---");
+        assert_eq!(
+            answer, "egress-ok_egress-ok_403",
+            "absolute-form and CONNECT reach the off-host responder; link-local is refused"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     // ---- live model turns ---------------------------------------------------
     //
     // A REAL turn against the operator's own subscription, inside a real VM.
@@ -5450,6 +5985,7 @@ format = "text"
         Some(
             discover(
                 b"verify-node-000000000000000000000",
+                &no_specs(),
                 None,
                 backend,
                 "verify",
@@ -5527,8 +6063,8 @@ format = "text"
     }
 
     /// the READ plane. Writes ride the broker and the run-action lane, both
-    /// already tunnelled; without the node's own port every `ducktape mcp`
-    /// read tool dies on the guest's own loopback (#1317).
+    /// already tunnelled; without the read lane's port every `ducktape mcp`
+    /// read tool dies on the guest's own loopback.
     #[test]
     fn the_guest_allowlist_carries_the_node_read_plane() {
         let mut envs = vec![

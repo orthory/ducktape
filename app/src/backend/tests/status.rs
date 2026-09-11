@@ -6,7 +6,7 @@ fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(plural(0, "agent", "agents"), "0 agents");
     assert_eq!(plural(2, "agent", "agents"), "2 agents");
     // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
+    assert_eq!(members_summary(true, &[]), "");
 }
 
 /// A SUBTITLE THAT COUNTS NOTHING, OVER A PLATE THAT ALREADY SAID SO. Approvals
@@ -17,45 +17,11 @@ fn a_count_of_one_takes_the_singular_noun() {
 /// sites it did not reach, and each of their screens plates the empty case in
 /// words already.
 ///
-/// A zero BESIDE a real reading is a different thing and stays: `1 agent ·
-/// 0 working` is the sentence doing its job.
+/// A zero BESIDE a real reading is a different thing and stays: `1 human ·
+/// 0 agents` is the sentence doing its job. The Agents subtitle is the
+/// `agents` module view's now, held to the same rule in `crates/views/agents`.
 #[test]
 fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
-    let agent = |live: bool| AgentRow {
-        id: "agent-1".into(),
-        name: "Quackbot".into(),
-        initials: "QU".into(),
-        capability: "mock-llm-1".into(),
-        status: "active".into(),
-        owner_handle: String::new(),
-        live,
-        skill_count: 0,
-        cap_count: 0,
-    };
-    let proposal = |open: bool| ProposalRow {
-        id: "proposal-1".into(),
-        action: "add_resident".into(),
-        detail: String::new(),
-        proposer: String::new(),
-        status: "open".into(),
-        deadline: 0,
-        approvals: 0,
-        rejections: 0,
-        rule: "threshold".into(),
-        required_yes: 1,
-        electorate: 1,
-        open,
-        settled_height: 0,
-    };
-    let entry = FsEntry {
-        key: 0,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 0,
-        object: String::new(),
-    };
-
     let human = MemberRow {
         key: "aa".into(),
         label: "aa".into(),
@@ -68,37 +34,9 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
 
     // Nothing there: the plate on each screen says it in words.
     assert_eq!(members_summary(true, &[]), "");
-    assert_eq!(agents_summary(true, &[]), "");
-    assert_eq!(proposals_summary(true, &[]), "");
-    assert_eq!(fs_counts_summary(true, true, &[]), "");
 
     // Something there: every subtitle speaks, zeros included.
     assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
-    assert_eq!(agents_summary(true, &[agent(false)]), "1 agent · 0 working");
-    assert_eq!(
-        proposals_summary(true, &[proposal(true)]),
-        "1 open · 0 settled"
-    );
-    assert_eq!(
-        proposals_summary(true, &[proposal(false)]),
-        "0 open · 1 settled"
-    );
-    assert_eq!(fs_counts_summary(true, true, &[entry]), "1 file · 0 dirs");
-}
-
-#[test]
-fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
-    // three of the four REQUIRED signatures are in, inside a six-node pool.
-    let dots = quorum_dots(3, 4);
-    assert_eq!(dots.len(), 4);
-    assert_eq!(dots.iter().filter(|seat| seat.filled).count(), 3);
-    assert_eq!(tally_label(3, 4), "3 / 4");
-    assert_eq!(tally_tone(3, 4), "near");
-    assert_eq!(tally_tone(1, 4), "far");
-    assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
-    assert_eq!(tally_note(4, 4), "quorum met");
-    assert_eq!(approve_label(3, 4), "Approve →");
-    assert_eq!(approve_label(1, 4), "Approve");
 }
 
 #[test]
@@ -123,54 +61,7 @@ fn a_log_line_splits_into_time_level_and_message() {
 }
 
 #[test]
-fn explorer_ops_keep_the_full_hash_and_pretty_print_json_payloads() {
-    let op_hash = "dd".repeat(32);
-    let rows = vec![serde_json::json!({
-        "height": 7,
-        "hash": "aa".repeat(32),
-        "commit_hash": "bb".repeat(32),
-        "ops": [
-            {
-                "proposer": "cc".repeat(32),
-                "target": "files",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": "{\"put\":{\"path\":\"/shared/a.png\"}}",
-                "operations": []
-            },
-            {
-                "proposer": "cc".repeat(32),
-                "target": "chat",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": "plain prose, not a document",
-                "operations": []
-            }
-        ]
-    })];
-    // the window lists newest first: ops arrive [files, chat] and reverse.
-    let data = explorer_window(1, &rows);
-    assert_eq!(
-        data.ops[1].op_hash, op_hash,
-        "the op hash is the blob key — the card carries it whole"
-    );
-    assert_eq!(
-        data.ops[1].payload, "{\n  \"put\": {\n    \"path\": \"/shared/a.png\"\n  }\n}",
-        "a JSON payload renders pretty-printed"
-    );
-    assert_eq!(
-        data.ops[0].payload, "plain prose, not a document",
-        "a non-JSON payload stays verbatim"
-    );
-    // the list's landmark stays the short form
-    assert_eq!(data.blocks[0].hash.chars().count(), 13);
-}
-
-#[test]
 fn machine_values_read_as_a_person_reads_them() {
-    assert_eq!(size_label(421_888), "412 KB");
-    assert_eq!(size_label(900), "900 B");
-    assert_eq!(size_label(3 * 1024 * 1024), "3.0 MB");
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");
     assert_eq!(initials_of("Kestrel Song"), "KS");
@@ -351,42 +242,6 @@ fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
     );
 }
 
-#[test]
-fn a_proposal_renders_its_payload_and_its_frozen_bar() {
-    let view = serde_json::json!({
-        "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
-        "voting_rule": { "threshold": { "required_yes": 4 } }
-    });
-    assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
-    // a threshold's bar does not move with the no votes.
-    assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
-    assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
-
-    // a participating majority's quorum is TURNOUT, and passing also needs
-    // yes > no — reading `quorum` straight into a yes counter says "quorum
-    // met" at 3/3 on a vote of 3 yes / 3 no, which does not settle.
-    let majority = serde_json::json!({ "participating_majority": { "quorum": 6 } });
-    assert_eq!(yes_needed(&majority, 0), 6);
-    assert_eq!(
-        yes_needed(&majority, 2),
-        4,
-        "two no votes count toward turnout"
-    );
-    assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
-    assert_eq!(
-        tally_note(3, yes_needed(&majority, 3)),
-        "3 approvals · 1 more for quorum"
-    );
-
-    assert_eq!(tagged_name(&view["action"]), "add_validator");
-    assert_eq!(proposal_kind_tone("add_validator"), "access");
-    assert_eq!(proposal_kind_tone("signal"), "neutral");
-    assert_eq!(
-        gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
-        "ship it"
-    );
-}
-
 /// ONE CARD, ONE SAMPLE — AND THE SAMPLE IS THE WHOLE PAIR.
 ///
 /// A checkpoint carries no meaning alone; it only ever says how far the durable
@@ -480,13 +335,30 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // duplication wearing the costume of defence in depth.
 }
 
-/// The duckfs root is `/`, never "": the module's path check is `starts_with('/')`,
-/// so the crumb's "" root answered every root open with a 400.
+/// A dropped file's target is composed under the directory the view stands
+/// in, and the duckfs root is `/`, never "": the module's path check is
+/// `starts_with('/')`, so a "" root answered every root write with a 400.
 #[test]
-fn the_files_root_is_a_slash() {
-    assert_eq!(fs_parent("/shared".into()), "/");
-    assert_eq!(fs_parent("/".into()), "/");
-    assert_eq!(fs_parent("/shared/reports".into()), "/shared");
+fn a_dropped_file_lands_under_its_directory() {
     assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
     assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
+}
+
+/// THE WRITE GATE IS THE FILES MODULE'S OWN RULE, asked before the round
+/// trip: the roots refuse, and every home and `/shared` answer with nothing.
+/// A device without a key has nothing to check; its refusal comes from the
+/// signer.
+#[test]
+fn the_files_write_gate_answers_in_the_modules_words() {
+    let me = "ab".repeat(32);
+    let other = "cd".repeat(32);
+    let gate = |dir: &str| files_write_gate(dir.into(), me.clone());
+    assert_eq!(gate("/"), "path is outside /home and /shared");
+    assert_eq!(gate("/home"), "home root is not writable");
+    assert_eq!(gate("/shared"), "");
+    assert_eq!(gate("/shared/reports"), "");
+    assert_eq!(gate(&format!("/home/ext:{me}")), "");
+    assert_eq!(gate(&format!("/home/ext:{me}/notes")), "");
+    assert_eq!(gate(&format!("/home/ext:{other}")), "");
+    assert_eq!(files_write_gate("/".into(), String::new()), "");
 }

@@ -23,13 +23,13 @@ fn retired_tagged_trigger_shape_rejects_loudly() {
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AutomationsReply, decode_reply, encode_msg, encode_query};
+use attribution::{AttributionMsg, decode_msg as attribution_decode_msg};
 use chat::{
     Block, Channel, Mark, MessageHead, MessageView, PostPolicy, Span,
     decode_msg as chat_decode_msg, decode_query as chat_decode_query,
     encode_event as chat_encode_event, encode_reply as chat_encode_reply,
 };
 use futures::executor::block_on;
-use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
 use sdk::{Env, Event};
 use sdk_testkit::{MemStore, TestCtx};
 use tasks::{
@@ -38,10 +38,9 @@ use tasks::{
 
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
-const INBOX: &str = "inbox";
+const ATTRIBUTION: &str = "attribution";
+const IDENTITY: &str = "identity";
 const ME: &str = "automations";
-/// the default admin submitter, and therefore the owner of every rule these
-/// tests create: only an authenticated EXTERNAL origin may own a rule.
 const OWNER: &[u8] = b"owner";
 /// a second submitter, who owns nothing.
 const STRANGER: &[u8] = b"stranger";
@@ -61,6 +60,8 @@ struct CaptureCtx {
     msgs: Vec<Msg>,
     /// when set, every query returns an error.
     fail_query: bool,
+    /// when set, only the message-text fetch (`MessagesRange`) errors.
+    fail_text_fetch: bool,
 }
 
 impl CaptureCtx {
@@ -69,17 +70,18 @@ impl CaptureCtx {
             env: Env {
                 height: 7,
                 consensus_time: 42,
-                // an admin ctx by default: rule CRUD is owner-bound, so the
-                // baseline origin is an authenticated submitter. hook-arm
-                // tests swap it with `with_chat_origin`.
+                // an admin ctx by default: rule CRUD records an authenticated
+                // submitter. hook-arm tests swap it with `with_chat_origin`.
                 origin: Origin::External(OWNER.to_vec()),
                 me: ME.into(),
+                cause: sdk::Cause::Direct,
             },
             transcripts: BTreeMap::new(),
             channels: BTreeSet::new(),
             tasks: Vec::new(),
             msgs: Vec::new(),
             fail_query: false,
+            fail_text_fetch: false,
         }
     }
     fn with_origin(mut self, origin: Origin) -> Self {
@@ -103,6 +105,18 @@ impl CaptureCtx {
             id: task_id.into(),
             title: task_id.into(),
             status: TaskStatus::Open,
+            owner: tasks::Party::Module("test".into()),
+            created_at: 0,
+            updated_at: 0,
+        });
+        self
+    }
+    fn with_task_owned_by(mut self, task_id: &str, owner: &[u8]) -> Self {
+        self.tasks.push(Task {
+            id: task_id.into(),
+            title: task_id.into(),
+            status: TaskStatus::Open,
+            owner: tasks::Party::Account(account_of(owner)),
             created_at: 0,
             updated_at: 0,
         });
@@ -110,6 +124,10 @@ impl CaptureCtx {
     }
     fn failing_query(mut self) -> Self {
         self.fail_query = true;
+        self
+    }
+    fn failing_text_fetch(mut self) -> Self {
+        self.fail_text_fetch = true;
         self
     }
     fn chat_msgs(&self) -> Vec<ChatMsg> {
@@ -126,11 +144,11 @@ impl CaptureCtx {
             .map(|m| tasks_decode_msg(&m.payload).expect("task msg"))
             .collect()
     }
-    fn inbox_msgs(&self) -> Vec<InboxMsg> {
+    fn report_msgs(&self) -> Vec<AttributionMsg> {
         self.msgs
             .iter()
-            .filter(|m| m.target == INBOX)
-            .map(|m| inbox_decode_msg(&m.payload).expect("inbox msg"))
+            .filter(|m| m.target == ATTRIBUTION)
+            .map(|m| attribution_decode_msg(&m.payload).expect("attribution msg"))
             .collect()
     }
 }
@@ -148,15 +166,20 @@ impl Ctx for CaptureCtx {
             return Err(Error::Module("query failed".into()));
         }
         match target {
+            IDENTITY => identity_probe(req),
             CHAT => match chat_decode_query(req).map_err(Error::Module)? {
                 ChatQuery::MessagesRange {
                     channel_id,
                     from_seq,
                     limit,
                 } => {
-                    let transcript = self.transcripts.get(&channel_id).ok_or_else(|| {
-                        Error::Module(format!("unknown channel: {channel_id}"))
-                    })?;
+                    if self.fail_text_fetch {
+                        return Err(Error::Module("text fetch failed".into()));
+                    }
+                    let transcript = self
+                        .transcripts
+                        .get(&channel_id)
+                        .ok_or_else(|| Error::Module(format!("unknown channel: {channel_id}")))?;
                     let head = transcript.len() as u64;
                     let from = from_seq.max(1);
                     let mut window = Vec::new();
@@ -176,20 +199,23 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
-                        owner: None,
+                        owner: Party::System,
+                        revision: 0,
                         archived: false,
                     });
                     Ok(chat_encode_reply(&ChatReply::Channel(channel)))
                 }
-                ChatQuery::Message { message_id } => {
-                    Ok(chat_encode_reply(&ChatReply::Message(
-                        self.transcripts
-                            .values()
-                            .flatten()
-                            .find(|view| view.head.message_id == message_id)
-                            .cloned(),
-                    )))
-                }
+                // no fire asks chat for a party's standing: a rule observes
+                // every hooked channel and posts wherever it names, so a
+                // standing probe is a query the module never sends.
+                ChatQuery::Access { .. } => Err(Error::QueryUnsupported),
+                ChatQuery::Message { message_id } => Ok(chat_encode_reply(&ChatReply::Message(
+                    self.transcripts
+                        .values()
+                        .flatten()
+                        .find(|view| view.head.message_id == message_id)
+                        .cloned(),
+                ))),
             },
             // the board answers the SAME two reads the real module does; the
             // duplicate probe uses the by-id `Get`.
@@ -207,6 +233,10 @@ impl Ctx for CaptureCtx {
                         .collect();
                     Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
                 }
+                TaskQuery::OwnerOpenCount { owner } => {
+                    let count = self.tasks.iter().filter(|t| t.owner == owner).count() as u64;
+                    Ok(tasks_encode_reply(&TaskReply::OwnerOpenCount(count)))
+                }
             },
             other => Err(Error::UnknownModule(other.into())),
         }
@@ -220,11 +250,18 @@ impl Ctx for CaptureCtx {
 // ---- fixtures -----------------------------------------------------------
 
 fn module() -> Automations {
-    Automations::new(ME, Box::new(MemStore::new()), CHAT, TASKS, INBOX)
+    Automations::new(
+        ME,
+        Box::new(MemStore::new()),
+        CHAT,
+        TASKS,
+        IDENTITY,
+        ATTRIBUTION,
+    )
 }
 
-fn user(byte: u8) -> AuthorRef {
-    AuthorRef::User(vec![byte; 4])
+fn user(byte: u8) -> Party {
+    Party::Key(vec![byte; 4])
 }
 
 fn post_trigger(channel: Option<&str>, text_contains: Option<&str>) -> Trigger {
@@ -249,12 +286,16 @@ fn task_action(prefix: &str, title: &str) -> Action {
     }
 }
 
-fn inbox_action(member: &str, kind: &str, body: &str) -> Action {
-    Action::DeliverInbox {
-        member_template: member.into(),
+fn report_action(recipient: u64, kind: &str, body: &str) -> Action {
+    Action::Report {
+        recipient,
         kind: kind.into(),
         body_template: body.into(),
     }
+}
+
+fn report_action_to(recipient: &[u8], kind: &str, body: &str) -> Action {
+    report_action(account_of(recipient), kind, body)
 }
 
 fn admin(m: &AutomationsMsg) -> Msg {
@@ -273,7 +314,7 @@ fn create(rule_id: &str, trigger: Trigger, action: Action) -> Msg {
 }
 
 /// a hook event as chat delivers it: raw ChatEvent bytes.
-fn posted(channel: &str, seq: u64, author: AuthorRef, mentions: Vec<AuthorRef>) -> Msg {
+fn posted(channel: &str, seq: u64, author: Party, mentions: Vec<u64>) -> Msg {
     Msg {
         target: ME.into(),
         payload: chat_encode_event(&ChatEvent::MessagePosted {
@@ -286,15 +327,24 @@ fn posted(channel: &str, seq: u64, author: AuthorRef, mentions: Vec<AuthorRef>) 
     }
 }
 
-fn message(channel: &str, seq: u64, author: AuthorRef, blocks: Vec<Block>) -> MessageView {
+fn message(channel: &str, seq: u64, author: Party, blocks: Vec<Block>) -> MessageView {
+    let origin = match &author {
+        Party::Account(account) => Origin::Program(*account),
+        Party::Key(key) => Origin::External(key.clone()),
+        Party::Module(id) => Origin::Module(id.clone()),
+        Party::System => Origin::System,
+    };
     MessageView {
         channel_id: channel.into(),
         seq,
         head: MessageHead {
             message_id: format!("{channel}-m{seq}"),
+            origin: origin.clone(),
+            content_origin: origin,
             author,
             blocks,
             created_at: 0,
+            revision: 0,
             rev: 0,
             edited_at: None,
             base_rev: None,
@@ -406,6 +456,69 @@ fn duplicate_rule_id_is_rejected() {
 }
 
 #[test]
+fn per_owner_rule_cap_refuses_the_next_create_for_that_owner_only() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    for n in 0..MAX_RULES_PER_OWNER {
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                &format!("r{n}"),
+                post_trigger(None, None),
+                task_action(&format!("t{n}"), "T"),
+            ),
+        )
+        .expect("under the per-owner cap");
+    }
+    block_on(m.commit_block()).expect("commit");
+
+    let refused = exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "r-over",
+            post_trigger(None, None),
+            task_action("t-over", "T"),
+        ),
+    )
+    .expect_err("this owner is at its per-owner cap");
+    assert!(
+        matches!(&refused, Error::Module(msg) if msg.contains("rule owner at cap")),
+        "unexpected error: {refused}"
+    );
+
+    // a different owner is unaffected.
+    let mut other = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    exec(
+        &mut m,
+        &mut other,
+        &create("s1", post_trigger(None, None), task_action("s-task", "T")),
+    )
+    .expect("another owner is still admitted");
+
+    // deleting one of the capped owner's rules frees a slot.
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&AutomationsMsg::DeleteRule {
+            rule_id: "r0".into(),
+        }),
+    )
+    .expect("delete frees a slot");
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "r-after-delete",
+            post_trigger(None, None),
+            task_action("t-after-delete", "T"),
+        ),
+    )
+    .expect("the freed slot is usable again");
+}
+
+#[test]
 fn set_enabled_and_delete() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
@@ -505,7 +618,6 @@ fn caps_are_enforced_at_execute() {
         .is_err()
     );
 
-    // empty inbox kind.
     assert!(
         exec(
             &mut m,
@@ -513,13 +625,12 @@ fn caps_are_enforced_at_execute() {
             &create(
                 "inbox-empty-kind",
                 post_trigger(None, None),
-                inbox_action("alice", "", "body")
+                report_action(account_of(OWNER), "", "body")
             ),
         )
         .is_err()
     );
 
-    // oversized inbox kind.
     assert!(
         exec(
             &mut m,
@@ -527,7 +638,7 @@ fn caps_are_enforced_at_execute() {
             &create(
                 "inbox-big-kind",
                 post_trigger(None, None),
-                inbox_action("alice", &"k".repeat(65), "body")
+                report_action(account_of(OWNER), &"k".repeat(65), "body")
             ),
         )
         .is_err()
@@ -541,7 +652,6 @@ fn caps_are_enforced_at_execute() {
 #[test]
 fn hook_event_from_non_chat_origin_is_rejected() {
     let mut m = module();
-    // an explicit HookEvent wrapper from an external submitter is a spoof.
     let mut ext = CaptureCtx::new().with_origin(Origin::External(vec![9; 4]));
     let err = exec(
         &mut m,
@@ -560,85 +670,66 @@ fn hook_event_from_non_chat_origin_is_rejected() {
 }
 
 #[test]
-fn a_rule_records_its_creator_and_only_the_creator_administers_it() {
+fn a_rule_records_its_creator_and_any_account_administers_it() {
     let mut m = module();
-    let mut owner = CaptureCtx::new();
+    let mut creator = CaptureCtx::new();
     exec(
         &mut m,
-        &mut owner,
+        &mut creator,
         &create("r", post_trigger(None, None), task_action("t", "T")),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
     assert_eq!(
         get_rule(&m, "r").expect("r").owner,
-        OWNER,
-        "the submitter of CreateRule is the rule's owner"
+        account_of(OWNER),
+        "the submitter of CreateRule is the rule's creator"
     );
 
-    // a stranger may neither disable nor delete it. a rule is a STANDING
-    // capability — an ungated SetEnabled is a kill switch on someone else's
-    // automation, and an ungated DeleteRule removes it outright.
+    // a rule is a standing capability of the network, not of its creator:
+    // any account disables and deletes it.
     let mut stranger = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
-    for op in [
-        AutomationsMsg::SetEnabled {
-            rule_id: "r".into(),
-            enabled: false,
-        },
-        AutomationsMsg::DeleteRule {
-            rule_id: "r".into(),
-        },
-    ] {
-        let err = exec(&mut m, &mut stranger, &admin(&op)).expect_err("stranger must be refused");
-        assert!(
-            matches!(&err, Error::Module(msg) if msg.contains("only the owner")),
-            "a non-owner must be refused: {err:?}"
-        );
-        block_on(m.abort_block()).expect("abort");
-    }
-    assert!(get_rule(&m, "r").expect("r").enabled, "nothing landed");
-
-    // the owner performs both.
     exec(
         &mut m,
-        &mut owner,
+        &mut stranger,
         &admin(&AutomationsMsg::SetEnabled {
             rule_id: "r".into(),
             enabled: false,
         }),
     )
-    .expect("owner disables");
+    .expect("a stranger disables");
+    block_on(m.commit_block()).expect("commit");
+    assert!(!get_rule(&m, "r").expect("r").enabled, "the disable landed");
     exec(
         &mut m,
-        &mut owner,
+        &mut stranger,
         &admin(&AutomationsMsg::DeleteRule {
             rule_id: "r".into(),
         }),
     )
-    .expect("owner deletes");
+    .expect("a stranger deletes");
     block_on(m.commit_block()).expect("commit");
     assert!(get_rule(&m, "r").is_none());
     assert!(list_rules(&m).is_empty());
 }
 
 #[test]
-fn a_stranger_cannot_walk_past_the_gate_on_a_no_op_set_enabled() {
-    // SetEnabled to the value a rule ALREADY holds stages nothing, so the
-    // owner check must come BEFORE that short-circuit or the gate is
-    // bypassable — and a stranger must not learn the rule's state from which
-    // refusal comes back.
+fn a_no_op_set_enabled_from_any_account_stages_nothing() {
+    // SetEnabled to the value a rule ALREADY holds is idempotent for every
+    // submitter: it is accepted and stages nothing, so the op log and the
+    // root stay byte-identical to no write at all.
     let mut m = module();
-    let mut owner = CaptureCtx::new();
+    let mut creator = CaptureCtx::new();
     exec(
         &mut m,
-        &mut owner,
+        &mut creator,
         &create("r", post_trigger(None, None), task_action("t", "T")),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
     let mut stranger = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
-    let err = exec(
+    exec(
         &mut m,
         &mut stranger,
         &admin(&AutomationsMsg::SetEnabled {
@@ -646,20 +737,17 @@ fn a_stranger_cannot_walk_past_the_gate_on_a_no_op_set_enabled() {
             enabled: true,
         }),
     )
-    .expect_err("an idempotent op is still an op");
-    assert!(matches!(&err, Error::Module(msg) if msg.contains("only the owner")));
+    .expect("an idempotent op is accepted");
+    assert!(m.staged.is_empty(), "nothing staged");
 }
 
 #[test]
 fn an_ownerless_rule_is_unrepresentable() {
-    // only an authenticated external submitter may own a rule, so every other
-    // origin is refused at CreateRule — there is no shape in which a rule
-    // exists without a principal answerable for it.
     let mut m = module();
     for (origin, refusal) in [
-        (Origin::System, "system origin"),
-        (Origin::Module("automations".into()), "module origin"),
-        (Origin::Module("governance".into()), "module origin"),
+        (Origin::System, "account origin"),
+        (Origin::Module("automations".into()), "account origin"),
+        (Origin::Module("governance".into()), "account origin"),
         (Origin::External(Vec::new()), "non-empty submitter id"),
     ] {
         let mut ctx = CaptureCtx::new().with_origin(origin.clone());
@@ -680,11 +768,6 @@ fn an_ownerless_rule_is_unrepresentable() {
 
 #[test]
 fn creating_a_rule_is_gated_but_firing_one_is_not() {
-    // the two principals are different and must stay so: a rule is CREATED by
-    // its owner's external origin, and RUN under `Origin::Module("automations")`.
-    // the hook lane is routed before the owner gate, so a chat event still
-    // fires the rule and its action still leaves as a module-authority
-    // follow-up — while the module's own origin cannot mint a rule.
     let mut m = module();
     let mut owner = CaptureCtx::new();
     exec(
@@ -707,14 +790,16 @@ fn creating_a_rule_is_gated_but_firing_one_is_not() {
         vec![TaskMsg::CreateTask {
             task_id: "auto-general-1".into(),
             title: "T".into(),
+            owner: Some(account_of(OWNER)),
         }],
-        "the owner-gated rule still fires under module authority"
+        "the rule fires under module authority, and the created task is \
+         attributed to the rule's creator, never this module"
     );
-    assert_eq!(get_rule(&m, "r").expect("r").owner, OWNER);
+    assert_eq!(get_rule(&m, "r").expect("r").owner, account_of(OWNER));
 }
 
 #[test]
-fn only_user_authored_posts_fire() {
+fn automatic_posts_do_not_recursively_fire_rules() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -733,7 +818,7 @@ fn only_user_authored_posts_fire() {
         &posted(
             "general",
             1,
-            AuthorRef::Module("automations".into()),
+            Party::Module("automations".into()),
             Vec::new(),
         ),
     )
@@ -771,7 +856,7 @@ fn create_task_action_emits_deterministic_task_id() {
     .expect("fire");
     let tasks = chat_ctx.task_msgs();
     assert_eq!(tasks.len(), 1);
-    let TaskMsg::CreateTask { task_id, title } = &tasks[0] else {
+    let TaskMsg::CreateTask { task_id, title, .. } = &tasks[0] else {
         panic!("expected CreateTask");
     };
     assert_eq!(task_id, "todo-general-5", "deterministic task id");
@@ -802,7 +887,9 @@ fn post_message_action_emits_deterministic_message_id() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("announce");
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_channel("announce");
     exec(
         &mut m,
         &mut chat_ctx,
@@ -857,22 +944,29 @@ fn post_message_fire_reads_chat_via_testkit_on_query() {
         consensus_time: 42,
         origin: Origin::Module(CHAT.into()),
         me: ME.into(),
+        cause: sdk::Cause::Direct,
     })
-    .on_query(CHAT, |req| match chat_decode_query(req).map_err(Error::Module)? {
-        ChatQuery::Channel { channel_id } => Ok(chat_encode_reply(&ChatReply::Channel(Some(Channel {
-            id: channel_id.clone(),
-            name: channel_id,
-            created_at: 0,
-            head_seq: 0,
-            post_policy: PostPolicy::Open,
-            hooks: Vec::new(),
-            pinned: Vec::new(),
-            huddle: Vec::new(),
-            owner: None,
-            archived: false,
-        })))),
-        ChatQuery::Message { .. } => Ok(chat_encode_reply(&ChatReply::Message(None))),
-        _ => Err(Error::QueryUnsupported),
+    .on_query(IDENTITY, identity_probe)
+    .on_query(CHAT, |req| {
+        match chat_decode_query(req).map_err(Error::Module)? {
+            ChatQuery::Channel { channel_id } => {
+                Ok(chat_encode_reply(&ChatReply::Channel(Some(Channel {
+                    id: channel_id.clone(),
+                    name: channel_id,
+                    created_at: 0,
+                    head_seq: 0,
+                    post_policy: PostPolicy::Open,
+                    hooks: Vec::new(),
+                    pinned: Vec::new(),
+                    huddle: Vec::new(),
+                    owner: Party::System,
+                    revision: 0,
+                    archived: false,
+                }))))
+            }
+            ChatQuery::Message { .. } => Ok(chat_encode_reply(&ChatReply::Message(None))),
+            _ => Err(Error::QueryUnsupported),
+        }
     });
 
     block_on(m.execute(&mut ctx, &posted("general", 3, user(2), Vec::new()))).expect("fire");
@@ -925,7 +1019,7 @@ fn channel_filter_gates_matching() {
 }
 
 #[test]
-fn mention_filter_matches_agent_display() {
+fn mention_filter_matches_account_identity() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -935,7 +1029,7 @@ fn mention_filter_matches_agent_display() {
             "r",
             Trigger {
                 channel_id: None,
-                mention: Some("helper".into()),
+                mention: Some("acct:1234".into()),
                 text_contains: None,
             },
             task_action("t", "T"),
@@ -944,16 +1038,13 @@ fn mention_filter_matches_agent_display() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let helper = AuthorRef::Agent {
-        module: "agent".into(),
-        agent_id: "helper".into(),
-    };
+    let helper = 1234;
     // mention present -> fire.
     let mut hit = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
         &mut hit,
-        &posted("general", 1, user(1), vec![helper.clone()]),
+        &posted("general", 1, user(1), vec![helper]),
     )
     .expect("fire");
     assert_eq!(hit.task_msgs().len(), 1);
@@ -1022,7 +1113,7 @@ fn text_contains_filter_fetches_message_once() {
 }
 
 #[test]
-fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
+fn chat_trigger_reports_with_chat_placeholders() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1031,8 +1122,8 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
         &create(
             "notify-chat",
             post_trigger(Some("general"), None),
-            inbox_action(
-                "{mention}",
+            report_action_to(
+                OWNER,
                 "chat",
                 "channel={channel} seq={seq} author={author} text={text} mention={mention}",
             ),
@@ -1041,10 +1132,7 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mentioned = AuthorRef::Agent {
-        module: "agent".into(),
-        agent_id: "helper".into(),
-    };
+    let mentioned = 1234;
     let msg = message(
         "general",
         1,
@@ -1061,76 +1149,72 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     )
     .expect("fire");
 
-    let delivered = chat_ctx.inbox_msgs();
+    let delivered = chat_ctx.report_msgs();
     assert_eq!(delivered.len(), 1);
-    let InboxMsg::Deliver { member, kind, body } = &delivered[0] else {
-        panic!("expected Deliver");
+    let AttributionMsg::Attribute {
+        object,
+        actor,
+        relations,
+        ..
+    } = &delivered[0]
+    else {
+        panic!("expected Attribute");
     };
-    assert_eq!(member, "agent/helper", "member uses the first mention");
-    assert_eq!(kind, "chat");
+    assert_eq!(object.kind, "report");
+    assert_eq!(*actor, attribution::Actor::Account(account_of(OWNER)));
+    assert_eq!(relations[0].recipient, account_of(OWNER));
+    assert_eq!(relations[0].reason, attribution::Reason::Report);
+    let detail: serde_json::Value = sdk::wire::decode(&relations[0].detail).unwrap();
+    assert_eq!(detail["kind"], "chat");
     assert_eq!(
-        body,
-        "channel=general seq=1 author=ext:03030303 text=please review mention=agent/helper"
+        detail["body"],
+        "channel=general seq=1 author=ext:03030303 text=please review mention=acct:1234"
     );
 }
 
-/// the regression #858 introduced and this module has to answer: an inbox
-/// member is a QUEUE NAME in `sdk::Origin::actor_string`'s domain, and inbox
-/// refuses a `MarkRead`/`Clear` naming any queue but the submitter's own — so a
-/// `{author}` member_template has to produce the queue that author owns.
-///
-/// asserted by DERIVATION from the triggering key, never by spelling: rendering
-/// the author as the index tier's `user:{hex}` display handle instead delivers
-/// mail to a queue no origin can ever ack.
 #[test]
-fn an_author_member_names_the_queue_that_author_owns() {
-    let author_key = vec![0x07; 4];
+fn a_report_reaches_any_account_its_rule_names() {
+    // a report is attributed to the rule's creator and delivered to whichever
+    // account the rule names: the creator's own, or anyone else's.
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
         &mut m,
         &mut ctx,
         &create(
-            "notify-author",
+            "notify-stranger",
             post_trigger(Some("general"), None),
-            inbox_action("{author}", "mention", "you were posted at"),
+            report_action_to(STRANGER, "mention", "you were posted at"),
         ),
     )
-    .expect("create");
+    .expect("create: a foreign recipient is accepted");
     block_on(m.commit_block()).expect("commit");
 
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin();
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("general");
     exec(
         &mut m,
         &mut chat_ctx,
-        &posted(
-            "general",
-            1,
-            AuthorRef::User(author_key.clone()),
-            Vec::new(),
-        ),
+        &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire");
-
-    let delivered = chat_ctx.inbox_msgs();
-    assert_eq!(delivered.len(), 1);
-    let InboxMsg::Deliver { member, .. } = &delivered[0] else {
-        panic!("expected Deliver");
+    let reports = chat_ctx.report_msgs();
+    assert_eq!(reports.len(), 1, "the report reaches attribution");
+    let AttributionMsg::Attribute {
+        actor, relations, ..
+    } = &reports[0]
+    else {
+        panic!("expected Attribute");
     };
-    assert_eq!(
-        member,
-        &Origin::External(author_key).actor_string(),
-        "the delivered queue must be one its author can ack"
-    );
-    // and the run history records the member it actually emitted.
+    assert_eq!(*actor, attribution::Actor::Account(account_of(OWNER)));
+    assert_eq!(relations[0].recipient, account_of(STRANGER));
     block_on(m.commit_block()).expect("commit fire");
-    let recs = history(&m, "notify-author", 16);
+    assert_eq!(get_rule(&m, "notify-stranger").expect("rule").fire_count, 1);
+    let recs = history(&m, "notify-stranger", 4);
     assert_eq!(recs.len(), 1);
     assert!(recs[0].action_ok);
-    assert!(
-        recs[0].detail.contains("ext:07070707"),
-        "detail: {}",
-        recs[0].detail
+    assert_eq!(
+        recs[0].detail,
+        format!("reported mention to account {}", account_of(STRANGER))
     );
 }
 
@@ -1153,7 +1237,7 @@ fn failed_text_fetch_is_recorded_not_guessed_empty() {
     // the fetch fails -> the text-needing rule cannot be evaluated: a
     // recorded failure (never empty-text guessing), no emit, and crucially
     // the block is NOT aborted.
-    let mut ctx = CaptureCtx::new().failing_query().with_chat_origin();
+    let mut ctx = CaptureCtx::new().failing_text_fetch().with_chat_origin();
     exec(&mut m, &mut ctx, &posted("general", 1, user(1), Vec::new()))
         .expect("no-fail arm survives a failed fetch");
     assert!(ctx.msgs.is_empty());
@@ -1237,43 +1321,40 @@ fn empty_template_records_action_ok_false_without_failing() {
 }
 
 #[test]
-fn inbox_member_over_cap_records_action_ok_false_without_emitting() {
+fn stable_report_recipient_does_not_depend_on_key_length() {
+    let big_owner = vec![0x11; MAX_FILTER_BYTES];
     let mut m = module();
-    let mut ctx = CaptureCtx::new();
+    let mut ctx = CaptureCtx::new().with_origin(Origin::External(big_owner.clone()));
     exec(
         &mut m,
         &mut ctx,
         &create(
             "member-cap",
             post_trigger(None, None),
-            inbox_action("{channel}", "chat", "body"),
+            report_action_to(&big_owner, "chat", "body"),
         ),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    // chat does not bound channel-id length, so a `{channel}` member can be
-    // substituted past the inbox member cap.
-    let long_channel = "c".repeat(MAX_MEMBER_BYTES + 1);
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
         &mut chat_ctx,
-        &posted(&long_channel, 1, user(1), Vec::new()),
+        &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire records failure");
-    assert!(chat_ctx.msgs.is_empty());
+    assert_eq!(chat_ctx.report_msgs().len(), 1);
     block_on(m.commit_block()).expect("commit");
 
     let recs = history(&m, "member-cap", 16);
     assert_eq!(recs.len(), 1);
-    assert!(!recs[0].action_ok);
-    assert!(recs[0].detail.contains("inbox member exceeds cap"));
-    assert_eq!(get_rule(&m, "member-cap").expect("rule").fire_count, 0);
+    assert!(recs[0].action_ok);
+    assert_eq!(get_rule(&m, "member-cap").expect("rule").fire_count, 1);
 }
 
 #[test]
-fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
+fn report_body_substitution_is_bounded() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1282,14 +1363,13 @@ fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
         &create(
             "body-cap",
             post_trigger(None, None),
-            inbox_action("alice", "chat", "{channel}"),
+            report_action_to(OWNER, "chat", "{channel}"),
         ),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    // an unbounded `{channel}` body substitutes past the inbox body cap.
-    let long_channel = "c".repeat(INBOX_MAX_BODY_BYTES + 1);
+    let long_channel = "c".repeat(MAX_SUBSTITUTED_BYTES + 1);
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
@@ -1297,14 +1377,22 @@ fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
         &posted(&long_channel, 1, user(1), Vec::new()),
     )
     .expect("fire records failure");
-    assert!(chat_ctx.msgs.is_empty());
+    let reports = chat_ctx.report_msgs();
+    assert_eq!(reports.len(), 1);
+    let AttributionMsg::Attribute { relations, .. } = &reports[0] else {
+        panic!("report");
+    };
+    let detail: serde_json::Value = sdk::wire::decode(&relations[0].detail).unwrap();
+    assert_eq!(
+        detail["body"].as_str().unwrap().len(),
+        MAX_SUBSTITUTED_BYTES
+    );
     block_on(m.commit_block()).expect("commit");
 
     let recs = history(&m, "body-cap", 16);
     assert_eq!(recs.len(), 1);
-    assert!(!recs[0].action_ok);
-    assert!(recs[0].detail.contains("inbox body exceeds cap"));
-    assert_eq!(get_rule(&m, "body-cap").expect("rule").fire_count, 0);
+    assert!(recs[0].action_ok);
+    assert_eq!(get_rule(&m, "body-cap").expect("rule").fire_count, 1);
 }
 
 #[test]
@@ -1450,6 +1538,119 @@ fn squatted_message_id_is_caught_by_probe() {
     assert!(recs[0].detail.contains("already taken"));
 }
 
+/// a rule posts wherever it names: the only chat probes before a post are
+/// the channel's existence and the composed id's vacancy, never a party's
+/// standing (the harness refuses a standing probe outright).
+#[test]
+fn a_rule_posts_wherever_it_names() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "brief",
+            post_trigger(Some("general"), None),
+            post_action("secrets", "from {channel}/{seq}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_channel("secrets")
+        .with_channel("general");
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 2, user(1), Vec::new()),
+    )
+    .expect("fire");
+    let posts = chat_ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "the post goes out");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "brief").expect("brief").fire_count, 1);
+}
+
+/// a wildcard trigger is "every channel chat hooks this module into": a rule
+/// observes a channel whoever registered it, and the report carries the text.
+#[test]
+fn a_wildcard_rule_observes_every_hooked_channel() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "digest",
+            post_trigger(None, None),
+            report_action_to(STRANGER, "note", "{channel}#{seq}: {text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_transcript(
+        "secrets",
+        vec![message(
+            "secrets",
+            1,
+            user(1),
+            vec![Block::paragraph("hello")],
+        )],
+    );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("secrets", 1, user(1), Vec::new()),
+    )
+    .expect("fire");
+    let reports = chat_ctx.report_msgs();
+    assert_eq!(reports.len(), 1);
+    let AttributionMsg::Attribute { relations, .. } = &reports[0] else {
+        panic!("expected Attribute");
+    };
+    let detail: serde_json::Value = sdk::wire::decode(&relations[0].detail).unwrap();
+    assert_eq!(detail["body"], "secrets#1: hello");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "digest").expect("digest").fire_count, 1);
+}
+
+/// an unanswerable action probe is a recorded failure, not a pass: the fire
+/// downgrades to a RunRecord and nothing is emitted.
+#[test]
+fn an_unanswerable_action_probe_records_a_failed_fire() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("t", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().failing_query().with_chat_origin();
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("no-fail arm survives a failed probe");
+    assert!(chat_ctx.msgs.is_empty());
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+    let recs = history(&m, "r", 4);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].action_ok);
+    assert!(
+        recs[0].detail.contains("probe failed"),
+        "{}",
+        recs[0].detail
+    );
+}
+
 #[test]
 fn task_id_collision_is_caught_by_probe() {
     let mut m = module();
@@ -1462,7 +1663,9 @@ fn task_id_collision_is_caught_by_probe() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_task("auto-general-5");
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_task("auto-general-5");
     exec(
         &mut m,
         &mut chat_ctx,
@@ -1475,6 +1678,41 @@ fn task_id_collision_is_caught_by_probe() {
     assert_eq!(recs.len(), 1);
     assert!(!recs[0].action_ok);
     assert!(recs[0].detail.contains("already exists"));
+}
+
+#[test]
+fn owner_task_cap_probe_refuses_the_action_not_the_block() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("auto", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin();
+    for n in 0..tasks::MAX_OPEN_TASKS_PER_OWNER {
+        chat_ctx = chat_ctx.with_task_owned_by(&format!("existing-{n}"), OWNER);
+    }
+    let result = exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    );
+    assert!(result.is_ok(), "a full owner never aborts the block");
+    assert!(chat_ctx.msgs.is_empty(), "no task is emitted past the cap");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+    let recs = history(&m, "r", 4);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].action_ok);
+    assert!(
+        recs[0].detail.contains("task cap"),
+        "detail: {}",
+        recs[0].detail
+    );
 }
 
 #[test]
@@ -1565,7 +1803,7 @@ fn an_amplifying_template_truncates_instead_of_failing_the_triggering_post() {
     .expect("the triggering post's op is ACCEPTED");
 
     let tasks = chat_ctx.task_msgs();
-    let [TaskMsg::CreateTask { task_id, title }] = &tasks[..] else {
+    let [TaskMsg::CreateTask { task_id, title, .. }] = &tasks[..] else {
         panic!("expected one CreateTask, got {tasks:?}");
     };
     assert_eq!(task_id, "todo-general-1");
@@ -1674,7 +1912,7 @@ fn fire_count_saturates_at_u64_max() {
 #[test]
 fn substitution_covers_all_placeholders_single_pass() {
     // {author} for a user renders its actor string; unknown tokens stay literal.
-    let author = actor_of(&AuthorRef::User(vec![0xab, 0xcd]));
+    let author = actor_of(&Party::Key(vec![0xab, 0xcd]));
     let out = substitute(
         "c={channel} s={seq} a={author} t={text} u={unknown}",
         "general",
@@ -1689,32 +1927,22 @@ fn substitution_covers_all_placeholders_single_pass() {
     assert_eq!(author, "ext:abcd");
 }
 
-/// every arm of the ONE author rendering is `sdk::Origin::actor_string` of the
-/// origin the handle names — derived, never spelled. the agent arm is the one
-/// refinement: its module's actor string plus the agent id, so a `mention`
-/// filter can address one agent instead of its whole module.
 #[test]
 fn every_author_renders_in_the_actor_string_domain() {
     let key = vec![0x03; 4];
     assert_eq!(
-        actor_of(&AuthorRef::User(key.clone())),
+        actor_of(&Party::Key(key.clone())),
         Origin::External(key).actor_string()
     );
     assert_eq!(
-        actor_of(&AuthorRef::Module("chat".into())),
+        actor_of(&Party::Module("chat".into())),
         Origin::Module("chat".into()).actor_string()
     );
-    assert_eq!(actor_of(&AuthorRef::System), Origin::System.actor_string());
-    assert_eq!(
-        actor_of(&AuthorRef::Agent {
-            module: "agent".into(),
-            agent_id: "helper".into(),
-        }),
-        format!("{}/helper", Origin::Module("agent".into()).actor_string())
-    );
+    assert_eq!(actor_of(&Party::System), Origin::System.actor_string());
+    assert_eq!(actor_of(&Party::Account(1234)), "acct:1234");
     // and NOT the index tier's display handle: no origin's actor string is
     // `user:…`, so a member rendered that way is a queue nobody can ack.
-    assert!(!actor_of(&AuthorRef::User(vec![0xab])).starts_with("user:"));
+    assert!(!actor_of(&Party::Key(vec![0xab])).starts_with("user:"));
 }
 
 #[test]
@@ -1817,7 +2045,7 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
                     mention: Some("ops".into()),
                     text_contains: None,
                 },
-                inbox_action("{author}", "notify", "posted {channel}@{seq}"),
+                report_action_to(OWNER, "notify", "posted {channel}@{seq}"),
             ),
         )
         .expect("create r3");
@@ -1924,11 +2152,84 @@ fn run_history_ring_drops_the_oldest_past_the_cap() {
     block_on(m.commit_block()).expect("commit fires");
 
     let records = history(&m, "r", MAX_RUN_HISTORY as u64);
-    assert_eq!(records.len(), MAX_RUN_HISTORY, "the ring holds exactly the cap");
+    assert_eq!(
+        records.len(),
+        MAX_RUN_HISTORY,
+        "the ring holds exactly the cap"
+    );
     assert_eq!(
         records.first().expect("oldest").seq,
         overflow + 1,
         "the oldest records were dropped"
     );
     assert_eq!(records.last().expect("newest").seq, total);
+}
+
+fn account_of(key: &[u8]) -> u64 {
+    match key {
+        OWNER => 1,
+        STRANGER => 2,
+        other => other.iter().fold(3_u64, |value, byte| {
+            value.wrapping_mul(257).wrapping_add(u64::from(*byte))
+        }),
+    }
+}
+fn account_view(number: u64) -> identity::AccountView {
+    identity::AccountView {
+        number,
+        name: String::new(),
+        control: identity::Control::Keys,
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    }
+}
+fn identity_probe(req: &[u8]) -> Result<Vec<u8>, Error> {
+    let number = match identity::decode_query(req).map_err(Error::Module)? {
+        identity::IdentityQuery::OfKey { key } => account_of(&key),
+        identity::IdentityQuery::Get { number } => number,
+        _ => return Err(Error::QueryUnsupported),
+    };
+    Ok(identity::encode_reply(&identity::IdentityReply::Account(
+        Some(account_view(number)),
+    )))
+}
+
+#[test]
+fn exhausted_history_refuses_before_emitting_or_staging_a_fire() {
+    let mut module = module();
+    let mut admin = CaptureCtx::new();
+    exec(
+        &mut module,
+        &mut admin,
+        &create(
+            "report",
+            post_trigger(None, None),
+            report_action_to(OWNER, "note", "body"),
+        ),
+    )
+    .unwrap();
+    module.store(
+        RUN_CURSOR_KEY.to_vec(),
+        &RunCursor {
+            head: u64::MAX,
+            next: u64::MAX,
+        },
+    );
+    block_on(module.commit_block()).unwrap();
+    let before = module.root();
+    let mut hook = CaptureCtx::new().with_chat_origin();
+    assert!(
+        exec(
+            &mut module,
+            &mut hook,
+            &posted("general", 1, user(1), Vec::new())
+        )
+        .is_err()
+    );
+    assert!(hook.msgs.is_empty());
+    block_on(module.commit_block()).unwrap();
+    assert_eq!(module.root(), before);
+    assert_eq!(get_rule(&module, "report").unwrap().fire_count, 0);
 }

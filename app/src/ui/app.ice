@@ -5,14 +5,14 @@ daemon Ducktape
   bg app_background
   fg app_text
   id "dev.ducktape.app"
-  font "../../../crates/design/assets/fonts/Geist[wght].ttf"
-  font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
+  font "../../../crates/views/support/design/assets/fonts/Geist[wght].ttf"
+  font "../../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf"
   // Not a type role: with no emoji face in the font system, cosmic-text
   // re-scans the whole database for EVERY emoji on EVERY fresh paragraph
   // (~3.7ms each, uncached on miss) — the chat row toolbar carries three,
   // which made every freshly mounted row ~11ms and a channel switch a
   // half-second layout freeze. A resolved fallback costs ~60us.
-  font "../../../crates/design/assets/fonts/NotoColorEmoji.ttf"
+  font "../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf"
   text-size 13.5
   antialiasing true
   // The status item. A click raises THIS menu, never a window: the platform
@@ -77,6 +77,14 @@ daemon Ducktape
     size 480 680
     position centered
     resizable false
+    // NO OS HEADER ON THE LAUNCH WINDOW. A titlebar over a centred sign-in
+    // column is chrome around chrome: the column already names the app and the
+    // step, and the traffic lights sat in a strip this window draws nothing in.
+    // Undecorated means the app owes the two things the strip used to give —
+    // a way to MOVE the window (the drag rail at the top of `HubColumn`, which
+    // routes `mouse press` to `task window drag`) and a way to CLOSE it (the ×
+    // beside it). Both live in `components/onboarding.ice`.
+    decorations false
     platform linux
       app-id "dev.ducktape.app"
   // The console. Same window the single-window app declared, now a named
@@ -87,7 +95,8 @@ daemon Ducktape
   // that never yields, leaving the message column whatever is left. At the
   // old 820 that was 177px — a composer whose Send button fell off the
   // window and a sentence wrapped over eleven lines. 1040 leaves 397, and it
-  // clears every other screen's worst case too (pages 612 + editor, roster
+  // clears every other screen's worst case too (pages sidebar + editor, with
+  // comments floating above the document; roster
   // 74+312, files 74+306). No `responsive` breakpoint: the only honest
   // alternative is suppressing a rail, and a console that silently drops the
   // pane you just opened is worse than one that will not get that small.
@@ -102,9 +111,9 @@ daemon Ducktape
       title-hidden true
       titlebar-transparent true
       fullsize-content-view true
-  // The huddle, popped out. It keeps REAL chrome — no `platform macos` block
-  // here — because the OS close button IS the dock control; the console is
-  // the one window that trades its titlebar away to draw its own.
+  // The huddle's window. It keeps REAL chrome — no `platform macos` block
+  // here — because the OS close button is its only close control; the console
+  // is the one window that trades its titlebar away to draw its own.
   // The panel scrolls its stage now, so no roster can push the controls out;
   // the minimum only has to hold the two chrome bands plus one row of tiles.
   // 340 = 42 header + 52 controls + 2 rules + ~190 of stage, and the width
@@ -113,20 +122,26 @@ daemon Ducktape
     icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
+    // A CALL FLOATS. This is what lets the huddle be its own window instead of
+    // a card parked over the console: at the normal level it would fall behind
+    // the console the moment you clicked back into your work, which is how
+    // the huddle used to disappear. Small, always on top, and yours to
+    // move — the placement is the OS's job, and it is better at it than a
+    // per-screen inset was.
+    level always-on-top
     platform linux
       app-id "dev.ducktape.app"
 
 use "extern/backend.ice"
 use "extern/editor.ice"
 use "extern/call.ice"
+use "extern/module_view.ice"
 use "ducktape-ui/recipes.ice"
-use "ducktape-ui/log-timeline.ice"
 use "theme.ice"
 use "state/types.ice"
 use "state/core.ice"
 use "state/chat.ice"
 use "state/shell.ice"
-use "state/explorer.ice"
 use "state/roster.ice"
 use "state/forge.ice"
 use "state/node.ice"
@@ -138,28 +153,13 @@ use "state/huddle.ice"
 use "state/derived.ice"
 use "components/icon.ice"
 use "components/kit.ice"
+use "components/richbody.ice"
 use "components/patterns.ice"
 use "components/overlay.ice"
 use "components/shell.ice"
 use "components/onboarding.ice"
-use "components/chat.ice"
-use "components/dm.ice"
 use "components/huddle.ice"
-use "components/pages.ice"
-use "components/forge.ice"
-use "components/roster.ice"
-use "components/files.ice"
-use "components/node.ice"
-use "screens/roster.ice"
-use "screens/governance.ice"
 use "screens/overlays.ice"
-use "screens/storage.ice"
-use "screens/settings.ice"
-use "screens/node.ice"
-use "screens/forge.ice"
-use "screens/pages.ice"
-use "screens/chat.ice"
-use "screens/shell.ice"
 use "handlers/lifecycle.ice"
 use "handlers/forge.ice"
 use "handlers/files.ice"
@@ -170,6 +170,5 @@ use "handlers/chat.ice"
 use "handlers/pages.ice"
 use "handlers/onboarding.ice"
 use "handlers/huddle.ice"
-use "handlers/shell.ice"
 use "view.ice"
 use "tests/app.ice"

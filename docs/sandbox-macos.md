@@ -12,13 +12,13 @@ macOS-specific component.
 ## Prerequisites — one pass
 
 ```sh
-ops/macos-preflight.sh        # GUEST_DIR=… if the images live elsewhere
+ops/macos-preflight.sh
 ```
 
 `make dev` runs this for you with `--prompt`: on a Mac it lists what is
 missing and asks once — "install these now? [Y/n]" — then runs the accepted
-steps (brew packages, the musl target, the shim build+sign, the guest
-images). Declining just leaves a node that refuses provider runs.
+steps (brew packages, the musl target, the shim build+sign). Declining just
+leaves a node that refuses provider runs.
 
 It checks everything the compute plane (airlock + provider runs) needs on a
 Mac and prints the exact install command for each missing piece: Apple
@@ -26,8 +26,9 @@ silicon/`kern.hv_support`, Xcode command line tools,
 `brew install e2fsprogs squashfs zstd` (e2fsprogs is keg-only — the node searches
 the standard Homebrew prefixes itself, do not add it to PATH),
 the `aarch64-unknown-linux-musl` target (`rust-toolchain.toml` lists it, so
-`rustup toolchain install` from the checkout is what installs it), the signed
-shim, and the guest images. Exit 0 means the node's boot probe will pass.
+`rustup toolchain install` from the checkout is what installs it), and the
+signed shim. Exit 0 means the host half of the node's boot probe will pass;
+the guest images are each workspace's own, built below.
 
 ## Bring-up on a Mac
 
@@ -35,26 +36,27 @@ shim, and the guest images. Exit 0 means the node's boot probe will pass.
 # 1. the shim (builds + ad-hoc codesigns the virtualization entitlement)
 INSTALL=~/bin bin/duck-vz-shim/build.sh        # ~/bin must be on PATH
 
-# 2. the guest artifacts (aarch64 kernel + rootfs; cross-builds the init
-#    with rust-lld, no musl toolchain needed)
-OUT=~/.ducktape/guest ops/build-guest-rootfs.sh
+# 2. the workspace's guest artifacts (aarch64 kernel + rootfs; cross-builds
+#    the init with rust-lld, no musl toolchain needed). A guest is per
+#    workspace: after `ducktape node init`/`join`, W is that workspace
+#    (`ducktape node list`), and `ducktape node sandbox` prints this line
+#    for one that is missing them.
+OUT=$W/guest ops/build-guest-rootfs.sh
 
-# 2b. the agent CLIs this host lends to runs (a checklist of what is missing,
-#     with each download's url and expected sha256)
-ducktape agent install
+# 2b. the agent CLIs this workspace lends to runs (a checklist of what is
+#     missing, with each download's url and expected sha256)
+ducktape agent install -n <chain-id>
 
 # 3. the smoke: one microVM end to end — boot, stdio, exit code, workspace
 #    read-back. This is the first thing to run and the thing to bisect with;
 #    `vm_smoke: OK` is the proof.
 cargo run -p sandbox-host --example vm_smoke -- \
-    --kernel ~/.ducktape/guest/vmlinux \
-    --rootfs ~/.ducktape/guest/rootfs.ext4
+    --kernel $W/guest/vmlinux \
+    --rootfs $W/guest/rootfs.ext4
 
-# 4. the node
+# 4. the node: the table says HOW, the images are read from $W/guest
 #   [sandbox]
 #   runtime = "vz"
-#   kernel  = "/Users/<you>/.ducktape/guest/vmlinux"
-#   rootfs  = "/Users/<you>/.ducktape/guest/rootfs.ext4"
 ```
 
 The boot probe fails loudly (daemon boot, not first run) when any of these is
@@ -65,8 +67,8 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
 ## What differs from Linux, deliberately
 
 - **No tap, no nftables.** A macOS guest gets no network device at all; runs
-  reach the host over the vsock tunnel allowlist only. That is the stricter
-  of the two Linux configurations, not a degraded one.
+  reach the host over the vsock tunnel allowlist only — the same as Linux,
+  where the single production `VmConfig` also sets no tap.
 - **The kernel is the Kata Containers VM kernel, not the Firecracker CI
   kernel.** VZ attaches virtio over PCI; the Firecracker CI kernel is
   virtio-MMIO only and boots into a silent black hole (no console, no disks).
@@ -94,7 +96,8 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
   (SPM aborting, the newest SDK unparseable by its own compiler).
 - **Executors must be Linux aarch64 ELF binaries**, and they do not come from
   the host `PATH` — a Mac's own `claude`/`codex` is Mach-O and the guest cannot
-  exec it at all. `ducktape agent install <name>` fetches the pinned linux/arm64
-  build into `~/.ducktape/executors`, and the node derives a read-only image
-  from that directory and mounts it at `/opt/duck/bin` for each run. The rootfs
-  carries no CLI, so installing one needs no image rebuild.
+  exec it at all. `ducktape agent install <name> -n <chain-id>` fetches the
+  pinned linux/arm64 build into `<workspace>/executors`, and the node derives
+  a read-only image from that directory and mounts it at `/opt/duck/bin` for
+  each run. The rootfs carries no CLI, so installing one needs no image
+  rebuild.

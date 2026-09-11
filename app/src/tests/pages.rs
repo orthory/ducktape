@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn background_refresh_preserves_editing_state() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let root = inlined(include_str!("../ui/app.ice"));
     let view = inlined(include_str!("../ui/view.ice"));
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
@@ -27,7 +28,6 @@ fn background_refresh_preserves_editing_state() {
         "rpc",
         "password",
         "channel_draft",
-        "chat_search_draft",
         "page_draft",
         "block_draft",
         "page_search_draft",
@@ -38,12 +38,6 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    for scoped in ["channel_name_draft", "member_key_draft"] {
-        assert!(refresh.contains(&format!(
-            "{scoped} = retain_for_endpoint({scoped}, active_channel, \
-keep_str(next.chat_loaded, next.active_channel, active_channel))"
-        )));
-    }
     assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
     // The evicted inline edit is rescued to the composer of the room it was
     // in, not to an app-wide plate (ducktape-ui#698). The DESTINATION is the
@@ -51,9 +45,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     // here — its own assignment is further down the handler — so the rescue
     // cannot surface over the room the resync is carrying her to.
     assert!(refresh.contains(
-        "slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, \
-message_edit_draft, \"\"), selected_message_seq > 0 || message_action != \
-MessageAction.editing) at composer_scope(connected_rpc, active_channel)"
+        "composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), \
+keep_str(message_action == MessageAction.editing, message_edit_draft, \"\"), \
+selected_message_seq > 0 || message_action != MessageAction.editing)"
     ));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
     assert_no_polling(&lifecycle);
@@ -90,15 +84,15 @@ MessageAction.editing) at composer_scope(connected_rpc, active_channel)"
     ));
     // A live resync must never install remote text over a buffer the user is
     // still typing in; the buffer and its dirty baseline move on ONE decision.
-    assert!(lifecycle.contains("page_editor = refreshed_page_editor("));
+    assert!(lifecycle.contains("page_text = refreshed_page_buffer("));
     assert!(lifecycle.contains("page_saved_text = resynced_saved"));
     // the comment rail is scoped to the PAGE it hangs off, so its draft
     // survives moving the cursor between blocks and dies with the page.
     assert!(lifecycle.contains(
         "block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)"
     ));
-    // the live comment-list callback settles state and stops — re-entering
-    // the resync from inside it would loop the rail against the page.
+    // The list callback may open the chosen inline thread, but never reloads
+    // its own page thread list.
     let pages_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
     let comment_callbacks = pages_handlers
         .split_once("on block_threads_loaded(next)\n")
@@ -107,11 +101,14 @@ MessageAction.editing) at composer_scope(connected_rpc, active_channel)"
         .split_once("\non load_more_block_threads")
         .unwrap()
         .0;
-    assert!(!comment_callbacks.contains("run "));
+    assert!(!comment_callbacks.contains("load_page_threads("));
+    assert!(comment_callbacks.contains("return if empty(inline_comment_target)"));
+    assert!(comment_callbacks.contains("selected == active_block_comment_thread"));
 }
 
 #[test]
 fn context_destroying_page_handlers_recover_drafts() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let pages = inlined(include_str!("../ui/handlers/pages.ice"));
     // The page BODY is no longer among the drafts to rescue: it is one buffer
     // that flushes to the node on its own tick and is reinstalled from the
@@ -148,6 +145,7 @@ fn context_destroying_page_handlers_recover_drafts() {
 /// still in flight behind a cross-tab bounce.
 #[test]
 fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
@@ -172,13 +170,14 @@ fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
 // removes the "vanished" lines.
 #[test]
 fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.connected = true;
     app.active_page = "page".into();
     // The buffer is this page's — the tick refuses one that is not.
     app.buffer_page = "page".into();
-    app.page_editor = compose("Title\nfresh body");
+    app.page_text = ("Title\nfresh body").to_string();
     app.page_saved_text = "Title\nstale".into();
     app.block_autosave_status = AutosaveStatus::Saving;
 
@@ -190,7 +189,7 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     );
 
     app.block_autosave_status = AutosaveStatus::Idle;
-    app.page_editor = compose("Title\n```\nstill typing");
+    app.page_text = ("Title\n```\nstill typing").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
         app.block_autosave_status,
@@ -198,19 +197,20 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
         "fence guard"
     );
 
-    app.page_editor = compose("Title\n```\ndone\n```");
+    app.page_text = ("Title\n```\ndone\n```").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(app.block_autosave_status, AutosaveStatus::Saving);
 }
 
 #[test]
 fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let pages = inlined(include_str!("../ui/handlers/pages.ice"));
     assert!(pages.contains(
         "run latest lane=page_autosave save_page_document(connected_rpc, password, active_page, text, page_saved_text) -> page_document_saved _ | page_document_save_failed _"
     ));
     assert!(!pages.contains("run replace lane=page_autosave"));
-    assert_eq!(pages.matches("invalidate lane=page_autosave").count(), 5);
+    assert_eq!(pages.matches("invalidate lane=page_autosave").count(), 4);
 
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
     assert_eq!(
@@ -236,12 +236,13 @@ fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
 /// same collision: a reader mid-sentence whose page is renamed under her.
 #[test]
 fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
     // she is mid-sentence; her line 0 is the OLD name and she never touched it.
-    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_text = ("Old Name\nbody mid-sentence").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     // WHAT THE TICK ACTUALLY SUBMITTED. The correction reads this, not the live
     // buffer, so leaving it at its default empty string would hand the baseline
@@ -300,18 +301,19 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
 /// erase what she typed. Worse than the bug this file exists to fix.
 #[test]
 fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
-    app.page_editor = compose("Notes\nhello");
+    app.page_text = ("Notes\nhello").to_string();
     app.page_saved_text = "Notes\nhello".into();
 
     // the tick submits what it can see.
     app.page_inflight_text = "Notes \nhello".into();
 
     // SHE FINISHES THE WORD while the save is in flight.
-    app.page_editor = compose("Notes A\nhello");
+    app.page_text = ("Notes A\nhello").to_string();
 
     // the save was a no-op — the trimmed title still matched the node.
     let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
@@ -350,11 +352,12 @@ fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
 /// plus a remote rename reverted the rename on the next tick.
 #[test]
 fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
-    app.page_editor = compose("Old Name\nbody typed on");
+    app.page_text = ("Old Name\nbody typed on").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     app.page_inflight_text = "Old Name\nbody typed".into();
 
@@ -396,6 +399,7 @@ fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
 /// have seen a line of it.
 #[test]
 fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let mut app = reading_alpha();
 
     let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
@@ -414,7 +418,7 @@ fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
         "no load landed, so the buffer belongs to no page"
     );
 
-    app.page_editor = compose("h");
+    app.page_text = ("h").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
 
     // The tick must refuse: the buffer is not Beta's.
@@ -432,6 +436,7 @@ fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
 // the very next frame — nothing has landed yet.
 #[test]
 fn a_page_click_repaints_before_the_load_lands() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let mut app = reading_alpha();
 
     let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
@@ -461,18 +466,16 @@ fn a_page_click_repaints_before_the_load_lands() {
     assert!(app.page_saved_text.is_empty());
 }
 
-// `buffer_page`, not `active_page`, is what the install decision compares.
-// Closing the front tab moves the selection while the buffer is still the old
-// page's and still DIRTY — read against `active_page` the landing document is
-// a same-page refresh, the dirty buffer refuses it, and Beta opens showing
-// Alpha's text.
+// `buffer_page`, not `active_page`, is what the install decision compares. A
+// live resync moves `active_page` while a DIRTY buffer stays on the page it
+// came from — read against `active_page` the landing document is a same-page
+// refresh, the dirty buffer refuses it, and Beta opens showing Alpha's text.
 #[test]
 fn the_landing_document_installs_when_the_page_actually_moved() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let mut app = reading_alpha();
-    app.page_editor = compose("Alpha\nalpha body, still typing");
-
-    let _ = app.__update(__DucktapeMessage::CloseDocTab("alpha".into()));
-    assert_eq!(app.active_page, "beta", "the tab close moved the selection");
+    app.page_text = ("Alpha\nalpha body, still typing").to_string();
+    app.active_page = "beta".into();
     assert_eq!(app.buffer_page, "alpha", "the buffer is still Alpha's");
 
     let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
@@ -495,8 +498,9 @@ fn the_landing_document_installs_when_the_page_actually_moved() {
 // install nothing anyway, and would prove nothing here.
 #[test]
 fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let mut app = reading_alpha();
-    app.page_editor = compose("Alpha\nalpha body, still typing");
+    app.page_text = ("Alpha\nalpha body, still typing").to_string();
 
     let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
         "alpha",
@@ -516,37 +520,49 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     assert_eq!(app.buffer_page, "alpha");
 }
 
-/// The artifact hangs comments off the document as a docked 306px rail on
-/// the sidebar ladder, NOT as a floating card over it — a card would cover
-/// the block it is about the moment the block sits on the right half.
+/// Opening comments preserves the document layout and leaves input outside
+/// the floating card available.
 #[test]
-fn block_comments_dock_a_rail_beside_the_document() {
-    // the pages screen is its own file now, so the slot slicing is gone.
-    let pages = inlined(include_str!("../ui/screens/pages.ice"));
-    // the rail is a sibling of the document, separated by the same 1px rule
-    // every other docked column uses — never an overlay layer.
-    let rail = pages
+fn block_comments_float_a_card_over_the_document() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
+    // the pages screen is the `pages` view's now (crates/views/pages).
+    let pages = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
+    // the card is a full-size positioning layer pinning a fixed-width card to
+    // the right edge through a native float, without a modal backdrop.
+    let card = pages
         .split_once("if connected && !empty(active_page) && block_comments_open\n")
         .unwrap()
         .1;
-    let mut opening = rail.lines().map(str::trim);
-    assert_eq!(opening.next(), Some("box w=1.0 h=fill bg=separator"));
-    assert_eq!(opening.next(), Some("space w=1.0 h=1.0"));
+    let mut opening = card.lines().map(str::trim);
+    assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0"));
     assert_eq!(
         opening.next(),
-        Some("box w=306.0 h=fill bg=sidebar clip=true")
+        Some("float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset")
     );
+    assert_eq!(
+        opening.next(),
+        Some(
+            "box #comments-card w=340.0 h=shrink max-h=comments_height bg=elevated r=12.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0 border=separator border-w=1.0 clip=true"
+        )
+    );
+    assert!(!pages.contains("w=306.0"));
+    // A STACK LAYER DECLARED AFTER THE DOCUMENT ARM, or it would paint under
+    // the text it covers and the editor would own the pointer through it. The
+    // delete confirm still outranks it: that one IS an overlay with a scrim.
+    let layer = pages.find("if connected && !empty(active_page) && block_comments_open");
+    assert!(pages.find("slot document") < layer);
+    assert!(layer < pages.find("overlay when=page_delete_armed"));
     assert!(!pages.contains("close_block_comments backdrop=transparent"));
     assert!(pages.contains("-> emit(close_block_comments)"));
-    assert!(pages.contains("#page-comment(scope_key(connected_rpc, active_page))"));
+    assert!(pages.contains("#page-comment(active_page)"));
     assert!(!pages.contains("button \"Save\""));
     assert!(!pages.contains("Saving"));
 
     // The control is a DOCUMENT ACTION in the header now, not a row buried in
-    // a per-block menu — the rail was always page-scoped.
+    // a per-block menu — the card was always page-scoped.
     assert!(pages.contains("button label=\"Comments\""));
     assert!(pages.contains("-> emit(toggle_block_comments)"));
-    let components = inlined(include_str!("../ui/components/pages.ice"));
+    let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     assert!(!components.contains("component BlockActionsMenu"));
 
     let handlers = inlined(include_str!("../ui/handlers/pages.ice"));
@@ -557,25 +573,26 @@ fn block_comments_dock_a_rail_beside_the_document() {
         "run every post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
     ));
     assert!(handlers.contains(
-        "let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)"
+        "let fresh_target = keep_str(!empty(inline_comment_target), inline_comment_target, caret_target)"
     ));
     // Opening a thread rides the thread's OWN anchor — a block-anchored
     // thread opened with the page id is refused by the node.
-    assert!(handlers.contains("on open_block_comment_thread(id, target)"));
-    // The document wears its comment story: washes from the load, resolve
-    // available from the open thread. The editor is handed the BLOCKS and the
-    // raw hit list rather than a precomputed line set, because the chip in the
-    // margin spells how many threads sit on the line and the count is the
-    // repetition in `commented_block_hits` — a precomputed `[i64]` of lines
-    // has already thrown it away.
-    assert!(pages.contains(
-        "page_document(page_editor, dark, (loading || !connected), blocks, commented_block_hits)"
-    ));
+    assert!(handlers.contains("on open_block_comment_thread(event)"));
+    assert!(handlers.contains("let target = event_text(event, \"target\")"));
+    // The guest editor shares the screen's document slot and keeps comment
+    // counts in its declarative presentation, under the comments card.
+    let guest_source = include_str!("../../../crates/views/pages/src/ui/app.ice");
+    assert!(guest_source.contains("editor #document <-> document -> document_committed _"));
+    let guest = inlined(guest_source);
+    assert!(guest.contains("document_marks = next.comment_marks"));
+    let view = inlined(include_str!("../ui/view.ice"));
+    assert!(view.contains(", blocks, commented_block_hits, caret_comment_target,"));
     assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
 }
 
 #[test]
 fn comment_pages_merge_by_identity_and_ordinal() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let thread = |id: &str, count: i64| backend::PageCommentThread {
         id: id.into(),
         target: "page".into(),
@@ -634,6 +651,7 @@ fn comment_pages_merge_by_identity_and_ordinal() {
 /// copy of the title the save ever reads.
 #[test]
 fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -643,7 +661,7 @@ fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
     app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
     app.blocks = vec![page_block("b1", "page", "body")];
     // A CLEAN buffer: baseline and buffer agree, so the rebuild is allowed.
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     let before = app.hydration_generation;
 
@@ -683,6 +701,7 @@ fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
 /// are not the reader's text), but the buffer does not.
 #[test]
 fn a_folded_rename_never_overwrites_a_dirty_buffer() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -692,7 +711,7 @@ fn a_folded_rename_never_overwrites_a_dirty_buffer() {
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
     // DIRTY: she has typed since the last save.
-    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_text = ("Old Name\nbody mid-sentence").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -731,6 +750,7 @@ fn a_folded_rename_never_overwrites_a_dirty_buffer() {
 /// the assertion that nothing was fetched.
 #[test]
 fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -807,6 +827,7 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
 /// is traded for the other.
 #[test]
 fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -815,7 +836,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     // Someone inserts a block: the structural delta buys the debounced resync.
@@ -908,6 +929,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
 /// block texts) are kept; every reply-owned field still lands.
 #[test]
 fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -916,7 +938,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -999,6 +1021,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
 /// inserted block the read was issued for.
 #[test]
 fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -1007,7 +1030,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
     app.active_page_title = "Doc".into();
     app.pages = vec![page_item("page", "Doc")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Doc\nbody");
+    app.page_text = ("Doc\nbody").to_string();
     app.page_saved_text = "Doc\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -1080,6 +1103,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
 /// permanent title freeze.
 #[test]
 fn a_request_issued_after_the_fold_lands_its_title_normally() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -1088,7 +1112,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     // The rename folds FIRST, then a structural delta buys the resync: the
@@ -1143,6 +1167,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
 
 #[test]
 fn live_comment_refresh_updates_threads_without_touching_the_draft() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -1249,6 +1274,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
 
 #[test]
 fn block_comment_recovery_always_unlocks_mutations() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut failed, _) = Ducktape::__boot();
     failed.block_comments_open = true;
     failed.block_comments_generation = 7;
@@ -1344,20 +1370,19 @@ fn block_comment_recovery_always_unlocks_mutations() {
 /// buffer down.
 #[test]
 fn an_armed_page_delete_answers_escape_and_seals_the_document() {
-    crate::pages::history::reset();
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.shell_tab = ShellTab::Pages;
     app.active_page = "alpha".into();
-    app.page_editor = compose("one");
-    crate::pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    app.page_text = ("one").to_string();
     app.page_delete_armed = true;
 
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
     assert_eq!(
-        app.page_editor.text(),
+        app.page_text.clone(),
         "one",
         "the scrim seals the document behind it"
     );
@@ -1369,6 +1394,83 @@ fn an_armed_page_delete_answers_escape_and_seals_the_document() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
-    assert_eq!(app.page_editor.text(), "");
-    crate::pages::history::reset();
+    assert_eq!(
+        app.page_text.clone(),
+        "one",
+        "Undo belongs to the guest binding"
+    );
+}
+
+#[test]
+fn a_document_comment_badge_opens_its_own_thread_and_rejects_old_replies() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.mutation_phase = MutationPhase::Idle;
+    app.active_page = "page".into();
+    app.block_comments_open = true;
+    app.block_comments_target = "page".into();
+    app.inline_comment_target = "block-b".into();
+    app.block_comments_generation = 10;
+    app.block_comment_threads_loading = true;
+    let thread = |id: &str, target: &str, resolved| backend::PageCommentThread {
+        id: id.into(),
+        target: target.into(),
+        resolved,
+        author: "Reader".into(),
+        meta: String::new(),
+        comment_count: 1,
+    };
+    let threads = vec![
+        thread("other", "block-a", false),
+        thread("resolved", "block-b", true),
+        thread("wanted", "block-b", false),
+    ];
+    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+        backend::BlockThreadListData {
+            generation: 10,
+            target: "page".into(),
+            from: 0,
+            threads,
+            total: 3,
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert_eq!(app.active_block_comment_thread, "wanted");
+    assert_eq!(app.active_thread_target, "block-b");
+    assert!(app.block_thread_comments_loading);
+    assert_eq!(app.block_comment_rows.len(), 2);
+    assert!(
+        app.block_comment_rows
+            .iter()
+            .all(|row| row.thread.target == "block-b")
+    );
+    let _ = app.__update(__DucktapeMessage::BlockCommentPageLoaded(
+        backend::BlockCommentData {
+            generation: 9,
+            target: "block-a".into(),
+            thread_id: "other".into(),
+            from: 0,
+            comments: Vec::new(),
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert!(
+        app.block_thread_comments_loading,
+        "the old thread must not complete this load"
+    );
+    let _ = app.__update(__DucktapeMessage::CloseBlockCommentThread);
+    assert!(app.inline_comment_target.is_empty());
+    assert_eq!(app.block_comment_rows.len(), 3);
+    assert!(app.active_block_comment_thread.is_empty());
+    app.inline_comment_target = "block-b".into();
+    app.caret_comment_target = "block-a".into();
+    app.block_comment_draft = "A new comment on B".into();
+    let _ = app.__update(__DucktapeMessage::PostBlockCommentSubmit);
+    assert_eq!(
+        app.active_thread_target, "block-b",
+        "moving the caret must not retarget the open composer"
+    );
 }

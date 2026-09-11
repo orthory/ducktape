@@ -6,11 +6,11 @@
 //! capability spec's own argv, the model calls its tools, the server signs a
 //! `RunsMsg::AgentAction` frame with the run's session key, the frame crosses the
 //! real router into the real `runs` module — which says NO, because the key is
-//! bound to no live run. the agent HOLDS `tasks.create`; the grant is not what
-//! stops it. the session gate is. a task appearing on the chain here would mean
+//! bound to no live run. nothing about the agent's record stops it; the
+//! session gate is what does. a task appearing on the chain here would mean
 //! that gate can be walked straight past.
 //!
-//! (the positive case — a bound session's write landing as `AuthorRef::Agent` —
+//! (the positive case — a bound session's write landing as `Party::Account` —
 //! is proven in `runs`'s own collaboration_loop e2e, which is the only harness
 //! with a real dispatch and a real committed lease to bind against.)
 //!
@@ -26,7 +26,7 @@
 //! cargo test -p node-bin --test mcp_live_runner -- --ignored --nocapture
 //! ```
 //!
-//! keep the argv below in lockstep with `capability-host`'s claude spec — the
+//! keep the argv below in lockstep with `provider-host`'s claude spec — the
 //! test is worthless if it proves a different command line than the one
 //! production runs.
 
@@ -45,7 +45,7 @@ const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape","arg
 #[test]
 #[ignore = "drives the real `claude` CLI: needs auth, network, and budget"]
 fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
-    let h = Harness::start(&["tasks.create"]);
+    let h = Harness::start();
 
     // the binary under test must be resolvable by BARE NAME, exactly as the
     // provisioner arranges it (path_entries() puts its dir on the run's PATH).
@@ -62,7 +62,8 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     );
 
     let prompt = "Use the ducktape MCP tools. First call ducktape_whoami. Then call \
-                  ducktape_task_create with the title: live-proof. Then reply with the word \
+                  ducktape_action with operation tasks.create, input {\"title\": \
+                  \"live-proof\"} and request_id live-proof. Then reply with the word \
                   DONE and nothing else.";
     // This harness dispatches no run, so it supplies an unavailable scoped
     // endpoint. The runner must surface the refusal and never fall back.
@@ -115,9 +116,9 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     // the model's prose is not evidence — a model will happily claim it called a
     // tool it never reached (it did, repeatedly, while this was built). the node
     // is the oracle, and it must hold NOTHING: the agent's session key is bound
-    // to no live run, so consensus refused the write even though the agent holds
-    // the tasks.create grant. a task appearing here would mean the write bypassed
-    // the session gate entirely — the exact defect this design closes.
+    // to no live run, so consensus refused the write however plainly the agent
+    // asked for it. a task appearing here would mean the write bypassed the
+    // session gate entirely — the exact defect this design closes.
     let reply = h.query("tasks", json!("list"));
     assert!(
         reply["tasks"].as_array().is_none_or(|t| t.is_empty()),

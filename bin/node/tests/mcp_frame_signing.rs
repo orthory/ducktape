@@ -106,18 +106,29 @@ fn call_tool(mut command: Command, tool: &str, arguments: Value) -> Value {
 }
 
 #[test]
-fn task_write_uses_the_exact_run_scoped_endpoint() {
-    let (result, captured) = capture_action("ducktape_task_create", json!({"title":"prove it"}));
+fn a_write_uses_the_exact_run_scoped_endpoint_and_carries_the_envelope_opaque() {
+    let (result, captured) = capture_action(
+        "ducktape_action",
+        json!({
+            "operation":"tasks.create",
+            "input":{"title":"prove it"},
+            "request_id":"prove-it",
+        }),
+    );
     assert_ne!(result["isError"], true, "{result}");
     assert_eq!(captured.path, "/v1/run-action");
     assert_eq!(captured.token.as_deref(), Some(TOKEN));
     match captured.message {
-        runs::RunsMsg::AgentAction { run_id, action } => {
+        runs::RunsMsg::AgentAction {
+            run_id,
+            request_id,
+            action,
+        } => {
             assert_eq!(run_id, RUN_ID);
-            match action {
-                agent::AgentAction::CreateTask { title, .. } => assert_eq!(title, "prove it"),
-                other => panic!("expected CreateTask, got {other:?}"),
-            }
+            assert_eq!(request_id, "prove-it");
+            assert_eq!(action.operation, "tasks.create");
+            assert_eq!(action.target, None);
+            assert_eq!(action.input, json!({"title":"prove it"}));
         }
         other => panic!("expected AgentAction, got {other:?}"),
     }
@@ -126,28 +137,31 @@ fn task_write_uses_the_exact_run_scoped_endpoint() {
 #[test]
 fn peer_call_exposes_no_caller_identity_or_authority_input() {
     let (result, captured) = capture_action(
-        "ducktape_delegate",
+        "ducktape_action",
         json!({
+            "operation":"agent.call",
+            "target":{"agent_id":"reviewer"},
+            "input":{"instruction":"Review this change", "skills":["/shared/skills/review"]},
             "request_id":"review-1",
-            "agent_id":"reviewer",
-            "instruction":"Review this change",
-            "skills":["/shared/skills/review"],
         }),
     );
     assert_ne!(result["isError"], true, "{result}");
     match captured.message {
-        runs::RunsMsg::DelegateRun {
+        runs::RunsMsg::AgentAction {
             run_id,
             request_id,
-            request,
+            action,
         } => {
             assert_eq!(run_id, RUN_ID);
             assert_eq!(request_id, "review-1");
-            assert_eq!(request.agent_id, "reviewer");
-            assert_eq!(request.instruction, "Review this change");
-            assert_eq!(request.skills, ["/shared/skills/review"]);
+            assert_eq!(action.operation, "agent.call");
+            assert_eq!(action.target, Some(json!({"agent_id":"reviewer"})));
+            assert_eq!(
+                action.input,
+                json!({"instruction":"Review this change", "skills":["/shared/skills/review"]})
+            );
         }
-        other => panic!("expected DelegateRun, got {other:?}"),
+        other => panic!("expected AgentAction, got {other:?}"),
     }
 }
 
@@ -155,8 +169,8 @@ fn peer_call_exposes_no_caller_identity_or_authority_input() {
 fn a_run_without_a_scoped_endpoint_refuses_to_write() {
     let result = call_tool(
         command(None),
-        "ducktape_task_create",
-        json!({"title":"nope"}),
+        "ducktape_action",
+        json!({"operation":"tasks.create", "input":{"title":"nope"}, "request_id":"nope"}),
     );
     assert_eq!(result["isError"], true);
     assert!(

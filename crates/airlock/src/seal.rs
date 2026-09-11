@@ -61,7 +61,7 @@ pub fn seal(recipient_pk: &[u8; 32], msg: &[u8]) -> Vec<u8> {
     let key = aead::hkdf32(shared.as_bytes(), SEAL_LABEL);
     let mut out = Vec::with_capacity(32 + 12 + 16 + msg.len());
     out.extend_from_slice(&eph_pk);
-    out.extend_from_slice(&aead::seal(&key, msg));
+    out.extend_from_slice(&aead::seal(&key, b"", msg));
     out
 }
 
@@ -72,7 +72,7 @@ pub fn unseal(kp: &SealKeypair, blob: &[u8]) -> Result<Vec<u8>> {
     let eph_pk: [u8; 32] = blob[..32].try_into().unwrap();
     let shared = kp.secret.diffie_hellman(&PublicKey::from(eph_pk));
     let key = aead::hkdf32(shared.as_bytes(), SEAL_LABEL);
-    aead::open(&key, &blob[32..])
+    aead::open(&key, b"", &blob[32..])
 }
 
 #[cfg(test)]

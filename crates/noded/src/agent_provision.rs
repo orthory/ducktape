@@ -25,7 +25,7 @@
 //! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
 //! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
 //! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
-//! and know who it acts for; the GRANT itself is never in the env (see
+//! and know who it acts for; the record itself is never in the env (see
 //! [`run_env`]).
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
@@ -42,8 +42,10 @@ use compute_service::{
     assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
+use runs::is_skill_mount_name;
 
 use crate::node_link::NodeLink;
+use provider_host::OperatorCredential;
 
 mod duckfs;
 mod forge;
@@ -189,18 +191,14 @@ fn run_slug(run_id: &str) -> String {
 }
 
 /// a W6 skill mount subpath is consensus-supplied data used as ONE host
-/// directory name — never a path. the envelope validates only non-emptiness
-/// (a `..` or `a/b` name would otherwise escape the ro root), so the trust
-/// boundary is HERE: a bounded charset, with `.`/`..` refused outright (both
-/// pass the charset alone).
+/// directory name — never a path. `runs::validate_skills` now enforces this
+/// exact shape at consensus time too, so a bad name is refused before it is
+/// ever committed; this call stays as the trust boundary of last resort (an
+/// older committed record, or a bug in the consensus-side check, must not
+/// let a `..` or `a/b` name escape the ro root). ONE predicate,
+/// [`runs::is_skill_mount_name`], gates both sides so they cannot drift.
 fn mount_dir_name(subpath: &str) -> Result<(), String> {
-    let safe = !subpath.is_empty()
-        && subpath != "."
-        && subpath != ".."
-        && subpath
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if safe {
+    if is_skill_mount_name(subpath) {
         Ok(())
     } else {
         Err(format!(
@@ -233,9 +231,8 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
 
 /// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
 /// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
-/// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
-/// agent's sandbox — so putting this one dir on the child's PATH is the whole
-/// of how `ducktape mcp` resolves.
+/// (codex/claude) spawns the MCP server by bare command name. The sandbox
+/// stages its commands as a read-only guest asset and translates this PATH entry.
 ///
 /// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
 /// degrades to NO entry rather than failing the run: the agent still runs,
@@ -254,27 +251,23 @@ fn tool_path_entries() -> Vec<PathBuf> {
 ///
 /// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape fs` reads — one
 /// name for "the node this process talks to", so every Ducktape tool a run
-/// spawns (the `ducktape mcp` server the runner CLI starts, outside the agent's
-/// sandbox, included) finds the node without a second convention. a node with
+/// spawns, including the MCP server inside the guest, finds the node through
+/// its read tunnel without a second convention. A node with
 /// no http surface has nothing to name, so the var is simply absent.
 ///
-/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the grant —
-/// owner, allowed_actions, ResourceCaps — is read back from the COMMITTED agent
-/// registry by whoever holds this id; copying it into the env would mint a
-/// second, unversioned copy that drifts from the record it came from the moment
-/// the registry moves. the committed record is the one truth.
+/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the model's
+/// record is read back from the COMMITTED agent registry by whoever holds this
+/// id; copying it into the env would mint a second, unversioned copy that
+/// drifts from the record it came from the moment the registry moves. the
+/// committed record is the one truth.
 ///
 /// `DUCKTAPE_RUN_ACTION_URL` + `DUCKTAPE_RUN_ACTION_TOKEN` + `DUCKTAPE_RUN_ID`
 /// are the write half of the tool plane. The endpoint signs only the two Runs
 /// messages scoped to this live run; the private key never enters child env.
 ///
-/// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
-/// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
-/// `spec.run_id` (`{saga_id}:{attempt}`, the on-disk dir key): the MCP server
-/// stamps this var onto every `RunsMsg::AgentAction` the agent submits, so a
-/// host-local id here would make every mid-run write name a run that does not
-/// exist — which is exactly how the write plane came to be dead-on-arrival.
-///
+/// `DUCKTAPE_RUN_ID` comes from [`WorkspaceSpec::agent`]: the committed model
+/// run ID used for both the read ceiling and interactive writes. The host's
+/// `WorkspaceSpec::run_id` names the on-disk attempt directory instead.
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
@@ -292,8 +285,20 @@ fn run_env(
     if let Some(url) = node_url {
         env.insert("DUCKTAPE_NODE".into(), url.to_string());
     }
-    if let Some(agent) = &spec.agent_id {
-        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
+    if let Some(agent) = &spec.agent {
+        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.agent_id.clone());
+        env.insert("DUCKTAPE_RUN_ID".into(), agent.run_id.clone());
+        // the AUTHOR of anything the run commits is the agent, on every lane:
+        // a forge checkout's commits and a push the run makes itself from a
+        // duckfs workspace attribute the same way.
+        env.insert(
+            "GIT_AUTHOR_NAME".into(),
+            forge::sanitize_display_name(&agent.display_name),
+        );
+        env.insert(
+            "GIT_AUTHOR_EMAIL".into(),
+            forge::agent_email(&agent.agent_id),
+        );
     }
     if let Some(session) = session {
         env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
@@ -301,9 +306,17 @@ fn run_env(
             session::ENV_ACTION_TOKEN.into(),
             session.action_token.clone(),
         );
-        env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
     }
     env
+}
+
+/// this node's operator credential as a run's node lane lends it: a fresh
+/// read of `admin.token` per use, because the node re-mints it every boot.
+fn operator_credential(node: &NodeLink) -> OperatorCredential {
+    let node = node.clone();
+    OperatorCredential::new(crate::admin::ADMIN_TOKEN_HEADER, move || {
+        node.operator_token()
+    })
 }
 
 /// the file every skill document is read from, inside its mount — the
@@ -341,7 +354,6 @@ fn checkout_ro_mounts(
     node: &NodeLink,
     ro_root: &Path,
     mounts: &[RoMount],
-    library_readable: bool,
 ) -> Result<String, String> {
     // built HERE, inside the caller's blocking context — see `NodeLink::files`.
     let api = node.files();
@@ -359,7 +371,7 @@ fn checkout_ro_mounts(
             read_skill_doc(ro_root, m)
         })
         .collect::<Result<Vec<_>, _>>()
-        .and_then(|docs| assemble_context_doc(&docs, library_readable))
+        .and_then(|docs| assemble_context_doc(&docs))
         .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(ro_root);
         })
@@ -538,6 +550,16 @@ impl WorkspaceProvisioner for NodedProvisioner {
     }
 }
 
+async fn cleanup_dirs(dir: PathBuf, ro_dir: Option<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(ro) = ro_dir {
+            let _ = std::fs::remove_dir_all(ro);
+        }
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +700,76 @@ mod tests {
         for good in ["skill", "my-skill_v2", "..dots.ok..", "A.B"] {
             assert!(mount_dir_name(good).is_ok(), "{good:?} must be admitted");
         }
+    }
+
+    #[test]
+    fn mount_dir_name_agrees_with_the_consensus_side_predicate() {
+        // `runs::validate_skills` and this provisioner gate the SAME name
+        // shape through ONE function (`runs::is_skill_mount_name`) — this
+        // pins that `mount_dir_name` is nothing but a call into it, so the
+        // two can never drift apart again.
+        for name in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "name with space",
+            "name\0nul",
+            "skill",
+            "my-skill_v2",
+            "..dots.ok..",
+            "A.B",
+            "code review",
+            "qa",
+        ] {
+            assert_eq!(
+                mount_dir_name(name).is_ok(),
+                is_skill_mount_name(name),
+                "{name:?}: mount_dir_name and is_skill_mount_name disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_consensus_run_id_rides_every_provisioned_run_session_or_not() {
+        // the tool plane names the run to the model BY THIS ID, and a run whose
+        // session was never opened must still be named — so the id is exported
+        // independently of the write half. it is identity, not a credential:
+        // nothing but the id crosses in the env.
+        let spec = WorkspaceSpec {
+            run_id: "s1:0".into(),
+            agent: Some(compute_service::AgentExecution {
+                run_id: "chat\u{1f}general\u{1f}2\u{1f}bot".into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
+            source: WorkspaceSource::Duckfs {
+                source_prefix: "/shared/agent-workspaces/bot".into(),
+                source_snapshot: None,
+            },
+            ro_mounts: Vec::new(),
+        };
+        let env = run_env(Path::new("/tmp/ws"), None, None, &spec, None);
+        assert_eq!(
+            env.get("DUCKTAPE_RUN_ID").map(String::as_str),
+            spec.agent.as_ref().map(|agent| agent.run_id.as_str())
+        );
+        // the write half is absent without a session.
+        assert!(!env.contains_key(session::ENV_ACTION_URL));
+        assert!(!env.contains_key(session::ENV_ACTION_TOKEN));
+
+        // a receipt-only spec names no run, so it exports none.
+        let receipt = WorkspaceSpec {
+            agent: None,
+            ..spec
+        };
+        assert!(
+            !run_env(Path::new("/tmp/ws"), None, None, &receipt, None)
+                .contains_key("DUCKTAPE_RUN_ID")
+        );
     }
 }

@@ -1,51 +1,8 @@
-//! the runs module's public wire surface — types only.
-//!
-//! the runs module is the collaboration loop's actor — the consumer on the
-//! tagging and dispatch planes: it watches chat channels through the tagging
-//! plane's engagement events, composes each engaged post's model input in
-//! consensus, dispatches it under the agent's recipe, and validates the
-//! model's response before any cross-module write happens. the agents it runs
-//! live in the agent REGISTRY (`agent`) — this module reads them by
-//! query and never holds registry state. run LIFECYCLE is not this module's
-//! state either — a dispatched task's lifecycle lives in the dispatch module
-//! (and its saga); this surface only exposes the module's own correlation
-//! entries for still-pending work. two payload families cross this surface:
-//!
-//! - [`RunsMsg`] — writes: channel watches, the jobs-worker toggle, explicit
-//!   run requests, and run cancellation.
-//! - [`RunsQuery`] -> [`RunsReply`] — reads over watches and the pending
-//!   (not-yet-delivered) runs.
-
 use std::collections::BTreeMap;
 
-use agent::{AgentAction, DelegationRequest, ReplyBlock};
-use saga::SagaOrigin;
+use crate::{ActionEnvelope, DelegationRequest, LaneKind, OperationView, ReplyBlock};
+use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
-
-// ---- watches ------------------------------------------------------------------
-
-/// how a watched channel selects which agents a user post engages.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum TurnPolicy {
-    /// agents whose `AuthorRef::Agent` ref appears in the post's mentions.
-    Mention,
-    /// every active agent.
-    All,
-    /// exactly this agent.
-    Assigned(String),
-    /// the sorted active agents indexed by `anchor_seq % n`.
-    RoundRobin,
-}
-
-/// one channel watch — the runs-module-side mirror of the tagging-plane
-/// subscription it was registered with (the two are staged atomically, P2).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WatchView {
-    pub channel_id: String,
-    pub policy: TurnPolicy,
-}
 
 // ---- pending runs ---------------------------------------------------------------
 
@@ -76,26 +33,29 @@ pub struct PendingRun {
     pub job_id: Option<String>,
     /// the jobs claim height a job-backed run is bound to; chat runs use 0.
     pub job_claim_height: u64,
-    /// the run-creating origin (the tagging plane, or the explicit
-    /// `RequestRun` submitter) — a cancel capability alongside the owner.
-    pub requester: SagaOrigin,
+    /// The origin that called runs to create this work.
+    pub requester: RunOrigin,
     pub created_at: u64,
 }
 
-// ---- delivered-run history --------------------------------------------------
+// ---- terminal-run history ---------------------------------------------------
 
-/// how a run ended: the result delivered, or it failed (worker error,
-/// timeout, cancellation, failed validation). a degraded-but-delivered run is
-/// `Delivered` with [`RunRecord::degraded`] set.
+/// Model-result admission and result-action execution are separate facts. An
+/// accepted result proposes effects that its program may execute or omit.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunOutcome {
-    Delivered,
+    /// The model result passed admission; this does not claim its effects ran.
+    ResultAccepted,
+    /// At least one proposed result action was refused by its program or target.
+    /// The corresponding ActionRequest carries the authenticated reason.
+    ActionRejected,
+    /// Worker error, timeout, cancellation, or failed result validation.
     Failed,
 }
 
-/// one terminal run in the delivered-runs ring — DERIVED observability state,
-/// recorded at delivery (the moment the pending entry prunes). never part of
+/// One terminal run in the history ring, recorded when its pending entry
+/// prunes and updated by authenticated result-action completions. Never part of
 /// `root()`/snapshot: replay rebuilds it deterministically, and a
 /// snapshot-joined node starts with an empty ring.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -109,7 +69,7 @@ pub struct RunRecord {
     /// thread key is `"{channel_id}#{seq}"`.
     pub anchor_seq: u64,
     pub outcome: RunOutcome,
-    /// the host observed the run as degraded but still delivered it.
+    /// The accepted model result was degraded during validation or composition.
     pub degraded: bool,
     /// consensus counters (creation block / delivery block) — counter DIFFS
     /// are meaningful, the raw values are whatever the lane stamps.
@@ -122,13 +82,95 @@ pub struct RunRecord {
     /// landed, else the duckfs output snapshot, else `None`.
     pub output_ref: Option<String>,
     /// the forge PR this run opened or updated, when the PR sink applied.
-    pub pr_number: Option<u64>,
+    pub pr: Option<PrRef>,
+}
+
+/// one forge pull request: the repository it lives in and its number. A
+/// number alone addresses nothing — forge numbers items per repository.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrRef {
+    pub repo: String,
+    pub number: u64,
+}
+
+// ---- the run journal ----------------------------------------------------------
+
+/// one lifecycle fact the module committed about a run. every op (and
+/// acknowledgment) that moves a run's lifecycle stamps the facts it
+/// committed ([`sdk::Ctx::set_assigned`], encoded by [`encode_assigned`]) so
+/// the derived tier folds the module's exact transitions into the run
+/// journal (`crate::index`) instead of re-deriving them from op payloads.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunFact {
+    /// the run was staged on the dispatch plane for `agent_id`.
+    Dispatched {
+        agent_id: String,
+        /// empty for job-backed runs.
+        channel_id: String,
+        /// 0 for job-backed runs.
+        anchor_seq: u64,
+        job_id: Option<String>,
+        /// the run-scoped call edge that created a delegated run.
+        delegation_id: Option<String>,
+        requester: RunOrigin,
+    },
+    /// the node holding the run's execution lease bound its session key.
+    SessionOpened {
+        attempt: u32,
+        /// lowercase key hex of the lease holder.
+        holder: String,
+    },
+    /// the run staged one action: a catalog operation it invoked, or an
+    /// effect this module authored for it (its own reply, its forge sink).
+    /// `lane` says which admission it came through — the session signer
+    /// mid-run, or the delivered response — and `result` is the receipt the
+    /// preparer minted (the destination it resolved, the ids it minted).
+    Acted {
+        request_id: String,
+        lane: LaneKind,
+        operation: String,
+        result: serde_json::Value,
+    },
+    /// the dispatch plane delivered the run's result: the run is over.
+    Settled {
+        outcome: RunOutcome,
+        /// the failure excerpt, for a failed run.
+        reason: Option<String>,
+        degraded: bool,
+        executing_node: String,
+        output_ref: Option<String>,
+        /// the PR the sink found already open on the pushed branch.
+        pr: Option<PrRef>,
+    },
+    /// a settled run's result action was refused by its program or target.
+    ResultActionRefused { request_id: String },
+    /// the forge PR a settled run's sink opened was authenticated.
+    PrLinked { pr: PrRef },
+}
+
+/// one journal entry: the run a fact is about.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvent {
+    pub run_id: String,
+    pub fact: RunFact,
+}
+
+/// the assigned stamp of one applied runs op: every fact it committed, in
+/// commit order. an op that moved no run stamps nothing.
+pub fn encode_assigned(journal: &[RunEvent]) -> Vec<u8> {
+    sdk::wire::encode(&journal)
+}
+pub fn decode_assigned(b: &[u8]) -> Result<Vec<RunEvent>, String> {
+    sdk::wire::decode(b)
 }
 
 // ---- run-scoped agent calls -------------------------------------------------
 
-/// Maximum caller-chosen idempotency-key size for one agent call.
-pub const MAX_DELEGATION_REQUEST_ID_BYTES: usize = 64;
+/// Maximum caller-chosen idempotency-key size for one action or agent call.
+pub const MAX_REQUEST_ID_BYTES: usize = 64;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -151,7 +193,7 @@ pub struct DelegationResult {
     pub error: Option<String>,
 }
 
-/// One ephemeral caller/callee edge. This is run state, not an AgentRecord
+/// One ephemeral caller/callee edge. This is run state, not an ModelRecord
 /// relation: both agents remain peers before and after the call.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -174,21 +216,70 @@ pub struct DelegationView {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+// Messages are decoded one at a time; keeping configuration inline preserves
+// the same direct construction API as the other module operations.
+#[allow(clippy::large_enum_variant)]
 pub enum RunsMsg {
-    /// watch a channel under `policy` AND subscribe on the tagging plane —
-    /// one atomic block (P2), so the watch and the subscription cannot drift.
-    WatchChannel {
-        channel_id: String,
-        policy: TurnPolicy,
+    /// A program commits an immutable deployment request for the node executors.
+    RequestModuleUpdate {
+        request_id: String,
+        run_id: String,
+        source: ModuleUpdateSource,
+        update: ModuleUpdateSpec,
     },
-    /// drop the watch and the plane subscription, atomically.
-    UnwatchChannel { channel_id: String },
+    /// A validator confirms local residency of this request's immutable artifact.
+    MarkModuleArtifactStaged {
+        sequence: u64,
+    },
+    /// Anyone may reconcile a request against its actual registry/governance outcome.
+    ReconcileModuleUpdate {
+        sequence: u64,
+    },
+    /// A validator reports an invalid deployment before its proposal exists.
+    RefuseModuleUpdate {
+        sequence: u64,
+        reason: String,
+    },
+    /// Configure model work for an existing keyless program account.
+    ConfigureModel {
+        operation: crate::ModelMsg,
+    },
+    RequestJobRun {
+        agent_id: String,
+        job_id: String,
+    },
+    RequestAttributedRun {
+        agent_id: String,
+        change_seq: u64,
+    },
+    ClaimActionRequest {
+        request_id: String,
+        target_step: u64,
+    },
+    CompleteActionRequest {
+        request_id: String,
+        call: sdk::CallId,
+        /// The program's decoded call binding. Output-derived links are
+        /// accepted only when their bytes match dispatch's committed digest.
+        result: agent::CallResult,
+    },
+    RejectActionRequest {
+        request_id: String,
+        reason: String,
+    },
+    /// Source-owned deferred publication; authenticated against the host delivery.
+    PublishActionRequest {
+        request_id: String,
+    },
     /// opt the runs module into or out of jobs-board submit notifications.
     /// the jobs module derives the worker id from this module's follow-up origin.
-    EnableJobWorker { enabled: bool },
-    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without an
-    /// engagement. the duplicate of a pending or already-dispatched turn is a
-    /// deterministic no-op — the turn claim: first in consensus order wins.
+    EnableJobWorker {
+        enabled: bool,
+    },
+    /// Ask the configured program to run this model against a channel anchor.
+    /// Calls for an already dispatched model/anchor are deterministic no-ops.
+    /// The eventual program execution passes each target's own account
+    /// authorization.
     RequestRun {
         agent_id: String,
         channel_id: String,
@@ -210,15 +301,18 @@ pub enum RunsMsg {
         #[serde(default)]
         skills: Vec<String>,
     },
-    /// cancel a PENDING run — only the run-creating origin or the agent's
-    /// owner. cancels the underlying dispatch in the same block; the plane's
-    /// Err("cancelled") delivery then prunes the entry (and finalizes a
-    /// job-backed run's job) through the one result path.
-    CancelRun { run_id: String },
-    /// fence the current attempt and move the run to another provider. gated
-    /// exactly like cancellation; `attempt` prevents a delayed click from
-    /// revoking a newer assignment.
-    ReassignRun { run_id: String, attempt: u32 },
+    /// cancel a PENDING run. cancels the underlying dispatch in the same
+    /// block; the plane's Err("cancelled") delivery then prunes the entry (and
+    /// finalizes a job-backed run's job) through the one result path.
+    CancelRun {
+        run_id: String,
+    },
+    /// fence the current attempt and move the run to another provider.
+    /// `attempt` prevents a delayed click from revoking a newer assignment.
+    ReassignRun {
+        run_id: String,
+        attempt: u32,
+    },
 
     // ---- the agent session lane (mid-run writes) --------------------------
     /// the EXECUTING node binds an ephemeral session key to a live run, so the
@@ -232,19 +326,19 @@ pub enum RunsMsg {
     /// works with nobody at a keyboard — and it is correct cross-node, because
     /// the lease names the node actually executing the run.
     ///
-    /// the OWNER's authority is deliberately not asked for here, because
-    /// consensus already holds it: `AgentRecord { owner, allowed_actions, caps }`
-    /// IS the capability grant — registering an agent with `chat.post` is the
-    /// act of authorizing it. what this op adds is not authority but PROOF: that
-    /// an op came from this agent's run and no other.
+    /// no owner signature is asked for: a run acts as its program account, and
+    /// what that account may do is each target module's own rule. what this op
+    /// adds is not authority but PROOF: that an op came from this agent's run
+    /// and no other.
     OpenAgentSession {
         run_id: String,
+        attempt: u32,
         /// the session's ed25519 PUBLIC key, exactly [`SESSION_KEY_LEN`] bytes.
         /// its private half never leaves the executing host and reaches only the
         /// agent's tool server — never the node key, which can sign anything.
         session_key: Vec<u8>,
     },
-    /// one agent action, applied MID-RUN, signed by the bound session key.
+    /// One catalog operation, invoked MID-RUN, signed by the bound session key.
     ///
     /// the origin must BE that session key. a frame's origin is its VERIFIED
     /// public key (`node::decode_frame` binds `(origin, seq, target, payload)`,
@@ -252,15 +346,21 @@ pub enum RunsMsg {
     /// is authorship consensus can trust — unlike the frameless `/v1/submit`
     /// lane, whose caller-supplied origin `bin/node` discards outright.
     ///
-    /// the action is then validated against the SAME `allowed_actions` + caps
-    /// the response path validates, by the same code: the tool plane must never
-    /// become a second, wider permission vocabulary.
-    AgentAction { run_id: String, action: AgentAction },
+    /// the envelope is decoded against the module-owned catalog and validated
+    /// by the SAME code the response path validates: the tool plane must never
+    /// become a second vocabulary. `request_id` names the logical invocation
+    /// within the run: an exact retry answers the same receipt, a reuse with
+    /// different bytes is refused.
+    AgentAction {
+        run_id: String,
+        request_id: String,
+        action: ActionEnvelope,
+    },
     /// Start one peer agent call while the caller is still running. The bound
-    /// session key authorizes the request; `subagent_budget` bounds concurrent
-    /// live calls across the root tree, and the callee executes with caller ∩
-    /// callee authority.
-    DelegateRun {
+    /// session key authorizes the request; the root tree holds at most
+    /// [`crate::MAX_DELEGATIONS_PER_RUN`] live calls, and the callee executes
+    /// as itself.
+    ExecuteDelegation {
         run_id: String,
         request_id: String,
         request: DelegationRequest,
@@ -272,10 +372,18 @@ pub enum RunsMsg {
 /// required byte length of a session key (an ed25519 public key).
 pub const SESSION_KEY_LEN: usize = 32;
 
-/// hard cap on writes and peer calls ONE session may apply — the mid-run peer of
-/// [`agent::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
+/// Hard cap on writes and peer calls across all attempts of one run — the
+/// mid-run peer of [`crate::MAX_ACTIONS_PER_RUN`]. A session that has burned
 /// its budget can still RETURN a response; it just cannot keep writing.
 pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
+
+/// The exact execution attempt authorized to act for a run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLease {
+    pub holder: Vec<u8>,
+    pub attempt: u32,
+}
 
 /// one live agent session: an ephemeral key bound to a run, plus the audit
 /// record of what it did with it.
@@ -292,8 +400,10 @@ pub struct AgentSession {
     /// the ed25519 public key that must sign every [`RunsMsg::AgentAction`] for
     /// this run.
     pub session_key: Vec<u8>,
+    /// Every action must still belong to this node and execution attempt.
+    pub lease: ExecutionLease,
     pub opened_at: u64,
-    /// how many actions this session has applied — the audit counter.
+    /// Actions admitted across all attempts; rotation never resets ids or budget.
     pub actions: u32,
 }
 
@@ -302,11 +412,35 @@ pub struct AgentSession {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    NodeWork {
+        node_key: Vec<u8>,
+        height: u64,
+        consensus_time: u64,
+    },
+    NextModuleUpdate,
+    ModuleUpdate {
+        sequence: u64,
+    },
+    Model {
+        query: crate::ModelQuery,
+    },
+    /// The module-owned action catalog, optionally narrowed to operation
+    /// names starting with `filter`.
+    Catalog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
+    /// Stored proposal data, without querying its program's status.
+    ActionPlan {
+        request_id: String,
+    },
+    ActionRequest {
+        request_id: String,
+    },
     /// every in-flight correlation entry, ascending by dispatch id. bounded:
     /// entries prune on delivery, and every dispatch has a deadline.
     PendingRuns,
-    Watches,
-    /// the delivered-runs ring, newest first (last 100). derived state — see
+    /// The terminal-runs ring, newest first (last 100). Derived state — see
     /// [`RunRecord`].
     RecentRuns,
     /// every LIVE agent session, ascending by run id — the audit surface: which
@@ -324,8 +458,12 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    NodeWork(Option<node_work::Directive>),
+    ModuleUpdate(Option<ModuleUpdateView>),
+    Model(crate::ModelReply),
+    Catalog(Vec<OperationView>),
+    ActionRequest(Option<ActionRequestView>),
     PendingRuns(Vec<PendingRun>),
-    Watches(Vec<WatchView>),
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
     Delegations(Vec<DelegationView>),
@@ -350,4 +488,101 @@ pub fn encode_reply(r: &RunsReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<RunsReply, String> {
     sdk::wire::decode(b)
+}
+
+/// A prebuilt artifact file within the output commit and its SHA-256 digest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateSpec {
+    pub module_id: String,
+    pub artifact: String,
+    pub code_hash: String,
+    pub after: u64,
+}
+
+/// The host-pushed output, bound before the program receives the deployment action.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateSource {
+    pub repo: String,
+    pub branch: String,
+    pub commit: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleUpdateStatus {
+    Requested,
+    Activated { height: u64 },
+    Rejected { reason: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateRequest {
+    pub sequence: u64,
+    pub request_id: String,
+    pub account: sdk::AccountNumber,
+    pub run_id: String,
+    pub source: ModuleUpdateSource,
+    pub update: ModuleUpdateSpec,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateView {
+    pub request: ModuleUpdateRequest,
+    pub status: ModuleUpdateStatus,
+}
+
+/// Every validator joins the same ceremony; a completed request never reuses its id.
+pub fn module_update_proposal_id(sequence: u64) -> String {
+    format!("program-module:{sequence}")
+}
+
+/// A run tool request is proposed work until a program's real target call completes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionStatus {
+    AwaitingProgram,
+    Claimed {
+        call: sdk::CallId,
+    },
+    Completed {
+        call: sdk::CallId,
+        outcome: dispatch::CallOutcomeSummary,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActionRequestView {
+    pub request_id: String,
+    pub account: sdk::AccountNumber,
+    pub generation: u64,
+    pub run_id: String,
+    /// The catalog operation this proposal invokes. A module-authored effect
+    /// carries its label instead: `reply` for the run's own reply, the target
+    /// module's id for an effect no operation prepared (the forge sink).
+    pub operation: String,
+    /// The deterministic result the operation prepared (ids it minted, the
+    /// destination it resolved); meaningful once `status` is completed.
+    pub result: serde_json::Value,
+    /// The module that executes the prepared message.
+    pub target: String,
+    pub payload: serde_json::Value,
+    pub status: ActionStatus,
+}
+
+/// The receipt id of one live invocation. A caller knows it before admission
+/// and awaits exactly this receipt; an exact retry resolves to the same id.
+pub fn action_request_id(run_id: &str, request_id: &str) -> String {
+    format!(
+        "action/{}/{}",
+        crate::dispatch_id_for(run_id),
+        crate::dispatch_id_for(request_id)
+    )
 }

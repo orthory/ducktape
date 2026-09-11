@@ -40,7 +40,7 @@
 //! identical in the engine transaction and the native test harness.
 
 use index_guest::search::{self, DEFAULT_POSTING_CAP};
-use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
+use index_guest::{Fail, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PageError;
@@ -74,6 +74,7 @@ const FAIL_PAGE_READ: i32 = 5;
 /// `Block` straight out of this row.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageBlockRow {
+    pub author: crate::Party,
     pub block_id: String,
     /// the page (root block id) this block belongs to; a root names itself.
     pub page_id: String,
@@ -100,6 +101,7 @@ impl PageBlockRow {
     /// [`crate::PageQuery::GetPage`] returns for the same id.
     fn to_block(&self) -> Block {
         Block {
+            author: self.author.clone(),
             id: self.block_id.clone(),
             parent: self.parent.clone(),
             page: self.page_id.clone(),
@@ -156,7 +158,7 @@ pub struct PageRow {
 pub struct ThreadRow {
     pub id: String,
     pub target: String,
-    /// rendered opener: `user:{id}`, `agent:{module}/{agent}`, `module:{id}`,
+    /// rendered opener: `user:{id}`, `acct:{number}`, `module:{id}`,
     /// or `system`.
     pub opener: String,
     pub created_at: u64,
@@ -215,6 +217,14 @@ pub enum PagesViewQuery {
     /// one call a page render makes with all visible block ids + the page
     /// id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
     ThreadsForTargets { targets: Vec<String> },
+    /// one block by id: the page it belongs to and its text, for a link that
+    /// names a block and has to say which page opens and what to call it.
+    GetBlock { block_id: String },
+    /// one comment thread by id, with the block it is anchored to.
+    GetThread { thread_id: String },
+    /// the thread one comment belongs to, comments included — a link that
+    /// names a comment needs its text and the block its thread anchors to.
+    ThreadOfComment { comment_id: String },
     Search {
         text: String,
         #[serde(default)]
@@ -241,6 +251,10 @@ pub enum PagesViewReply {
     },
     /// live threads grouped per requested target, request order.
     Threads(Vec<TargetThreadsRow>),
+    /// one block, `None` for an id this index does not hold.
+    Block(Option<PageBlockRow>),
+    /// one thread, `None` for an id this index does not hold.
+    Thread(Option<ThreadRow>),
     /// search hits, newest first.
     Hits(Vec<PageBlockRow>),
 }
@@ -279,15 +293,12 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// rendered author, mirroring how the module derives authorship: the origin
-/// decides, `as_agent` refines a module origin into an agent author.
-fn render_author(origin: &OriginTag, as_agent: Option<&str>) -> String {
-    let id = origin.id.as_deref().unwrap_or_default();
-    match (origin.kind, as_agent) {
-        (OriginKind::Module, Some(agent)) => format!("agent:{id}/{agent}"),
-        (OriginKind::Module, None) => format!("module:{id}"),
-        (OriginKind::External, _) => format!("user:{id}"),
-        (OriginKind::System, _) => "system".to_string(),
+fn render_author(party: &crate::Party) -> String {
+    match party {
+        crate::Party::Account(account) => format!("acct:{account}"),
+        crate::Party::Key(key) => format!("user:{}", index_guest::user_handle(key)),
+        crate::Party::Module(module) => format!("module:{module}"),
+        crate::Party::System => "system".into(),
     }
 }
 
@@ -310,6 +321,56 @@ fn encode_row(row: &PageBlockRow) -> Result<Vec<u8>, Fail> {
 
 fn put_row(out: &mut Writes, row: &PageBlockRow) -> Result<(), Fail> {
     index_guest::put(out, blk_key(&row.block_id), encode_row(row)?);
+    Ok(())
+}
+
+/// mirror one new child block under `parent` at sibling index `at`: its row
+/// and postings, a subpage's page-list entry when its kind is `Page`, and
+/// the parent's child order. the caller stores the parent row afterwards.
+/// marks that do not fit the text leave the block out, exactly as the
+/// canonical insert refuses them (a refused op never reaches the feed, so
+/// this only guards a mirror against bytes the canonical lane never took).
+fn place_child_row(
+    out: &mut Writes,
+    parent: &mut PageBlockRow,
+    at: usize,
+    block: crate::NewBlock,
+    actor: &crate::Party,
+    op: &OpRow,
+) -> Result<(), Fail> {
+    let page_id = if block.kind == BlockKind::Page {
+        put_page(
+            out,
+            &PageRow {
+                id: block.id.clone(),
+                title: block.text.clone(),
+                parent: Some(parent.page_id.clone()),
+            },
+        )?;
+        block.id.clone()
+    } else {
+        parent.page_id.clone()
+    };
+    // the canonical insert normalizes the client's marks against the
+    // block's own text before storing them; same call, same result.
+    let Ok(marks) = validate_marks(&block.text, block.marks) else {
+        return Ok(());
+    };
+    let row = PageBlockRow {
+        author: actor.clone(),
+        block_id: block.id.clone(),
+        page_id,
+        parent: Some(parent.block_id.clone()),
+        kind: block.kind,
+        text: block.text,
+        marks,
+        checked: false,
+        children: Vec::new(),
+        height: op.height,
+        time: op.time,
+    };
+    put_row_and_toks(out, &row)?;
+    parent.children.insert(at, block.id);
     Ok(())
 }
 
@@ -360,11 +421,7 @@ fn delete_subtree(read: &impl StateRead, out: &mut Writes, root: PageBlockRow) -
 /// delete every thread anchored to `target`: rows, markers, and comment
 /// pointers. one scan pass per removed block, mirroring the module's
 /// `purge_comments_for_target`.
-fn purge_target_threads(
-    read: &impl StateRead,
-    out: &mut Writes,
-    target: &str,
-) -> Result<(), Fail> {
+fn purge_target_threads(read: &impl StateRead, out: &mut Writes, target: &str) -> Result<(), Fail> {
     let prefix = ctgt_prefix(target);
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -422,10 +479,7 @@ fn put_thread(out: &mut Writes, row: &ThreadRow) -> Result<(), Fail> {
 /// resolve a comment id to its owning thread row via the `cmt/` pointer. an
 /// absent pointer means the comment predates this index — a deterministic
 /// skip, like every pre-index record.
-fn thread_of_comment(
-    read: &impl StateRead,
-    comment_id: &str,
-) -> Result<Option<ThreadRow>, Fail> {
+fn thread_of_comment(read: &impl StateRead, comment_id: &str) -> Result<Option<ThreadRow>, Fail> {
     let Some(pointer) = read.get(cmt_key(comment_id).as_bytes()) else {
         return Ok(None);
     };
@@ -488,12 +542,24 @@ fn move_block(
         old.children.retain(|child| child != &block_id);
         put_row(out, &old)?;
     }
+    // A PAGE MOVED UNDER ANOTHER PARENT CHANGES WHICH PAGE CONTAINS IT, and
+    // the page list serves that from `page/<id>`, not from the block row:
+    // mirror the canonical `index_set_parent` — the CONTAINING page of the
+    // new parent (a page block names itself, a body block names its page),
+    // `None` at the root.
+    let mut containing_page = None;
     if let Some(parent_id) = &parent
         && let Some(mut new_parent) = read_row(read, parent_id)?
     {
         let at = insert_index(&new_parent.children, after.as_deref());
         new_parent.children.insert(at, block_id.clone());
+        containing_page = Some(new_parent.page_id.clone());
         put_row(out, &new_parent)?;
+    }
+    let moves_page = row.kind == BlockKind::Page;
+    if moves_page && let Some(mut page) = read_page(read, &block_id)? {
+        page.parent = containing_page;
+        put_page(out, &page)?;
     }
     row.parent = parent;
     put_row(out, &row)
@@ -502,11 +568,18 @@ fn move_block(
 /// fold one applied op into derived writes.
 pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
+    let actor = crate::decode_assigned(&op.assigned)
+        .map_err(|e| Fail::new(FAIL_OP_DECODE, e))?
+        .actor;
     let mut out = Writes::new();
     match msg {
-        PageMsg::CreatePage { page_id, title } => {
+        PageMsg::CreatePage {
+            page_id,
+            title,
+            blocks,
+        } => {
             // idempotence mirror: re-creating an existing page is a no-op
-            // that changes neither the title nor the parent.
+            // that changes neither the title, the body, nor the parent.
             if read_row(read, &page_id)?.is_some() {
                 return Ok(out);
             }
@@ -518,7 +591,8 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     parent: None,
                 },
             )?;
-            let row = PageBlockRow {
+            let mut page_row = PageBlockRow {
+                author: actor.clone(),
                 page_id: page_id.clone(),
                 block_id: page_id,
                 parent: None,
@@ -530,7 +604,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 height: op.height,
                 time: op.time,
             };
-            put_row_and_toks(&mut out, &row)?;
+            // the body in document order, each block after the one before.
+            for (at, block) in blocks.into_iter().enumerate() {
+                place_child_row(&mut out, &mut page_row, at, block, &actor, op)?;
+            }
+            put_row_and_toks(&mut out, &page_row)?;
         }
         PageMsg::InsertBlock {
             parent,
@@ -542,39 +620,8 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut parent_row) = read_row(read, &parent)? else {
                 return Ok(out);
             };
-            let page_id = if block.kind == BlockKind::Page {
-                put_page(
-                    &mut out,
-                    &PageRow {
-                        id: block.id.clone(),
-                        title: block.text.clone(),
-                        parent: Some(parent_row.page_id.clone()),
-                    },
-                )?;
-                block.id.clone()
-            } else {
-                parent_row.page_id.clone()
-            };
-            // the canonical insert normalizes the client's marks against the
-            // block's own text before storing them; same call, same result.
-            let Ok(marks) = validate_marks(&block.text, block.marks) else {
-                return Ok(out);
-            };
-            let row = PageBlockRow {
-                block_id: block.id.clone(),
-                page_id,
-                parent: Some(parent.clone()),
-                kind: block.kind,
-                text: block.text,
-                marks,
-                checked: false,
-                children: Vec::new(),
-                height: op.height,
-                time: op.time,
-            };
-            put_row_and_toks(&mut out, &row)?;
             let at = insert_index(&parent_row.children, after.as_deref());
-            parent_row.children.insert(at, block.id);
+            place_child_row(&mut out, &mut parent_row, at, block, &actor, op)?;
             put_row(&mut out, &parent_row)?;
         }
         PageMsg::UpdateText {
@@ -672,10 +719,9 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             target,
             text,
             anchor,
-            as_agent,
             ..
         } => {
-            let author = render_author(&op.origin, as_agent.as_deref());
+            let author = render_author(&actor);
             let comment = CommentRow {
                 id: comment_id.clone(),
                 author: author.clone(),
@@ -692,11 +738,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 None => {
                     // a fresh thread: the opener is this comment's author and
                     // the target marker makes it scannable per target.
-                    index_guest::put(
-                        &mut out,
-                        ctgt_key(&target, &thread_id),
-                        Vec::new(),
-                    );
+                    index_guest::put(&mut out, ctgt_key(&target, &thread_id), Vec::new());
                     ThreadRow {
                         id: thread_id.clone(),
                         target,
@@ -732,8 +774,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut thread) = thread_of_comment(read, &comment_id)? else {
                 return Ok(out);
             };
-            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id)
-            else {
+            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id) else {
                 return Ok(out);
             };
             comment.text = text;
@@ -744,8 +785,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut thread) = thread_of_comment(read, &comment_id)? else {
                 return Ok(out);
             };
-            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id)
-            else {
+            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id) else {
                 return Ok(out);
             };
             comment.deleted = true;
@@ -767,7 +807,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 return Ok(out);
             };
             thread.resolved = resolved;
-            thread.resolved_by = resolved.then(|| render_author(&op.origin, None));
+            thread.resolved_by = resolved.then(|| render_author(&actor));
             put_thread(&mut out, &thread)?;
         }
     }
@@ -1022,6 +1062,15 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             }
             reply_json(&PagesViewReply::Threads(groups))
         }
+        PagesViewQuery::GetBlock { block_id } => {
+            reply_json(&PagesViewReply::Block(read_row(read, &block_id)?))
+        }
+        PagesViewQuery::GetThread { thread_id } => {
+            reply_json(&PagesViewReply::Thread(read_thread(read, &thread_id)?))
+        }
+        PagesViewQuery::ThreadOfComment { comment_id } => reply_json(&PagesViewReply::Thread(
+            thread_of_comment(read, &comment_id)?,
+        )),
         PagesViewQuery::Search {
             text,
             page_id,
@@ -1074,7 +1123,9 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_msg(msg),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&crate::PageAssigned {
+                actor: crate::Party::Key(b"jess".to_vec()),
+            }),
         }
     }
 
@@ -1096,6 +1147,7 @@ mod tests {
             None => PageMsg::CreatePage {
                 page_id: id.into(),
                 title: title.into(),
+                blocks: Vec::new(),
             },
             // a foldered page is a Page-kind block inserted under its parent.
             Some(parent) => PageMsg::InsertBlock {
@@ -1119,7 +1171,6 @@ mod tests {
             text: text.into(),
             anchor: None,
             mentions: Vec::new(),
-            as_agent: None,
         }
     }
 
@@ -1150,7 +1201,10 @@ mod tests {
     }
 
     fn threads(map: &Map, targets: &[&str]) -> Vec<TargetThreadsRow> {
-        match view(map, serde_json::json!({"threads_for_targets": {"targets": targets}})) {
+        match view(
+            map,
+            serde_json::json!({"threads_for_targets": {"targets": targets}}),
+        ) {
             PagesViewReply::Threads(groups) => groups,
             other => panic!("expected threads, got {other:?}"),
         }
@@ -1166,6 +1220,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "roadmap draft".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "quarter goals"),
                 insert("b1", "b2", "nested milestone detail"),
@@ -1186,6 +1241,7 @@ mod tests {
             &[PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "usurper".into(),
+                blocks: Vec::new(),
             }],
         );
         assert!(search(&map, serde_json::json!({"search": {"text": "usurper"}})).is_empty());
@@ -1205,6 +1261,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "root".into(),
                     title: "root document".into(),
+                    blocks: Vec::new(),
                 },
                 PageMsg::InsertBlock {
                     parent: "root".into(),
@@ -1247,6 +1304,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "toggle section"),
                 insert("b1", "b2", "hidden inner text"),
@@ -1279,6 +1337,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "first"),
                 insert("p1", "b2", "second"),
@@ -1314,6 +1373,87 @@ mod tests {
         assert_eq!(children(&map), ["b1", "b2"], "None anchors at the HEAD");
     }
 
+    /// The page list reads `page/<id>.parent`, so a page moved under another
+    /// page — or under a BODY block of one, or back to the root — must land
+    /// there too, the way the canonical `index_set_parent` records the
+    /// containing page. A same-parent reorder leaves it alone.
+    #[test]
+    fn a_moved_page_changes_the_parent_the_page_list_reports() {
+        let mut map = Map::new();
+        let page = |id: &str| PageMsg::CreatePage {
+            page_id: id.into(),
+            title: id.to_uppercase(),
+            blocks: Vec::new(),
+        };
+        apply(
+            &mut map,
+            1,
+            &[page("a"), page("b"), page("c"), insert("a", "a1", "body")],
+        );
+        let parent_of = |map: &Map, id: &str| {
+            list(map)
+                .into_iter()
+                .find(|row| row.id == id)
+                .expect("the page is listed")
+                .parent
+        };
+        assert_eq!(parent_of(&map, "b"), None);
+
+        // top-level → nested under a page
+        apply(
+            &mut map,
+            2,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: Some("a".into()),
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), Some("a".into()));
+        assert_eq!(
+            read_row(&map, "b").unwrap().unwrap().parent,
+            Some("a".into()),
+            "the block row moves with it"
+        );
+
+        // nested under a BODY block: the containing page, not the block
+        apply(
+            &mut map,
+            3,
+            &[PageMsg::MoveBlock {
+                block_id: "c".into(),
+                parent: Some("a1".into()),
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "c"), Some("a".into()));
+
+        // a same-parent reorder is not a re-homing
+        apply(
+            &mut map,
+            4,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: Some("a".into()),
+                after: Some("a1".into()),
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), Some("a".into()));
+
+        // nested → top-level
+        apply(
+            &mut map,
+            5,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: None,
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), None);
+        assert_eq!(read_row(&map, "b").unwrap().unwrap().parent, None);
+    }
+
     #[test]
     fn update_text_renames_and_page_filter_applies() {
         let mut map = Map::new();
@@ -1324,10 +1464,12 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "alpha".into(),
+                    blocks: Vec::new(),
                 },
                 PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "beta".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "shared term"),
                 insert("p2", "b2", "shared term"),
@@ -1373,10 +1515,8 @@ mod tests {
                 create("mid", "M", Some("alpha")),
             ],
         );
-        let got: Vec<(String, Option<String>)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.parent))
-            .collect();
+        let got: Vec<(String, Option<String>)> =
+            list(&map).into_iter().map(|r| (r.id, r.parent)).collect();
         assert_eq!(
             got,
             [
@@ -1399,10 +1539,8 @@ mod tests {
                 create("alpha", "usurper", None),
             ],
         );
-        let titles: Vec<(String, String)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.title))
-            .collect();
+        let titles: Vec<(String, String)> =
+            list(&map).into_iter().map(|r| (r.id, r.title)).collect();
         assert_eq!(
             titles,
             [
@@ -1457,10 +1595,8 @@ mod tests {
         );
 
         // the subtree removal takes parent AND its nested child page rows.
-        let got: Vec<(String, Option<String>)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.parent))
-            .collect();
+        let got: Vec<(String, Option<String>)> =
+            list(&map).into_iter().map(|r| (r.id, r.parent)).collect();
         assert_eq!(got, [("grand".into(), None)]);
         // the deleted page's block subtree left the search index with it.
         assert!(search(&map, serde_json::json!({"search": {"text": "doomed"}})).is_empty());
@@ -1523,7 +1659,10 @@ mod tests {
         let t1 = &groups[0].threads[0];
         assert!(t1.resolved);
         assert_eq!(t1.resolved_by.as_deref(), Some("user:jess"));
-        assert!(t1.comments[0].deleted, "the tombstone is served, not hidden");
+        assert!(
+            t1.comments[0].deleted,
+            "the tombstone is served, not hidden"
+        );
         assert_eq!(t1.comments[0].text, "", "tombstoned content is emptied");
         assert_eq!(t1.comments[1].text, "reworded");
         assert_eq!(t1.comments[1].edited_at, Some(1_002));
@@ -1551,6 +1690,68 @@ mod tests {
         let groups = threads(&map, &["b1", "b2"]);
         assert_eq!(names(&groups[0]), ["t1", "t3"]);
         assert!(groups[1].threads.is_empty());
+    }
+
+    /// A LINK THAT NAMES A BLOCK OR A THREAD resolves on this lane: the
+    /// block's page and text, the thread's target block. An id this index
+    /// never folded answers `None`, never a refusal — a run's journal can
+    /// name a block the mirror has not caught up to yet.
+    #[test]
+    fn a_block_and_a_thread_read_by_id_on_the_view_lane() {
+        let mut map = Map::new();
+        apply(
+            &mut map,
+            1,
+            &[
+                create("notes", "Release notes", None),
+                insert("notes", "b1", "ship it"),
+                add("t1", "c1", "b1", "not yet"),
+            ],
+        );
+        let block = serde_json::to_vec(&PagesViewQuery::GetBlock {
+            block_id: "b1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &block).expect("answers")).unwrap();
+        let PagesViewReply::Block(Some(row)) = reply else {
+            panic!("expected the block, got {reply:?}");
+        };
+        assert_eq!(
+            (row.page_id.as_str(), row.text.as_str()),
+            ("notes", "ship it")
+        );
+
+        let thread = serde_json::to_vec(&PagesViewQuery::GetThread {
+            thread_id: "t1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &thread).expect("answers")).unwrap();
+        let PagesViewReply::Thread(Some(row)) = reply else {
+            panic!("expected the thread, got {reply:?}");
+        };
+        assert_eq!(row.target, "b1");
+
+        let of_comment = serde_json::to_vec(&PagesViewQuery::ThreadOfComment {
+            comment_id: "c1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &of_comment).expect("answers")).unwrap();
+        let PagesViewReply::Thread(Some(row)) = reply else {
+            panic!("expected the comment's thread, got {reply:?}");
+        };
+        assert_eq!(row.id, "t1");
+        assert_eq!(row.comments[0].text, "not yet");
+
+        let unknown = serde_json::to_vec(&PagesViewQuery::GetBlock {
+            block_id: "nope".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &unknown).expect("answers")).unwrap();
+        assert!(matches!(reply, PagesViewReply::Block(None)), "{reply:?}");
     }
 
     #[test]

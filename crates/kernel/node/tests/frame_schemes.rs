@@ -92,6 +92,55 @@ fn a_key_under_the_wrong_scheme_is_rejected() {
     assert!(node::decode_frame(&frame).is_err());
 }
 
+/// the SAME wallet key spelled uncompressed (65-byte SEC1). recovery compares
+/// curve points, so the proof itself is valid — but `Origin::External` is raw
+/// bytes and every index downstream compares them, so a second spelling would
+/// be a second principal for one private key. the decoder refuses it.
+#[test]
+fn an_uncompressed_wallet_origin_is_refused_at_decode() {
+    let sk = eth_key(9);
+    let uncompressed = sk
+        .verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    assert_eq!(uncompressed.len(), 65);
+    let mut frame = node::frame_preimage(KeyScheme::Secp256k1, &uncompressed, 7, &msg());
+    let proof = eth_proof(&sk, node::FRAME_NS, &frame);
+    frame.extend_from_slice(&proof);
+    let refusal = node::decode_frame(&frame).expect_err("a non-canonical origin never decodes");
+    assert!(
+        refusal.to_string().contains("malformed for its scheme"),
+        "{refusal}"
+    );
+    // the canonical spelling of that key frames the same op fine.
+    let mut frame = node::frame_preimage(KeyScheme::Secp256k1, &eth_pubkey(&sk), 7, &msg());
+    let proof = eth_proof(&sk, node::FRAME_NS, &frame);
+    frame.extend_from_slice(&proof);
+    assert!(node::decode_frame(&frame).is_ok());
+}
+
+/// the passkey half of the same rule.
+#[test]
+fn an_uncompressed_passkey_origin_is_refused_at_decode() {
+    let sk = passkey(0x31);
+    let uncompressed = sk
+        .verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    let mut frame = node::frame_preimage(KeyScheme::Secp256r1, &uncompressed, 1, &msg());
+    let proof = passkey_proof(
+        &sk,
+        "auth.ducktape.industries",
+        node::FRAME_NS,
+        &frame,
+        true,
+    );
+    frame.extend_from_slice(&proof);
+    assert!(node::decode_frame(&frame).is_err());
+}
+
 #[test]
 fn a_tampered_wallet_frame_is_rejected() {
     let sk = eth_key(4);

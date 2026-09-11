@@ -1,162 +1,5 @@
 use super::*;
 
-/// A SEARCH COSTS ITS SLOWEST SOURCE, NOT THEIR SUM. `search_workspace` awaited
-/// six independent sources one after another, and nothing in it reads what
-/// another leg produced. Warm that is worth nothing — every leg answers in a
-/// few milliseconds. COLD it is the whole cost: a module's first touch measured
-/// 10-54 s against this app's 30 s client ceiling, so serial is several
-/// ceilings end to end and fanned out is one.
-///
-/// THE OVERLAP IS THE GUARANTEE, SO THE OVERLAP IS WHAT IS PINNED — observed
-/// from outside the process by a node that answers nothing until all six legs
-/// are in flight together. The pin this replaced greped the join's text for six
-/// names, which folding two legs into one `async { a.await; b.await }` inside
-/// the join defeats while staying green.
-///
-/// The row order is asserted in the same run: a fan-out that silently reordered
-/// the results would be a different defect.
-///
-/// This does NOT contradict the `join_all` ban in backend/document.rs: that one
-/// guards the WRITE chain, where an op built on the block before it must land
-/// after it.
-#[tokio::test(flavor = "current_thread")]
-async fn a_workspace_search_reaches_its_six_sources_together() {
-    let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
-    let rpc = node_that_answers_only_a_full_fan_out(9, &[], watch.clone()).await;
-
-    let results = search_workspace(rpc, "needle".into()).await;
-
-    assert_eq!(
-        watch.lock().expect("stub watch").overlapped,
-        [
-            "chat", "files", "forge", "pages", "runs", "runs", "tasks", "tasks", "tasks"
-        ],
-        "every round trip a workspace search opens with must be in flight at \
-         once — anything missing here waited on another request's reply. The \
-         repeats are the legs that read more than one thing: tasks walks three \
-         status pages, runs reads pending and recent."
-    );
-    // Every lane answered, so nothing is held back.
-    assert_eq!(results.partial, "");
-    // And the rows land in the order the screen shows them. The tasks lane is
-    // three status pages behind one source, hence the run-length squash.
-    let mut order: Vec<String> = results.hits.iter().map(|hit| hit.kind.clone()).collect();
-    order.dedup();
-    assert_eq!(order, ["page", "code", "file", "task", "run"]);
-    // The page row heads with its PAGE, which is the second wave's whole job —
-    // and the reason `list_pages` is a lane of its own rather than a substring
-    // collision with the search it follows. Served the search's reply instead,
-    // the title lookup fails and every page hit falls back to "Untitled".
-    let page = results
-        .hits
-        .iter()
-        .find(|hit| hit.kind == "page")
-        .expect("the pages lane answered");
-    assert_eq!(page.title, "The needle page");
-}
-
-/// A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. All six
-/// legs failed silently — `if let Ok(..)` on two, `return Vec::new()` on the
-/// rest — and the node's per-module cold start runs tens of seconds against a
-/// 30 s client ceiling, so a timeout was the ordinary case, not the exotic one.
-/// A search that reached the node and lost three of its six sources still
-/// rendered a confident count, a full chip strip reading 0 for kinds it never
-/// read, and — when the survivors were empty — "Nothing matched that query in
-/// this workspace". Three lies off one timeout, in the app that spent the night
-/// learning to say nothing rather than something false.
-///
-/// EVERY LEG, NOT THE ONE I FIXED FIRST. The round-2 version refused the forge
-/// lane alone, and reverting the silence report on chat, files or tasks — two
-/// of them the `return Vec::new()` swallowers — kept the suite green. The
-/// defect was class-wide, so the pin walks the class: each source in turn is
-/// the one that does not answer.
-#[tokio::test(flavor = "current_thread")]
-async fn a_search_that_lost_a_source_says_which_one() {
-    /// The six sources, each with the name the screen must call it by and the
-    /// hit kind it contributes. One table: a seventh source added to
-    /// `search_workspace` with no silence report has to be added here to pass,
-    /// and then fails.
-    const SOURCES: [(&str, &str, &str); 6] = [
-        ("chat", "Messages", "message"),
-        ("pages", "Pages", "page"),
-        ("forge", "Code", "code"),
-        ("files", "Files", "file"),
-        ("tasks", "Tasks", "task"),
-        ("runs", "Runs", "run"),
-    ];
-
-    for (leg, label, silent_kind) in SOURCES {
-        let leg_alone: &'static [&'static str] = match leg {
-            "chat" => &["chat"],
-            "pages" => &["pages"],
-            "forge" => &["forge"],
-            "files" => &["files"],
-            "tasks" => &["tasks"],
-            _ => &["runs"],
-        };
-        let rpc = node_that_answers_only_a_full_fan_out(9, leg_alone, Default::default()).await;
-
-        let results = search_workspace(rpc, "needle".into()).await;
-
-        assert_eq!(
-            results.partial,
-            format!("{label} did not answer — these results are incomplete."),
-            "the screen must name the source it did not read"
-        );
-        // The chip strip's contract is "a count of 0 means nothing matched,
-        // never no loader", so the source that never ran keeps no chip at all.
-        let chips: Vec<&str> = results
-            .kinds
-            .iter()
-            .map(|kind| kind.kind.as_str())
-            .collect();
-        let answered: Vec<&str> = SOURCES
-            .iter()
-            .map(|(_, _, kind)| *kind)
-            .filter(|kind| *kind != silent_kind)
-            .collect();
-        assert_eq!(chips, answered, "{label} was refused, so it keeps no chip");
-        // And the answer that did arrive is untouched, in screen order —
-        // degrading the survivors would be the opposite mistake. The chat lane
-        // carries no rows on purpose (see `SEARCH_LANES`); every other source
-        // contributes exactly one.
-        let mut rows: Vec<&str> = results.hits.iter().map(|hit| hit.kind.as_str()).collect();
-        rows.dedup();
-        let carried: Vec<&str> = ["page", "code", "file", "task", "run"]
-            .into_iter()
-            .filter(|kind| *kind != silent_kind)
-            .collect();
-        assert_eq!(
-            rows, carried,
-            "with {label} silent the other sources still land, in screen order"
-        );
-    }
-
-    // CARDINALITY. Every case above refuses exactly ONE source, and a filter
-    // keyed on `silent.first()` instead of `silent.contains(..)` passes all six
-    // — the reviewer changed that one token and the suite stayed green while a
-    // second silent source got a chip reading 0, against the strip's own "a
-    // count of 0 means nothing matched, never no loader". Two at once is the
-    // case the PR body's own headline scenario describes.
-    let rpc =
-        node_that_answers_only_a_full_fan_out(9, &["chat", "pages"], Default::default()).await;
-    let results = search_workspace(rpc, "needle".into()).await;
-    assert_eq!(
-        results.partial, "Messages, Pages did not answer — these results are incomplete.",
-        "both silent sources are named, in screen order"
-    );
-    let chips: Vec<&str> = results
-        .kinds
-        .iter()
-        .map(|kind| kind.kind.as_str())
-        .collect();
-    assert_eq!(
-        chips,
-        ["code", "file", "task", "run"],
-        "NEITHER refused source keeps a chip — not just the first one"
-    );
-}
-
 /// The key file's own reading, WITHOUT its password — what the launch window
 /// and the identity cache both resolve through. A plaintext or garbled file is
 /// not "a key we could not open", it is not a key.
@@ -254,8 +97,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         ed25519::PrivateKey::from_seed(12),
     );
     // Two people, two nodes — the huddle's roster is (user, node) pairs, and
-    // it is the NODE half the media plane speaks.
-    let (my_node, peer_node) = ([0xa1u8; 32], [0xb2u8; 32]);
+    // it is the NODE half the media plane speaks. Each node signs its own
+    // `node_proof` over the join (proof of possession).
+    let (my_node, peer_node) = (
+        ed25519::PrivateKey::from_seed(21),
+        ed25519::PrivateKey::from_seed(22),
+    );
+    let my_node_pub = my_node.public_key().as_ref().to_vec();
+    let peer_node_pub = peer_node.public_key().as_ref().to_vec();
 
     submit_test(
         &rpc,
@@ -276,7 +125,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: my_node.to_vec(),
+            node: my_node_pub.clone(),
+            node_proof: my_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", me.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
@@ -287,15 +143,24 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: peer_node.to_vec(),
+            node: peer_node_pub.clone(),
+            node_proof: peer_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", peer.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
 
     let mine = me.public_key().as_ref().to_vec();
-    let (_channel, roster) = load_channel_facts(&rpc, "eng", Some(&mine))
+    let names = NameDirectory::default();
+    let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
         .await
-        .expect("the huddle's channel reads back");
+        .expect("the huddle's channel reads back")
+        .expect("the huddle's channel is on this node");
     assert_eq!(roster.len(), 2, "both people are on the roster");
     assert_eq!(
         roster.iter().filter(|row| row.is_you).count(),
@@ -303,10 +168,10 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "exactly one row is this device's — the id vocabulary has to match"
     );
 
-    let nodes = huddle_recipient_nodes(roster);
+    let nodes = huddle_recipient_nodes(roster, None);
     assert_eq!(
         nodes,
-        vec![hex_encode(&peer_node)],
+        vec![hex_encode(&peer_node_pub)],
         "the fan-out is the OTHER node's key: ours in it would aim this \
          device's media at itself, and the peer's missing from it is the \
          silence this whole poll exists to end"
@@ -323,6 +188,82 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     sim.shutdown();
 }
 
+/// A ROOM THIS NODE CANNOT SEE IS A LANDING, NOT A RED BANNER.
+///
+/// Both halves of it were reported by one resident in one session: she joined a
+/// second network in an app that was still holding the first one's room id, and
+/// the node she joined spent minutes in `joining` with an unfolded chat index
+/// answering `{"channel": null}` for every id there is. Either way the switch
+/// loader read a channel record that is not there, and either way the console
+/// put "channel record was not found" over the timeline — a node-broken reading
+/// of two states that are neither broken nor hers to fix.
+///
+/// So the walk here is the second state THEN the first: an index with nothing
+/// in it answers with no room at all, and an index that has folded answers with
+/// the room there is to read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    let me = ed25519::PrivateKey::from_seed(11);
+
+    // The joining resident: nothing folded yet, so no id resolves — including
+    // the one the sidebar is asking for.
+    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is an empty console, not a failed load");
+    assert!(
+        unfolded.active_channel.is_empty() && unfolded.channels.is_empty(),
+        "a workspace with no rooms to see lands on no room, honestly empty"
+    );
+
+    submit_test(
+        &rpc,
+        &me,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "eng".into(),
+            name: "Engineering".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &me,
+        2,
+        "chat",
+        chat::encode_msg(&ChatMsg::PostMessage {
+            channel_id: "eng".into(),
+            message_id: "message-1".into(),
+            blocks: vec![chat::Block::paragraph("first")],
+            thread: None,
+        }),
+    )
+    .await;
+
+    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is a landing, not a failed load");
+    assert_eq!(
+        landed.active_channel, "eng",
+        "the id nothing answers for resolves to the landing channel"
+    );
+    assert_eq!(landed.active_channel_name, "Engineering");
+    assert_eq!(landed.messages.len(), 1, "and it lands with its timeline");
+    sim.shutdown();
+}
+
 #[test]
 fn post_commit_hydration_errors_are_not_retryable() {
     let error = committed_error("read failed".into());
@@ -332,6 +273,7 @@ fn post_commit_hydration_errors_are_not_retryable() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn chat_and_pages_round_trip_over_signed_frames() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -368,7 +310,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "hello-1".into(),
             blocks: vec![chat::Block::paragraph("hello from the app")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -380,6 +321,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         pages::encode_msg(&PageMsg::CreatePage {
             page_id: "welcome".into(),
             title: "Welcome".into(),
+            blocks: Vec::new(),
         }),
     )
     .await;
@@ -448,6 +390,9 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         after.blocks[0].text, "A signed page block",
         "the refused save must not have touched the page it fell back to"
     );
+    // the module views load from whatever node connects last: take the
+    // turn the deployment tests take, so this node is not theirs
+    let _turn = crate::module_view::tests::connection_turn().await;
     let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = next_change(&mut live).await;
@@ -463,7 +408,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "hello-2".into(),
             blocks: vec![chat::Block::paragraph("arrived on the next block")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -508,7 +452,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "reply-1".into(),
             blocks: vec![chat::Block::paragraph("a threaded reply")],
             thread: Some(1),
-            as_agent: None,
         }),
     )
     .await;
@@ -566,6 +509,33 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert_eq!(hit.active_thread_seq, 1);
     assert_eq!(hit.thread_target_seq, 3);
     assert_eq!(hit.thread_messages[1].body, "a threaded reply");
+    // A duck://channel/general#3 link supplies only the reply's sequence.
+    // Resolve its canonical thread root instead of looking for reply 3 in
+    // the root-only channel window and reporting "message was not found".
+    let linked_reply = load_chat_hit(origin.clone(), "general".into(), 3, 3, 8)
+        .await
+        .unwrap();
+    assert_eq!(linked_reply.generation, 8);
+    assert_eq!(linked_reply.selected_message_seq, 1);
+    assert_eq!(linked_reply.active_thread_seq, 1);
+    assert_eq!(linked_reply.thread_target_seq, 3);
+    assert_eq!(linked_reply.thread_messages[1].body, "a threaded reply");
+    let linked_root = load_chat_hit(origin.clone(), "general".into(), 1, 1, 9)
+        .await
+        .unwrap();
+    assert_eq!(linked_root.selected_message_seq, 1);
+    assert_eq!(linked_root.active_thread_seq, 0);
+    assert!(linked_root.thread_messages.is_empty());
+    let wrong_thread = load_chat_hit(origin.clone(), "general".into(), 2, 3, 10).await;
+    assert!(
+        wrong_thread.is_err(),
+        "a supplied root must still match the reply"
+    );
+    let missing = load_chat_hit(origin.clone(), "general".into(), 999, 999, 11).await;
+    assert!(
+        missing.is_err(),
+        "an index-clamped neighbor is not the requested message"
+    );
     submit_test(
         &rpc,
         &signer,
@@ -650,7 +620,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             text: "temporary".into(),
             anchor: None,
             mentions: Vec::new(),
-            as_agent: None,
         }),
     )
     .await;
@@ -717,14 +686,14 @@ fn hydration_retry_is_capped() {
     assert_eq!(retry_delay(99), Duration::from_secs(16));
 }
 
-/// A `runs` OP IS A SIGNAL, NOT A FOLD. Nothing on screen draws a run row: the
-/// fact that module feeds is `AgentRow.live`, joined into the AGENTS
-/// projection out of another module's state (`agents_with_a_run_in_flight`).
-/// So there is nothing local to fold into, and the only useful shape is a
-/// plane update naming `runs` — which the handler answers by refetching that
-/// projection, the Forge seat's live dot with it.
+/// A `runs` OP IS A SIGNAL, NOT A FOLD. The app holds no run state at all:
+/// the agents view reads its own register, and what it needs off this op is
+/// only that the plane moved. So the only useful shape is a plane update
+/// naming `runs`, which the lifecycle hands the kernel's `rpc.live` — and
+/// the view re-reads.
 #[tokio::test(flavor = "current_thread")]
-async fn a_runs_op_asks_the_agents_projection_to_refetch() {
+async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let update = folded_update(
         "",
         "runs",
@@ -749,17 +718,19 @@ async fn a_runs_op_asks_the_agents_projection_to_refetch() {
     assert_eq!(update.height, 7);
     assert!(
         !update.load_chat && !update.load_pages,
-        "the signal buys the agents projection, not a chat or pages slice"
+        "the signal buys a plane hit, not a chat or pages slice"
     );
 }
 
 /// A PLANE WITH NO SUBSCRIPTION IS A DEAD ARM, and a silent one. `folded_update`
 /// can only route an op the stream was asked to deliver, so the subscribe list
 /// and its match arms are one contract kept in two places. `runs` is the case
-/// that proved it: `AgentRow.live` is read from that module, the Forge seat
-/// draws a live dot off the joined row, and nothing ever said the module
-/// changed — so the dot stayed dark for the length of a run. The EXACT list is
-/// the pin, because a topic dropped here fails nothing else.
+/// that proved it: an agent's liveness is committed there, the rail draws a
+/// live dot off it, and nothing ever said the module changed — so the dot
+/// stayed dark for the length of a run. A view on the kernel contract is
+/// told a plane moved through THIS list too (`rpc.live`), so a topic dropped
+/// here silences that view as well. The EXACT list is the pin, because a
+/// topic dropped here fails nothing else.
 #[test]
 fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     const LIVE: &str = include_str!("../live.rs");
@@ -796,30 +767,6 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     );
 }
 
-/// TWO MODULES, ONE PROJECTION — every quadrant. `agent` commits an agent's
-/// registration and `runs` commits its liveness, so this is the only plane
-/// predicate that answers for a pair; `plane_live_hit`'s single `want` cannot
-/// express it and the Ice checker will not let the handler spell the pair
-/// inline. A non-plane kind must stay false whatever module it names, or a
-/// chat fold's module string starts issuing agent queries.
-#[test]
-fn the_agents_plane_hit_answers_for_both_of_its_modules_and_nothing_else() {
-    for (kind, module, want) in [
-        (crate::LiveKind::Plane, "agent", true),
-        (crate::LiveKind::Plane, "runs", true),
-        (crate::LiveKind::Plane, "valset", false),
-        (crate::LiveKind::Chat, "agent", false),
-        (crate::LiveKind::Chat, "runs", false),
-        (crate::LiveKind::Resync, "runs", false),
-    ] {
-        assert_eq!(
-            agents_plane_hit(kind, module.into()),
-            want,
-            "{kind:?} / {module}"
-        );
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
     let gate = Arc::new(tokio::sync::Semaphore::new(1));
@@ -848,7 +795,7 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
 ///
 /// The heartbeat rides every block, and an idle chain nop-fills once per
-/// block time (node.toml `block_time_ms`) — so anything this update
+/// block time (network.toml `block_time_ms`) — so anything this update
 /// triggers runs at ~1 Hz forever, on a chain where nothing happened. A load
 /// hung off it would be a poll wearing a consensus costume, and `/v1/query` is
 /// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing

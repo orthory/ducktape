@@ -677,19 +677,19 @@ fn history_is_newest_first_with_round_tripped_fields() {
     assert_eq!(hist.len(), 3, "three commits in the window");
     // newest first: S3, S2, S1.
     assert_eq!(hist[0].id, s3);
-    assert_eq!(hist[0].author, "system");
+    assert_eq!(hist[0].author, files::Actor::System);
     assert_eq!(hist[0].height, 3);
     assert_eq!(hist[0].message, "third");
     assert_eq!(hist[0].parent, Some(s2.clone()), "parent is the prior head");
 
     assert_eq!(hist[1].id, s2);
-    assert_eq!(hist[1].author, "bob");
+    assert_eq!(hist[1].author, files::Actor::Module("bob".into()));
     assert_eq!(hist[1].height, 2);
     assert_eq!(hist[1].message, "second");
     assert_eq!(hist[1].parent, Some(s1.clone()));
 
     assert_eq!(hist[2].id, s1);
-    assert_eq!(hist[2].author, "alice");
+    assert_eq!(hist[2].author, files::Actor::Module("alice".into()));
     assert_eq!(hist[2].height, 1);
     assert_eq!(hist[2].message, "first");
     assert_eq!(hist[2].parent, None, "the first commit has no parent");

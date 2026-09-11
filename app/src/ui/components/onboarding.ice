@@ -1,8 +1,11 @@
 // THE LAUNCH WINDOW'S COLUMN. `hub_step` is the single discriminant:
-// (password | wallets) -> [restore] -> networks -> [join -> provisioning ->
-// live] -> [account]. The console never renders here — it lives in its own
-// window, opened on a network pick (once the device key has an account there,
-// or the user goes on without one).
+// networks -> (password | wallets) -> [restore] -> [account], with [join ->
+// provisioning -> live] off the network list. The network comes first
+// because a wallet is an identity ON a network, kept in that network's
+// workspace: the wallet screens show the PICKED network's keystore. The
+// console never renders here — it lives in its own window, opened once a key
+// is unlocked there (and has an account, or the user goes on without one), or
+// straight off a read-only pick.
 //
 // THERE IS NO CREATE-NETWORK ROUTE. Founding a network is an operator act on
 // the node (`ducktape node init`). This app attaches to a node somebody
@@ -13,7 +16,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
@@ -32,146 +35,171 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
     restore_submit(str, str)
     pick_network(str)
     open_network_submit
-    forget_network_submit(str, str)
+    forget_network_submit(str)
     connect_remote_submit(str)
-    restore_hidden_submit
     go_join
     go_networks
-    go_wallets
     join_network_submit
     copy_onboarding_invite
     enter_console
+    drag_launch_window
+    close_launch_window
   box #root
     with
       w=fill
       h=fill
-      p=26.0
-      align-x=center
-      align-y=center
       bg=bg_wash
-    col gap=0.0
-      match step
-        HubStep.wallets
-          WalletsScreen #wallets
-            with
-              wallets
-              selected=wallet_selected
-              busy
-              error
-            forward
-              pick_wallet
-              unlock_submit
-              login_skip
-              go_restore
-        HubStep.password
-          PasswordScreen #password busy=busy error=error
-            forward
-              password_submit
-              go_restore
-              login_skip
-        // The two ceremony steps read the phrase the backend is holding
-        // rather than any app state — the words are never a reading this
-        // process keeps, and both screens are gone the moment it lets go.
-        HubStep.phrase
-          PhraseScreen #phrase
-            with
-              rows=phrase_rows()
-              busy
-            forward
-              phrase_written_down
-        HubStep.confirm
-          ConfirmPhraseScreen #confirm
-            with
-              prompt=recovery_prompt()
-              busy
-              error
-            forward
-              confirm_phrase_submit
-              show_phrase_again
-        HubStep.restore
-          RestoreScreen
-            with
-              busy=busy
-              error=error
-              phrase_empty=restore_empty
-            forward
-              restore_submit
-              go_login
-            phrase:
-              slot restore_phrase?
-        HubStep.networks
-          NetworksScreen #networks
-            with
-              networks
-              selected
-              hidden
-              busy
-              error
-              active_wallet=wallet_selected
-            forward
-              pick_network
-              open_network_submit
-              forget_network_submit
-              connect_remote_submit
-              restore_hidden_submit
-              go_join
-              go_wallets
-        HubStep.provisioning
-          ProvisioningScreen
-            with
-              name
-              steps
-              step_index
-              error
-        HubStep.live
-          LiveScreen
-            with
-              name
-              invite
-              height
-              peers_live=0
-              peers_total=0
-              tier
-              busy
-              error
-            forward
-              go_networks
-              copy_onboarding_invite
-              enter_console
-        HubStep.join
-          JoinScreen
-            with
-              busy=busy
-              error=error
-              invite_empty=join_empty
-            forward
-              go_networks
-              join_network_submit
-            invite:
-              slot join_invite?
-        HubStep.loading
-          col gap=0.0 align=center
-            text "…"
-              with
-                size=13.5
-                wrap=none
-                @text-hint
-        HubStep.account
-          WelcomeScreen name_draft<->name_draft #welcome
-            with
-              network
-              phase
-              qr
-              detail
-              left
-              busy
-              error
-            forward
-              welcome_create_submit
-              welcome_login_submit
-              welcome_desktop
-              welcome_cancel
-              welcome_skip
+    col w=fill h=fill
+      // THE RAIL THE TITLEBAR WAS. With `decorations false` (app.ice) this window
+      // has no OS strip, so this is the whole of its chrome: press-and-drag
+      // anywhere along it to move the window, and one × to close it. `mouse
+      // press` and not a button, because a drag has to start on the press — a
+      // button answers on release, by which time there is nothing to drag.
+      row
+        with
+          w=fill
+          h=34.0
+          align=center
+          px=10.0
+        mouse press=emit(drag_launch_window)
+          space w=fill h=34.0
+        button #launch-close -> emit(close_launch_window)
+          with
+            label="Close Ducktape"
+            @icon_action
+            @p-5px
+          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+          hovered bg=subtle text=fg
+          pressed bg=subtle text=fg
+          text "✕" size=12.5 font=ui
+      box
+        with
+          w=fill
+          h=fill
+          pl=26.0
+          pr=26.0
+          pb=26.0
+          align-x=center
+          align-y=center
+        col gap=0.0
+          match step
+            HubStep.wallets
+              WalletsScreen #wallets
+                with
+                  wallets
+                  selected=wallet_selected
+                  network
+                  busy
+                  error
+                forward
+                  pick_wallet
+                  unlock_submit
+                  login_skip
+                  go_restore
+                  go_networks
+            HubStep.password
+              PasswordScreen #password network=network busy=busy error=error
+                forward
+                  password_submit
+                  go_restore
+                  login_skip
+                  go_networks
+            // The two ceremony steps read the phrase the backend is holding
+            // rather than any app state — the words are never a reading this
+            // process keeps, and both screens are gone the moment it lets go.
+            HubStep.phrase
+              PhraseScreen #phrase rows=phrase_rows() busy
+                forward
+                  phrase_written_down
+            HubStep.confirm
+              ConfirmPhraseScreen #confirm
+                with
+                  prompt=recovery_prompt()
+                  busy
+                  error
+                forward
+                  confirm_phrase_submit
+                  show_phrase_again
+            HubStep.restore
+              RestoreScreen
+                with
+                  busy=busy
+                  error=error
+                  phrase_empty=restore_empty
+                forward
+                  restore_submit
+                  go_login
+                phrase:
+                  slot restore_phrase?
+            HubStep.networks
+              NetworksScreen #networks
+                with
+                  networks
+                  selected
+                  busy
+                  error
+                forward
+                  pick_network
+                  open_network_submit
+                  forget_network_submit
+                  connect_remote_submit
+                  go_join
+            HubStep.provisioning
+              ProvisioningScreen
+                with
+                  name
+                  steps
+                  step_index
+                  error
+            HubStep.live
+              LiveScreen
+                with
+                  name
+                  invite
+                  height
+                  peers_live=0
+                  peers_total=0
+                  tier
+                  busy
+                  error
+                forward
+                  go_networks
+                  copy_onboarding_invite
+                  enter_console
+            HubStep.join
+              JoinScreen
+                with
+                  busy=busy
+                  error=error
+                  invite_empty=join_empty
+                forward
+                  go_networks
+                  join_network_submit
+                invite:
+                  slot join_invite?
+            HubStep.loading
+              col gap=0.0 align=center
+                text "…"
+                  with
+                    size=13.5
+                    wrap=none
+                    @text-hint
+            HubStep.account
+              WelcomeScreen name_draft<->name_draft #welcome
+                with
+                  network
+                  phase
+                  qr
+                  detail
+                  left
+                  busy
+                  error
+                forward
+                  welcome_create_submit
+                  welcome_login_submit
+                  welcome_desktop
+                  welcome_cancel
+                  welcome_skip
 
 // The brand plate every sign-in screen opens with.
 component HubBrand(title:str, caption:str)
@@ -211,19 +239,24 @@ component HubBrand(title:str, caption:str)
             align-x=center
             @text-caption
 
-// WALLETS. Returning device: the keystore's named identities, one row each.
+// WALLETS. The picked network's keystore: its named identities, one row each.
 // The selected row is the one that opens — its password field is right there,
 // so choosing an identity and unlocking it is one gesture, not two screens.
 // Reads never need a wallet, so the quiet way past a forgotten password stays
-// one click.
-component WalletsScreen(wallets:[WalletInfo], selected:str, busy:bool, error:str)
+// one click, and the network list is one click back.
+component WalletsScreen(wallets:[WalletInfo], selected:str, network:str, busy:bool, error:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
     login_skip
     go_restore
+    go_networks
   col #root w=428.0 gap=0.0
-    HubBrand title="Choose a wallet" caption="Unlock an identity to sign what you do."
+    BackToNetworks
+      forward
+        go_networks
+    space w=fill h=16.0
+    HubBrand title="Choose a wallet" caption=wallet_caption(network)
     box w=fill pt=22.0
       scroll
         with
@@ -249,7 +282,6 @@ component WalletsScreen(wallets:[WalletInfo], selected:str, busy:bool, error:str
         button "Restore from recovery phrase" -> emit(go_restore)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -258,7 +290,6 @@ component WalletsScreen(wallets:[WalletInfo], selected:str, busy:bool, error:str
         button "Continue read-only" -> emit(login_skip)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -423,25 +454,30 @@ component WalletRow(row:WalletInfo, selected:bool, busy:bool)
         hovered bg=subtle text=fg
         pressed bg=rail_hover text=fg
 
-// PASSWORD. First run: one password, and the device key is minted under it.
-// The mint's 24 words are shown on the next step and confirmed on the one
-// after — they are the ONLY backup this key has once the disk holding it is
-// gone. The authoritative password floor lives in Rust
-// (`password_problem` mirrors the CLI's 8-char minimum); the button stays
-// dead until the pair is acceptable.
-component PasswordScreen(busy:bool, error:str)
+// PASSWORD. A network with no wallet yet: one password, and the device key
+// for that network is minted under it into its keystore. The mint's 24 words
+// are shown on the next step and confirmed on the one after — they are the
+// ONLY backup this key has once the disk holding it is gone. The
+// authoritative password floor lives in Rust (`password_problem` mirrors the
+// CLI's 8-char minimum); the button stays dead until the pair is acceptable.
+component PasswordScreen(network:str, busy:bool, error:str)
   emits
     password_submit(str)
     go_restore
     login_skip
+    go_networks
   state
     pw = ""
     pw2 = ""
   col #root w=428.0 gap=0.0
+    BackToNetworks
+      forward
+        go_networks
+    space w=fill h=16.0
     HubBrand
       with
-        title="Welcome to ducktape"
-        caption="Set a password for this device. It encrypts the key on this disk — the next screen shows the 24 words that are the only way to get that key back."
+        title="Your key on this network"
+        caption=password_caption(network)
     box w=fill pt=26.0
       text "PASSWORD"
         with
@@ -533,7 +569,6 @@ component PasswordScreen(busy:bool, error:str)
         button "Restore from recovery phrase" -> emit(go_restore)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -546,7 +581,6 @@ component PasswordScreen(busy:bool, error:str)
         button "Continue read-only" #password-skip -> emit(login_skip)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -572,13 +606,39 @@ component PasswordScreen(busy:bool, error:str)
             @text-icon_idle
     OnboardingError message=error
 
+// The one row back to the network list, above the wallet screens: the pick
+// is what put them on screen.
+component BackToNetworks()
+  emits
+    go_networks
+  col #root w=fill gap=0.0
+    button -> emit(go_networks)
+      with
+        label="Back"
+        @ghost_action
+        @px-0px
+        @py-0px
+        @rounded-6px
+      row gap=8.0 align=center
+        text "‹"
+          with
+            size=14.0
+            wrap=none
+            @text-meta
+        text "NETWORKS"
+          with
+            size=11.0
+            wrap=none
+            font=code_medium
+            @text-meta
+
 // THE PHRASE, SHOWN EXACTLY ONCE. The mint picked 24 words and no key file
 // exists yet — the confirm on the next screen is what seals it — and this is
 // the only screen in the app that will ever draw them: there is no copy
 // button (a phrase in the clipboard is a phrase in every paste target), no
 // skip, and no re-show. Off the app, someone who still HAS the key file and
 // its password can read them back with
-// `ducktape user key reveal --key $DUCKTAPE_HOME/keys/<name>.key` — which
+// `ducktape user key reveal --key <workspace>/keys/<name>.key` — which
 // is exactly the case this screen exists for the loss of. The rows are
 // paired 1↔13 … 12↔24 in Rust because Ice cannot index a list, and because
 // twelve rows fit this window and twenty-four do not.
@@ -754,7 +814,6 @@ component ConfirmPhraseScreen(prompt:str, busy:bool, error:str)
         button "Show the phrase again" #confirm-back -> emit(show_phrase_again)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -776,10 +835,7 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
     welcome_cancel
     welcome_skip
   col #root w=428.0 gap=0.0
-    HubBrand
-      with
-        title="No account on this network yet"
-        caption=network
+    HubBrand title="No account on this network yet" caption=network
     if phase == "show_qr"
       box w=fill pt=22.0
         col
@@ -818,7 +874,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
           button "Use this computer's passkey instead" #welcome-desktop -> emit(welcome_desktop)
             with
               disabled=busy
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -826,7 +881,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
             pressed bg=fg/14
           button "Cancel" #welcome-cancel -> emit(welcome_cancel)
             with
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -848,7 +902,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
               @text-caption
           button "Cancel" #welcome-cancel-working -> emit(welcome_cancel)
             with
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -920,7 +973,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
           button "Continue without an account" #welcome-skip -> emit(welcome_skip)
             with
               disabled=busy
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -1072,17 +1124,17 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
     OnboardingError message=error
 
 // NETWORKS. The launch window's home: every network this device knows —
-// workspaces on disk and saved remote endpoints — most recently used first.
-// An empty list is the old welcome screen wearing its real name.
-component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:bool, error:str, active_wallet:str)
+// workspaces under the ducktape home and saved remote endpoints — most
+// recently used first. An empty list is the old welcome screen wearing its
+// real name. Opening a row is what loads its wallets: the identity comes
+// after the network, because it lives in the network's workspace.
+component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:str)
   emits
     pick_network(str)
     open_network_submit
-    forget_network_submit(str, str)
+    forget_network_submit(str)
     go_join
-    go_wallets
     connect_remote_submit(str)
-    restore_hidden_submit
   state
     remote = ""
   col #root w=428.0 gap=0.0
@@ -1152,37 +1204,12 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
             font=display
             @text-primary
         box w=fill pt=6.0
-          text "Local workspaces on this device and saved remote endpoints."
+          text "Local workspaces on this device and saved remote endpoints. Opening one asks for its wallet."
             with
               w=fill
               size=13.0
               line-h=1.5
               @text-caption
-        // Which identity the next console signs as, and the one click back to
-        // the wallet list. A network pick that silently signs as whoever was
-        // active last is the thing this line exists to stop.
-        box w=fill pt=12.0
-          row
-            with
-              w=fill
-              gap=9.0
-              align=center
-            text active_wallet_label(active_wallet)
-              with
-                w=fill
-                size=11.0
-                wrap=none
-                font=code_medium
-                @text-meta
-            button "Switch wallet" #switch-wallet -> emit(go_wallets)
-              with
-                disabled=busy
-                h=24.0
-                p=4.0
-                @ghost_action
-              active bg=transparent text=muted r=7.0
-              hovered bg=fg/9 text=fg
-              pressed bg=fg/14
         box w=fill pt=16.0
           scroll
             with
@@ -1226,66 +1253,49 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
             button "Join another network with an invite" -> emit(go_join)
               with
                 disabled=busy
-                h=26.0
                 p=5.0
                 @ghost_action
               active bg=transparent text=muted r=7.0
               hovered bg=fg/9 text=fg
               pressed bg=fg/14
-        // A remote node this device holds no workspace for — Enter connects,
-        // and a successful connect is what saves it as a remote row.
-        box w=fill pt=10.0
-          box
-            with
-              w=fill
-              px=14.0
-              py=10.0
-              bg=surface
-              border=border
-              border-w=1.0
-              r=10.0
-            input "" #remote-endpoint <-> remote
-              with
-                label="Remote node endpoint"
-                hint="connect a remote node… (http://host:port)"
-                disabled=busy
-                submit=emit(connect_remote_submit, remote)
-                w=fill
-                p=0.0
-                text-size=12.0
-                line-h=1.2
-                font=code
-                @control
-              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-              disabled value=hint
-    // Forgetting is not a one-way door: every hidden local network comes
-    // back with one click. Lives OUTSIDE the empty/non-empty branch —
-    // forgetting the ONLY network empties the list, and that is exactly
-    // when the door must stay visible.
-    if hidden > 0
-      box w=fill pt=10.0
-        col
+    // A remote node this device holds no workspace for — Enter connects,
+    // and a successful connect is what saves it as a remote row. Lives
+    // OUTSIDE the empty/non-empty branch: a device with no local network
+    // is exactly the one that reaches a node this way.
+    box w=fill pt=10.0
+      box
+        with
+          w=fill
+          px=14.0
+          py=10.0
+          bg=surface
+          border=border
+          border-w=1.0
+          r=10.0
+        input "" #remote-endpoint <-> remote
           with
+            label="Remote node endpoint"
+            hint="connect a remote node… (http://host:port)"
+            disabled=busy
+            submit=emit(connect_remote_submit, remote)
             w=fill
-            gap=0.0
-            align=center
-          button "Restore hidden networks" #restore-hidden -> emit(restore_hidden_submit)
-            with
-              disabled=busy
-              h=24.0
-              p=4.0
-              @ghost_action
-            active bg=transparent text=muted r=7.0
-            hovered bg=fg/9 text=fg
-            pressed bg=fg/14
+            p=0.0
+            text-size=12.0
+            line-h=1.2
+            font=code
+            @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
     OnboardingError message=error
 
 // One network row: the liveness dot, the name, where it lives, and — while
-// selected — the honest state line and the forget control.
+// selected — the honest state line, and for a saved remote the forget
+// control. A local network is a directory under the ducktape home, which
+// this app does not delete, so it has nothing to forget.
 component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
   emits
     pick_network(str)
-    forget_network_submit(str, str)
+    forget_network_submit(str)
   col #root w=fill gap=0.0
     if selected
       col w=fill gap=0.0
@@ -1352,20 +1362,20 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
           active bg=selected_row text=fg border=primary border-w=1.5 r=11.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
-        box
-          with
-            w=fill
-            pt=4.0
-            align-x=end
-          button "Forget" -> emit(forget_network_submit, row.id, row.kind)
+        if row.kind == "remote"
+          box
             with
-              disabled=busy
-              h=22.0
-              p=4.0
-              @ghost_action
-            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-            hovered bg=danger_bg text=fg
-            pressed bg=danger_bg text=fg
+              w=fill
+              pt=4.0
+              align-x=end
+            button "Forget" -> emit(forget_network_submit, row.id)
+              with
+                disabled=busy
+                p=4.0
+                @ghost_action text-11px leading-snug font-medium
+              active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+              hovered bg=danger_bg text=fg
+              pressed bg=danger_bg text=fg
     if !selected
       button -> emit(pick_network, row.id)
         with
@@ -1648,25 +1658,9 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
     copy_onboarding_invite
     enter_console
   col #root w=428.0 gap=0.0
-    button -> emit(go_networks)
-      with
-        label="Back"
-        @ghost_action
-        @px-0px
-        @py-0px
-        @rounded-6px
-      row gap=8.0 align=center
-        text "‹"
-          with
-            size=14.0
-            wrap=none
-            @text-meta
-        text "NETWORKS"
-          with
-            size=11.0
-            wrap=none
-            font=code_medium
-            @text-meta
+    BackToNetworks
+      forward
+        go_networks
     box w=fill pt=16.0
       row
         with
@@ -1911,25 +1905,9 @@ component JoinScreen(busy:bool, error:str, invite_empty:bool)
     go_networks
     join_network_submit
   col #root w=428.0 gap=0.0
-    button -> emit(go_networks)
-      with
-        label="Back"
-        @ghost_action
-        @px-0px
-        @py-0px
-        @rounded-6px
-      row gap=8.0 align=center
-        text "‹"
-          with
-            size=14.0
-            wrap=none
-            @text-meta
-        text "NETWORKS"
-          with
-            size=11.0
-            wrap=none
-            font=code_medium
-            @text-meta
+    BackToNetworks
+      forward
+        go_networks
     box w=fill pt=16.0
       text "Join a network"
         with
@@ -2105,47 +2083,12 @@ component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, pas
                 @text-meta
             button "Create or sign in" #open -> emit(open_account_welcome)
               with
-                h=26.0
                 p=5.0
                 @secondary_action
             button "Dismiss" #dismiss -> emit(dismiss_account_banner)
               with
-                h=26.0
                 p=5.0
                 @ghost_action
               active bg=transparent text=muted r=7.0
               hovered bg=fg/9 text=fg
               pressed bg=fg/14
-
-// A PHONE CEREMONY ON A CARD: the QR while the phone is asked, the line
-// while the chain is; an empty phase renders nothing. The Settings card's
-// reading of the same stream the welcome shows full-size.
-component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
-  emits
-    account_ceremony_cancel()
-  col #root w=fill gap=8.0 align=center
-    if phase == "show_qr"
-      qr qr #plate-qr cell-size=3.0 correction=medium
-      text detail
-        with
-          w=fill
-          size=12.0
-          align-x=center
-          @text-meta
-      text left #plate-left
-        with
-          size=11.0
-          wrap=none
-          font=code_medium
-          @text-hint
-      button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
-        with
-          h=26.0
-          p=5.0
-          @secondary_action
-    if phase == "working"
-      text detail
-        with
-          w=fill
-          size=12.0
-          @text-meta

@@ -73,14 +73,12 @@ component ConfirmDelete(title:str, subject:str, note:str, action:str, busy:bool)
           button "Cancel" -> emit(cancel)
             with
               disabled=busy
-              h=30.0
               p=7.0
               @secondary_action
           button -> emit(confirm)
             with
               label=action
               disabled=busy
-              h=30.0
               p=7.0
               @danger_action
             text action size=13.0 wrap=none
@@ -251,60 +249,6 @@ component TabLabel(label:str, count:i64, active:bool)
           bg=transparent
         space w=1.0 h=1.0
 
-// A filter chip with its matched count: the Explorer kind strip and the
-// members All/Humans/Agents/Validators strip. Selected inverts to ink.
-component FilterChip(label:str, count:i64, selected:bool)
-  col #root
-    if selected
-      box
-        with
-          px=11.0
-          py=6.0
-          bg=primary
-          border=primary
-          border-w=1.0
-          r=8.0
-        row gap=6.0 align=center
-          text label
-            with
-              size=12.0
-              wrap=none
-              font=display
-              @text-primary_fg
-          text count
-            with
-              size=10.0
-              wrap=none
-              font=code_semibold
-              @text-meta
-    if !selected
-      box
-        with
-          px=11.0
-          py=6.0
-          bg=surface
-          border=border
-          border-w=1.0
-          r=8.0
-        row gap=6.0 align=center
-          text label
-            with
-              size=12.0
-              wrap=none
-              font=display
-              @text-secondary_fg
-          text count
-            with
-              size=10.0
-              wrap=none
-              font=code_semibold
-              @text-label
-
-// The 9px mono section label, with the artifact's optional trailing note
-// (`needs quorum to change`) hung beside it.
-// NOTE: the artifact sets letter-spacing .1em on this label and iced exposes
-// none. The per-glyph row that would fake it needs a chars-splitting helper in
-// backend.rs, which this file does not own — it renders tight until that lands.
 component Eyebrow(label:str, note:str)
   row #root gap=8.0 align=center
     text label
@@ -332,37 +276,3 @@ component Eyebrow(label:str, note:str)
 // signal elsewhere is `PulseDot`. Reviving the ring costs a `spin = 1.0`
 // driver alongside `pulse` in handlers/lifecycle.ice plus one canvas; until
 // that driver exists, the honest marker is the static one.
-
-// One NETWORK stat card: a mono caps label over the machine reading, with an
-// optional unit suffix (`ms`) beside it.
-component StatCard(label:str, value:str, note:str)
-  box #root
-    with
-      w=fill
-      px=13.0
-      py=11.0
-      bg=surface
-      border=card_line
-      border-w=1.0
-      r=10.0
-    col w=fill gap=3.0
-      text label
-        with
-          size=9.0
-          wrap=none
-          font=code_semibold
-          @text-label
-      row gap=4.0 align=center
-        text value
-          with
-            size=14.0
-            wrap=none
-            font=code_semibold
-            @text-primary
-        if note != ""
-          text note
-            with
-              size=11.0
-              wrap=none
-              font=code_medium
-              @text-meta

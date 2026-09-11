@@ -27,7 +27,7 @@ use std::path::Path;
 
 use commonware_cryptography::Signer as _;
 
-use crate::account_cli::resolve_account;
+use crate::account_cli::resolve_account_authority;
 use crate::cli_args::NodeAddr;
 use crate::config;
 use crate::userkey_cli::load_user_signer;
@@ -73,10 +73,13 @@ pub(crate) enum CredCmd {
     Grant {
         /// the credential name
         name: String,
-        /// an account number or a display name. The grant reaches exactly the
-        /// runs this account's keys sign (`agent sched --host-node`, which names
-        /// this credential in the committed work), on the node each run is
-        /// pinned to, until that run ends. Nobody else's work.
+        /// an account NUMBER. A display name is refused: it is freely
+        /// rewritable and not unique, so it cannot name who this credential
+        /// trusts (look the number up with `ducktape account show`). The
+        /// grant reaches exactly the runs this account's keys sign (`agent
+        /// sched --host-node`, which names this credential in the committed
+        /// work), on the node each run is pinned to, until that run ends.
+        /// Nobody else's work.
         account: String,
     },
     /// rescind a lend (owner-signed). In flight sessions keep working until their
@@ -84,11 +87,12 @@ pub(crate) enum CredCmd {
     Revoke {
         /// the credential name
         name: String,
-        /// the account to stop lending to — the same account `grant` named
+        /// the account NUMBER to stop lending to — the same account `grant`
+        /// named (a display name is refused; see `grant`'s help)
         account: String,
     },
     /// read a TEE gateway's enclave measurement out of its quote, so it can be
-    /// pinned as `seal --measurement`
+    /// pinned as `seal --measurement` (needs a `--features verify` build)
     Inspect {
         #[command(flatten)]
         gateway: crate::cred_seal::GatewayArgs,
@@ -96,7 +100,7 @@ pub(crate) enum CredCmd {
         attest: crate::cred_seal::AttestArgs,
     },
     /// verify a TEE gateway's quote, then seal a credential under the attested
-    /// key and upload it
+    /// key and upload it (needs a `--features verify` build)
     Seal {
         #[command(flatten)]
         gateway: crate::cred_seal::GatewayArgs,
@@ -202,7 +206,7 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
             gateway,
             attest,
             seal,
-        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base()),
+        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base(), stdin),
     }
 }
 
@@ -219,14 +223,16 @@ impl VerbCtx {
     }
 
     /// the user key path for the signing verbs: explicit `--key` wins, else
-    /// THE shared wallet resolver ($DUCKTAPE_USER_KEY, else the keystore's
-    /// active wallet). A MISSING key is a loud error, never a cue to mint:
-    /// these verbs sign AS a key, and a silently minted stranger would be a
-    /// fresh, accountless identity wearing the right path.
+    /// `$DUCKTAPE_USER_KEY`, else the active wallet of the workspace behind
+    /// the node this verb dials (a wallet is an identity ON a network, so it
+    /// lives in that network's workspace). A MISSING key is a loud error,
+    /// never a cue to mint: these verbs sign AS a key, and a silently minted
+    /// stranger would be a fresh, accountless identity wearing the right path.
     pub(crate) fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-        let path = match &self.key {
-            Some(explicit) => explicit.clone(),
-            None => keystore::wallet::active_user_key()?,
+        let path = match (&self.key, keystore::wallet::env_user_key()) {
+            (Some(explicit), _) => explicit.clone(),
+            (None, Some(env)) => env,
+            (None, None) => keystore::wallet::active_key_path(&self.addr.workspace()?)?,
         };
         if !path.exists() {
             return Err(format!(
@@ -292,7 +298,7 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
-    let grantee = resolve_account(&base, &account)?;
+    let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,
@@ -323,7 +329,7 @@ fn cmd_revoke(
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
-    let grantee = resolve_account(&base, &account)?;
+    let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,
@@ -441,10 +447,14 @@ fn cmd_add(
     };
     gateway::validate_credential_name(&name)?;
 
-    // capture the login artifact into the on-disk store, keyed by name.
+    // capture the login artifact into the on-disk store, keyed by name. Both
+    // `airlock-creds/` and the credential's own dir are 0700: the artifact
+    // inside is a live vendor OAuth secret, worth strictly more than the
+    // `seal.key` beside it.
     let store = airlock_service::cred_store_root(&resolved.service.storage_dir);
     let dir = store.join(&name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    airlock_service::create_private_dir(&store)?;
+    airlock_service::create_private_dir(&dir)?;
     // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
     // vendor login artifact (a `.credentials.json` / `auth.json` the operator
     // already produced) instead of driving the vendor's browser OAuth flow —
@@ -456,7 +466,16 @@ fn cmd_add(
         .filter(|src| !src.is_empty());
     match reuse {
         Some(src) => {
-            std::fs::copy(&src, dir.join(provider.artifact()))
+            // Read-then-write-0600 rather than `std::fs::copy`, which on Unix
+            // replicates the SOURCE file's mode onto the destination — a
+            // 0644-umask export would otherwise land world-readable inside a
+            // 0700 dir. Stale-file removal mirrors the browser arm below, so a
+            // retry after a prior failed attempt is unambiguous, not a
+            // silent leftover.
+            let bytes = std::fs::read(&src).map_err(|e| format!("reuse artifact {src}: {e}"))?;
+            let artifact_path = dir.join(provider.artifact());
+            let _ = std::fs::remove_file(&artifact_path);
+            airlock_service::write_secret_0600(&artifact_path, &bytes)
                 .map_err(|e| format!("reuse artifact {src}: {e}"))?;
         }
         None => {

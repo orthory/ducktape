@@ -1,7 +1,8 @@
 //! Epoch-engine construction and recovery resume.
 //!
-//! `EpochSpawner` owns the pre-registered channel bank so boot and live
-//! cutover use one engine-construction path.
+//! `EpochSpawner` owns the five fixed engine lanes so boot and live cutover
+//! use one engine-construction path: every spawn retargets the same five
+//! demuxes at the epoch it is standing up.
 
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
@@ -17,8 +18,9 @@ use recovery::Recovery;
 use sdk::Msg;
 use tasks::{TaskMsg, encode_task_msg};
 
-use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
+use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::resume_resident_keys;
+use crate::mesh_lanes::EngineLanes;
 use crate::util::{epoch_floor, fatal, hex};
 
 pub(super) struct EpochSpawner<'a> {
@@ -27,7 +29,7 @@ pub(super) struct EpochSpawner<'a> {
     signer: ed25519::PrivateKey,
     namespace: Vec<u8>,
     label: String,
-    channel_bank: super::LaneBank,
+    lanes: EngineLanes,
     cadence: consensus::Cadence,
 }
 
@@ -39,7 +41,7 @@ impl<'a> EpochSpawner<'a> {
         signer: ed25519::PrivateKey,
         namespace: Vec<u8>,
         label: String,
-        channel_bank: super::LaneBank,
+        lanes: EngineLanes,
         cadence: consensus::Cadence,
     ) -> Self {
         Self {
@@ -48,7 +50,7 @@ impl<'a> EpochSpawner<'a> {
             signer,
             namespace,
             label,
-            channel_bank,
+            lanes,
             cadence,
         }
     }
@@ -60,19 +62,14 @@ impl<'a> EpochSpawner<'a> {
         store: ContentStore,
         floor_bytes: Option<Vec<u8>>,
     ) -> SimplexOrderer {
-        let Some(slot) = self.channel_bank.claim(epoch).await else {
-            fatal!(
-                self.label,
-                "epoch {epoch} exhausts the pre-registered channel bank \
-                 ({EPOCH_CHANNEL_BANK}) — restart; boot re-banks from the \
-                 checkpoint epoch"
-            );
-        };
-        // bundle this epoch's mesh channel slot + the oracle behind the mesh
-        // carrier seam — the swap point where the sim arm substitutes an
-        // in-process `simulated::Network` (crates/kernel/consensus/tests/
-        // in_process_cluster.rs) for this real encrypted-TCP transport.
-        let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
+        // retarget the five fixed lanes at this epoch and bundle them with the
+        // oracle behind the mesh carrier seam — the swap point where the sim
+        // arm substitutes an in-process `simulated::Network`
+        // (crates/kernel/consensus/tests/in_process_cluster.rs) for this real
+        // encrypted-TCP transport. The predecessor engine's mailboxes are
+        // dropped by the retarget, so nothing that arrives from here on can
+        // reach it, and nothing older than `epoch` reaches this one.
+        let carrier = super::DiscoveryMesh::new(epoch, &self.lanes, self.oracle.clone());
         // ed25519 — the wired scheme; see the rekey/respawn contract in
         // `crates/kernel/consensus/src/lib.rs` for a scheme change.
         let scheme =
@@ -209,6 +206,12 @@ pub(super) async fn resume(
         None => OrderedNode::with_sink(host, orderer, recovery),
     };
     node.set_code_source(code_source);
+    // RESTORE the replay guard from the journal suffix the replay just
+    // walked: a restarted validator must keep refusing the batches it already
+    // journaled, or it applies a re-proposed one its running peers refuse.
+    if let Some(rec) = resumed {
+        node.seed_replay_window(rec.applied_frames.iter().copied());
+    }
     // the observation barrier: every drain batch ends AT a block that
     // moves the valset root, so the orchestration step below observes a
     // membership change at exactly its block's view — the same view on
@@ -282,6 +285,7 @@ pub(super) async fn resume(
             payload: encode_task_msg(&TaskMsg::CreateTask {
                 task_id: format!("k{n}"),
                 title: format!("node-{n}"),
+                owner: None,
             }),
         };
         node.submit(signer, 0, op).await.expect("submit op");

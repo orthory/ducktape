@@ -144,16 +144,16 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
 fn the_explorer_is_handed_the_live_head_and_the_phase() {
     let view = inlined(include_str!("../ui/view.ice"));
     let explorer = view
-        .split_once("ExplorerScreen")
+        .split_once("extern explorer_view(")
         .expect("the explorer mounts here")
         .1;
-    let explorer = explorer.split_once("events").expect("props end").0;
+    let explorer = explorer.split_once(" #explorer").expect("props end").0;
     assert!(
-        explorer.contains("head=block_height"),
+        explorer.contains("block_height"),
         "the explorer must draw the live register, not the newest row of its own window"
     );
     assert!(
-        explorer.contains("sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)"),
+        explorer.contains("sync_label(node_phase, node_sync_applied, node_sync_target)"),
         "a head that is not advancing and a node still catching up are different \
          facts, and the second one needs saying"
     );
@@ -220,11 +220,12 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
 /// the screen in Settings again while leaving its handlers intact.
 #[test]
 fn node_operations_are_a_first_class_screen() {
-    let settings = include_str!("../ui/screens/settings.ice");
-    let node = include_str!("../ui/screens/node.ice");
+    // both screens ship as module-owned views; their sources are the guests'
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
+    let node = include_str!("../../../crates/views/node/src/ui/app.ice");
     assert!(settings.contains("component SettingsScreen("));
     assert!(node.contains("component NodeScreen("));
-    assert!(settings.contains("emit(select_shell_tab, ShellTab.node)"));
+    assert!(settings.contains("emit(show_tab, \"node\")"));
     for node_detail in [
         "node-overview-tab",
         "node-permissions-tab",
@@ -241,8 +242,8 @@ fn node_operations_are_a_first_class_screen() {
     let shell = include_str!("../ui/components/shell.ice");
     assert!(shell.contains("ShellTab.node\n                  slot node"));
     let view = include_str!("../ui/view.ice");
-    assert!(view.contains("node:\n          NodeScreen"));
-    assert!(view.contains("settings:\n          SettingsScreen"));
+    assert!(view.contains("node:\n          extern node_view("));
+    assert!(view.contains("settings:\n          extern settings_view("));
 }
 
 /// A hydration error belongs to the pane that raised it.
@@ -321,7 +322,7 @@ fn peer_readers_use_the_names_the_node_serves() {
 /// an already-running replace lane.
 ///
 /// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
-/// writer, so its governance/agents runs must NOT carry a second
+/// writer, so its governance run must NOT carry a second
 /// `shell_tab ==` gate. Gating both leaves the approvals badge dark until you
 /// open Approvals — which is the one thing the badge exists to spare you.
 #[test]
@@ -335,20 +336,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_load_selected",
             "members",
             "members_generation",
-        ),
-        (
-            "load_governance",
-            "governance_load",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
-        ),
-        (
-            "load_agents",
-            "agents_load",
-            "agents_load_selected",
-            "agents",
-            "agents_generation",
         ),
         (
             "load_account",
@@ -382,12 +369,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_generation",
         ),
         (
-            "load_governance",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
-        ),
-        (
             "load_account",
             "account_load_selected",
             "identity",
@@ -406,23 +387,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         assert!(
             lifecycle.contains(&live),
             "a {module} commit must refresh {loader} on any tab: {live}"
-        );
-    }
-
-    // THE AGENTS PROJECTION IS THE ONE PLANE TWO MODULES WRITE, so its live
-    // arm is the one that does not ride `plane_live_hit`: `agent` commits the
-    // registration and `runs` commits the liveness `AgentRow.live` is read
-    // from (`agents_with_a_run_in_flight`). BOTH lines take the predicate —
-    // a bump without the load refetches nothing, and a load without the bump
-    // answers on a generation `agents_loaded` rejects. Narrow either back to
-    // `"agent"` and the Forge seat's dot goes dark for the length of a run.
-    for line in [
-        "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
-        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n          try request -> done request\n          done -> agents_load_selected _",
-    ] {
-        assert!(
-            lifecycle.contains(line),
-            "the agents live arm must ride the two-module predicate: {line}"
         );
     }
 
@@ -446,21 +410,11 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // A selector is a queued message. If an older one lands after a newer
     // intent, it must not start and replace the newer lane.
     for (selected, generation) in [
-        ("explorer_load_selected", "explorer_generation"),
-        ("files_list_selected", "fs_generation"),
-        ("files_history_selected", "fs_generation"),
         ("members_load_selected", "members_generation"),
-        ("governance_load_selected", "gov_generation"),
         ("settings_load_selected", "settings_generation"),
         ("peers_load_selected", "node_peers_generation"),
-        ("agents_load_selected", "agents_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
-        ("forge_load_selected", "forge_generation"),
-        (
-            "shell_credentials_load_selected",
-            "shell_credentials_generation",
-        ),
     ] {
         let guarded = format!(
             "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}"
@@ -472,18 +426,10 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     }
 
     for (selected, unmounted) in [
-        ("explorer_load_selected", "shell_tab != ShellTab.explorer"),
-        ("files_list_selected", "shell_tab != ShellTab.files"),
-        ("files_history_selected", "shell_tab != ShellTab.files"),
         ("settings_load_selected", "shell_tab != ShellTab.settings"),
         (
             "peers_load_selected",
             "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
-        ),
-        ("forge_load_selected", "shell_tab != ShellTab.forge"),
-        (
-            "shell_credentials_load_selected",
-            "shell_tab != ShellTab.shell",
         ),
     ] {
         let handler = lifecycle
@@ -523,7 +469,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
-            open_tabs: 0,
             user_key: "abcd".into(),
         },
     ));
@@ -540,66 +485,22 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     );
 }
 
-/// THE AGENTS BUMP IS THE SAME HALF, AND `run replace` DOES NOT COVER IT.
-/// Replacing a lane aborts work still running there, but it cannot retract a
-/// completion the runtime has already queued — that reply is delivered
-/// anyway, and an unconditional bump on the way out is precisely what makes
-/// `agents_loaded` throw it away. The Forge seat's live dot reads those rows
-/// on EVERY tab, so opening the destination pane does not re-earn them: the
-/// next `agent` or `runs` op does, and for a run that just started that op is
-/// the one that ends it.
+/// THE JOIN OPENS THE CALL'S WINDOW, AND THE CONSOLE KEEPS SAYING SO.
+///
+/// A huddle has exactly one surface — its own window — so an ack that opened
+/// none would leave someone in a live call with nowhere to see it. The route is
+/// pinned here because a join routed back to the generic `chat_acked` would
+/// land the same silence.
+///
+/// THIS USED TO BE THE OPPOSITE ASSERTION, and the defect it guarded is worth
+/// restating because it is what the two lines below now answer: a second OS
+/// window fell behind the console the moment anything in the console was
+/// clicked, and the console said nothing about the call at all. So the window
+/// floats (`level always-on-top`, app.ice) and the channel's LIVE pill draws
+/// whenever that channel's call is live rather than only while the window is
+/// up — the pill is the way back to a window someone has closed.
 #[test]
-fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-
-    // the run's own commit is what asks for the rows; its generation is the
-    // one the reply below carries.
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: LiveKind::Plane,
-        status: "Live".into(),
-        height: 12,
-        module: "runs".into(),
-        ..backend::LiveUpdate::default()
-    }));
-    let in_flight = app.agents_generation;
-
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
-    let _ = app.__update(__DucktapeMessage::AgentsLoaded(backend::AgentsData {
-        generation: in_flight,
-        agents: vec![backend::AgentRow {
-            id: "agent-1".into(),
-            name: "Quackbot".into(),
-            initials: "QU".into(),
-            capability: "mock-llm-1".into(),
-            status: "active".into(),
-            owner_handle: String::new(),
-            live: true,
-            skill_count: 0,
-            cap_count: 0,
-        }],
-    }));
-    assert!(
-        backend::any_agent_active(&app.agents_rows),
-        "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
-    );
-
-    // and the tab that DOES draw the rows still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Agents));
-    assert_ne!(
-        app.agents_generation, in_flight,
-        "entering Agents must issue a fresh read"
-    );
-}
-
-/// THE JOIN OPENS THE HUDDLE. Every face, every shared screen and every media
-/// control lives in the huddle window; the header pill it docks into shows
-/// none of them. A join routed back to the generic `chat_acked` leaves someone
-/// sitting in a live call watching a static pill, which is indistinguishable
-/// from a huddle that does not work — so the route is pinned here.
-#[test]
-fn joining_a_huddle_opens_the_window_that_shows_it() {
+fn joining_a_huddle_opens_the_call_window() {
     let handler = inlined(include_str!("../ui/handlers/chat.ice"));
     assert!(
         handler
@@ -611,10 +512,114 @@ fn joining_a_huddle_opens_the_window_that_shows_it() {
         .expect("the join ack handler exists")
         .1;
     let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
-    assert!(ack.contains("task window open huddle"));
+    // Through the summon, not an outright open: a window somehow still up (the
+    // reconciler took the seat away, the reader joined again before closing
+    // it) is raised rather than doubled and leaked.
     assert!(
-        ack.contains("return if huddle_win != none"),
-        "a window already up is not opened twice"
+        ack.contains("done -> show_huddle()"),
+        "a join that opens no window is a call with nowhere to be"
+    );
+    assert!(
+        !ack.contains("task window open huddle"),
+        "the ack opens a window outright, doubling one that is still up"
+    );
+    // AND THE ACK LANDS THE JOINED STATE ITSELF. `huddle_joined` has no other
+    // writer on the way in: it is answered off a chat load's roster, and an ack
+    // that only cleared the mutation left the write committed, the chain roster
+    // listing her, and the app showing the start button with no media session —
+    // `call_session` is gated on this very flag.
+    for landed in [
+        "huddle_joined = true",
+        "huddle_channel = active_channel",
+        "huddle_channel_name = active_channel_name",
+        "huddle_joined_at = huddle_now",
+    ] {
+        assert!(ack.contains(landed), "the join ack lands {landed}");
+    }
+    assert!(
+        ack.contains(
+            "run replace lane=chat_load load_channel_window(connected_rpc, active_channel, \
+             chat_generation) -> chat_updated"
+        ),
+        "and asks that channel for the roster the tiles and the reconciler need"
+    );
+    // THE WINDOW FLOATS, or it is behind the console the moment you click back
+    // into your work — the hole the docked card was dug to fill.
+    let app = include_str!("../ui/app.ice");
+    let huddle_window = app
+        .split_once("window huddle")
+        .expect("the huddle window is declared")
+        .1;
+    let huddle_window = huddle_window
+        .split_once("\n  window ")
+        .map_or(huddle_window, |split| split.0);
+    assert!(
+        huddle_window.contains("level always-on-top"),
+        "the call window stopped floating: {huddle_window}"
+    );
+    // AND THE CONSOLE SAYS THE CALL IS LIVE whether or not that window is up.
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    assert!(
+        chat.contains("if huddle_joined && huddle_channel == active_channel"),
+        "the LIVE pill stopped drawing for the channel's own call"
+    );
+    assert!(
+        !chat.contains("huddle_joined && huddle_channel == active_channel && huddle_popped"),
+        "the pill is gated on the window again, so a closed window has no way back"
+    );
+    // ONE VIDEO SURFACE, EVER. The `call_video_*` widgets each run a 4 ms
+    // repaint clock while a tile is live, so a second component drawing them
+    // would be two clocks for one call. Only the panel may.
+    let huddle = include_str!("../ui/components/huddle.ice");
+    for component in ["HuddleDock(", "HuddleDockedPill("] {
+        assert!(
+            !huddle.contains(&format!("component {component}")),
+            "{component} is back — the call has one surface, its window"
+        );
+    }
+}
+
+/// ONE HUDDLE SURFACE AT A TIME.
+///
+/// The chat header used to carry two of its own — a LIVE pill in the huddle's
+/// room and a "call in progress" chip in every other one — beside a dock that
+/// says both things on every screen, with faces, a clock and a way in. Both
+/// are gone. What is left in the header is the one state the dock cannot
+/// speak for: a huddle popped out into its own OS window, where the pill is
+/// how you raise it.
+#[test]
+fn the_chat_header_carries_no_second_huddle_surface() {
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    assert!(
+        !screen.contains("HuddleElsewhere"),
+        "the dock names the huddle's room on every screen — the header chip          was the same sentence twice"
+    );
+    let at = screen
+        .find("HuddleLivePill")
+        .expect("the header's live pill");
+    let pill = screen[..at]
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("if "))
+        .map(str::trim)
+        .expect("its guard");
+    // THE PILL IS THE WAY BACK, so it cannot be gated on the window being up.
+    // It used to carry `&& huddle_popped` because the in-window dock covered
+    // the other case; with the call in its own window and nothing else drawing
+    // it, that term made the pill vanish in exactly the state it is needed —
+    // the window closed and the call still running.
+    assert_eq!(
+        pill, "if huddle_joined && huddle_channel == active_channel",
+        "the pill is gated on the window again, so a closed window has no way back"
+    );
+    let components = inlined(include_str!("../ui/components/huddle.ice"));
+    assert!(
+        !components.contains("component HuddleElsewhere"),
+        "deleted, not deprecated"
+    );
+    assert!(
+        !components.contains("component HuddleLivePill(name:str"),
+        "the pill names no channel now: the header it sits in already says which room this is"
     );
 }
 
@@ -714,7 +719,10 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
 /// unreachable.
 #[test]
 fn approvals_tells_a_first_run_apart_from_a_finished_one() {
-    let source = inlined(include_str!("../ui/screens/governance.ice"));
+    // The screen is the `governance` module view's source now.
+    let source = inlined(include_str!(
+        "../../../crates/views/governance/src/ui/app.ice"
+    ));
     let arms: Vec<&str> = source
         .lines()
         .filter(|line| line.trim_start().starts_with("if ") && line.contains("answered"))
@@ -742,8 +750,8 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
     assert!(
         !first_run
-            .split("EmptyPlate")
-            .nth(1)
+            .split("if connected && open_proposals(rows) <= 0")
+            .next()
             .unwrap_or("")
             .contains("finalized"),
         "the first-run plate must not claim decisions were finalized"
@@ -761,7 +769,9 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
 /// not given to the screen.
 #[test]
 fn the_identity_card_counts_only_an_existing_account() {
-    let settings = inlined(include_str!("../ui/screens/settings.ice"));
+    let settings = inlined(include_str!(
+        "../../../crates/views/settings/src/ui/settings.ice"
+    ));
     assert!(
         settings.contains("account_exists:bool"),
         "the screen has to be handed the fact before it can use it"
@@ -847,7 +857,7 @@ fn the_two_counts_that_printed_a_zero_now_say_nothing() {
     // sits under `if !empty(channel_members)` and its comment says why
     // ("`· 0 added` on every normal channel is noise"). A file-wide negative
     // would flag that one too, which is how this assertion first failed.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let eyebrow = chat
         .split("Eyebrow label=\"MEMBERS\"")
         .nth(1)
@@ -888,51 +898,34 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .collect()
     }
 
-    let members = component(SCREENS.as_str(), "MembersScreen");
-    let members_state = local_state(members);
-    for field in [
-        "filter:MembersFilter = MembersFilter.all",
-        "selected = \"\"",
-    ] {
+    // The Explorer is a module-owned view: the draft, the kind filter and the
+    // selected block are the guest's own state, and the app holds only the
+    // answer to the search it runs on the guest's behalf.
+    let explorer = include_str!("../../../crates/views/explorer/src/ui/app.ice");
+    let explorer_state = explorer
+        .split_once("\nstate\n")
+        .expect("the guest's state block")
+        .1;
+    for field in ["query = \"\"", "kind = \"all\"", "selected:i64 = 0"] {
         assert!(
-            members_state.contains(&field),
-            "MembersScreen owns `{field}`"
-        );
-    }
-    for handler in ["on pick_members_filter(next)", "on open_member(key)"] {
-        assert!(members.contains(handler), "MembersScreen owns `{handler}`");
-    }
-
-    let explorer = component(SCREENS.as_str(), "ExplorerScreen");
-    let explorer_state = local_state(explorer);
-    for field in [
-        "query = \"\"",
-        "kind = \"all\"",
-        "hits:[ExplorerHit] = []",
-        "kinds:[KindCount] = []",
-        "partial = \"\"",
-        "searching = false",
-        "selected:i64 = 0",
-    ] {
-        assert!(
-            explorer_state.contains(&field),
-            "ExplorerScreen owns `{field}`"
+            explorer_state.contains(field),
+            "the explorer view owns `{field}`"
         );
     }
     for handler in [
-        "on explorer_search_submit(rpc, online)",
-        "on explorer_results_loaded(next)",
+        "on search_submit",
         "on clear_explorer_search",
         "on pick_explorer_kind(next)",
         "on select_explorer_block(height)",
     ] {
         assert!(
             explorer.contains(handler),
-            "ExplorerScreen owns `{handler}`"
+            "the explorer view owns `{handler}`"
         );
     }
 
-    let chat = component(SCREENS.as_str(), "ChatScreen");
+    let chat_screen = include_str!("../../../crates/views/chat/src/ui/chat.ice");
+    let chat = component(chat_screen, "ChatScreen");
     let chat_state = local_state(chat);
     for field in [
         "message_action_focus = \"\"",
@@ -952,7 +945,10 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         assert!(chat.contains(handler), "ChatScreen owns `{handler}`");
     }
 
-    let files = component(SCREENS.as_str(), "FilesScreen");
+    // The Files screen is the `files` module view's now; the history fold
+    // stays the screen's own there.
+    let files_view = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
+    let files = component(files_view.as_str(), "FilesScreen");
     assert!(local_state(files).contains(&"history_open = false"));
     assert!(files.contains("on fs_toggle_history"));
 
@@ -973,13 +969,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for field in [
         "members_filter",
         "members_selected",
-        "explorer_query",
-        "explorer_kind",
-        "explorer_hits",
-        "explorer_kinds",
-        "explorer_partial",
-        "explorer_searching",
-        "explorer_selected",
         "message_action_focus",
         "chat_pointer_y",
         "chat_height",
@@ -1009,8 +998,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for route in [
         "pick_members_filter ->",
         "open_member ->",
-        "explorer_search_submit ->",
-        "clear_explorer_search ->",
         "pick_explorer_kind ->",
         "select_explorer_block ->",
         "fs_toggle_history ->",
@@ -1045,13 +1032,12 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for local in ["pending_message_id", "pending_reply_id", "pending_id"] {
         assert!(!root_state.contains(local), "root state holds `{local}`");
     }
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
     assert!(
-        chat_components.contains("fresh_operation_id(composer_op_prefix("),
-        "the composer mints its own operation id as it emits"
+        include_str!("../composer_surface.rs").contains("crate::backend::fresh_operation_id("),
+        "the composer surface mints its own operation id as it publishes"
     );
     assert!(
-        chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id)"),
+        chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id, scope)"),
         "and the app takes it as a parameter, not from state"
     );
     assert!(
@@ -1061,11 +1047,8 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "root state reclaimed `reply_draft`"
     );
     let page_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
-    assert!(!root_state.contains("closing_doc_tab"));
-    assert!(page_handlers.contains("on close_doc_tab(id)"));
-    assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
     assert!(!root_state.contains("page_link"));
-    assert!(page_handlers.contains("let page_link = page_link_of(event)"));
+    assert!(page_handlers.contains("let page_link = document.link"));
 
     let native_surfaces = concat!(
         include_str!("../backend/live.rs"),
@@ -1113,34 +1096,21 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 /// value must carry its name, one set must not have two names on one screen,
 /// and no row may contradict the name the screen prints over it.
 ///
-/// AND WHAT THE SCREEN LOADS MUST LAND IN ITS OWN STATE. Search is interaction
-/// state owned by `ExplorerScreen`; its reply and both reset paths must still
-/// carry every field the view reads.
+/// AND WHAT THE SCREEN READS MUST LAND IN ITS OWN STATE. Search is the view's
+/// own; its answer and both reset paths must still carry every field the
+/// screen reads.
+///
+/// The DERIVATIONS this used to pin beside the copy — the dispatch trace's
+/// units and the op-carrying filter — moved into the guest with the reads that
+/// produce them, and are pinned in `crates/views/explorer/tests/readings.rs`.
 #[test]
 fn the_explorer_names_what_it_shows() {
-    // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
-    // serves. Both units appear once singular and once plural, so a hand-rolled
-    // `{n} msgs` that skips the `plural` seam fails here.
-    let hops = vec![
-        serde_json::json!({
-            "module": "chat", "origin": "external",
-            "emitted_msgs": 1, "emitted_events": 0,
-        }),
-        serde_json::json!({
-            "module": "tagging", "origin": "module:chat",
-            "emitted_msgs": 0, "emitted_events": 2,
-        }),
-    ];
-    assert_eq!(
-        backend::explorer_trace(Some(&hops)),
-        "chat · 1 msg · 0 events → tagging · 0 msgs · 2 events",
-        "every count in the trace names what it counts"
-    );
-
-    let explorer = SCREENS
-        .split_once("component ExplorerScreen(")
-        .expect("the Explorer screen exists")
-        .1;
+    // The Explorer is a module-owned view: the screen, the search and its
+    // resets are all the guest's source.
+    let guest = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
+    let explorer = guest.split_once("\nview\n").expect("the guest's view").1;
     let explorer = explorer
         .split_once("\ncomponent ")
         .map_or(explorer, |(body, _)| body);
@@ -1170,42 +1140,10 @@ fn the_explorer_names_what_it_shows() {
         );
     }
 
-    // AND NO ROW MAY CONTRADICT THAT SENTENCE — which is a claim about the
-    // DATA, not about the copy, because `/v1/blocks` is not uniformly filtered.
-    // Three of its four row writers drop an op-less block; the fourth,
-    // `boundary_block_row` (`bin/node/src/explorer.rs`, applied in
-    // `replica/park.rs`), writes the follower's ascension tip with `hash: ""`
-    // and no ops. `bin/node/src/main.rs` routes every key that is neither a
-    // validator nor seated by the checkpoint into `replica::run` — every joined
-    // member until promotion — so that row drew a blank hash and `0 ops`
-    // directly under the subtitle asserted above, and opened to an empty pane.
-    let served = [
-        serde_json::json!({
-            "height": 41, "hash": "", "commit_hash": "aa11bb22cc33dd44", "ops": [],
-        }),
-        serde_json::json!({
-            "height": 42, "hash": "ee55ff66aa77bb88", "commit_hash": "cc99dd00ee11ff22",
-            "ops": [{
-                "proposer": "abc123def456789a", "disposition": "applied", "target": "chat",
-                "op_hash": "0f1e2d3c4b5a6978", "payload": "hi", "operations": hops,
-            }],
-        }),
-    ];
-    let window = backend::explorer_window(0, &served);
-    assert_eq!(
-        window
-            .blocks
-            .iter()
-            .map(|block| (block.height, block.op_count))
-            .collect::<Vec<_>>(),
-        vec![(42, 1)],
-        "the Explorer listed a block carrying no operations under a subtitle \
-         that says every row carried some"
-    );
-    assert!(
-        window.ops.iter().all(|op| op.height == 42),
-        "an op was attributed to a block the list does not hold"
-    );
+    // AND NO ROW MAY CONTRADICT THAT SENTENCE — a claim about the DATA, not
+    // about the copy, because `/v1/blocks` is not uniformly filtered. That
+    // gate is the view's own fold now (`explorer_window`), pinned beside it in
+    // `crates/views/explorer/tests/readings.rs`.
 
     // AND EVERY VALUE IN THE OP DETAIL CARRIES ITS NAME. `by` was already
     // right and is pinned with the two that were not, so the rule reads as a
@@ -1215,14 +1153,17 @@ fn the_explorer_names_what_it_shows() {
         .split_once("for op in explorer_ops_at(ops, selected)")
         .expect("the op detail pane iterates the selected block's ops")
         .1;
-    for (label, value) in [
-        ("hash", "text op.op_hash"),
-        ("by", "text op.proposer"),
-        ("dispatch", "text op.trace"),
+    // The two digests are drawn by `DigestRow`, which takes its label as a
+    // prop; the trace is still a bare pair of `text`s. The RULE is the same
+    // either way — the name is written before the value — so each row names
+    // the two markers its own shape uses rather than the check assuming one.
+    for (named, value) in [
+        ("name=\"hash\"", "digest=op.op_hash"),
+        ("name=\"by\"", "digest=op.proposer"),
+        ("text \"dispatch\"", "text op.trace"),
     ] {
-        let named = format!("text \"{label}\"");
         let label_at = detail
-            .find(&named)
+            .find(named)
             .unwrap_or_else(|| panic!("`{value}` is drawn with no `{named}` beside it"));
         let value_at = detail
             .find(value)
@@ -1237,30 +1178,17 @@ fn the_explorer_names_what_it_shows() {
     // CALLS IT AN ANSWER. `partial` is the field this rule was written for:
     // without it the strip's kinds and the hit count are still rendered, so the
     // screen goes back to presenting whatever survived as the whole truth.
-    let loaded = explorer
-        .split_once("on explorer_results_loaded(next)")
-        .expect("the Explorer's results handler")
-        .1
-        .split_once("\n  on ")
-        .expect("the next handler closes it")
-        .0;
+    let answered = ice_handler_body(&guest, "search_arrived");
     // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
     // the hits and the strip; a `partial` left standing keeps naming a source
     // that failed to answer a query the reader has since cleared or replaced.
-    let resets = ["on explorer_search_submit", "on clear_explorer_search"].map(|opener| {
-        explorer
-            .split_once(opener)
-            .unwrap_or_else(|| panic!("`{opener}` is where it was"))
-            .1
-            .split_once("\n  on ")
-            .expect("the next handler closes it")
-            .0
-    });
+    let resets = ["search_submit", "clear_explorer_search"]
+        .map(|handler| ice_handler_body(&guest, handler));
     for (field, cleared) in [("hits", "[]"), ("kinds", "[]"), ("partial", r#""""#)] {
         assert!(
-            loaded.contains(&format!("{field} = next.{field}")),
+            answered.contains(&format!("{field} = item.{field}")),
             "`{field}` comes back from the search and nothing lands it in \
-             the screen's local state"
+             the screen's own state"
         );
         for reset in &resets {
             assert!(
@@ -1285,7 +1213,10 @@ fn the_explorer_names_what_it_shows() {
 /// both-arms-identical bug in a new coat.
 #[test]
 fn the_explorer_marks_the_block_row_whose_detail_is_open() {
-    let source = inlined(include_str!("../ui/screens/storage.ice"));
+    // the Explorer is a module-owned view; the row is the guest's
+    let source = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
     let row = source
         .split("component ExplorerBlockRow")
         .nth(1)
@@ -1320,199 +1251,6 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
         plate_of(unselected),
         "a selected row that paints the unselected plate marks nothing"
     );
-}
-
-/// A DIRECTORY YOU HAVE NOT LISTED HAS NO CONTENTS TO REPORT. Measured live:
-/// clicking `reports` inside `/shared` moved the crumb to
-/// `duckfs /shared/reports` while the rows below it, and the `0 files · 1 dir`
-/// beside the crumb, still described `/shared`. Both were `/shared`'s reading,
-/// printed under `/shared/reports`'s name — and `/shared/reports` is in fact
-/// empty, so every word of it was wrong.
-///
-/// `fs_path` is the path asked for (the crumb moves on the click, deliberately
-/// — a click that repaints nothing reads as a dead app). `fs_listed_path` is
-/// the path the rows describe. Same split as `active_page`/`buffer_page`.
-#[test]
-fn the_files_pane_reports_only_a_directory_it_has_listed() {
-    let entry = |path: &str, kind: &str| backend::FsEntry {
-        key: 0,
-        path: path.into(),
-        name: path.rsplit('/').next().unwrap_or(path).into(),
-        kind: kind.into(),
-        size: 0,
-        object: String::new(),
-    };
-    let listing = |generation: i64, path: &str, entries: Vec<backend::FsEntry>| {
-        __DucktapeMessage::FsListed(backend::FsListing {
-            generation,
-            path: path.into(),
-            entries,
-        })
-    };
-
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    let _ = app.__update(listing(
-        app.fs_generation,
-        "/shared",
-        vec![entry("/shared/reports", "dir")],
-    ));
-    assert_eq!(
-        app.fs_listed_path, app.fs_path,
-        "the listing answered for it"
-    );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "0 files · 1 dir"
-    );
-
-    // Navigate. The crumb moves at once; the rows have not.
-    let _ = app.__update(__DucktapeMessage::FsOpenDir("/shared/reports".into()));
-    assert_eq!(
-        app.fs_path, "/shared/reports",
-        "the crumb moves on the click"
-    );
-    assert_eq!(
-        app.fs_listed_path, "/shared",
-        "the rows still describe where you came from"
-    );
-    assert_ne!(
-        app.fs_listed_path, app.fs_path,
-        "`listed` is false for the whole of the navigation, and every reading \
-         of `entries` on the screen is gated on it"
-    );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, false, &app.fs_entries),
-        "",
-        "no tally for a directory nobody has answered for"
-    );
-
-    // The answer lands and the two agree again. The directory is empty, so the
-    // tally stays silent — the pane's own plate says "Empty directory" in
-    // words, and a subtitle of nothing but zeros repeats it in digits.
-    let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
-    assert_eq!(app.fs_listed_path, app.fs_path);
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        ""
-    );
-
-    // A same-path refresh — what a write kicks off — must NOT blank the pane:
-    // the rows on hand still describe the path in the crumb.
-    let _ = app.__update(listing(
-        app.fs_generation,
-        "/shared/reports",
-        vec![entry("/shared/reports/q3.md", "file")],
-    ));
-    assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "1 file · 0 dirs",
-        "and it speaks again as soon as there is something to count"
-    );
-
-    // And the screen actually gates on it, at every reading of the rows.
-    let storage = inlined(include_str!("../ui/screens/storage.ice"));
-    let files = storage
-        .split_once("component FilesScreen(")
-        .expect("the screen")
-        .1
-        .split_once("\ncomponent ")
-        .expect("the screen ends")
-        .0;
-    assert!(
-        files.contains("listed:bool"),
-        "the screen is handed the fact"
-    );
-    for gate in [
-        "meta=fs_counts_summary(connected, listed, entries)",
-        "if connected && listed && empty(directories)",
-        "if connected && listed",
-        "if listed && empty(entries)",
-        "if listed && !empty(entries)",
-    ] {
-        assert!(files.contains(gate), "ungated reading of the rows: {gate}");
-    }
-    let view = inlined(include_str!("../ui/view.ice"));
-    assert!(
-        view.contains("listed=(fs_listed_path == fs_path)"),
-        "the mount has to compute it"
-    );
-}
-
-/// THE FILES PREVIEW IS THE FORGE READER, NOT A PLAIN TEXT NODE.
-///
-/// Text files read as numbered, syntect-coloured rows through the same
-/// `forge_code` extern the forge blob pane mounts (behind the same `lazy`
-/// memo boundary), and a Markdown path reads as a document through
-/// `agent_markdown`. Pinned so the pane cannot quietly fall back to the one-ink
-/// `text preview_text` it shipped with — and so a pick clears the previous
-/// body before the read lands, instead of showing A's text under B's path.
-#[test]
-fn the_files_preview_reads_text_through_the_forge_reader() {
-    let storage = inlined(include_str!("../ui/screens/storage.ice"));
-    let files = storage
-        .split_once("component FilesScreen(")
-        .expect("the screen")
-        .1
-        .split_once("\ncomponent ")
-        .expect("the screen ends")
-        .0;
-    assert!(
-        files.contains("lazy preview_text by preview_text, preview_path, dark as cached_source"),
-        "the reader's memo boundary is the mount's lazy"
-    );
-    assert!(
-        files.contains("extern forge_code(cached_source, preview_path, dark) #fs-code"),
-        "text mounts the highlighted reader"
-    );
-    assert!(
-        files.contains("if !preview_binary && !preview_picture && markdown_path(preview_path)")
-            && files
-                .contains("lazy preview_text by preview_text, preview_path, dark as cached_doc")
-            && files.contains("extern agent_markdown(cached_doc, dark) #fs-markdown"),
-        "a markdown path reads as a document"
-    );
-    assert!(
-        files.contains("if preview_picture\n")
-            && files.contains("extern picture(\"files\", preview_path) #fs-picture"),
-        "a picture draws through the viewer"
-    );
-    assert!(
-        files.contains("if !preview_binary && !preview_picture && !editing && !preview_truncated"),
-        "a picture has no Edit"
-    );
-    assert!(
-        !files.contains("text preview_text\n"),
-        "no arm falls back to the one-ink text node"
-    );
-
-    let view = inlined(include_str!("../ui/view.ice"));
-    let mount = view
-        .split_once("FilesScreen new_name<->fs_new_name")
-        .expect("the mount")
-        .1
-        .split_once("\n        members:")
-        .expect("the mount ends")
-        .0;
-    assert!(mount.contains("dark\n"), "the mount hands the screen the appearance");
-    assert!(
-        mount.contains("open_message_link -> open_message_link _"),
-        "markdown links route through the shell's link seam"
-    );
-
-    let handlers = include_str!("../ui/handlers/files.ice");
-    let open_file = handlers
-        .split_once("on fs_open_file(path)")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("the handler ends")
-        .0;
-    let cleared = open_file.find("fs_preview_text = \"\"").expect("the old body is cleared");
-    let unpictured = open_file.find("fs_preview_picture = false").expect("the old picture flag is cleared");
-    let read = open_file.find("run replace lane=files_preview").expect("the read");
-    assert!(cleared < read && unpictured < read, "the body is cleared before the read is issued");
 }
 
 /// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
@@ -1550,35 +1288,6 @@ fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
     assert_eq!(app.thread_message_action, MessageAction::Toolbar);
     assert_eq!(app.thread_edit_draft, "");
-}
-
-/// THE FILES DELETE CONFIRM IS AN OVERLAY, SO IT ANSWERS ESCAPE.
-///
-/// `fs_delete_target` arms a scrim + `ConfirmDelete` over duckfs
-/// (`screens/storage.ice`). Its dismiss route is the backdrop click and the
-/// Cancel button — a destructive confirm with no keyboard exit, which is the
-/// state the drawer was in before #1132 gave it a rung.
-#[test]
-fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Files;
-    app.fs_delete_target = "/shared/report.md".into();
-
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert_eq!(
-        app.fs_delete_target, "",
-        "Escape is the keyboard way out of a destructive confirm"
-    );
-
-    // And the rung is scoped like every other per-tab rung: from another tab
-    // the confirm is not on screen, so the press names no layer at all.
-    app.shell_tab = ShellTab::Node;
-    app.fs_delete_target = "/shared/report.md".into();
-    app.bell_open = true;
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert!(!app.bell_open, "the bell rides every tab and answers first");
-    assert_eq!(app.fs_delete_target, "/shared/report.md");
 }
 
 /// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
@@ -1790,9 +1499,7 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     app.thread_selected_rev = 1;
     app.thread_message_action = MessageAction::Editing;
     app.thread_edit_draft = "half typed too".into();
-    app.forge_repo_menu = true;
     app.page_delete_armed = true;
-    app.fs_delete_target = "/shared/report.md".into();
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
 
@@ -1804,20 +1511,18 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.thread_edit_draft, "");
     assert_eq!(app.thread_selected_seq, 0);
     assert_eq!(app.thread_selected_rev, 0);
-    assert!(!app.forge_repo_menu);
     assert!(
         !app.page_delete_armed,
         "an armed delete never rides a tab move"
     );
-    assert_eq!(app.fs_delete_target, "");
 
     // The disconnected path returns before the generation bumps, and retires
     // the same set — the clear sits above both early returns, like `error`.
     let (mut app, _) = Ducktape::__boot();
-    app.shell_tab = ShellTab::Files;
-    app.fs_delete_target = "/shared/report.md".into();
+    app.shell_tab = ShellTab::Pages;
+    app.page_delete_armed = true;
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(app.fs_delete_target, "");
+    assert!(!app.page_delete_armed);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 
     // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
@@ -1841,148 +1546,60 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.selected_message_rev, 2);
 }
 
-/// A RUN IN FLIGHT IS NOT A CAGE.
-///
-/// The Shell screen used to refuse, while a task or a session was live: the
-/// surface switch, both pickers, and the reset — `return if shell_terminal_busy
-/// || shell_terminal_running || shell_chat_busy` at the top of every one. That
-/// left exactly one state with no exit: a run whose event stream stalls holds
-/// `shell_chat_busy` forever, and every control that could have moved the
-/// operator off it is disabled by the same flag. The tab is wedged until the
-/// app restarts.
-///
-/// Two properties close it, and both are pinned here: the switch always lands,
-/// and `shell_chat_detach` — the operator's way out — is reachable from INSIDE
-/// the busy state it exits.
-#[test]
-fn a_running_turn_never_locks_the_screen_that_started_it() {
-    let saga = format!("origin/sched\u{1f}{}", "a".repeat(64));
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Shell;
-    app.shell_provider = "codex".into();
-    app.shell_chat_entries =
-        backend::agent_chat_push_user(Vec::new(), "do it".into(), "codex".into());
-    app.shell_chat_busy = true;
-    app.shell_chat_saga = saga.clone();
-
-    let _ = app.__update(__DucktapeMessage::ShellSurfaceChanged(
-        ShellSurface::Terminal,
-    ));
-    assert_eq!(
-        app.shell_surface,
-        ShellSurface::Terminal,
-        "a live task must not pin the operator to the surface that started it"
-    );
-
-    let _ = app.__update(__DucktapeMessage::ShellChatDetach);
-    assert!(!app.shell_chat_busy, "detaching leaves the busy state");
-    assert_eq!(
-        app.shell_detached_saga, saga,
-        "STOP WATCHING, NOT STOP RUNNING: the turn keeps the id that reaches \
-         the still-executing saga"
-    );
-    let closed = app.shell_chat_entries.last().expect("the turn is closed");
-    assert_eq!(closed.status, "detached");
-    assert_eq!(closed.saga_id, saga);
-
-    // and discarding it hands the composer back.
-    let _ = app.__update(__DucktapeMessage::ShellChatDiscard);
-    assert!(app.shell_detached_saga.is_empty());
-    assert_eq!(app.shell_chat_entries.len(), 1);
-}
-
-/// ONE PICK, BOTH ANSWERS. `--cred` decides the provider, so choosing an
-/// identity settles the credential AND the provider, and re-narrows the host
-/// list to the peers that announced it — a peer that cannot serve the pick must
-/// not survive the change that made it unreachable.
-#[test]
-fn choosing_an_identity_settles_the_provider_and_re_narrows_the_hosts() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Shell;
-    app.shell_host_nodes = vec![backend::AgentHostNode {
-        key: "b".repeat(64),
-        label: "bo".into(),
-        providers: vec!["codex".into()],
-    }];
-    app.shell_identities = backend::agent_identities(vec![
-        backend::AgentCredential {
-            name: "x1".into(),
-            provider: "codex".into(),
-        },
-        backend::AgentCredential {
-            name: "c1".into(),
-            provider: "claude".into(),
-        },
-    ]);
-
-    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged("x1 · Codex".into()));
-    assert_eq!(app.shell_provider, "codex");
-    assert_eq!(app.shell_credential, "x1");
-    assert_eq!(app.shell_host_node_options, ["This node", "bo"]);
-
-    let _ = app.__update(__DucktapeMessage::ShellHostNodeChanged("bo".into()));
-    assert_eq!(app.shell_host_node_key, "b".repeat(64));
-
-    // bo announces no claude provider, so the run it would bounce is not on
-    // offer — and the pick that pointed at it falls back to the local row.
-    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged(
-        "c1 · Claude Code".into(),
-    ));
-    assert_eq!(app.shell_provider, "claude");
-    assert_eq!(app.shell_host_node_options, ["This node"]);
-    assert_eq!(app.shell_host_node, "This node");
-    assert_eq!(app.shell_host_node_key, "");
-}
-
 /// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
-/// handler that re-reads the account for them, and it clears every draft an op
-/// consumed — a ticket left on screen after its device joined is a stale blob
-/// that looks like a secret, and a create draft after the account exists is a
-/// second Create waiting to be refused.
+/// handler that re-reads the account for them, and it tells the Settings view
+/// — which holds the drafts — that every draft an op consumed is spent: a
+/// ticket left on screen after its device joined is a stale blob that looks
+/// like a secret, and a create draft after the account exists is a second
+/// Create waiting to be refused.
 #[test]
 fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.account_busy = true;
-    app.account_create_draft = "me".into();
-    app.account_join_draft = "{}".into();
     app.account_ticket = "{}".into();
     let before = app.account_generation;
+    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountChanged(true));
 
     assert!(!app.account_busy, "the op is over");
     assert_eq!(app.account_generation, before + 1, "the account is re-read");
-    assert!(app.account_create_draft.is_empty());
-    assert!(app.account_join_draft.is_empty());
-    assert!(app.account_key_draft.is_empty());
-    assert!(app.account_key_label_draft.is_empty());
     assert!(app.account_ticket.is_empty());
+    assert_eq!(app.settings_drafts_cleared, cleared + 1);
+    assert_eq!(app.settings_drafts_scope, "account");
 }
 
 /// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
-/// its own signal, each handler runs its backend fn on the connected chain
-/// under the signing seat, and every one lands in `account_changed` /
-/// `account_op_failed` — the one pair that re-reads the account and frees
-/// the card. And each is offered only where consensus would accept it:
-/// registering/linking with an account, logging in without one.
+/// its own signal, the Settings view sends it as an intent, and each intent's
+/// arm runs its backend fn on the connected chain under the signing seat,
+/// landing in `account_changed` / `account_op_failed` — the one pair that
+/// re-reads the account and frees the card. And each is offered only where
+/// consensus would accept it: registering/linking with an account, logging in
+/// without one.
 #[test]
 fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
-    let settings = include_str!("../ui/screens/settings.ice");
-    let roster = include_str!("../ui/handlers/roster.ice");
-    for (button, signal, backend) in [
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
+    let view_app = include_str!("../../../crates/views/settings/src/ui/app.ice");
+    let handlers = include_str!("../ui/handlers/node.ice");
+    for (button, signal, intent, backend) in [
         (
             "In this browser",
             "account_passkey_desktop",
+            "passkey_desktop",
             "register_passkey",
         ),
-        ("Link a wallet", "account_wallet_submit", "link_wallet"),
+        (
+            "Link a wallet",
+            "account_wallet_submit",
+            "wallet",
+            "link_wallet",
+        ),
         (
             "Log in with a passkey",
             "account_login_submit",
+            "login",
             "login_with_passkey",
         ),
     ] {
@@ -1990,16 +1607,20 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
             settings.contains(&format!(r#"button "{button}" -> emit({signal})"#)),
             "{button} emits {signal}"
         );
-        let handler = roster
-            .split(&format!("\non {signal}\n"))
+        assert!(
+            view_app.contains(&format!("\non {signal}\n")),
+            "the view sends {signal} as an intent"
+        );
+        let handler = handlers
+            .split(&format!("\n    SettingsIntent.{intent}\n"))
             .nth(1)
-            .unwrap_or_else(|| panic!("a handler for {signal}"))
-            .split("\non ")
+            .unwrap_or_else(|| panic!("an arm for {intent}"))
+            .split("\n    SettingsIntent.")
             .next()
             .unwrap();
         assert!(
             handler.contains(&format!(
-                "run every {backend}(connected_rpc, password, network_chain_id"
+                "run replace lane=account_desktop_ceremony {backend}(connected_rpc, password, network_chain_id"
             )),
             "{signal} runs {backend} on the connected chain"
         );
@@ -2041,9 +1662,8 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
 fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
     let (mut app, _) = Ducktape::__boot();
     app.account_busy = true;
-    app.account_key_draft = "ab".into();
-    app.account_key_label_draft = "phone".into();
     let before = app.account_generation;
+    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
         r#"{"add_key":{}}"#.into(),
@@ -2051,8 +1671,11 @@ fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
 
     assert!(!app.account_busy);
     assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
-    assert!(app.account_key_draft.is_empty());
-    assert!(app.account_key_label_draft.is_empty());
+    assert_eq!(app.settings_drafts_cleared, cleared + 1);
+    assert_eq!(
+        app.settings_drafts_scope, "keys",
+        "the key and its label are spent; nothing else is"
+    );
     assert_eq!(app.account_generation, before, "minting re-reads nothing");
 }
 
@@ -2061,7 +1684,7 @@ fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
 /// it, and a button that always refuses is a lie).
 #[test]
 fn the_account_card_gates_founding_and_the_last_key() {
-    let settings = include_str!("../ui/screens/settings.ice");
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
     let create = settings.find("#account-create").expect("the create input");
     assert!(
         settings[..create].rfind("if !account_exists").is_some(),

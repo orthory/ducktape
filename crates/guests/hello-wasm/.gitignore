@@ -2,4 +2,3 @@
 # committed under crates/kernel/wasm-host/tests/fixtures instead).
 /target
 /out
-/Cargo.lock

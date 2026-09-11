@@ -1,11 +1,12 @@
-# Running a node as a service (systemd)
+# Running a node as a service
 
 How to keep a `ducktape` node — and the compute / agent / airlock daemons
-that serve it — running across reboots and crashes on a Linux host. The
-units are `ops/node/ducktape-node@.service` and
-`ops/node/ducktape-service@.service`; the log rotation is
-`ops/node/ducktape-node.logrotate`. Every path below matches what those
-files set.
+that serve it — running across reboots and crashes. Everything up to
+"macOS (launchd)" is the Linux host: the units are
+`ops/node/ducktape-node@.service` and `ops/node/ducktape-service@.service`,
+the log rotation is `ops/node/ducktape-node.logrotate`, and every path below
+matches what those files set. macOS runs the node as a per-user LaunchAgent
+instead; that section names its two files and its commands.
 
 The node is supervisor-ready: on a validator SIGTERM takes the graceful
 checkpoint path (the same one the desktop shell uses on quit; a resident
@@ -16,19 +17,24 @@ soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 
 ## Where the workspace lives
 
-Everything the node keeps on disk sits under **`DUCKTAPE_HOME`**
-(`crates/workspace-config/src/lib.rs`, `ducktape_home`): `$DUCKTAPE_HOME`
-when set, else `~/.ducktape`. The units set
-`DUCKTAPE_HOME=/var/lib/ducktape` (a systemd `StateDirectory`, owned by the
-`ducktape` user), so under them the layout is:
+Everything a network keeps on disk sits in its workspace under
+**`DUCKTAPE_HOME`** (`crates/workspace-config/src/lib.rs`, `ducktape_home`):
+`$DUCKTAPE_HOME` when set, else `~/.ducktape`. The home holds one directory
+per network and nothing else — two networks on one host share no file. The
+units set `DUCKTAPE_HOME=/var/lib/ducktape` (a systemd `StateDirectory`,
+owned by the `ducktape` user), so under them the layout is:
 
 ```
 /var/lib/ducktape/
-  workspaces/<chain-id>/     one dir per network (`ducktape node list`)
+  <chain-id>/                one dir per network (`ducktape node list`)
     node.toml                the operator file: listeners, storage_dir, [sandbox]
     network.toml             the network descriptor (validators, reach hints, the genesis pin)
     genesis                  the network's wasm (every component + index guest), pinned by network.toml
     identity.key             THIS NODE'S seat key, 0600 — back it up (see backup-and-keys.md)
+    keys/                    this network's user wallets + `active` pointer (`ducktape wallet new <name> -n <chain-id>`)
+    guest/                   the kernel + rootfs its runs boot (`OUT=<workspace>/guest ops/build-guest-rootfs.sh`)
+    executors/               the pinned agent CLIs its runs exec (`ducktape agent install -n <chain-id>`)
+    capabilities/            operator capability specs, `*.toml`
     wireguard.key            the tunnel keypair (regenerable)
     services.toml            service grants (`ducktape service enable`)
     coord.cap                the coordinator admission capability, when issued
@@ -36,9 +42,8 @@ when set, else `~/.ducktape`. The units set
     daemon.log               `node run`'s tee (append-only)
     <kind>.log               `service run <kind>`'s tee (append-only)
     storage/                 consensus state, blobs, mesh-state.json, airlock-creds/
-  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): what `node init` composes a genesis from
-  executors/                 pinned agent CLIs (`ducktape agent install`)
-  keys/                      user wallets + `active` pointer (only if you run wallet verbs as this user)
+/usr/local/lib/ducktape/
+  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): program data the unit's DUCKTAPE_MODULES_DIR names, what `node init` composes a genesis from
 ```
 
 ### What grows, and what nothing prunes
@@ -87,9 +92,10 @@ sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
 # 3. The founding set: what `node init --modules` composes the genesis from,
 #    and where the unit's DUCKTAPE_MODULES_DIR has the netstack guest read.
-sudo install -d -o ducktape -g ducktape /var/lib/ducktape/modules
-sudo cp ~/.cargo/bin/modules/*.wasm /var/lib/ducktape/modules/
-sudo chown -R ducktape:ducktape /var/lib/ducktape/modules
+#    Program data beside the binary's prefix, never under the home.
+sudo install -d -m 0755 /usr/local/lib/ducktape/modules
+sudo cp ~/.cargo/bin/modules/*.wasm /usr/local/lib/ducktape/modules/
+sudo chmod -R a+rX /usr/local/lib/ducktape/modules
 
 # 4. Units and log rotation.
 sudo cp ops/node/ducktape-node@.service ops/node/ducktape-service@.service /etc/systemd/system/
@@ -100,7 +106,7 @@ sudo systemctl daemon-reload
 #    the unit will look for them. A member (an identity the founder admitted
 #    before genesis) joins with the founder's `<workspace>/genesis`; a
 #    resident fetches it off the mesh at first boot.
-dt node init --name mynet --modules /var/lib/ducktape/modules   # founder
+dt node init --name mynet --modules /usr/local/lib/ducktape/modules   # founder
 dt node join '<invite blob>'                                    # ...or a resident
 dt node join '<invite blob>' --genesis /path/to/founders/genesis # ...or a member
 dt node list                              # the chain id the instance names
@@ -108,13 +114,15 @@ dt node list                              # the chain id the instance names
 
 `node init`/`node join` probe the host and write the `[sandbox]` table when
 `/dev/kvm` opens; a host that gained KVM later runs `dt node sandbox` once.
-Firecracker, `mke2fs`, `debugfs` AND `nft` must be on the service's `PATH`
+The table names HOW a run is isolated, never where its images are: those are
+the workspace's own, built by `OUT=/var/lib/ducktape/<chain-id>/guest
+ops/build-guest-rootfs.sh` (as the service user, or chowned to it), and
+`dt node sandbox` names the exact invocation for a workspace missing them.
+Firecracker, `mke2fs` AND `debugfs` must be on the service's `PATH`
 — `/usr/local/bin`, `/usr/sbin` and `/sbin` are searched
-(`crates/services/sandbox/src/host_tools.rs`). `nft` is not optional: the
-Firecracker backend lists it unconditionally (`sandbox.rs`,
-`required_tools`) and the compute/agent daemon refuses to boot without it
-(`nft is not executable on PATH`), tap-networked run or not — install
-`nftables` alongside `e2fsprogs`.
+(`crates/services/sandbox/src/host_tools.rs`); the compute/agent daemon
+refuses to boot without them (`sandbox.rs`, `required_tools`) — install
+`e2fsprogs`.
 
 ## Enable and start
 
@@ -167,8 +175,8 @@ workspace. They never disagree about what was recorded.
 
 ```sh
 journalctl -fu ducktape-node@mynet
-tail -f /var/lib/ducktape/workspaces/<chain-id>/daemon.log
-tail -f /var/lib/ducktape/workspaces/<chain-id>/compute.log
+tail -f /var/lib/ducktape/<chain-id>/daemon.log
+tail -f /var/lib/ducktape/<chain-id>/compute.log
 
 # turn one plane up on the LIVE node — never restart to look at a wedged state.
 # the route mutates the process, so it takes a credential: the verb signs with
@@ -176,7 +184,7 @@ tail -f /var/lib/ducktape/workspaces/<chain-id>/compute.log
 # credential does (an uncredentialed curl is refused 401).
 ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>
 curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug' \
-  -H "x-ducktape-admin-token: $(cat /var/lib/ducktape/workspaces/<chain-id>/admin.token)"
+  -H "x-ducktape-admin-token: $(cat /var/lib/ducktape/<chain-id>/admin.token)"
 ```
 
 The tee files are opened append-only once and never reopened, which is why
@@ -184,7 +192,7 @@ the logrotate drop-in uses `copytruncate` (weekly, or at 256 MB, eight kept).
 
 A wedged node (no more progress, no crash) can dump every async task it is
 parked on: `kill -USR1 $(systemctl show -p MainPID --value ducktape-node@mynet)`
-writes `/var/lib/ducktape/workspaces/<chain-id>/tasks.txt` (overwritten each
+writes `/var/lib/ducktape/<chain-id>/tasks.txt` (overwritten each
 time) and logs one `task_dump_written` line to `daemon.log`. Linux
 x86_64/aarch64 only; elsewhere the signal does nothing.
 
@@ -307,6 +315,65 @@ backed up — no verb helps, and there is no key-rotation verb to reach for
 either: `ducktape node member` is `promote | remove | leave | status`, so the
 key IS the seat. See `backup-and-keys.md`.
 
+## macOS (launchd)
+
+There is no systemd on a Mac, so the node runs as a **per-user LaunchAgent**:
+as the logged-in user, out of that user's `~/.ducktape`, installable without
+root. `ops/node/dev.ducktape.node.plist` is the agent, and it is a template —
+a plist cannot expand `~` or a workspace selector — which
+`ops/node/install-macos.sh` renders and loads:
+
+```sh
+ducktape node init --name mynet        # found (or join) as yourself, first
+ops/node/install-macos.sh --dry-run --workspace mynet   # print the rendered plist
+ops/node/install-macos.sh --workspace mynet             # write it and bootstrap it
+```
+
+The script resolves the binary with `command -v ducktape` (`--binary` overrides
+it), writes `~/Library/LaunchAgents/dev.ducktape.node.plist`, and runs
+`launchctl bootstrap gui/$(id -u) <plist>`. It is idempotent: a re-run
+re-renders and re-loads, which is also how you change the workspace, the log
+filter (`--rust-log`) or `DUCKTAPE_HOME` (`--home`). A second network on the
+same Mac needs `--label <label>`, because the label is the agent's identity in
+the user's launchd domain. `--uninstall` boots the agent out and removes the
+plist, leaving the workspace alone.
+
+```sh
+launchctl print gui/$(id -u)/dev.ducktape.node    # state and last exit status
+launchctl kickstart -k gui/$(id -u)/dev.ducktape.node   # restart it
+launchctl bootout gui/$(id -u)/dev.ducktape.node        # stop it until re-bootstrapped
+ops/node/install-macos.sh --uninstall                   # ...and forget it
+```
+
+What the plist carries, and why:
+
+- `RunAtLoad` + `KeepAlive` + `ThrottleInterval 3` — the unit's
+  `Restart=always` / `RestartSec=3`.
+- `ExitTimeOut 120` — launchd's SIGTERM-to-SIGKILL gap, the unit's
+  `TimeoutStopSec`. A validator needs it: SIGTERM takes the graceful
+  checkpoint path.
+- `SoftResourceLimits`/`HardResourceLimits` `NumberOfFiles` 10240 / 65536. A
+  GUI-launched process inherits a soft limit of **256** (`launchctl limit
+  maxfiles` says `256 unlimited`), which the module stores blow past into a
+  bare `EMFILE`; the node raises its own soft limit toward 65536 and is clamped
+  to the lower of the hard limit and `kern.maxfilesperproc`
+  (`crates/kernel/node/src/resource_limits.rs`), so the hard limit here is what
+  that raise may reach and the soft limit is the floor if it refuses.
+- `ProcessType Interactive` — an unset `ProcessType` lets launchd throttle the
+  job's CPU and I/O, which a validator cannot bear.
+- `EnvironmentVariables` for `DUCKTAPE_HOME`, `RUST_LOG`, and a `PATH` naming
+  the Homebrew prefixes, since launchd hands a job a minimal one.
+
+Logs: `~/Library/Logs/ducktape/node.err.log` (the tracing stream) and
+`node.out.log`, plus the workspace's own `daemon.log` as on Linux. **Nothing
+rotates the two Library files** — launchd has no logrotate — so truncate them
+yourself if they grow; `daemon.log` is the copy to keep.
+
+Before the compute plane will run on that Mac, `ops/macos-preflight.sh` has to
+pass (the vz shim, its entitlement, the guest images). The rest of this
+document — ports, the halt at three validators, the log-filter route, backup —
+reads the same on both platforms.
+
 ## Listen ports
 
 Defaults from `crates/workspace-config/src/node_toml.rs`, written into
@@ -318,7 +385,7 @@ Defaults from `crates/workspace-config/src/node_toml.rs`, written into
 | p2p control mesh (`listen`) | `[::]:8846` | TCP | **Yes** for a node others dial directly (a founder, a `Direct`-hinted member). A member that advertises `"overlay"` is dialed over the WireGuard tunnel instead. |
 | WireGuard tunnel plane (`wireguard_listen`) | `0.0.0.0:51820` | UDP | **Yes** for an inviter / a node without a coordinator; the plane hole-punches through a coordinator otherwise. Bind the concrete IP on a LAN or VPS without a coordinator — an unspecified bind advertises an endpoint-less record and joiner↔joiner tunnels stay dark. |
 | invite intro (`invite_listen`) | WireGuard port + 1 → `0.0.0.0:51821` | UDP | **Yes** on any node that mints invites (a joiner rings this doorbell first). |
-| node HTTP API (`http_listen`) | `127.0.0.1:8844` | TCP | No — loopback only. Every mutating `/v1` route requires a per-request user signature or the workspace's operator token from a loopback peer, and every co-located process dials this plane over loopback whatever it is bound to; never bind it wider. |
+| node HTTP API (`http_listen`) | `0.0.0.0:8844` | TCP | **Yes** for a remote desktop app or CLI. Reads are open to any peer; every mutating `/v1` route requires a per-request user signature or the workspace's operator token from a loopback peer, and `/v1/admin/*` follows `DUCKTAPE_ADMIN` (`crates/noded/src/admin.rs`). Every co-located process dials this plane over loopback whatever it is bound to. |
 | operator rpc (`rpc_listen`) | `127.0.0.1:8845` | TCP | No — loopback only. |
 | browser gateway (`gateway_listen`) | `127.0.0.1:0` | TCP | No — port 0, printed at boot, re-read per session. |
 

@@ -10,18 +10,18 @@ mod harness;
 
 use harness::Sim;
 
-/// The default 15-module sim genesis root-hash.
+/// The default 16-module sim genesis root-hash.
 ///
 /// This is the SIM's number and only the sim's: `sim_base` excludes all four of
-/// `acl`, `governance`, `lifecycle` and `valset`, so it is NOT what a node runs
+/// `acl`, `governance`, `modules` and `valset`, so it is NOT what a node runs
 /// and it is NOT the consensus pin. That one is
 /// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
 /// module set — moving THAT is the flag day that matters. This constant guards
 /// something narrower and still worth guarding: that composing the sim's
-/// genesis is a pure function of the topology selection, so a change in how the
+/// genesis is a pure function of deployment bytes and bindings, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "2134e5430210ae57d1d70eb3645500969fe1fe8c2b84b0e5c20a4353f5d94826";
+    "1b85e0879dfa2a3117d6d1247b59085c2fa28590cc20949196ea8dc2549f8dd5";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -38,11 +38,12 @@ fn default_genesis_composes_topology_sim_base() {
     let sim = Sim::spawn(storage.path(), &[]);
     let status = sim.status();
 
-    let want: Vec<String> = topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
+    let mut want: Vec<String> = topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
+    want.sort_unstable();
     assert_eq!(
         module_ids(&status),
         want,
-        "sim default genesis composes topology sim_base, in registry order"
+        "sim default genesis composes topology sim_base; status lists the host's set by id"
     );
     // the module a capability-tagged saga draws its Strict-lease pool from
     // ANSWERS here — an empty set — instead of erroring `UnknownModule`. That
@@ -77,8 +78,8 @@ fn default_genesis_composes_topology_sim_base() {
          list is already pinned by the assertion above).\n\
          \n\
          EITHER WAY this is NOT the consensus pin, and updating it proves \
-         nothing about production: `sim_base` is 15 modules and excludes \
-         acl/valset/governance/lifecycle. The number a network forks on is \
+         nothing about production: `sim_base` is 16 modules and excludes \
+         acl/valset/governance/modules. The number a network forks on is \
          GENESIS_ROOT_HASH in bin/node/src/host_state.rs — if that moved too, go \
          read its message instead."
     );
@@ -93,28 +94,29 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &key]);
     let status = sim.status();
 
-    let want: Vec<String> = topology::SIM_BASE
+    let mut want: Vec<String> = topology::SIM_BASE
         .iter()
         .chain(topology::SIM_VALSET)
         .map(|s| s.to_string())
         .collect();
+    want.sort_unstable();
     assert_eq!(
         module_ids(&status),
         want,
-        "--with-valset appends topology sim_valset after sim_base, in registry order"
+        "--with-valset composes topology sim_base plus sim_valset; status lists the host's set by id"
     );
 
-    // governance composes as a WASM tenant now, so the lifecycle code registry
+    // governance composes as a WASM tenant now, so the modules code registry
     // it is wired to comes with it: an UpdateModule proposal opens a ballot
     // instead of being refused at the door. the code hash names no component
-    // the network has — lifecycle refuses that at execute, which is a different
+    // the network has — the registry refuses that at execute, which is a different
     // (and later) gate; the claim here is only that a registry exists at all.
     let propose = governance::GovMsg::Propose {
         proposal_id: "u".into(),
         action: governance::GovAction::UpdateModule {
             name: "x".into(),
             module_id: "chat".into(),
-            activation_height: 10_000,
+            activation_lead: 10_000,
             code_hash: vec![0; 32],
         },
         voting_period: 600_000,

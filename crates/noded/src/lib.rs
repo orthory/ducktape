@@ -36,7 +36,7 @@ pub mod blobs;
 // the `Host` finisher.
 pub mod bundle;
 // the ONE module composer every host in the workspace builds its module set
-// through: a topology selection + a code source + a store source.
+// through: deployment hashes + a code source + a store source.
 pub mod compose;
 pub mod log;
 pub mod stream;
@@ -85,13 +85,16 @@ pub use handle::{
 };
 
 mod module_code;
-pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
+pub mod node_work;
+pub use module_code::{
+    CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
+};
 // the node-local, off-chain interactive terminal-session plane. public so
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
 pub use term::{
-    CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
-    TermFeedEvent, TermRing, TerminalSessions,
+    AttachGuard, CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing,
+    TermError, TermFeedEvent, TermRing, TerminalSessions,
 };
 
 pub mod term_remote;
@@ -102,7 +105,9 @@ pub mod services;
 /// A service daemon's handle on the node it serves: the `/v1` twin of the
 /// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
 pub mod node_link;
-pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
+pub use term_remote::{
+    CONTROL_DEADLINE, RemoteSessions, SessionInputWire, SessionJob, SessionLane,
+};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
 mod term_consensus;
@@ -115,8 +120,8 @@ pub use term_consensus::{command_blocks, command_text, session_channel};
 // /v1/blocks.
 mod index;
 pub use index::{
-    BlocksParams, FOLDED_HEADER, IndexGuests, IndexScanParams, converge_index_guests,
-    index_block_ops, index_origin, open_index_store, stale_modules, stamp_stale_modules,
+    BlocksParams, FOLDED_HEADER, IndexScanParams, converge_host_modules, index_block_ops,
+    index_host_modules, index_origin, open_index_store, stale_modules, stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
@@ -140,11 +145,12 @@ pub mod testkit;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use commonware_cryptography::Signer as _;
 use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
@@ -264,6 +270,7 @@ impl From<&host::DispatchRecord> for DispatchInfo {
             origin: match &record.origin {
                 sdk::Origin::External(_) => "external".to_string(),
                 sdk::Origin::Module(id) => format!("module:{id}"),
+                sdk::Origin::Program(account) => format!("acct:{account}"),
                 sdk::Origin::System => "system".to_string(),
             },
             emitted_msgs: record.emitted_msgs,
@@ -308,6 +315,16 @@ pub struct NodeStatus {
     pub version: String,
     pub root_hash: String,
     pub height: u64,
+    /// the `Env` clock every module compares `expires_at` against, stamped
+    /// from `height` under this node's `ConsensusTimePolicy` — a block height
+    /// on the validator/replica lanes, a millisecond epoch on the sim lane.
+    /// a client minting a TTL-bounded consent (identity's `AddKey`) MUST read
+    /// this, never `height`: the two units diverge on simnode.
+    pub consensus_time: u64,
+    /// which unit [`Self::consensus_time`] is expressed in, so a client can
+    /// scale a TTL window correctly regardless of which lane it is talking
+    /// to. defaults to `Height` (the validator/replica lanes' only policy).
+    pub consensus_time_unit: ConsensusTimeUnit,
     pub modules: Vec<ModuleStatus>,
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
@@ -489,6 +506,31 @@ pub struct StoreOperationalStatus {
     pub files: u64,
 }
 
+/// the unit a `NodeStatus::consensus_time` reading is in — mirrors
+/// [`node::ConsensusTimePolicy`]'s two arms, so a status client never needs
+/// the kernel crate just to scale a TTL correctly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusTimeUnit {
+    /// `consensus_time` IS the block height (the validator/replica lanes'
+    /// only policy); one unit is roughly one second at a one-block-per-second
+    /// heartbeat.
+    #[default]
+    Height,
+    /// `consensus_time` is a millisecond epoch clock (the sim lane); one unit
+    /// is one millisecond.
+    Millis,
+}
+
+impl From<node::ConsensusTimePolicy> for ConsensusTimeUnit {
+    fn from(policy: node::ConsensusTimePolicy) -> Self {
+        match policy {
+            node::ConsensusTimePolicy::HeightIsTime => Self::Height,
+            node::ConsensusTimePolicy::Epoch { .. } => Self::Millis,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexOperationalStatus {
     pub module: String,
@@ -637,6 +679,10 @@ pub fn router(handle: NodeHandle) -> Router {
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
         .route("/v1/query", post(query))
+        // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
+        // is to `/v1/submit`: the caller's own proof decides who is asking, so
+        // a module can serve content it would refuse an anonymous reader.
+        .route("/v1/query/reader", post(query_as_reader))
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
         .route("/v1/blocks", get(blocks))
@@ -651,6 +697,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/log-filter", post(log_filter))
+        .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
@@ -683,6 +730,12 @@ pub fn router(handle: NodeHandle) -> Router {
         )
         .route("/v1/files/commit", post(files_commit))
         .route("/v1/files/pin", post(files_pin))
+        // the name rides a signed JSON body, not a path segment: `url`
+        // normalizes `%2E`/`%2E%2E` path segments as dot-segments before the
+        // request leaves the client, so a pin named `.` or `..` (both legal,
+        // see `pin_apply`) could reach a different route or fail signature
+        // verification through a path-shaped route.
+        .route("/v1/files/unpin", post(files_unpin))
         .route("/v1/files/watch", post(files_watch))
         .route("/v1/files/stat", get(files_stat))
         .route("/v1/files/ls", get(files_ls))
@@ -747,7 +800,10 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
-    // EVERY mutating route above carries a user signature; the reads do not.
+    // EVERY mutating route above carries a credential; the reads do not. WHICH
+    // credential is `signed_req::Lane::authority`'s call: a module-bound write
+    // takes any acting key (the module decides), a node-level one takes this
+    // node's operator.
     // `route_layer`, NOT `layer`: a layer would also wrap the fallback, and an
     // unmatched path must 404 rather than be told it needs a signature.
     // `signed_req::lane_of` is the whole table — a new mutating route is added
@@ -787,8 +843,11 @@ pub const DEFAULT_ORIGIN: &str = "noded";
 /// committed. the real node has a keypair for this and signs; the embedded
 /// daemon has only its trusted-client origin string, so it must be ONE string
 /// — the binary's actor loop, its oracle pool, and the provisioner all name it
-/// here rather than each inventing a spelling.
-pub const ORACLE_ORIGIN: &[u8] = b"oracle";
+/// here rather than each inventing a spelling. 32 bytes: `Accept` gates on
+/// valset standing (and, for a tagged saga, an announced capability), the
+/// same shape a real node's ed25519 key has — a scenario that needs this
+/// identity to actually claim a saga registers it via `--with-valset`.
+pub const ORACLE_ORIGIN: &[u8] = &[b'o'; 32];
 
 /// the network name BOTH single-writer daemons compose under: the composer
 /// binds it into the identity and gateway guests' genesis `__config`, and
@@ -811,8 +870,12 @@ pub const LOCAL_CHAIN_ID: &str = "local";
 /// sandbox guest, or any peer on a widened `http_listen`, forge an op under
 /// this node's own consensus key.
 ///
-/// A request that DID sign acts as its key: the verified signer overrides the
-/// caller-supplied [`SubmitRequest::origin`], which is a claim (see there).
+/// `signed_req` gates this route at `Authority::Operator`: the only PoP that
+/// clears it is a signature by [`crate::AdminConfig::owner_key`] (the operator's
+/// own key), so a signed caller here has already proven it IS the operator, and
+/// that verified signer overrides the caller-supplied [`SubmitRequest::origin`],
+/// which is a claim (see there) — never a self-chosen key, which the gate never
+/// lets reach this handler at all (#1808).
 async fn submit(
     State(handle): State<NodeHandle>,
     signed: Option<axum::Extension<SignedBy>>,
@@ -946,6 +1009,86 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
     }
 }
 
+/// POST /v1/query/reader — the AUTHENTICATED read lane.
+///
+/// Same `{target, query}` body as `/v1/query`, and the same committed state
+/// behind it. The one difference is the whole point: the caller proves
+/// possession of a key with the data-plane signature trio
+/// ([`crate::signed_req`]), and that verified key reaches the module as
+/// [`host::Origin::External`] — the SAME `Env::origin` field a write's
+/// authority arrives in, so a module gates a protected read with the vocabulary
+/// it already gates writes with.
+///
+/// ## why the reader cannot ride in the body
+///
+/// It was tried. A `{"reader": …}` envelope inside `query` is forgeable by
+/// anyone who can POST the UNAUTHENTICATED `/v1/query`, which is open to
+/// anything that can dial this port — a sandboxed guest reaching this listener
+/// through its vsock tunnel included (see [`crate::signed_req`]'s module doc).
+/// A caller supplies request BYTES and nothing else; putting the reader outside
+/// those bytes is what makes it unforgeable, and no refusal rule on the open
+/// lane is needed to keep it that way.
+///
+/// ## fail-closed, and where
+///
+/// This route establishes WHO. It deliberately does not decide what that reader
+/// may see: only the module holds the roster. The corollary is the module's
+/// obligation — a module serving protected content MUST refuse
+/// [`host::Origin::System`] for it, because System is exactly what the open
+/// lane still passes. A module that forgets is open on `/v1/query`, and no
+/// route can fix that for it.
+///
+/// This authenticates the READER at the RPC edge. It is not confidentiality:
+/// bodies live in replicated committed state, so every validator can read them.
+/// Nothing here promises end-to-end encryption.
+async fn query_as_reader(
+    State(handle): State<NodeHandle>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
+    // the signature covers the EXACT bytes below, so verify before decoding:
+    // an unauthenticated caller learns nothing about the body's shape.
+    let reader = match crate::signed_req::verify_signed_request(
+        &handle,
+        &axum::http::Method::POST,
+        path_and_query,
+        &headers,
+        &body,
+    ) {
+        Ok(key) => key,
+        Err(refusal) => return crate::signed_req::refuse(path_and_query, refusal),
+    };
+    let Ok(req) = serde_json::from_slice::<QueryRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "body must be {target, query}");
+    };
+    let req_bytes = serde_json::to_vec(&req.query).expect("a decoded json value re-serializes");
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle
+        .send(NodeCommand::QueryAs {
+            target: req.target,
+            req: req_bytes,
+            reader,
+            reply,
+        })
+        .await
+    {
+        return resp;
+    }
+    match rx.await {
+        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "module reply was not json",
+            ),
+        },
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Err(_) => actor_gone(),
+    }
+}
+
 /// GET /v1/status — the last boundary snapshot the owning actor published,
 /// with live operations overlaid, straight off the handle's [`StatusCell`].
 /// deliberately NEVER crosses the command lane: a sync/catch-up stage keeps
@@ -999,16 +1142,73 @@ pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 /// tree is unreachable without a restart — and restarting a wedged node destroys
 /// the state you restarted it to look at.
 ///
-/// AUTH: it MUTATES the running process, so it carries a user signature like
-/// every other mutating route ([`signed_req`]). turning `ducktape::x=trace` on
-/// is a real denial-of-service against the node's own disk — `daemon.log` has
-/// no rate limit — and a bare `curl` from anything that could dial the port
-/// used to be enough. the operator verb signs for you.
+/// AUTH: it MUTATES the running PROCESS and reads no acting identity, so it is
+/// one of the node-level routes (`signed_req`, `Authority::Operator`): this
+/// node's operator credential, or a signature by the key it knows as its
+/// operator's. turning `ducktape::x=trace` on is a real denial-of-service
+/// against the node's own disk — `daemon.log` has no rate limit — and any key a
+/// caller minted for itself must not buy it. `ducktape node log-filter` signs
+/// with the active wallet key, which is the key the node read at boot.
 async fn log_filter(body: String) -> Response {
     match crate::log::set_filter(body.trim()) {
         Ok(()) => (StatusCode::OK, body).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &err),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HuddleNodeProofBody {
+    channel_id: String,
+}
+
+#[derive(Serialize)]
+struct HuddleNodeProofResponse {
+    node: String,
+    node_proof: String,
+}
+
+/// POST /v1/huddle/node-proof `{"channel_id": "…"}` — mints the ed25519
+/// signature `chat::ChatMsg::JoinHuddle.node_proof` needs: THIS node's own
+/// identity key, signing `chat::huddle_join_preimage(channel_id, signer)`
+/// under `chat::HUDDLE_JOIN_NS`. 503 on a daemon with no mesh identity (the
+/// embedded local daemon, `bin/noded`) — huddle routing has nothing to name
+/// there either.
+///
+/// AUTH: a SIGNED request (`signed_req`, `Lane::HuddleProof`) by a key that
+/// holds an identity account. the proof binds the VERIFIED signer, never a
+/// caller-supplied user, so a roster entry can only ever carry a node that
+/// agreed to route that exact person — and the node agrees only for a member
+/// of its own network (`key_without_account` otherwise). the operator
+/// credential, which the guard admits on every lane, names no person to bind
+/// and is refused here: a device that hosts this node signs like any other.
+async fn huddle_node_proof(
+    State(handle): State<NodeHandle>,
+    signed: Option<axum::Extension<SignedBy>>,
+    Json(body): Json<HuddleNodeProofBody>,
+) -> Response {
+    let Some(signer) = handle.node_signer.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node has no mesh identity to prove a huddle node key with",
+        );
+    };
+    let Some(axum::Extension(SignedBy(user))) = signed else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "a huddle node proof binds the key that signed the request; sign it as the joining user",
+        );
+    };
+    if let Err(refused) = call::account_holder(&handle, user.clone()).await {
+        return refused;
+    }
+    let preimage = chat::huddle_join_preimage(&body.channel_id, &user);
+    let node_proof = signer.sign(chat::HUDDLE_JOIN_NS, &preimage);
+    Json(HuddleNodeProofResponse {
+        node: hex_bytes(signer.public_key().as_ref()),
+        node_proof: hex_bytes(node_proof.as_ref()),
+    })
+    .into_response()
 }
 
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
@@ -1027,11 +1227,12 @@ async fn log_filter(body: String) -> Response {
 /// descriptor to fold a hint into.
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
-/// up to 365 days — so minting one is behind the signed-write gate
-/// ([`signed_req`]) like every other mutation: a user signature, or this node's
-/// operator credential from a local process that can read its workspace. The
-/// desktop app presents the latter (it already reads the same workspace for the
-/// service-link token).
+/// up to 365 days — and this handler reads no acting identity, so possession of
+/// a self-minted key buys nothing here. It is node-level
+/// (`signed_req`, `Authority::Operator`): this node's operator credential from
+/// a local process that can read its workspace, or a signature by the key the
+/// node knows as its operator's. The desktop app presents the former (it
+/// already reads the same workspace for the service-link token).
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,
@@ -1138,8 +1339,45 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
     .await
 }
 
-async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| stream::stream_session(socket, handle))
+/// what a ws upgrade may ask for before it has a socket.
+#[derive(serde::Deserialize)]
+struct WsParams {
+    /// one dispatch id, to be admitted as its creator
+    /// ([`stream::admit_run_reader`]). Absent on every other client, which is
+    /// why this surface stays open in `signed_req::required_authority`: the
+    /// proof is demanded by the ASK, not by the route.
+    run: Option<String>,
+}
+
+async fn ws(
+    State(handle): State<NodeHandle>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Query(params): Query<WsParams>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    // A RUN ASK IS PROVED BEFORE THE UPGRADE. An unadmitted caller gets an HTTP
+    // refusal and no socket — it never reaches a state where a subscribe could
+    // be tried, and it learns nothing about whether the run exists.
+    let reader_of = match params.run {
+        None => None,
+        Some(run) => {
+            let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
+            if let Err(refused) =
+                stream::admit_run_reader(&handle, &run, &headers, path_and_query).await
+            {
+                return refused;
+            }
+            Some(run)
+        }
+    };
+    // unauthenticated surface: cap the frame/message tungstenite otherwise
+    // defaults to 64 MiB, so a single frame cannot force a large buffer before
+    // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
+    upgrade
+        .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of))
 }
 
 #[cfg(test)]

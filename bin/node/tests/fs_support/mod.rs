@@ -1,5 +1,5 @@
 //! an in-process duckfs node for the CLI e2e, over noded's shared in-proc
-//! daemon testkit: a REAL `host::Host::genesis` with ONLY the files module,
+//! daemon testkit: a REAL `host::Host::genesis` with files, identity and attribution,
 //! fronted by noded's router on a loopback listener. the CLI subprocess
 //! (`env!(CARGO_BIN_EXE_ducktape) fs`) drives it over http exactly as it would
 //! a real daemon.
@@ -10,6 +10,7 @@
 
 use std::process::Command;
 
+use commonware_cryptography::{Signer as _, ed25519};
 use host::Host;
 use noded::testkit::InProcDaemon;
 
@@ -34,12 +35,26 @@ impl Harness {
             .tempdir()
             .expect("harness tempdir");
         let duckfs_dir = dir.path().join("duckfs");
-        let daemon = InProcDaemon::start(
+        let node_key = ed25519::PrivateKey::from_seed(rand::random()).public_key();
+        let daemon = InProcDaemon::start_with_node_key(
             move || {
                 let files = files::Files::open("files", duckfs_dir).expect("open files");
-                Host::genesis(vec![Box::new(files)]).expect("genesis")
+                Host::genesis(vec![
+                    Box::new(identity::Identity::new(
+                        "identity",
+                        Box::new(sdk_testkit::MemStore::new()),
+                        "fs-e2e".into(),
+                    )),
+                    Box::new(attribution::AttributionModule::new(
+                        "attribution",
+                        Box::new(sdk_testkit::MemStore::new()),
+                    )),
+                    Box::new(files),
+                ])
+                .expect("genesis")
             },
-            vec!["files".into()],
+            vec!["files".into(), "identity".into(), "attribution".into()],
+            node_key,
         );
         let harness = Harness { daemon, dir };
         harness.mint_wallet();
@@ -53,11 +68,12 @@ impl Harness {
     /// so the verb has an identity or it has nothing to write as. A REAL
     /// `ducktape wallet new` rather than a hand-written key file: the format is
     /// the wallet verb's to define, and a fixture that hand-rolls it tests the
-    /// fixture.
+    /// fixture. A keystore is a WORKSPACE's, and this in-process node has
+    /// none, so the wallet is minted into a bare one.
     fn mint_wallet(&self) {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .args(["wallet", "new", "harness"])
-            .env("DUCKTAPE_HOME", self.dir.path())
+            .args(["wallet", "new", "harness", "--workspace"])
+            .arg(self.workspace())
             .stdin(self.password_pipe())
             .output()
             .expect("mint the harness wallet");
@@ -65,6 +81,19 @@ impl Harness {
             out.status.success(),
             "the harness wallet must mint: {out:?}"
         );
+    }
+
+    /// the workspace the harness wallet lives in — a keystore and nothing
+    /// else, since the node here runs in-process.
+    fn workspace(&self) -> std::path::PathBuf {
+        self.dir.path().join("workspace")
+    }
+
+    /// the harness wallet's key file, handed to every verb as
+    /// `DUCKTAPE_USER_KEY`: a verb's own ladder finds a key through the
+    /// workspace behind the node it dials, and this node has none.
+    fn user_key(&self) -> std::path::PathBuf {
+        keystore::wallet::key_file(&self.workspace(), "harness")
     }
 
     /// stdin for one CLI run: the wallet password, on a file rather than a pipe
@@ -102,6 +131,7 @@ impl Harness {
             .arg("--node")
             .arg(self.node_url())
             .env("DUCKTAPE_HOME", self.dir.path())
+            .env("DUCKTAPE_USER_KEY", self.user_key())
             .stdin(self.password_pipe());
         cmd
     }
@@ -110,14 +140,16 @@ impl Harness {
     /// and stub-verb cases.
     ///
     /// `DUCKTAPE_HOME` points at this harness's own temp dir so the bottom rung
-    /// of the addressing ladder (the lone registered workspace) sees an EMPTY
-    /// registry. Without it the run reads the developer's real
-    /// `~/.ducktape/workspaces` and the outcome depends on whose box it is.
+    /// of the addressing ladder (the lone workspace on the box) sees an EMPTY
+    /// home — the harness workspace holds a keystore and no `node.toml`, so it
+    /// is no network. Without it the run reads the developer's real
+    /// `~/.ducktape` and the outcome depends on whose box it is.
     pub fn cli_bare(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
         cmd.arg("fs")
             .args(args)
             .env("DUCKTAPE_HOME", self.dir.path())
+            .env("DUCKTAPE_USER_KEY", self.user_key())
             .stdin(self.password_pipe());
         cmd
     }

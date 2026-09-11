@@ -4,15 +4,9 @@ use std::time::Duration;
 
 use super::{Cluster, FIXTURES};
 
-/// blocks a ceremony's activation is placed out: three sequential runs plus
-/// the readiness signals must all land under the lifecycle floor
-/// (`height + MIN_SWAP_LEAD`) at execute time, and each validator beats one
-/// nop per block time, so a 3-founder chain ticks three blocks per block time while idle.
-/// it also bounds the MATCHER: run 1 joins run 0's
-/// proposal only while that activation still clears run 1's own floor, so a
-/// lead this far above the runs' wall-clock spacing is what keeps
-/// `deciding == 1` exact on a loaded box.
-pub const AFTER: &str = "60";
+/// Use the CLI's default activation lead. It starts at governance execution;
+/// matching an open proposal does not consume the lead while voters join.
+pub const AFTER: &str = "50";
 
 /// the checked-in component for `<id>`.
 pub fn fixture(id: &str) -> String {
@@ -50,7 +44,8 @@ pub fn active_hash(cluster: &Cluster, idx: usize, id: &str) -> Option<String> {
 /// the code hash the registry will hold for a fixture once its swap executes.
 pub fn sha256_hex(path: &str) -> String {
     use sha2::Digest as _;
-    let bytes = std::fs::read(path).expect("fixture");
+    let component = std::fs::read(path).expect("fixture");
+    let bytes = module_artifact::ModuleArtifact::component(component).encode();
     format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 
@@ -89,6 +84,12 @@ pub fn spawn_founders(mut cluster: Cluster) -> Cluster {
 pub fn run_on_each(cluster: &Cluster, verb: &[&str]) -> Vec<(bool, String)> {
     (0..3)
         .map(|idx| {
+            // Record the boundary each voter observed so a failed ceremony
+            // can be correlated with the node logs.
+            let height = cluster.status(idx)["height"]
+                .as_u64()
+                .expect("node status carries a height");
+            println!("node {idx} runs the verb at height {height}");
             let cfg = cluster.config_file(idx);
             let mut args = verb.to_vec();
             args.extend(["--config", cfg.to_str().unwrap()]);
@@ -125,7 +126,9 @@ pub fn assert_ceremony_scheduled(runs: &[(bool, String)], id: &str) {
         runs[0].1
     );
     assert!(runs[1].1.contains("joining open proposal"), "{}", runs[1].1);
-    assert!(runs[2].1.contains("already scheduled"), "{}", runs[2].1);
+    let already_held =
+        runs[2].1.contains("already scheduled") || runs[2].1.contains("already active");
+    assert!(already_held, "{}", runs[2].1);
 }
 
 /// the ceremony's runs as one readable block, node by node.

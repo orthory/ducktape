@@ -1,115 +1,36 @@
-//! the runs module — the collaboration loop's actor.
-//!
-//! a pure state-machine module (in the root-hash) holding channel watches and
-//! the correlation entries for still-pending dispatches. the agents it runs
-//! are NOT its state: the agent registry (`crates/modules/apps/agent`) is the record
-//! book, and this module reads it by query — staged same-block registrations
-//! included, through the host's live query routing. run LIFECYCLE is not here
-//! either: a run is a dispatched task, and its status, outcome, and history
-//! live in the dispatch module (and its saga) — per-dispatched-task, never
-//! agent-owned. what this module keeps per run is exactly what acting on the
-//! eventual `ResultEvent` needs (where the reply goes, which job to finalize,
-//! who may cancel), pruned when the result delivers.
-//!
-//! the module implements the platform's ordering-contract promises where they
-//! touch agents (docs/records/architecture/agent-collaboration-design.md §2, §3, §5):
-//!
-//! - **P2 — atomic causal cascades.** a user post, the tagging plane's
-//!   engagement delivery, the pending entry, and the dispatch commit in ONE
-//!   block; a watch and its plane subscription commit in one block; a
-//!   validated response's chat reply and task writes commit in the delivery
-//!   block. the registry hook extends this to registration: an agent's
-//!   registry record and its dispatch recipe land (or abort) as one unit.
-//! - **P4 — anchored generation.** the ENTIRE model input is composed in
-//!   consensus — transcript window, prompt framing, output contract — and
-//!   rides the dispatch as committed payload data (the structured envelope in
-//!   [`envelope`]; the agent's prompt rides as its committed hash, resolved
-//!   from the content-addressed blob store by the host), so any validator
-//!   holds the exact prompt input as ordered state, and the reply is never
-//!   presented as ordered before its anchor.
-//! - **P6 — callback adjacency.** on the dispatch plane this becomes
-//!   next-block delivery: the ResultEvent, the validated reply, the task
-//!   writes, and a job-backed run's finalize all commit in the one delivery
-//!   block.
-//!
-//! ## execute routing — payload namespaces, keyed by ORIGIN
-//!
-//! the dispatch origin is host-assigned and cannot be chosen by a submitter,
-//! so routing on it makes every privileged intake spoof-proof by
-//! construction:
-//!
-//! - `Origin::Module(tagging)` → an `EngagementEvent` (the engagement
-//!   intake): the tagging plane's routed report of a user post in a watched
-//!   channel, tags included;
-//! - `Origin::Module(dispatch)` → a `ResultEvent` (the dispatch plane's
-//!   next-block delivery — the ONLY result intake);
-//! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
-//! - `Origin::Module(agent)` → an [`AgentEvent`] (the registry hook): the
-//!   registry's same-block notification that an agent landed or changed
-//!   capability, answered here by registering/retuning the agent's
-//!   dispatch-plane recipe. unlike every other module intake this one MAY
-//!   error — it rides the registry write's own block, and aborting that
-//!   block is exactly the atomicity the recipe seam needs;
-//! - `Origin::Module(saga)` → a dead-letter no-op. nothing here rides the
-//!   saga directly, but any submitter can point a saga trigger's `reply_to`
-//!   at this module — the tombstone keeps that callback from ever aborting
-//!   the saga's terminal block (the callback-poison rule);
-//! - `Origin::Module(chat)` → a dead-letter no-op (chat never notifies this
-//!   module directly; the tombstone keeps a stray follow-up from aborting a
-//!   posting block);
-//! - anything else → a [`RunsMsg`] (admin ops and explicit runs). an
-//!   external submitter shipping intake-shaped bytes lands HERE and fails the
-//!   `RunsMsg` decode — it can never fake an intake.
-//!
-//! ## the NO-FAIL arms (design §4)
-//!
-//! every privileged intake except the registry hook MUST NEVER return `Err`:
-//!
-//! - the result intake runs inside the delivery block; an `Err` would abort
-//!   it, the committed mailbox would re-inject next block, and every
-//!   subsequent block would abort (the permanent-abort loop the dispatch
-//!   module documents). malformed events and unknown dispatch ids are staged
-//!   no-ops (plus an observability event), and a response that fails
-//!   validation FAILS THE RUN, never the block. anything the emitted
-//!   follow-ups could make chat or tasks reject (a squatted reply message id,
-//!   an oversized reply, a duplicate task id, a full thread) is probed
-//!   deterministically first — an emitted follow-up must be valid by
-//!   construction.
-//! - the engagement intake runs in the same block as the user's post. an
-//!   `Err` here would abort the post (and every other subscriber's delivery),
-//!   so a malformed event or a failed context pin is equally a staged no-op.
-//! - the jobs intake runs in the same block as the job submit. jobs queries
-//!   are committed-only, so the just-staged job is invisible to
-//!   `JobsQuery::Get`; this path skips that blind probe and relies on the
-//!   documented single claiming-worker cascade rule before emitting its
-//!   `Claim`.
-//!
-//! ## agent identity
-//!
-//! this module posts replies `as_agent`, so chat's origin-derived authorship
-//! makes every agent's wire identity `{runs}/{agent_id}` — the module that
-//! ACTS for agents, not the registry that records them. mentions and
-//! engagement tags use the same ref (`EntityRef { module: runs, entity }`),
-//! so mentioning a reply's author round-trips into an engagement.
-//!
-//! ## the turn claim
-//!
-//! chat run ids and job run ids use disjoint `0x1f`-delimited keyspaces.
-//! creating a run that already exists (staged or committed) is a
-//! deterministic no-op, so however many paths race to claim a turn — the
-//! engagement and an explicit `RequestRun`, or two identical requests — the
-//! first in consensus order wins and the rest fall through silently.
-//!
-//! `root()` folds in every field of both maps, so any transition moves the
-//! root-hash. a joiner rebuilds this module from a peer via
-//! [`RunsModule::snapshot`] / [`RunsModule::install`]: the snapshot ships the
-//! committed maps in the exact canonical encoding `root()` hashes, and
-//! install re-derives the root from the decoded temporaries before adopting
-//! them — the consensus-agreed root, not the peer, is the trust anchor.
-
+//! Callable model work for programmable users. Model configuration and context
+//! are consensus state; workers return data or propose session actions. A
+//! user's program chooses each source write and receives its actual dispatch
+//! outcome, under each target module's own rules.
 // the wire surface: this module's shared types, flattened at the crate root.
+mod model;
+pub use model::*;
+mod model_config;
+pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
+
 mod interface;
 pub use interface::*;
+// the derived-tier run journal: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
+pub mod index;
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
+
+// the module-owned action catalog: the envelope the host carries, the typed
+// operations it decodes to, and the views discovery answers.
+mod catalog;
+pub use catalog::{
+    ActionEnvelope, ContentPart, LaneKind, OP_AGENT_CALL, OP_CHAT_POST_MESSAGE,
+    OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER, OP_DUCKFS_WRITE_TEXT, OP_FORGE_OPEN_PR,
+    OP_JOBS_COMMENT, OP_MODULES_UPDATE, OP_PAGES_COMMENT, OP_PAGES_POST, OP_PAGES_SET_CHECKED,
+    OP_REACT, OP_REPLY, OP_SUBMIT, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS, OP_UNREACT,
+    OperationView, catalog, content_blocks, operation_view, validate_request_id,
+};
 
 // dispatch payload composition: the structured run envelope.
 mod envelope;
@@ -117,14 +38,7 @@ mod envelope;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use agent::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentEvent, AgentQuery, AgentRecord,
-    AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query,
-};
+use attribution::{Actor, AttributionMsg, ObjectRef, Reason, Relation};
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
@@ -132,22 +46,17 @@ use chat::{
 };
 use dispatch::{
     DispatchMsg, DispatchQuery, DispatchReply, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent,
-    Routing, decode_reply as dispatch_decode_reply, decode_result_event,
-    encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
+    Routing, decode_reply as dispatch_decode_reply, encode_msg as dispatch_encode_msg,
+    encode_query as dispatch_encode_query,
 };
 use files::{
-    Change as FilesChange, Content as FilesContent, FilesMsg, FilesQuery, FilesReply,
+    Change as FilesChange, Content as FilesContent, EntryInfo, FilesMsg, FilesQuery, FilesReply,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };
-use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tagging::{
-    EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
-    encode_msg as tagging_encode_msg,
-};
 use tasks::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
     decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
@@ -175,9 +84,10 @@ pub const RUN_LEASE_VIEWS: u64 = 1024;
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// every peer-call callee requests this fixed sandbox profile. One root call
-/// tree runs at most `min(root_budget, 8)` callees concurrently, so the same cap
-/// bounds live delegated compute at `2*min(root_budget, 8)` cores and
-/// `4*min(root_budget, 8)` GiB. completed calls release their slot.
+/// tree runs at most `MAX_DELEGATIONS_PER_RUN` callees concurrently, so the
+/// same bound holds live delegated compute at `2 * MAX_DELEGATIONS_PER_RUN`
+/// cores and `4 * MAX_DELEGATIONS_PER_RUN` GiB. completed calls release
+/// their slot.
 pub const DELEGATED_CHILD_CORES: u64 = 2;
 pub const DELEGATED_CHILD_MEM_GB: u64 = 4;
 
@@ -239,18 +149,33 @@ pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
     )
 }
 
-/// Internal pending-state coordinate for a Pages comment thread. The `runs:`
+/// Internal pending-state coordinates for Pages sources. The `runs:`
 /// chat namespace is reserved to this module, and Runs never mints chat
 /// channels below this sub-prefix, so the existing snapshot shape can carry
 /// the source discriminator without colliding with a real chat run.
 const PAGE_CHANNEL_PREFIX: &str = "runs:pages:";
+const PAGE_BLOCK_CHANNEL_PREFIX: &str = "runs:page-block:";
 
-fn page_channel_id(thread_id: &str) -> String {
+pub(crate) enum PageSource<'a> {
+    CommentThread(&'a str),
+    Block(&'a str),
+}
+
+pub(crate) fn page_channel_id(thread_id: &str) -> String {
     format!("{PAGE_CHANNEL_PREFIX}{thread_id}")
 }
 
-fn page_thread_id(channel_id: &str) -> Option<&str> {
-    channel_id.strip_prefix(PAGE_CHANNEL_PREFIX)
+pub(crate) fn page_block_channel_id(block_id: &str) -> String {
+    format!("{PAGE_BLOCK_CHANNEL_PREFIX}{block_id}")
+}
+
+pub(crate) fn page_source(channel_id: &str) -> Option<PageSource<'_>> {
+    match channel_id.strip_prefix(PAGE_CHANNEL_PREFIX) {
+        Some(thread) => Some(PageSource::CommentThread(thread)),
+        None => channel_id
+            .strip_prefix(PAGE_BLOCK_CHANNEL_PREFIX)
+            .map(PageSource::Block),
+    }
 }
 
 pub fn page_run_id_for(thread_id: &str, ordinal: u64, agent_id: &str) -> String {
@@ -271,9 +196,10 @@ pub fn job_spec_hash(spec: &[u8]) -> Vec<u8> {
     Sha256::digest(spec).to_vec()
 }
 
-/// the chat message id of a run's reply — one run posts at most one reply.
+/// The chat message id of a run's reply. Hash the internal run key so its
+/// reserved separators and arbitrary suffixes cannot enter the public id space.
 pub fn reply_message_id(run_id: &str) -> String {
-    format!("agent/{run_id}")
+    format!("agent/{}", dispatch_id_for(run_id))
 }
 
 /// which lane an agent action is being applied from — and therefore how its
@@ -307,6 +233,23 @@ impl Lane {
             Lane::Session(actions) => format!("s{actions}"),
         }
     }
+
+    /// the catalog lane this path admits operations for: the settle paths
+    /// carry the run's final response, the session lane its live actions.
+    fn kind(self) -> LaneKind {
+        match self {
+            Lane::Settle | Lane::DelegatedSettle => LaneKind::Final,
+            Lane::Session(_) => LaneKind::Live,
+        }
+    }
+
+    /// the lane's catalog name, as the strict-lane diagnostics print it.
+    fn kind_name(self) -> &'static str {
+        match self.kind() {
+            LaneKind::Final => "final",
+            LaneKind::Live => "live",
+        }
+    }
 }
 
 /// the chat message id of an agent's `chat.post_message` — distinct from
@@ -315,11 +258,11 @@ impl Lane {
 /// catches). the slot is the action's [`Lane`] slot: its index in the delivered
 /// response, or `s{n}` for the nth action of the run's session.
 pub fn post_message_id(run_id: &str, slot: &str) -> String {
-    format!("agent/{run_id}/post/{slot}")
+    format!("agent/{}/post/{slot}", dispatch_id_for(run_id))
 }
 
 /// the dispatch-plane recipe an agent's runs execute under — registered
-/// (module-owned) by the registry hook in the same block as the agent itself.
+/// owned by runs and registered atomically with its model configuration.
 pub(crate) fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
 }
@@ -373,10 +316,19 @@ pub(crate) fn truncate_on_boundary(s: &str, budget: usize, suffix: &str) -> Stri
 }
 
 mod admin;
-mod agent_intake;
+mod model_intake;
+use model_intake::ModelChange;
+mod action_requests;
+mod action_storage;
+mod deployment;
 mod dispatch_flow;
 mod engagement;
+mod module_updates;
+mod receipts;
+mod workflow;
+pub use workflow::model_program;
 mod facets;
+use facets::WireSink;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
 // tracker/refs mirrors, and the item-session workspace/sink composition.
 mod forge_source;
@@ -386,12 +338,12 @@ mod inject;
 mod jobs_intake;
 mod module_impl;
 // the pages effects lane (M2): pages.comment / pages.set_checked applied at
-// the run boundary — probe-guarded, cap-gated, per-action degrade.
+// the run boundary — probe-guarded, per-action degrade.
 mod pages_effects;
 mod response;
 // the agent session lane: the mid-run write path — an ephemeral key bound to a
-// live run, and the actions it signs, validated against the SAME grant the
-// settle path validates.
+// live run, and the actions it signs, decoded against the SAME catalog the
+// settle path decodes.
 mod sessions;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.
@@ -410,6 +362,9 @@ use state::{
 /// result delivers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingState {
+    account: u64,
+    generation: u64,
+    cause: sdk::Cause,
     /// Explicit because delegated calls have their own idempotency-keyed run
     /// ids rather than pretending to be another chat turn.
     run_id: String,
@@ -418,10 +373,6 @@ struct PendingState {
     /// already share their item branch, but keeping this explicit makes both
     /// paths agree under nested calls.
     workspace_agent_id: String,
-    /// `None` for an ordinary run. A callee stores the authority intersection
-    /// fixed when the call was admitted; later registry changes may narrow it
-    /// again, never widen it.
-    authority: Option<RunAuthority>,
     /// The run-scoped call edge that created this entry.
     delegation_id: Option<String>,
     /// empty for job-backed runs.
@@ -434,36 +385,52 @@ struct PendingState {
     job_id: Option<String>,
     /// the claim height this job-backed run is bound to; chat runs use 0.
     job_claim_height: u64,
-    /// the run-creating origin — a cancel capability alongside the owner.
-    requester: SagaOrigin,
+    /// the ACCOUNT the run speaks for: the explicit requester, or the author
+    /// whose post engaged the agent — never the plane that carried the event.
+    /// it is both a cancel capability alongside the owner and the chat standing
+    /// an agent's own posts are held to (`requester_may_post`).
+    requester: RunOrigin,
+    /// the sink COMMITTED at dispatch — the binding delivery enforces (#1835).
+    /// an executing node's echoed result sink is compared against this, never
+    /// trusted on its own: a mismatch degrades delivery to `Chain`.
+    sink: WireSink,
     created_at: u64,
 }
 
 impl PendingState {
-    fn run_id(&self) -> String {
-        self.run_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RunAuthority {
-    allowed_actions: Vec<String>,
-    caps: ResourceCaps,
-}
-
-impl RunAuthority {
-    fn from_record(record: &AgentRecord) -> Self {
-        Self {
-            allowed_actions: record.allowed_actions.clone(),
-            caps: record.caps.clone(),
+    fn reply_destination(&self) -> Result<ReplyDestination, String> {
+        if let Some(job_id) = &self.job_id {
+            return Ok(ReplyDestination::Job {
+                job_id: job_id.clone(),
+            });
+        }
+        match page_source(&self.channel_id) {
+            Some(PageSource::Block(target)) => Ok(ReplyDestination::Page {
+                target: target.into(),
+            }),
+            Some(PageSource::CommentThread(thread_id)) => Ok(ReplyDestination::PageThread {
+                thread_id: thread_id.into(),
+            }),
+            None => {
+                let has_source = !self.channel_id.is_empty() && self.anchor_seq != 0;
+                if !has_source {
+                    return Err("this run has no reply destination".into());
+                }
+                Ok(ReplyDestination::Chat {
+                    channel_id: self.channel_id.clone(),
+                    thread: self.reply_thread(),
+                })
+            }
         }
     }
 
-    fn apply(&self, record: &AgentRecord) -> AgentRecord {
-        let mut ceiling = record.clone();
-        ceiling.allowed_actions = self.allowed_actions.clone();
-        ceiling.caps = self.caps.clone();
-        ceiling.scoped_for_call(record)
+    fn reply_thread(&self) -> Option<u64> {
+        let has_anchor = self.anchor_seq != 0;
+        self.thread_root.or(has_anchor.then_some(self.anchor_seq))
+    }
+
+    fn run_id(&self) -> String {
+        self.run_id.clone()
     }
 }
 
@@ -479,6 +446,11 @@ struct DelegationState {
 struct PreparedDispatch {
     thread_root: Option<u64>,
     payload: Vec<u8>,
+    account: u64,
+    generation: u64,
+    /// the requested sink composed into `payload`'s `result_contract` —
+    /// captured here so the caller can commit it into `PendingState` (#1835).
+    sink: WireSink,
 }
 
 // ---- the module -----------------------------------------------------------
@@ -490,14 +462,12 @@ pub struct RunsModule {
     /// dead-letter routing only: a saga callback pointed here by a foreign
     /// trigger's `reply_to` must be swallowed, never abort its block.
     saga: ModuleId,
-    /// the tagging plane — the engagement intake's trusted origin and the
-    /// target of watch subscriptions.
-    tagging: ModuleId,
+    /// Source reports and authenticated model workflow triggers.
+    attribution: ModuleId,
     /// the dispatch plane — every run's recipe registry, executor, and
     /// lifecycle ledger.
     dispatch: ModuleId,
-    /// the agent registry — the record book this module reads by query, and
-    /// the registry hook's trusted origin.
+    /// Executor of the account's programmable workflow.
     agent: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
@@ -512,14 +482,19 @@ pub struct RunsModule {
     /// production composer wires it; unwired (dev tools/tests) the envelope
     /// still composes v1, with a null pin.
     files: Option<ModuleId>,
-    /// the pages module id — queried for `[[page:<id>]]` refs so a run's
-    /// context can carry referenced page subtrees (M2). genesis config, NOT
+    /// the pages module id — queried for `duck://page/<id>` refs so a run's
+    /// context can carry referenced page subtrees. genesis config, NOT
     /// committed state (never in `root()`). `None` on nodes not wired for
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
     pages: Option<ModuleId>,
+    /// the collaboration module id — the target of the two `collaboration.*`
+    /// operations. genesis config, NOT committed state (never in `root()`).
+    /// `None` on nodes not wired for it, and then those operations refuse
+    /// rather than degrade: an unsent message must never look sent.
+    collaboration: Option<ModuleId>,
     /// this network's chain id, from the genesis `__config` record
-    /// (`topology::CONFIG_CHAIN_ID`) — the ONLY way a fixed component learns
+    /// (`sdk::genesis_config::CHAIN_ID`) — the ONLY way a fixed component learns
     /// which network it is running on. Genesis config, NOT committed state
     /// (never in `root()`). Every `duck://` link this module renders into an
     /// agent's context stamps its `?net=` half from it; empty (dev tools,
@@ -527,7 +502,11 @@ pub struct RunsModule {
     /// network the reader is on.
     chain_id: String,
     /// committed state — what `root()` and the root-hash commit to.
-    watches: BTreeMap<String, TurnPolicy>,
+    models: BTreeMap<String, ModelRecord>,
+    pending_models: BTreeMap<String, Option<ModelRecord>>,
+    receipts: receipts::Receipts,
+    next_action_item: u64,
+    staged_next_action_item: Option<u64>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.
     pending: BTreeMap<String, PendingState>,
@@ -543,9 +522,8 @@ pub struct RunsModule {
     delegations: BTreeMap<String, DelegationState>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
-    /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
+    /// `commit_block`. a pending
     /// entry stages `None` for its prune; a session stages `None` for its prune.
-    pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
     pending_sessions: BTreeMap<String, Option<AgentSession>>,
     pending_delegations: BTreeMap<String, Option<DelegationState>>,
@@ -557,6 +535,18 @@ pub struct RunsModule {
     /// this block's staged history records — merged into the ring only at
     /// `commit_block` (an aborted block must leave no ghost record).
     pending_history: Vec<RunRecord>,
+    /// Verified PR allocations update existing history only at commit.
+    pending_pr_links: BTreeMap<String, PrRef>,
+    /// Authenticated result-action refusals become visible only at commit.
+    pending_action_rejections: BTreeSet<String>,
+    /// The receipt facts of every effect prepared in the current execute,
+    /// keyed by its message digest, so the proposal staged for that message
+    /// records which operation produced it. Transient: never committed state.
+    prepared_receipts: RefCell<BTreeMap<[u8; 32], action_requests::ReceiptMeta>>,
+    /// the lifecycle facts the current op has committed, stamped onto the op
+    /// once it applies ([`RunsModule::stamp_journal`]). Transient: never
+    /// committed state, cleared at every op's start.
+    journal: Vec<RunEvent>,
 }
 
 impl RunsModule {
@@ -568,7 +558,7 @@ impl RunsModule {
         id: impl Into<ModuleId>,
         chat: impl Into<ModuleId>,
         saga: impl Into<ModuleId>,
-        tagging: impl Into<ModuleId>,
+        attribution: impl Into<ModuleId>,
         dispatch: impl Into<ModuleId>,
         agent: impl Into<ModuleId>,
         tasks: Option<ModuleId>,
@@ -577,14 +567,14 @@ impl RunsModule {
         let id = id.into();
         let chat = chat.into();
         let saga = saga.into();
-        let tagging = tagging.into();
+        let attribution = attribution.into();
         let dispatch = dispatch.into();
         let agent = agent.into();
         let core = BTreeSet::from([
             id.clone(),
             chat.clone(),
             saga.clone(),
-            tagging.clone(),
+            attribution.clone(),
             dispatch.clone(),
             agent.clone(),
         ]);
@@ -607,7 +597,7 @@ impl RunsModule {
             id,
             chat,
             saga,
-            tagging,
+            attribution,
             dispatch,
             agent,
             tasks,
@@ -615,32 +605,93 @@ impl RunsModule {
             forge: None,
             files: None,
             pages: None,
+            collaboration: None,
             chain_id: String::new(),
-            watches: BTreeMap::new(),
+            models: BTreeMap::new(),
+            pending_models: BTreeMap::new(),
+            receipts: receipts::Receipts::default(),
+            next_action_item: 0,
+            staged_next_action_item: None,
             pending: BTreeMap::new(),
             sessions: BTreeMap::new(),
             delegations: BTreeMap::new(),
-            pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
             pending_sessions: BTreeMap::new(),
             pending_delegations: BTreeMap::new(),
             history: VecDeque::new(),
             pending_history: Vec::new(),
+            pending_pr_links: BTreeMap::new(),
+            pending_action_rejections: BTreeSet::new(),
+            prepared_receipts: RefCell::new(BTreeMap::new()),
+            journal: Vec::new(),
         }
+    }
+
+    /// commit one lifecycle fact about `run_id` to the current op's journal.
+    fn record(&mut self, run_id: &str, fact: RunFact) {
+        self.journal.push(RunEvent {
+            run_id: run_id.to_string(),
+            fact,
+        });
+    }
+
+    /// the one settle writer: a terminal run enters the delivered-runs ring
+    /// and its journal in the same step, so the two can never disagree.
+    fn record_settled(&mut self, record: RunRecord, reason: Option<String>) {
+        self.record(
+            &record.run_id,
+            RunFact::Settled {
+                outcome: record.outcome,
+                reason,
+                degraded: record.degraded,
+                executing_node: record.executing_node.clone(),
+                output_ref: record.output_ref.clone(),
+                pr: record.pr.clone(),
+            },
+        );
+        self.pending_history.push(record);
+    }
+
+    /// stamp the facts the applying op committed onto its trace, as the
+    /// assigned stamp the derived tier folds. an op that moved no run
+    /// stamps nothing.
+    fn stamp_journal(&mut self, ctx: &mut dyn Ctx) {
+        if self.journal.is_empty() {
+            return;
+        }
+        ctx.set_assigned(encode_assigned(&std::mem::take(&mut self.journal)));
+    }
+
+    /// Emit one prepared effect and remember its receipt facts for the
+    /// proposal that will be staged for its exact message.
+    fn emit_prepared(&self, ctx: &mut dyn Ctx, prepared: action_requests::Prepared) {
+        self.prepared_receipts.borrow_mut().insert(
+            action_requests::message_digest(&prepared.message),
+            prepared.receipt,
+        );
+        ctx.emit_msg(prepared.message);
+    }
+
+    /// The receipt facts recorded for `message`, or an effect label naming its
+    /// target for a message no preparer annotated.
+    fn take_prepared_receipt(&self, message: &Msg) -> action_requests::ReceiptMeta {
+        self.prepared_receipts
+            .borrow_mut()
+            .remove(&action_requests::message_digest(message))
+            .unwrap_or_else(|| action_requests::ReceiptMeta::effect(message.target.clone()))
     }
 
     /// wire the forge module as the PR/merge sink target (O2), after
     /// construction — mirrors the injected `Option<ModuleId>` collaborators so
-    /// `new` and every existing call site stay untouched. the PR sink only fires
-    /// under a D3 forge-push cap; without this wired the sink degrades to a
-    /// breadcrumb.
+    /// `new` and every existing call site stay untouched. without this wired
+    /// the PR sink degrades to a breadcrumb.
     pub fn with_sink_forge(mut self, forge: impl Into<ModuleId>) -> Self {
         let forge = forge.into();
         assert!(
             forge != self.id
                 && forge != self.chat
                 && forge != self.saga
-                && forge != self.tagging
+                && forge != self.attribution
                 && forge != self.dispatch
                 && forge != self.agent
                 && Some(&forge) != self.tasks.as_ref()
@@ -666,9 +717,9 @@ impl RunsModule {
         self
     }
 
-    /// wire the pages module so `[[page:<id>]]` refs in a run's trigger
+    /// wire the pages module so `duck://page/<id>` refs in a run's trigger
     /// message or injected item body render referenced page subtrees into the
-    /// composed context (M2), after construction — mirrors the injected
+    /// composed context, after construction — mirrors the injected
     /// `Option<ModuleId>` collaborators so `new` and every existing call site
     /// stay untouched. unwired, page refs compose no page section.
     pub fn with_pages_module(mut self, pages: impl Into<ModuleId>) -> Self {
@@ -678,6 +729,20 @@ impl RunsModule {
             "pages module id must be distinct from the runs module id"
         );
         self.pages = Some(pages);
+        self
+    }
+
+    /// wire the collaboration module so the `collaboration.*` operations have a
+    /// target, after construction — mirrors the injected `Option<ModuleId>`
+    /// collaborators so `new` and every existing call site stay untouched.
+    /// unwired, those operations are refused by name.
+    pub fn with_collaboration_module(mut self, collaboration: impl Into<ModuleId>) -> Self {
+        let collaboration = collaboration.into();
+        assert!(
+            collaboration != self.id,
+            "collaboration module id must be distinct from the runs module id"
+        );
+        self.collaboration = Some(collaboration);
         self
     }
 
@@ -697,13 +762,6 @@ impl RunsModule {
     }
 
     // ---- staged-over-committed reads ---------------------------------------
-
-    fn watch(&self, channel_id: &str) -> Option<&TurnPolicy> {
-        match self.pending_watches.get(channel_id) {
-            Some(staged) => staged.as_ref(),
-            None => self.watches.get(channel_id),
-        }
-    }
 
     fn pending_entry(&self, dispatch_id: &str) -> Option<&PendingState> {
         match self.pending_overlay.get(dispatch_id) {
@@ -771,8 +829,8 @@ impl RunsModule {
 
     /// admin ops take a non-empty external key or a module as the submitter.
     /// the pre-consensus empty external default and the system origin (which
-    /// any genesis path could wear) never administer watches.
-    fn admin_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
+    /// any genesis path could wear) cannot administer model work.
+    fn admin_origin(origin: &Origin) -> Result<RunOrigin, Error> {
         match origin {
             Origin::External(key) if key.is_empty() => Err(Error::Module(
                 "runs admin ops require a non-empty submitter id".into(),
@@ -780,7 +838,7 @@ impl RunsModule {
             Origin::System => Err(Error::Module(
                 "runs admin ops require an external or module origin".into(),
             )),
-            other => Ok(canonical_origin(other)),
+            other => canonical_origin(other),
         }
     }
 
@@ -800,12 +858,20 @@ impl RunsModule {
     /// serialize the COMMITTED continuation state (never the staged overlay)
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
+    #[cfg(any(test, all(feature = "guest", target_arch = "wasm32")))]
+    fn with_receipt_store(mut self, store: Box<dyn sdk::MerkleStore>) -> Self {
+        self.receipts = receipts::Receipts::hosted(store);
+        self
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
         encode_committed(
-            &self.watches,
+            &self.receipts.snapshot(),
+            self.next_action_item,
             &self.pending,
             &self.sessions,
             &self.delegations,
+            &self.models,
         )
     }
 
@@ -817,17 +883,27 @@ impl RunsModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (watches, pending, sessions, delegations) =
+        let (action_requests, next_action_item, pending, sessions, delegations, models) =
             decode_committed(bytes).map_err(Error::Module)?;
         sdk::verify_snapshot_root(
-            committed_root(&watches, &pending, &sessions, &delegations),
+            committed_root(
+                &action_requests,
+                next_action_item,
+                &pending,
+                &sessions,
+                &delegations,
+                &models,
+            ),
             expected,
         )?;
-        self.watches = watches;
+        self.receipts.install(action_requests)?;
+        self.models = models;
+        self.pending_models.clear();
+        self.next_action_item = next_action_item;
+        self.staged_next_action_item = None;
         self.pending = pending;
         self.sessions = sessions;
         self.delegations = delegations;
-        self.pending_watches.clear();
         self.pending_overlay.clear();
         self.pending_sessions.clear();
         self.pending_delegations.clear();
@@ -835,6 +911,8 @@ impl RunsModule {
         // boundary this node never executed, so its history starts empty.
         self.history.clear();
         self.pending_history.clear();
+        self.pending_pr_links.clear();
+        self.pending_action_rejections.clear();
         Ok(())
     }
 
@@ -873,6 +951,8 @@ impl RunsModule {
         }
         self.history = history;
         self.pending_history.clear();
+        self.pending_pr_links.clear();
+        self.pending_action_rejections.clear();
         Ok(())
     }
 }

@@ -24,12 +24,18 @@
 //! that set where a freshly built binary looks — `target/<profile>/modules`,
 //! beside the binary (`workspace_config::modules_dir`) — so a built node is
 //! complete without an install step. The set is the checkout's committed
-//! artifacts (`make wasm-modules` refreshes them), one file per artifact the
-//! topology declares: a declared component or index guest the checkout lacks
-//! fails the build here, naming the path, instead of `node init` later.
+//! artifacts (`make wasm-modules` refreshes them): one component per wasm
+//! module the topology names, plus one index guest per module whose crate
+//! declares one by carrying `src/index_guest.rs`. A declared artifact the
+//! checkout lacks fails the build here, naming the path, instead of `node
+//! init` later. Desktop view declarations instead leave a pending marker when
+//! output is missing: compilation succeeds and deployment preparation refuses
+//! the incomplete set until `make views` and restaging complete.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub(crate) mod view_staging;
 
 fn main() {
     // re-run when HEAD moves. `--git-path` resolves correctly inside a git
@@ -61,31 +67,92 @@ fn stage_founding_set() {
         .ancestors()
         .nth(3)
         .expect("OUT_DIR sits three levels under the profile dir");
-    let dest = profile_dir.join("modules");
-    std::fs::create_dir_all(&dest).expect("create the staged founding set dir");
-    let checkout = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"))
-        .join("../..");
+    let checkout =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir")).join("../..");
+    stage_preset(
+        &checkout,
+        &profile_dir.join("modules"),
+        topology::PRODUCTION,
+    );
+    let simulation: Vec<&str> = topology::TOPOLOGY
+        .modules
+        .iter()
+        .map(|module| module.id)
+        .collect();
+    stage_preset(&checkout, &profile_dir.join("sim-modules"), &simulation);
+}
 
-    for spec in topology::TOPOLOGY.modules {
-        if spec.code != topology::Code::Wasm {
-            continue;
+pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
+    std::fs::create_dir_all(dest).expect("create the staged module directory");
+    for entry in std::fs::read_dir(dest).expect("read staged module directory") {
+        let path = entry.expect("read staged artifact").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let artifact_id = name
+            .strip_suffix(".component.wasm")
+            .or_else(|| name.strip_suffix(".index.wasm"))
+            .or_else(|| name.strip_suffix(".view.wasm"))
+            .or_else(|| name.strip_suffix(".view.pending"))
+            .or_else(|| name.strip_suffix(".assets"));
+        let obsolete = artifact_id.is_some_and(|id| id != "netstack" && !ids.contains(&id));
+        if obsolete {
+            if std::fs::symlink_metadata(&path)
+                .expect("inspect obsolete staged artifact")
+                .is_dir()
+            {
+                std::fs::remove_dir_all(&path).expect("remove obsolete staged assets");
+            } else {
+                std::fs::remove_file(&path).expect("remove obsolete staged artifact");
+            }
         }
-        let module_dir = module_dir(&checkout, spec.id);
+    }
+    for id in ids {
+        let spec = topology::TOPOLOGY
+            .spec(id)
+            .expect("build preset is in the catalog");
+        let module_dir = module_dir(checkout, spec.id);
         stage(
             &module_dir.join("component.wasm"),
             &dest.join(format!("{}.component.wasm", spec.id)),
         );
-        if spec.index_guest {
-            stage(
-                &module_dir.join("index.wasm"),
-                &dest.join(format!("{}.index.wasm", spec.id)),
-            );
+        view_staging::stage_view(checkout, dest, id).expect("stage module view");
+        let ships_guest = declares_index_guest(&module_dir);
+        // The catalog and source declaration must agree for build presets.
+        assert_eq!(
+            ships_guest, spec.has_index_guest,
+            "module {}: crates/noded/build.rs sees src/index_guest.rs = {ships_guest} but \
+             topology::TOPOLOGY says has_index_guest = {} — update crates/topology/src/lib.rs \
+             to match",
+            spec.id, spec.has_index_guest
+        );
+        let index_path = dest.join(format!("{}.index.wasm", spec.id));
+        if ships_guest {
+            stage(&module_dir.join("index.wasm"), &index_path);
+            continue;
+        }
+        match std::fs::remove_file(&index_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove obsolete mapper {}: {error}", index_path.display()),
         }
     }
     stage(
         &checkout.join("crates/networking/netstack-machine/component.wasm"),
         &dest.join("netstack.component.wasm"),
     );
+}
+
+/// a module declares its index guest by carrying the guest's engine shell:
+/// `src/index_guest.rs` (built by `guest-builder --index` into the crate's
+/// committed `index.wasm`). the file is the declaration, so a module cannot
+/// ship a mapper the founding set omits or be declared to ship one it lacks.
+/// the file is a rerun trigger too: adding or removing the shell re-stages.
+fn declares_index_guest(module_dir: &Path) -> bool {
+    let shell = module_dir.join("src/index_guest.rs");
+    println!("cargo:rerun-if-changed={}", shell.display());
+    shell.is_file()
 }
 
 /// the checkout directory a module's committed artifacts live in: the

@@ -119,7 +119,13 @@ fn collect(
         collect_snapshot(snapshot, store, &mut visited, &mut missing, verify_chunks)?;
     }
     for pin in refs.pins.values() {
-        collect_snapshot(&pin.snapshot, store, &mut visited, &mut missing, verify_chunks)?;
+        collect_snapshot(
+            &pin.snapshot,
+            store,
+            &mut visited,
+            &mut missing,
+            verify_chunks,
+        )?;
     }
     for digest in refs.staging.keys() {
         collect_chunk(digest, store, &mut visited, &mut missing, verify_chunks)?;
@@ -371,12 +377,13 @@ mod tests {
     fn mark_covers_head_window_pins_and_staging() {
         let mut fs = new_fs();
         // an unreferenced staged chunk — a staging root.
-        fs.putblob("system", 1, b"staged-bytes").unwrap();
+        fs.putblob(&crate::Authority::System, 1, b"staged-bytes")
+            .unwrap();
         commit_block(&mut fs);
         let staged = object_id(Kind::Chunk, b"staged-bytes");
         // a committed snapshot — head + window root.
         fs.commit(
-            "system",
+            &crate::Authority::System,
             2,
             2,
             None,
@@ -387,7 +394,8 @@ mod tests {
         commit_block(&mut fs);
         let head = fs.committed_head_for_test().unwrap();
         // pin it — a pin root.
-        fs.pin("system", 3, head.clone(), "p".into()).unwrap();
+        fs.pin(&crate::Authority::System, 3, head.clone(), "p".into())
+            .unwrap();
         commit_block(&mut fs);
 
         let live = mark(fs.refs(), fs.store_ref()).unwrap();
@@ -416,7 +424,7 @@ mod tests {
         let mut fs = new_fs();
         fs.set_history_window_for_tests(1); // window keeps only the newest snapshot
         fs.commit(
-            "system",
+            &crate::Authority::System,
             1,
             1,
             None,
@@ -430,7 +438,7 @@ mod tests {
         // overwrite /shared/f: the previous snapshot leaves the size-1 window and
         // its exclusive objects become unreachable.
         fs.commit(
-            "system",
+            &crate::Authority::System,
             2,
             2,
             Some(head1.clone()),
@@ -464,7 +472,7 @@ mod tests {
     fn partial_mark_errors_and_gc_removes_nothing() {
         let mut fs = new_fs();
         fs.commit(
-            "system",
+            &crate::Authority::System,
             1,
             1,
             None,
@@ -500,7 +508,7 @@ mod tests {
     fn symlink_fileobj_and_target_chunk_are_marked() {
         let mut fs = new_fs();
         fs.commit(
-            "system",
+            &crate::Authority::System,
             1,
             1,
             None,
@@ -531,7 +539,7 @@ mod tests {
     fn empty_tree_sentinel_is_reachable() {
         let mut fs = new_fs();
         fs.commit(
-            "system",
+            &crate::Authority::System,
             1,
             1,
             None,
@@ -544,7 +552,7 @@ mod tests {
         // remove the whole /shared subtree so the root tree is fully empty: the
         // commit stages the canonical empty-tree sentinel as the new root.
         fs.commit(
-            "system",
+            &crate::Authority::System,
             2,
             2,
             Some(head1),

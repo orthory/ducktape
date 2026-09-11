@@ -1,6 +1,7 @@
-//! path normalization and authority (task 4): NFC-normalized absolute paths,
-//! segment/depth/byte caps, and the `/home/<module-id>/**` write-authority
-//! rule over a plain `actor: &str` (origin mapping stays in the native glue).
+//! path normalization and the writable namespaces: NFC-normalized absolute
+//! paths, segment/depth/byte caps, and the rule that `/home/<label>/**` and
+//! `/shared/**` are every authenticated authority's to write while the
+//! namespace roots and everything outside them are system's alone.
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -83,33 +84,28 @@ pub fn is_namespace_root(segments: &[String]) -> bool {
     matches!(segments, [only] if only == "home" || only == "shared")
 }
 
-/// decide whether `owner` may write to the already-canonicalized `segments`.
-/// `system` writes anywhere; `/home/<o>/**` is writable only by `o`, and the
-/// home root itself (`/home` or `/home/<o>`) is never a writable file — only
+/// Decide whether authenticated `authority` may write the canonical `segments`.
+/// System writes anywhere. A home names its actor label, and every member
+/// writes under every home: the label is attribution, never a gate. The home
+/// root itself (`/home` or `/home/<label>`) is never a writable file — only
 /// paths strictly under it; `/shared/**` (≥ 2 segments) is writable by anyone;
-/// everything else (including the filesystem root) is rejected. authority never
-/// re-derives or mutates the path.
-pub fn check_authority(owner: &str, segments: &[String]) -> Result<(), String> {
+/// everything else (including the filesystem root) is rejected. authority
+/// never re-derives or mutates the path.
+pub fn check_authority(authority: &crate::Authority, segments: &[String]) -> Result<(), String> {
     // system bypasses authority entirely (the path was still canonicalized).
-    if owner == "system" {
+    if matches!(authority, crate::Authority::System) {
         return Ok(());
     }
     match segments.first().map(String::as_str) {
-        Some("home") => match segments.get(1) {
-            // a home tree needs the owner segment AND at least one entry under
-            // it: `["home", o, ..]`. the home root itself is not a file.
-            Some(o) if segments.len() >= 3 => {
-                if o == owner {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "files: actor '{owner}' is not the home owner '{o}'"
-                    ))
-                }
+        // a home tree needs the label segment AND at least one entry under
+        // it: `["home", label, ..]`. the home root itself is not a file.
+        Some("home") => {
+            if segments.len() >= 3 {
+                Ok(())
+            } else {
+                Err("files: home root is not writable".to_string())
             }
-            // `/home` or `/home/<o>` on their own: writing the home root rejects.
-            _ => Err("files: home root is not writable".to_string()),
-        },
+        }
         // `/shared/**` is public, but the shared root itself is not a target.
         Some("shared") => {
             if segments.len() >= 2 {

@@ -24,22 +24,22 @@
 //!
 //! dispatch is a SELF-CONTAINED plane: its `execute` reads only `ctx.env()` and
 //! EMITS follow-ups (a saga `Trigger`, event breadcrumbs); it makes no
-//! cross-module `query-module` reads, so — unlike tagging/runs — the guest needs
+//! cross-module `query-module` reads, so — unlike attribution/runs — the guest needs
 //! no memoized sibling replay.
 //!
 //! ## PART 2: the committed-only query lane
 //!
 //! dispatch answers `Module::query` from COMMITTED state alone regardless of
 //! caller, so a same-block staged write never leaks into the host's delivery
-//! injection or runs' `turn_taken` read. on the wasm side that is
-//! `.with_committed_queries()`, which drops the outer staged overlay for a query
-//! round so `WitStore` serves the native module's `get_committed` reads exactly
-//! as the native store does.
+//! injection or runs' `turn_taken` read. on the wasm side the component
+//! declares it (`shape().committed_queries`), and the host drops the outer
+//! staged overlay for a query round so `WitStore` serves the native module's
+//! `get_committed` reads exactly as the native store does.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::{
     DispatchModule, DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, OutputContract,
-    Routing, decode_reply, decode_result_event, encode_msg, encode_query,
+    Routing, decode_reply, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use saga::{SagaCallback, SagaOutcome, encode_callback};
@@ -59,6 +59,7 @@ async fn native_dispatch(context: &deterministic::Context, label: &'static str) 
     DispatchModule::new(
         "dispatch",
         "saga",
+        "identity",
         Box::new(QmdbStore::init(context.child(label), "dispatch").await),
     )
 }
@@ -69,11 +70,11 @@ async fn wasm_dispatch(context: &deterministic::Context, label: &'static str) ->
         DISPATCH_WASM,
         Box::new(QmdbStore::init(context.child(label), "dispatch").await),
     )
-    .expect("load component")
     // dispatch's query surface is committed-only regardless of caller (the
     // native contract): a same-block staged write must never leak into a
-    // mid-block sibling read. this is the genesis wiring, pinned here.
-    .with_committed_queries()
+    // mid-block sibling read. the component declares it (`shape`), so the
+    // load applies it — nothing to wire here.
+    .expect("load component")
 }
 
 /// a stand-in sibling that records every follow-up `Msg` delivered to it — under
@@ -487,7 +488,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     );
 
     // the admin surface: register (all fields), a duplicate rejection, an
-    // owner-gated update, a foreign update rejection.
+    // update by the registrant, an update by anyone else.
     accept(
         &mut native,
         &mut wasm,
@@ -515,15 +516,15 @@ async fn same_ops_inner(context: &deterministic::Context) {
         max_attempts: Some(5),
     };
     accept(&mut native, &mut wasm, 3, alice.clone(), op(&update), true).await;
-    reject(
-        &mut native,
-        &mut wasm,
-        4,
-        bob.clone(),
-        op(&update),
-        "not owned",
-    )
-    .await;
+    let by_anyone = DispatchMsg::UpdateRecipe {
+        recipe_id: "summarize".into(),
+        description: Some("summarize, terser still".into()),
+        capability: None,
+        routing: None,
+        output_contract: None,
+        max_attempts: None,
+    };
+    accept(&mut native, &mut wasm, 4, bob.clone(), op(&by_anyone), true).await;
 
     // the run surface, under a MODULE origin (the receiver of the result):
     // two dispatches, a duplicate that is a deterministic NO-OP (roots hold on
@@ -613,26 +614,29 @@ async fn same_ops_inner(context: &deterministic::Context) {
         true,
     )
     .await;
+    assert_eq!(
+        deliveries(&wasm, "caller").await.len(),
+        1,
+        "the second result cannot deliver in its own callback block"
+    );
     // a callback for an UNKNOWN key is a deterministic no-op on both runtimes —
-    // and the mailbox is already drained, so no injection rides this block.
+    // while the second result is delivered from the previous committed boundary.
     accept(
         &mut native,
         &mut wasm,
         12,
         saga.clone(),
         callback_op(&key_of("caller", "ghost"), SagaOutcome::Done(b"x".to_vec())),
-        false,
+        true,
     )
     .await;
-    // an explicit sweep over the now-EMPTY mailbox stages nothing on either
-    // side: an idle `DeliverPending` must not move the root, or every block on
-    // a quiet chain would.
+    // An idle pump must leave the already-drained mailbox unchanged.
     accept(
         &mut native,
         &mut wasm,
         13,
         Origin::System,
-        op(&DispatchMsg::DeliverPending {}),
+        op(&DispatchMsg::Nudge {}),
         false,
     )
     .await;
@@ -664,23 +668,41 @@ async fn same_ops_inner(context: &deterministic::Context) {
     let d1 = dispatch_view(&wasm, "d1")
         .await
         .expect("the receipt survives");
-    assert_eq!(d1.status, DispatchStatus::Delivered);
+    assert_eq!(
+        d1.status,
+        DispatchStatus::Delivered {
+            delivery: sdk::DeliveryOutcome::Applied
+        }
+    );
     assert_eq!(d1.outcome, None, "delivery drops this module's copy");
     assert_eq!(d1.created_at, 1_005);
     assert_eq!(d1.updated_at, 1_011, "delivered by block 11's injection");
     let d2 = dispatch_view(&wasm, "d2")
         .await
         .expect("the receipt survives");
-    assert_eq!(d2.status, DispatchStatus::Delivered);
+    assert_eq!(
+        d2.status,
+        DispatchStatus::Delivered {
+            delivery: sdk::DeliveryOutcome::Applied
+        }
+    );
 
     // the receiver got BOTH results, in mailbox (FIFO) order, with every byte.
     let received = deliveries(&wasm, "caller").await;
     assert_eq!(received.len(), 2, "one ResultEvent per dispatch");
-    let first = decode_result_event(&received[0].1).expect("decode");
+    let dispatch::Delivery::Result(first) =
+        dispatch::decode_delivery(&received[0].1).expect("decode")
+    else {
+        panic!("result delivery")
+    };
     assert_eq!(first.dispatch_id, "d1");
     assert_eq!(first.recipe_id, "summarize");
     assert_eq!(first.outcome, Ok(br#"{"ok":1}"#.to_vec()));
-    let second = decode_result_event(&received[1].1).expect("decode");
+    let dispatch::Delivery::Result(second) =
+        dispatch::decode_delivery(&received[1].1).expect("decode")
+    else {
+        panic!("result delivery")
+    };
     assert_eq!(second.dispatch_id, "d2");
     assert_eq!(second.outcome, Err("cancelled".into()));
 
@@ -816,12 +838,6 @@ async fn rejections_inner(context: &deterministic::Context) {
             "unknown recipe",
         ),
         (
-            // DeliverPending is host-injected: no ordinary origin may force it.
-            alice.clone(),
-            op(&DispatchMsg::DeliverPending {}),
-            "System-origin only",
-        ),
-        (
             // a payload that is not a dispatch op at all: both sides reject
             // with the same serde rendering (decode runs inside the guest too).
             alice.clone(),
@@ -950,9 +966,10 @@ fn sync_handle_matches_native() {
 /// port. dispatch answers its query surface from COMMITTED state ALONE
 /// regardless of caller, so a recipe registered earlier in the SAME block is
 /// invisible to a mid-block sibling read. runs' consensus-visible sibling reads
-/// (turn-taken, lease-holder) rely on this; without `.with_committed_queries()`
-/// the guest's `WitStore` would serve the host's staged overlay and leak the
-/// same-block write. this matrix pins the contract: op 1 registers a recipe
+/// (turn-taken, lease-holder) rely on this; without the component's
+/// `committed_queries` declaration the guest's `WitStore` would serve the
+/// host's staged overlay and leak the same-block write. this matrix pins the
+/// contract: op 1 registers a recipe
 /// (staged, uncommitted) and op 2 — a sibling in the SAME block — reads it back
 /// through dispatch's query surface, and BOTH runtimes must answer
 /// `Recipe(None)`.

@@ -12,7 +12,6 @@ pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> L
         chat: Vec::new(),
         pages: PagesDelta::default(),
         bell: BellDelta::default(),
-        forge: ForgeRefresh::default(),
         permit: LivePermit::default(),
     }
 }
@@ -64,24 +63,6 @@ pub fn titlebar_inset() -> f64 {
     if cfg!(target_os = "macos") { 68.0 } else { 0.0 }
 }
 
-/// Tints an icon with one step of the artifact's ink ramp. The asset itself is
-/// drawn on `currentColor`, so the tone — not a second asset — is what makes a
-/// muted rail icon and an accent action icon different.
-pub fn icon_tint(
-    theme: &iced::Theme,
-    _status: iced::widget::svg::Status,
-    tone: impl AsRef<str>,
-) -> iced::widget::svg::Style {
-    let ramp = if theme_is_dark(theme) {
-        design::ink::tone_dark
-    } else {
-        design::ink::tone
-    };
-    iced::widget::svg::Style {
-        color: Some(rgb(ramp(tone.as_ref()))),
-    }
-}
-
 /// Whether the live palette is the dark reading. The generated theme's base
 /// text color IS `app_text`, so light text means a dark surface — no theme
 /// name string to allocate and compare per style call.
@@ -89,17 +70,8 @@ pub(crate) fn theme_is_dark(theme: &iced::Theme) -> bool {
     theme.palette().text.r > 0.5
 }
 
-/// An artifact hex literal as an opaque iced color.
-fn rgb(hex: u32) -> iced::Color {
-    iced::Color::from_rgb8(
-        ((hex >> 16) & 0xff) as u8,
-        ((hex >> 8) & 0xff) as u8,
-        (hex & 0xff) as u8,
-    )
-}
-
 /// The token set matching the live palette reading.
-fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
+pub(crate) fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
     if theme_is_dark(theme) {
         ui_lang_components::ui::theme::DARK
     } else {
@@ -130,19 +102,6 @@ pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-pub(crate) fn short_hex(bytes: &[u8]) -> String {
-    let mut output = String::new();
-    for byte in bytes.iter().take(4) {
-        let _ = write!(output, "{byte:02x}");
-    }
-    if bytes.len() > 4 {
-        output.push('…');
-    }
-    output
-}
-
-/// A shortened display label for an id string: its first 8 characters, with an
-/// ellipsis when more follow.
 pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",
@@ -316,4 +275,21 @@ pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
             u8::from_str_radix(pair, 16).map_err(|_| "ducktape signer returned invalid hex".into())
         })
         .collect()
+}
+
+/// THE MESSAGE ROW'S PLATE, as one discriminant instead of a ladder of
+/// booleans over the same box. A row is at most one of these, and they are
+/// ordered by how much they mean: the row you are ON outranks a row that
+/// merely sits inside a copy range, and a deleted row wears neither — its body
+/// is a tombstone, and tinting it would say there is something there to lift.
+///
+/// The colours stay in `theme.ice`, which is the only place that holds a
+/// palette; this says WHICH plate, never what it is made of.
+pub fn message_plate(deleted: bool, selected: bool, in_range: bool) -> crate::RowPlate {
+    match (deleted, selected, in_range) {
+        (true, _, _) => crate::RowPlate::Plain,
+        (false, true, _) => crate::RowPlate::Selected,
+        (false, false, true) => crate::RowPlate::Ranged,
+        (false, false, false) => crate::RowPlate::Plain,
+    }
 }

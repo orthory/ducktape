@@ -90,7 +90,7 @@ pub struct TdxRoots {
 
 /// Which pinned trust anchor a quote must chain to. Plain data: this crate
 /// never reads env or flags — each binary parses its own config ONCE at its
-/// boundary into these typed values (capability-host's `AirlockConfig`, the
+/// boundary into these typed values (the provider's `AirlockConfig`, the
 /// bins' flag parsing) and hands them in.
 #[derive(Clone)]
 pub enum TrustRoots {

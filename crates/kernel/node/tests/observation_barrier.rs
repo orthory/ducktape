@@ -137,3 +137,58 @@ fn batch_ends_at_the_block_that_moves_the_watched_root() {
         assert_eq!(node.last_engine_view(), Some(8));
     });
 }
+
+/// the replica-shaped repro from ducktape#1819: WITHOUT the barrier armed, a
+/// pass that folds several finalized frames in one `drain_delivered` call —
+/// exactly how a replica's park loop folds a backfill burst — reports the
+/// pass's LAST view, not the view that moved the watched (valset) module.
+/// This is the bug: `bin/node/src/replica/park.rs` derived its `folded_view`
+/// from the pass's last served height instead of `last_engine_view()`, so a
+/// membership change folded anywhere but the last frame of a multi-block pass
+/// armed a cutover ceiling (and, on promotion, a `view_base`) at a later view
+/// than every validator armed (which — with `watch_module` — always stops
+/// AT the changing block, per `batch_ends_at_the_block_that_moves_the_watched_root`
+/// above).
+#[test]
+fn without_the_barrier_a_multi_frame_pass_reports_the_last_view_not_the_changing_one() {
+    block_on(async {
+        let host = Host::genesis(vec![
+            Box::new(Directory::new("dir_a")),
+            Box::new(Directory::new("dir_b")),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::new(host, RoundOrderer::new());
+        // deliberately no `node.watch_module("dir_b")` — the exact wiring gap
+        // #1819 found at both replica `OrderedNode::resume` sites.
+
+        // views 0..=3 (v-1..v+2 with the watched change at v=1), all
+        // finalized before a single drain call — the multi-frame pass shape a
+        // replica folding a backfill burst produces.
+        for (seq, op) in [
+            set("dir_a", "d0", "x"),
+            set("dir_b", "w0", "j"),
+            set("dir_a", "d1", "x"),
+            set("dir_a", "d2", "x"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            node.submit(&sk(1), seq as u64, op).await.expect("submit");
+            node.flush_batch().await.expect("flush");
+        }
+
+        assert_eq!(
+            node.drain_delivered().await.expect("drain"),
+            4,
+            "unwatched, the whole pass folds in one call — nothing defers"
+        );
+        assert_eq!(
+            node.last_engine_view(),
+            Some(3),
+            "without the barrier the pass reports its LAST view, past the \
+             view (1) that actually moved the watched module — the exact \
+             defect: a replica computing its cutover coordinates off this \
+             value arms them at a later view than every validator did"
+        );
+    });
+}

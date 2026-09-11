@@ -130,9 +130,7 @@ fn refusal_reason(message: &str) -> &'static str {
         ("quota exceeded", "quota_exceeded"),
         ("exceeds the change cap", "too_many_changes"),
         ("chunk exceeds", "chunk_over_size"),
-        ("is not the home owner", "bad_owner"),
         ("root is not writable", "bad_owner"),
-        ("only the pin owner", "bad_owner"),
         ("module-origin only", "bad_owner"),
         ("outside /home and /shared", "path_outside_roots"),
         ("changed since base", "cas_conflict"),
@@ -304,6 +302,41 @@ pub(crate) async fn files_pin(
         "files op"
     );
     match files_submit(&handle, "pin", origin, payload).await {
+        Ok(block) => Json(block).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// the json body of POST /v1/files/unpin.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnpinBody {
+    pub name: String,
+}
+
+/// POST /v1/files/unpin — release a pin so gc can reclaim it once nothing
+/// else roots it. any signer releases any pin; an unknown name is the
+/// module's verbatim 400. the name travels in the signed JSON body, never a
+/// path segment: a
+/// pin name has no charset restriction (`.` and `..` are legal, see
+/// `pin_apply`), and a path segment is normalized by the `url` crate before
+/// it reaches the wire — `%2E%2E` collapses to a different route. a body is
+/// opaque to URL normalization and is exactly the bytes the signature covers.
+pub(crate) async fn files_unpin(
+    State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
+    Json(body): Json<UnpinBody>,
+) -> Response {
+    let origin = acting_origin(signed.as_deref());
+    let payload = encode_msg(&FilesMsg::Unpin { name: body.name });
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "unpin",
+        origin = to_hex(&origin),
+        bytes = payload.len(),
+        "files op"
+    );
+    match files_submit(&handle, "unpin", origin, payload).await {
         Ok(block) => Json(block).into_response(),
         Err(resp) => resp,
     }

@@ -3,17 +3,19 @@
 //!
 //! everything here runs inside the delivery block and follows the NO-FAIL
 //! rule (R4): every missing precondition — malformed sink, unwired forge,
-//! missing agent, missing `ForgePush` cap, unborn branch, unreadable tracker
-//! state — degrades to a [`RunsModule::note`] breadcrumb and never aborts.
+//! missing agent, unborn branch, unreadable tracker state — degrades to a
+//! [`RunsModule::note`] breadcrumb and never aborts.
 //! reads are COMMITTED forge state via ctx queries with local serde MIRRORS
 //! of forge's wire types (`forge` stays a DEV-ONLY dependency; conformance
 //! tests pin every mirror against the real forge codec).
 
-use agent::{CapRequest, ReplyBlock};
+use crate::action_requests::{Prepared, ReceiptMeta};
+use crate::catalog::Operation;
+use crate::{OP_FORGE_OPEN_PR, PendingState, PrRef, ReplyBlock};
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
-use sdk::{Ctx, Msg};
+use sdk::{Ctx, ModuleId, Msg};
 use serde::Serialize;
 
 use crate::facets::{WireSink, WorkspaceReceipt};
@@ -29,12 +31,12 @@ const PR_TITLE_MAX_CHARS: usize = 100;
 /// title exceeds it would REJECT — and a rejected follow-up aborts the
 /// delivery block, so the derivation must clamp below it (100 4-byte chars
 /// would be 400 bytes).
-const FORGE_TITLE_BYTE_CAP: usize = 256;
+pub(crate) const FORGE_TITLE_BYTE_CAP: usize = 256;
 
 /// mirror of `forge::MAX_BODY_BYTES` (conformance-pinned) — same no-abort
 /// reasoning as the title cap. unreachable under the 32 KiB reply-blocks cap;
 /// kept as a deterministic guard.
-const FORGE_BODY_BYTE_CAP: usize = 64 * 1024;
+pub(crate) const FORGE_BODY_BYTE_CAP: usize = 64 * 1024;
 
 /// the saga id the dispatch module derives for one of OUR dispatches — a
 /// MIRROR of dispatch's private `saga_id_for(dispatch_key(receiver, id))`
@@ -155,227 +157,401 @@ pub(crate) enum ForgeSinkQuery<'a> {
     ListRefs { repo: &'a str },
 }
 
+/// the strict-lane check of a proposed PR's own fields — what forge would
+/// reject at apply, refused here by name instead of aborting the delivery
+/// block: both branches named and different, a non-empty title inside forge's
+/// byte cap, a body inside forge's cap before the run's breadcrumb.
+pub(crate) fn validate_pr_proposal(
+    source_branch: &str,
+    target_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    if source_branch.is_empty() || target_branch.is_empty() {
+        return Err("forge.open_pr names both a source and a target branch".into());
+    }
+    if source_branch == target_branch {
+        return Err(format!(
+            "forge.open_pr source and target are the same branch: {source_branch}"
+        ));
+    }
+    if title.trim().is_empty() {
+        return Err("forge.open_pr requires a non-empty title".into());
+    }
+    if title.len() > FORGE_TITLE_BYTE_CAP {
+        return Err(format!(
+            "forge.open_pr title is {} bytes; the cap is {FORGE_TITLE_BYTE_CAP}",
+            title.len()
+        ));
+    }
+    if body.len() > FORGE_BODY_BYTE_CAP {
+        return Err(format!(
+            "forge.open_pr body is {} bytes; the cap is {FORGE_BODY_BYTE_CAP}",
+            body.len()
+        ));
+    }
+    Ok(())
+}
+
+/// one pull request a run proposes: the branches, and the prose forge stores.
+struct PrProposal<'a> {
+    repo: &'a str,
+    source_branch: &'a str,
+    target_branch: &'a str,
+    title: String,
+    body: String,
+}
+
 impl RunsModule {
     /// apply the O1/O2 sink. Chain is a breadcrumb/no-op in v1 (durable
     /// output_ref chaining is future work — the receipt already carries the
-    /// output_ref for a downstream consumer). Pr emits a forge `OpenPr` gated on
-    /// the agent's D3 `ForgePush` cap (Phase 4's `permits`, NOT a KNOWN_ACTIONS
-    /// grant), committed-state branch-born probes for BOTH the source and the
-    /// target (the no-fail rule: an OpenPr for an unborn branch — either end —
-    /// or with source == target would abort the block), and the duplicate-PR
-    /// guard (an OPEN PR already sourcing this branch was UPDATED by the push
-    /// — skip with a breadcrumb). Both paths require a host-observed commit
-    /// pushed to this sink's source branch; prose and a stale ref are never a
-    /// publication signal. the OpenPr title comes from the verified
-    /// bound Forge item; only an unavailable item falls back to `message`.
-    /// The body carries the full rendered message facet and `receipt` — the
-    /// wire sink's echoed empty title/body are IGNORED. `executing_node` is
-    /// the caller-computed saga attribution ([`Self::executing_node`]) the PR
-    /// body breadcrumb names.
-    /// any missing precondition degrades to a breadcrumb — the sink NEVER
-    /// aborts the delivery block.
+    /// output_ref for a downstream consumer). Pr proposes a forge `OpenPr`
+    /// through [`Self::propose_pr`] once the receipt proves this run pushed
+    /// the sink's source branch: a host-observed commit standing at forge's
+    /// committed tip of that branch. Prose and a stale ref are never a
+    /// publication signal. the OpenPr title comes from the verified bound
+    /// Forge item; only an unavailable item falls back to `message`. The body
+    /// carries the full rendered message facet and `receipt` — the wire
+    /// sink's echoed empty title/body are IGNORED. `executing_node` is the
+    /// caller-computed saga attribution ([`Self::executing_node`]) the PR
+    /// body breadcrumb names. any missing precondition degrades to a
+    /// breadcrumb — the sink NEVER aborts the delivery block.
     ///
-    /// returns the PR number this sink touched — the guard-found open PR the
-    /// push updated, or the number the emitted `OpenPr` gets (the tracker
-    /// numbers items sequentially: committed max + 1) — for the delivered-runs
-    /// ring. `None` when no PR was involved.
+    /// Returns only a committed PR the push already updated. A newly proposed
+    /// OpenPr has no link until its authenticated target receipt supplies the
+    /// allocated number; another operation may allocate first or the program
+    /// may decline to open it.
     #[allow(clippy::too_many_arguments, reason = "delivery-scoped internal seam")]
     pub(crate) async fn emit_sink(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
-        entry: &crate::PendingState,
+        entry: &PendingState,
         sink: &WireSink,
         message: &str,
         receipt: &WorkspaceReceipt,
         executing_node: &str,
-    ) -> Option<u64> {
-        match sink {
-            WireSink::Chain => None,
-            WireSink::Pr {
-                repo,
-                source_branch,
-                target_branch,
-                // delivery derivation is authoritative (§6): the requested
-                // sink composes these empty, and even a non-empty echo loses.
-                title: _,
-                body: _,
-            } => {
-                // malformed pr sinks degrade to a breadcrumb.
-                if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
-                    self.note(
-                        ctx,
-                        format!(
-                            "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
-                        ),
-                    );
-                    return None;
-                }
-                // forge rejects an OpenPr with identical branches — malformed,
-                // same degrade class as the incomplete sink above.
-                if source_branch == target_branch {
-                    self.note(
-                        ctx,
-                        format!(
-                            "run {run_id} pr sink skipped: source and target are the same branch"
-                        ),
-                    );
-                    return None;
-                }
-                let Some(forge) = self.forge.clone() else {
-                    self.note(
-                        ctx,
-                        format!("run {run_id} pr sink skipped: no forge module wired"),
-                    );
-                    return None;
-                };
-                let agent = match self.agent_for_run(&*ctx, entry).await {
-                    Ok(Some(a)) => a,
-                    _ => {
-                        self.note(
-                            ctx,
-                            format!("run {run_id} pr sink skipped: agent not registered"),
-                        );
-                        return None;
-                    }
-                };
-                if !agent.permits(&CapRequest::ForgePush(repo.as_str())) {
-                    self.note(
-                        ctx,
-                        format!("run {run_id} pr sink skipped: agent lacks forge_push for {repo}"),
-                    );
-                    return None;
-                }
-                // The workspace receipt is the host-authored publication
-                // boundary. A requested PR sink, response prose, and even a
-                // pre-existing source ref do not prove this run moved the ref.
-                // Gate BEFORE the duplicate-PR probe so no-change/review-only
-                // runs cannot be misreported as having updated an existing PR.
-                let has_publishable_commit = matches!(
-                    (&receipt.branch, &receipt.output_commit),
-                    (Some(branch), Some(oid))
-                        if receipt.source_prefix == format!("forge:{repo}")
-                            && branch == source_branch
-                            && !receipt.no_changes
-                            && receipt.commit_error.is_none()
-                            && oid.len() == 40
-                            && oid.bytes().all(|b| b.is_ascii_hexdigit())
+    ) -> Option<PrRef> {
+        let WireSink::Pr {
+            repo,
+            source_branch,
+            target_branch,
+            // delivery derivation is authoritative (§6): the requested
+            // sink composes these empty, and even a non-empty echo loses.
+            title: _,
+            body: _,
+        } = sink
+        else {
+            return None;
+        };
+        // malformed pr sinks degrade to a breadcrumb.
+        if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
+            self.note(
+                ctx,
+                format!(
+                    "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
+                ),
+            );
+            return None;
+        }
+        // forge rejects an OpenPr with identical branches — malformed,
+        // same degrade class as the incomplete sink above.
+        if source_branch == target_branch {
+            self.note(
+                ctx,
+                format!("run {run_id} pr sink skipped: source and target are the same branch"),
+            );
+            return None;
+        }
+        let forge = self
+            .forge_proposal_gate(ctx, run_id, entry, "pr sink")
+            .await?;
+        // The workspace receipt is the host-authored publication
+        // boundary. A requested PR sink, response prose, and even a
+        // pre-existing source ref do not prove this run moved the ref.
+        // Gate BEFORE the duplicate-PR probe so no-change/review-only
+        // runs cannot be misreported as having updated an existing PR.
+        let has_publishable_commit = matches!(
+            (&receipt.branch, &receipt.output_commit),
+            (Some(branch), Some(oid))
+                if receipt.source_prefix == format!("forge:{repo}")
+                    && branch == source_branch
+                    && !receipt.no_changes
+                    && receipt.commit_error.is_none()
+                    && oid.len() == 40
+                    && oid.bytes().all(|b| b.is_ascii_hexdigit())
+        );
+        if !has_publishable_commit {
+            self.note(
+                ctx,
+                format!(
+                    "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
+                ),
+            );
+            return None;
+        }
+        // #1835: the receipt's output_commit must BE the branch's
+        // committed tip, not merely a well-formed oid — a receipt
+        // cannot name a commit the push lane never landed. reads the
+        // same `ListRefs` mirror `forge_branch_born` uses, so a
+        // deleted/renamed source branch degrades identically.
+        let source_tip = match self
+            .forge_branch_tip(&*ctx, &forge, repo, source_branch)
+            .await
+        {
+            Ok(Some(tip)) => tip,
+            Ok(None) => {
+                self.note(
+                    ctx,
+                    format!("run {run_id} pr sink skipped: source branch not present"),
                 );
-                if !has_publishable_commit {
-                    self.note(
-                        ctx,
-                        format!(
-                            "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
-                        ),
-                    );
-                    return None;
-                }
-                match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        self.note(
-                            ctx,
-                            format!("run {run_id} pr sink skipped: source branch not present"),
-                        );
-                        return None;
-                    }
-                    Err(why) => {
-                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
-                        return None;
-                    }
-                }
-                // A receipt can arrive after its anchor was closed or merged.
-                // Re-read committed tracker state at the publication boundary
-                // and keep that late result in chat/history only.
-                let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
-                    Some(item_ref) if item_ref.repo == repo => {
-                        match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
-                            Ok(Some(item)) if item.state == ForgeItemState::Open => {
-                                Some(item.title)
-                            }
-                            Ok(Some(item)) => {
-                                self.note(
-                                    ctx,
-                                    format!(
-                                        "run {run_id} pr sink skipped: bound Forge item is {}",
-                                        item.state.as_str()
-                                    ),
-                                );
-                                return None;
-                            }
-                            Ok(None) => {
-                                self.note(
-                                    ctx,
-                                    format!(
-                                        "run {run_id} pr sink: bound Forge item unavailable; using response-title fallback"
-                                    ),
-                                );
-                                None
-                            }
-                            Err(why) => {
-                                self.note(
-                                    ctx,
-                                    format!(
-                                        "run {run_id} pr sink: bound Forge item unavailable ({why}); using response-title fallback"
-                                    ),
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                // the duplicate-PR guard: an OPEN PR already sourcing this
-                // branch means the session's push WAS the feedback — never a
-                // second PR.
-                let next_number = match self
-                    .forge_pr_probe(&*ctx, &forge, repo, source_branch)
-                    .await
-                {
-                    Ok((Some(number), _)) => {
-                        self.note(ctx, format!("run {run_id} pr sink: updated PR #{number}"));
-                        return Some(number);
-                    }
-                    Ok((None, next_number)) => next_number,
-                    Err(why) => {
-                        // an unreadable tracker must not risk a duplicate PR.
-                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
-                        return None;
-                    }
-                };
-                // forge ALSO rejects an OpenPr whose TARGET branch is unborn
-                // in committed refs — and a rejected follow-up aborts the
-                // whole delivery block (R4), deterministically, on every
-                // retry. checked AFTER the duplicate-PR guard on purpose: an
-                // already-open PR emits nothing (no abort risk) and its
-                // "updated PR #n" breadcrumb stays honest even when the
-                // target was since deleted. born-in-committed-refs also
-                // implies the name normalizes (forge validates on push).
-                match self.forge_branch_born(&*ctx, &forge, repo, target_branch).await {
-                    Ok(true) => {}
-                    Ok(false) => {
+                return None;
+            }
+            Err(why) => {
+                self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                return None;
+            }
+        };
+        let output_commit_is_source_tip =
+            receipt.output_commit.as_deref() == Some(source_tip.as_str());
+        if !output_commit_is_source_tip {
+            self.note(
+                ctx,
+                format!(
+                    "run {run_id} pr sink skipped: output_commit is not forge's committed tip of {source_branch}"
+                ),
+            );
+            return None;
+        }
+        // A receipt can arrive after its anchor was closed or merged.
+        // Re-read committed tracker state at the publication boundary
+        // and keep that late result in chat/history only.
+        let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
+            Some(item_ref) if item_ref.repo == repo => {
+                match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
+                    Ok(Some(item)) if item.state == ForgeItemState::Open => Some(item.title),
+                    Ok(Some(item)) => {
                         self.note(
                             ctx,
                             format!(
-                                "run {run_id} pr sink skipped: target branch {target_branch} not born"
+                                "run {run_id} pr sink skipped: bound Forge item is {}",
+                                item.state.as_str()
                             ),
                         );
                         return None;
                     }
+                    Ok(None) => {
+                        self.note(
+                            ctx,
+                            format!(
+                                "run {run_id} pr sink: bound Forge item unavailable; using response-title fallback"
+                            ),
+                        );
+                        None
+                    }
                     Err(why) => {
-                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
-                        return None;
+                        self.note(
+                            ctx,
+                            format!(
+                                "run {run_id} pr sink: bound Forge item unavailable ({why}); using response-title fallback"
+                            ),
+                        );
+                        None
                     }
                 }
-                let title = derive_pr_title(item_title.as_deref(), message, run_id);
-                let body = derive_pr_body(message, run_id, receipt, executing_node);
-                ctx.emit_msg(Msg {
-                    target: forge,
-                    payload: forge_open_pr_bytes(repo, &title, &body, source_branch, target_branch),
+            }
+            _ => None,
+        };
+        let proposal = PrProposal {
+            repo,
+            source_branch,
+            target_branch,
+            title: derive_pr_title(item_title.as_deref(), message, run_id),
+            body: derive_pr_body(message, run_id, receipt, executing_node),
+        };
+        self.propose_pr(
+            ctx,
+            run_id,
+            "pr sink",
+            &forge,
+            proposal,
+            ReceiptMeta::effect(forge.clone()),
+        )
+        .await
+    }
+
+    /// the run's own `forge.open_pr` proposals, applied after the committed
+    /// sink so a proposal of the sink's branch is the sink's PR and never a
+    /// second one. The response validated each: the cap on the repo, the
+    /// fields forge would reject. What remains are facts about the forge at
+    /// delivery — an unborn branch, a PR already open on the source — and
+    /// each degrades ALONE with a breadcrumb, like the sink. The body is the
+    /// model's prose plus the run's breadcrumb. Returns the first PR a
+    /// proposal found already open; a newly proposed one links through its
+    /// authenticated target receipt.
+    #[allow(clippy::too_many_arguments, reason = "delivery-scoped internal seam")]
+    pub(crate) async fn emit_forge_proposals(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        sink: &WireSink,
+        operations: &[Operation],
+        receipt: &WorkspaceReceipt,
+        executing_node: &str,
+    ) -> Option<PrRef> {
+        let mut linked = None;
+        for operation in operations {
+            let Operation::ForgeOpenPr {
+                repo,
+                source_branch,
+                target_branch,
+                title,
+                body,
+            } = operation
+            else {
+                continue;
+            };
+            let sink_proposes_this_branch = matches!(
+                sink,
+                WireSink::Pr { repo: sink_repo, source_branch: sink_source, .. }
+                    if sink_repo == repo && sink_source == source_branch
+            );
+            if sink_proposes_this_branch {
+                self.note(
+                    ctx,
+                    format!(
+                        "run {run_id} {OP_FORGE_OPEN_PR} skipped: the run's committed sink already proposes {source_branch}"
+                    ),
+                );
+                continue;
+            }
+            let Some(forge) = self
+                .forge_proposal_gate(ctx, run_id, entry, OP_FORGE_OPEN_PR)
+                .await
+            else {
+                continue;
+            };
+            let proposal = PrProposal {
+                repo,
+                source_branch,
+                target_branch,
+                title: title.clone(),
+                body: derive_pr_body(body, run_id, receipt, executing_node),
+            };
+            let meta = ReceiptMeta {
+                operation: OP_FORGE_OPEN_PR.into(),
+                result: serde_json::json!({
+                    "repo": repo,
+                    "source_branch": source_branch,
+                    "target_branch": target_branch,
+                }),
+                invocation: None,
+            };
+            let opened = self
+                .propose_pr(ctx, run_id, OP_FORGE_OPEN_PR, &forge, proposal, meta)
+                .await;
+            linked = linked.or(opened);
+        }
+        linked
+    }
+
+    /// the gates every PR proposal shares: a forge wired and the agent still
+    /// registered. Answers the forge target, or notes under `label` why the
+    /// proposal degrades.
+    async fn forge_proposal_gate(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        label: &str,
+    ) -> Option<ModuleId> {
+        let Some(forge) = self.forge.clone() else {
+            self.note(
+                ctx,
+                format!("run {run_id} {label} skipped: no forge module wired"),
+            );
+            return None;
+        };
+        let registered = matches!(self.agent_record(&*ctx, &entry.agent_id).await, Ok(Some(_)));
+        if !registered {
+            self.note(
+                ctx,
+                format!("run {run_id} {label} skipped: agent not registered"),
+            );
+            return None;
+        }
+        Some(forge)
+    }
+
+    /// open `proposal` unless a PR already sources its branch. The
+    /// duplicate-PR guard first: an OPEN PR already sourcing this branch was
+    /// UPDATED by the push — that PR is the link, with a breadcrumb, never a
+    /// second one. Then the target-born probe: forge ALSO rejects an OpenPr
+    /// whose TARGET branch is unborn in committed refs, and a rejected
+    /// follow-up aborts the whole delivery block (R4), deterministically, on
+    /// every retry — checked AFTER the duplicate guard on purpose, since an
+    /// already-open PR emits nothing and its breadcrumb stays honest even when
+    /// the target was since deleted. Then the OpenPr, under `meta`'s receipt.
+    async fn propose_pr(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        label: &str,
+        forge: &ModuleId,
+        proposal: PrProposal<'_>,
+        meta: ReceiptMeta,
+    ) -> Option<PrRef> {
+        let PrProposal {
+            repo,
+            source_branch,
+            target_branch,
+            title,
+            body,
+        } = proposal;
+        match self.forge_pr_probe(&*ctx, forge, repo, source_branch).await {
+            Ok(Some(number)) => {
+                self.note(ctx, format!("run {run_id} {label}: updated PR #{number}"));
+                return Some(PrRef {
+                    repo: repo.to_owned(),
+                    number,
                 });
-                Some(next_number)
+            }
+            Ok(None) => {}
+            Err(why) => {
+                // an unreadable tracker must not risk a duplicate PR.
+                self.note(ctx, format!("run {run_id} {label} skipped: {why}"));
+                return None;
+            }
+        };
+        match self
+            .forge_branch_born(&*ctx, forge, repo, target_branch)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.note(
+                    ctx,
+                    format!("run {run_id} {label} skipped: target branch {target_branch} not born"),
+                );
+                return None;
+            }
+            Err(why) => {
+                self.note(ctx, format!("run {run_id} {label} skipped: {why}"));
+                return None;
             }
         }
+        self.emit_prepared(
+            ctx,
+            Prepared {
+                message: Msg {
+                    target: forge.clone(),
+                    payload: forge_open_pr_bytes(repo, &title, &body, source_branch, target_branch),
+                },
+                receipt: meta,
+            },
+        );
+        None
     }
 
     /// deterministic committed-state probe: is `branch` a born ref of `repo`?
@@ -406,23 +582,48 @@ impl RunsModule {
             .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
     }
 
-    /// the duplicate-PR guard's read, plus the tracker's NEXT item number:
-    /// `(open_pr, next_number)`. `open_pr` is the lowest-numbered OPEN PR whose
+    /// `branch`'s committed tip, or `None` when it is not a born ref of
+    /// `repo` — the SAME `ListRefs` mirror [`Self::forge_branch_born`] reads,
+    /// but returning the 40-hex tip a receipt's `output_commit` must equal
+    /// (#1835), not merely a born/unborn verdict.
+    async fn forge_branch_tip(
+        &self,
+        ctx: &dyn Ctx,
+        forge: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<String>, String> {
+        let reply = ctx
+            .query(
+                forge,
+                &serde_json::to_vec(&ForgeSinkQuery::ListRefs { repo }).expect("query serializes"),
+            )
+            .await
+            .map_err(|e| format!("forge refs lookup failed: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&reply).map_err(|e| format!("undecodable forge reply: {e}"))?;
+        let Some(refs) = value.get("refs").and_then(|r| r.as_array()) else {
+            return Err("unexpected forge reply for a refs listing".into());
+        };
+        Ok(refs
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch))
+            .and_then(|r| r.get("head").and_then(|h| h.as_str()).map(str::to_string)))
+    }
+
+    /// The duplicate-PR guard returns the lowest-numbered OPEN PR whose
     /// source branch is `source_branch`, from COMMITTED tracker state
     /// (summaries via the ListItems mirror, then one GetItem per open PR —
     /// `ItemSummary` carries no branches); deterministic: the listing is
-    /// ascending by number, first match wins. `next_number` is the number a
-    /// fresh `OpenPr` gets — forge numbers items sequentially per repo, so it
-    /// is the committed max + 1.
+    /// ascending by number, first match wins.
     async fn forge_pr_probe(
         &self,
         ctx: &dyn Ctx,
         forge: &str,
         repo: &str,
         source_branch: &str,
-    ) -> Result<(Option<u64>, u64), String> {
+    ) -> Result<Option<u64>, String> {
         let summaries = self.forge_item_summaries(ctx, forge, repo).await?;
-        let next_number = summaries.iter().map(|s| s.number).max().unwrap_or(0) + 1;
         for summary in summaries {
             if summary.kind != ForgeItemKind::Pr || summary.state != ForgeItemState::Open {
                 continue;
@@ -431,10 +632,10 @@ impl RunsModule {
                 continue;
             };
             if item.source_branch.as_deref() == Some(source_branch) {
-                return Ok((Some(summary.number), next_number));
+                return Ok(Some(summary.number));
             }
         }
-        Ok((None, next_number))
+        Ok(None)
     }
 
     /// the run's durable executor attribution: the `assignee` on its DONE saga
@@ -524,7 +725,10 @@ mod tests {
     #[test]
     fn bound_item_title_never_degrades_to_a_generic_message() {
         let issue = "Use Forge issue titles for auto-published Agent PRs";
-        assert_eq!(derive_pr_title(Some(issue), "Apply agent changes", "run-1"), issue);
+        assert_eq!(
+            derive_pr_title(Some(issue), "Apply agent changes", "run-1"),
+            issue
+        );
     }
 
     #[test]
@@ -534,7 +738,10 @@ mod tests {
             "Useful response"
         );
         assert_eq!(derive_pr_title(None, "", "run-1"), "agent run run-1");
-        assert_eq!(derive_pr_title(None, "  \n\t\n", "run-1"), "agent run run-1");
+        assert_eq!(
+            derive_pr_title(None, "  \n\t\n", "run-1"),
+            "agent run run-1"
+        );
     }
 
     #[test]
@@ -579,7 +786,10 @@ mod tests {
         // guard keeps a regression from handing forge a rejectable op.
         let receipt = crate::facets::WorkspaceReceipt::default();
         let body = derive_pr_body(&"x".repeat(FORGE_BODY_BYTE_CAP), "r1", &receipt, "unknown");
-        assert!(body.len() <= FORGE_BODY_BYTE_CAP, "body stays inside forge's cap");
+        assert!(
+            body.len() <= FORGE_BODY_BYTE_CAP,
+            "body stays inside forge's cap"
+        );
         assert!(body.ends_with("---\nrun: r1\noutput: none\nnode: unknown"));
     }
 
@@ -618,6 +828,7 @@ mod tests {
                 consensus_time: t,
                 origin,
                 me: "forge".into(),
+                cause: sdk::Cause::Direct,
             });
             let msg = Msg {
                 target: "forge".into(),
@@ -629,7 +840,7 @@ mod tests {
         };
 
         // birth the repo and both branches: a member pushes (a ref-moving op
-        // still requires an external principal — #860's owner gate, untouched).
+        // requires an external principal).
         let member = sdk::Origin::External(vec![1u8; 32]);
         for (t, branch) in [(1u64, "main"), (2, "agent/run-1")] {
             let push = forge::encode_msg(&forge::ForgeMsg::PushRefs {
@@ -666,7 +877,7 @@ mod tests {
         };
         assert_eq!(
             item.summary.author,
-            chat::AuthorRef::Module("runs".into()),
+            chat::Party::Module("runs".into()),
             "the PR is authored by the emitting MODULE, not a forged user"
         );
         let _ = std::fs::remove_dir_all(&base);

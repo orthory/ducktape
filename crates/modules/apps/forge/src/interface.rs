@@ -84,7 +84,7 @@ pub enum ForgeMsg {
         #[serde(default)]
         target_branch: String,
     },
-    /// edit an item's title and/or body — author-only.
+    /// edit an item's title and/or body.
     EditItem {
         repo: String,
         number: u64,

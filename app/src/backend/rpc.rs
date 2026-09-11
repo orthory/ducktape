@@ -24,6 +24,54 @@ pub(crate) async fn signed_write(
     submit_raw_frame(rpc, target, frame).await
 }
 
+/// Sign and submit one module op WITH THE KEY ALREADY SEATED — the seat a
+/// password opened in the launch window or Settings — or refuse while the
+/// seat is locked. The kernel's `op.submit` for a module view: the view
+/// names the target and the message, and never carries a password.
+pub(crate) async fn seated_write(
+    rpc: &RpcClient,
+    target: &str,
+    payload: Vec<u8>,
+) -> Result<u64, String> {
+    if payload.is_empty() || payload.len() > ::node::MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "{target} transaction exceeds the signed payload limit"
+        ));
+    }
+    let frame = {
+        let session = SIGNER.lock().await;
+        let Some(signer) = session.as_ref() else {
+            return Err("the local user key is locked; enter its password".into());
+        };
+        signer.sign(target, next_sequence(), &payload)
+    };
+    submit_raw_frame(rpc, target, frame).await
+}
+
+/// A data-plane signer over the key ALREADY SEATED, or the locked refusal:
+/// the kernel's reader queries and raw-bytes writes for a module view, which
+/// carries no password of its own.
+pub(crate) async fn seated_data_plane_signer(
+    rpc: &RpcClient,
+) -> Result<ducktape_rpc::WriteAuth, String> {
+    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+    let key = {
+        let session = SIGNER.lock().await;
+        let Some(signer) = session.as_ref() else {
+            return Err("the local user key is locked; enter its password".into());
+        };
+        signer.key.clone()
+    };
+    Ok(std::sync::Arc::new(
+        move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        },
+    ))
+}
+
 /// Submit a frame signed ELSEWHERE — by a passkey or a wallet in the browser
 /// (`authpage`), never this device's key — through the same funnel, so the
 /// block it lands in is noted for the reads that follow.
@@ -190,9 +238,9 @@ pub(crate) async fn await_fold<Q: serde::Serialize>(
 static SIGNER: tokio::sync::Mutex<Option<Signer>> = tokio::sync::Mutex::const_new(None);
 
 pub(super) struct Signer {
-    /// The password this seat was opened with. A different one is a different
-    /// seat (a re-login, or a restored key), so it re-opens rather than signing
-    /// under the key this one holds.
+    /// The password this seat was opened with. The seat is taken where a
+    /// wallet is unlocked — the launch window, Settings — and a signing verb
+    /// only presents the password again: a different one is not this seat.
     password: Zeroizing<String>,
     key: ed25519::PrivateKey,
 }
@@ -202,9 +250,9 @@ impl Signer {
     /// because 64 MiB of memory-hard KDF on an async worker stalls every other
     /// task sharing it (the render thread's `Task` results included).
     ///
-    /// The key path is an argument rather than a read of `user_key_path()` so
-    /// the session can be driven against a fixture without touching this
-    /// process's environment.
+    /// The key path is an argument: the wallet is the WORKSPACE's, so whoever
+    /// picked the network names the file, and a session can be driven against
+    /// a fixture without touching this process's environment.
     pub(super) async fn unlock(key: PathBuf, password: Zeroizing<String>) -> Result<Self, String> {
         require_password(&password)?;
         let opening = {
@@ -242,14 +290,17 @@ async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Ve
 
 /// The member consent an identity `AddKey` ticket carries: this device's key
 /// signs the module's own `add_key_preimage` for `new_key` at its current
-/// `generation` on `chain_id` — the same seat [`sign_frame`] uses, so a ticket
-/// costs no argon2 pass of its own.
+/// `generation` on `chain_id`, naming `account` and dying at `expires_at` —
+/// the same seat [`sign_frame`] uses, so a ticket costs no argon2 pass of its
+/// own.
 pub(crate) async fn sign_add_key_consent(
     password: String,
     chain_id: &str,
     scheme: identity::KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: u64,
+    expires_at: u64,
 ) -> Result<identity::Authorizer, String> {
     let session = seated_signer(password).await?;
     let signer = session.as_ref().expect("the session was seated above");
@@ -259,22 +310,104 @@ pub(crate) async fn sign_add_key_consent(
         scheme,
         new_key,
         generation,
+        account,
+        expires_at,
     ))
 }
 
-/// The session seat, opened under `password` if it is not already: the lock
-/// is what makes the seat singular — a burst of reactions opens the key once
-/// between them instead of racing five argon2 passes into it.
+/// The person's proof for a raw-bytes write (a staged chunk, a forge pack):
+/// this device's key signs each request, bound to the node it is sent to,
+/// through the one message the daemon verifies (`node::signed_req`). The
+/// same seat [`sign_frame`] uses, so it costs no argon2 pass of its own.
+pub(crate) async fn data_plane_signer(
+    rpc: &RpcClient,
+    password: String,
+) -> Result<ducktape_rpc::WriteAuth, String> {
+    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+    let key = {
+        let session = seated_signer(password).await?;
+        session
+            .as_ref()
+            .expect("the session was seated above")
+            .key
+            .clone()
+    };
+    Ok(std::sync::Arc::new(
+        move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        },
+    ))
+}
+
+/// Take the session seat: the key at `path`, opened under `password`. THE
+/// one place a key is opened for signing — the wallet ceremonies call it with
+/// the workspace's key file, having just proved the password on it — so a
+/// signing verb never has to know which workspace it is signing for, and a
+/// network switch that drops the seat ([`lock_signer`]) leaves nothing that
+/// could sign as the previous network's wallet. Answers the public key it
+/// opened, in hex: the identity the session now signs as.
+pub(crate) async fn seat_signer(
+    path: PathBuf,
+    password: Zeroizing<String>,
+) -> Result<String, String> {
+    let signer = Signer::unlock(path, password).await?;
+    let pubkey = hex_encode(signer.key.public_key().as_ref());
+    *SIGNER.lock().await = Some(signer);
+    Ok(pubkey)
+}
+
+/// Sign one data-plane request with the key ALREADY SEATED — the seat the
+/// action before this one opened under the person's password — or `None`
+/// while the seat is locked. For a caller that has no password of its own:
+/// the huddle's call socket is a subscription the app runs `when
+/// huddle_joined`, and the join that set that flag is what seated the key.
+pub(crate) async fn seated_request_headers(
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    body: &[u8],
+) -> Option<[(&'static str, String); 3]> {
+    let session = SIGNER.lock().await;
+    let signer = session.as_ref()?;
+    Some(::node::signed_req::request_headers(
+        &signer.key,
+        method,
+        path_and_query,
+        node_key,
+        body,
+    ))
+}
+
+/// This node's own public key — the bytes a data-plane signature is bound to, so
+/// a proof minted for one node cannot be replayed at another. Read off the
+/// node's own `status`, which is where every other signing caller reads it.
+pub(crate) async fn node_public_key(rpc: &str) -> Result<Vec<u8>, String> {
+    let status = crate::backend::rpc_client(rpc)?
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::backend::hex_decode(&status.public_key)
+}
+
+/// The session seat, when `password` is the one it was taken with. The lock
+/// is what makes the seat singular — a burst of reactions shares one opened
+/// key instead of racing five argon2 passes into it. No seat, or another
+/// password, is the locked state: the launch window and Settings are where a
+/// seat is taken, never a write that happened to carry a password.
 async fn seated_signer(
     password: String,
 ) -> Result<tokio::sync::MutexGuard<'static, Option<Signer>>, String> {
+    require_password(&password)?;
     let password = Zeroizing::new(password);
-    let mut session = SIGNER.lock().await;
+    let session = SIGNER.lock().await;
     let seated = session
         .as_ref()
         .is_some_and(|signer| signer.password == password);
     if !seated {
-        *session = Some(Signer::unlock(user_key_path()?, password).await?);
+        return Err("the local user key is locked; enter its password".into());
     }
     Ok(session)
 }
@@ -294,54 +427,52 @@ pub(crate) fn require_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The cached identity: `None` = not read yet, `Some(reading)` = the disk's
-/// answer. A plain cache would freeze the launch state for process life —
-/// the launch window can MINT the key in-process now, so its creators refresh
-/// this through [`set_local_user_key`] instead of demanding a restart.
-static LOCAL_USER_KEY: tokio::sync::RwLock<Option<Option<Vec<u8>>>> =
-    tokio::sync::RwLock::const_new(None);
+/// The identity this session is about: the pubkey of the picked network's
+/// wallet, or `None` for a network picked with no key to sign as. Set where
+/// the identity is decided — a network pick reads the workspace's active
+/// wallet without a password ([`super::load_wallets`]), and the wallet
+/// ceremonies replace it with the key they just opened or sealed — never read
+/// lazily off a global path, because there is no global key: a wallet is an
+/// identity ON a network, kept in that network's workspace.
+static LOCAL_USER_KEY: tokio::sync::RwLock<Option<Vec<u8>>> = tokio::sync::RwLock::const_new(None);
 
 pub(crate) async fn local_user_key() -> Option<Vec<u8>> {
-    if let Some(reading) = LOCAL_USER_KEY.read().await.clone() {
-        return reading;
-    }
-    let reading = read_local_user_key().await;
-    *LOCAL_USER_KEY.write().await = Some(reading.clone());
-    reading
+    LOCAL_USER_KEY.read().await.clone()
 }
 
-/// Replace the cached identity — called by the key ceremonies (init/restore)
-/// with the pubkey the CLI just printed.
+/// Replace the session's identity — a network pick, a wallet ceremony.
 pub(crate) async fn set_local_user_key(reading: Option<Vec<u8>>) {
-    *LOCAL_USER_KEY.write().await = Some(reading);
+    *LOCAL_USER_KEY.write().await = reading;
 }
 
-/// The cached identity WITHOUT waiting — the update thread's synchronous
-/// folds cannot await. `None` covers the cold cache and a held write lock;
-/// by any reaction tap the cache is warm (every hydrate reads it first).
+/// The identity WITHOUT waiting — the update thread's synchronous folds
+/// cannot await. `None` covers a held write lock; by any reaction tap the
+/// pick that set it is long done.
 pub(crate) fn cached_user_key() -> Option<Vec<u8>> {
     LOCAL_USER_KEY
         .try_read()
         .ok()
-        .and_then(|reading| reading.clone().flatten())
+        .and_then(|reading| reading.clone())
 }
 
-/// This device's identity, read WITHOUT its password — the pubkey rides in the
-/// clear inside the encrypted line precisely so `status` can answer while the
-/// key is locked. A parse failure (an unreadable or non-v1 file) is `None`,
-/// the same answer as no key at all.
-async fn read_local_user_key() -> Option<Vec<u8>> {
-    let key = user_key_path().ok()?;
-    keystore::userkey::read_user_key_file(&key)
+/// A key file's pubkey, read WITHOUT its password — the pubkey rides in the
+/// clear inside the encrypted line precisely so a pick can say who it is
+/// about to sign as while the key is locked. A parse failure (an unreadable
+/// or non-v1 file) is `None`, the same answer as no key at all.
+pub(crate) fn pubkey_of_key_file(path: &Path) -> Option<Vec<u8>> {
+    keystore::userkey::read_user_key_file(path)
         .ok()
         .map(|encrypted| encrypted.pubkey)
 }
 
-/// The client-local UI prefs file (doc tabs, per-endpoint) — sibling to the
-/// user key: `$DUCKTAPE_HOME/app-prefs.json`, else `~/.ducktape/app-prefs.json`.
-/// Never wire state: purely this device's view preferences.
+/// The app's own preferences file — `prefs.json` in the app's config
+/// directory ([`super::app_dirs::config_dir`]), never under the ducktape
+/// home: the home holds workspaces and nothing else. Never wire state: purely
+/// this device's view preferences.
 fn prefs_path() -> Option<PathBuf> {
-    duck_home().ok().map(|home| home.join("app-prefs.json"))
+    super::app_dirs::config_dir()
+        .ok()
+        .map(|dir| dir.join("prefs.json"))
 }
 
 pub(crate) fn read_prefs() -> serde_json::Value {
@@ -388,134 +519,117 @@ pub async fn save_appearance(mode: crate::Appearance) -> bool {
     write_prefs(&prefs)
 }
 
-/// This endpoint's persisted doc tabs (open page ids, in open order).
-pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
-    let prefs = read_prefs();
-    prefs["doc_tabs"][&rpc]
-        .as_array()
-        .map(|tabs| {
-            tabs.iter()
-                .filter_map(|tab| tab.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Persist this endpoint's doc tabs. Best-effort: a failed write only costs
-/// tab restoration on the next boot.
-pub async fn save_doc_tabs(rpc: String, tabs: Vec<String>) -> bool {
-    let mut prefs = read_prefs();
-    prefs["doc_tabs"][&rpc] = serde_json::json!(tabs);
-    write_prefs(&prefs)
-}
-
-/// Add a page to the doc-tab strip (idempotent, keeps open order).
-pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    if page_id.is_empty() || tabs.contains(&page_id) {
-        return tabs;
+/// The prefs key a network's per-network readings (`networks[<key>]`: its
+/// last-used stamp) sit under: the chain id when the endpoint is served by a
+/// workspace on this device — the one name that survives a port change —
+/// else the canonical endpoint of a remote.
+pub(crate) fn network_key(rpc: &str) -> String {
+    match workspace_at(rpc) {
+        Some((chain_id, _)) => chain_id,
+        None => canonical_endpoint(rpc.to_string()),
     }
-    tabs.push(page_id);
-    tabs
 }
 
-/// Close one tab.
-pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    tabs.retain(|tab| *tab != page_id);
-    tabs
-}
-
-/// One rendered doc tab.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct DocTab {
-    pub id: String,
-    pub title: String,
-    pub active: bool,
-}
-
-/// The rendered tab strip: open tabs that still exist, titled from the page
-/// list, the active one flagged.
-pub fn doc_tab_rows(tabs: &[String], pages: &[PageItem], active: &str) -> Vec<DocTab> {
-    tabs.iter()
-        .filter_map(|tab| {
-            let page = pages.iter().find(|page| page.id == *tab)?;
-            Some(DocTab {
-                title: page.title.clone(),
-                active: tab == active,
-                id: tab.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Drop tabs whose page is gone. `doc_tab_rows` already resolves every tab
-/// against the live page list when it draws, so a dead id is invisible in the
-/// bar — but the PERSISTED list kept them forever, and Settings counts that
-/// list: `Open page tabs 11` beside a bar showing two. Pruning where the pages
-/// land keeps the stored list and its count honest.
-pub fn doc_tabs_pruned(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
-}
-
-/// The tab to activate after closing one: the last remaining tab, or empty.
-pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
-    if closed != active {
-        return active;
+/// WHERE A NETWORK'S WALLETS LIVE ON THIS DEVICE. A wallet is an identity ON
+/// a network, so its keystore is keyed by the network — and every network
+/// this device talks to has one, whether or not it also runs that network's
+/// node here:
+///
+/// - a network this device hosts keeps its keys in the node's workspace, as
+///   the CLI does (`<workspace>/keys/`);
+/// - a network reached only through a remote endpoint keeps them under
+///   `<ducktape home>/remotes/<chain id>/keys/` — the chain id, not the
+///   endpoint, because the same network dialled through a different tunnel or
+///   port is the same identity.
+///
+/// The keystore used to be the workspace and nothing else, which made a device
+/// that hosts no node a device that can hold no key: it dropped into the
+/// console read-only, silently, with no way to create or unlock anything. The
+/// launch window's key screens now open for a remote exactly as for a local
+/// network.
+///
+/// A remote's chain id is what its `/v1/status` says; [`note_remote_chain`]
+/// records it when the launch window loads the keystore, and until it has,
+/// the root is a refusal — "not yet reached", never a guess.
+pub(crate) fn keystore_root(rpc: &str) -> Result<PathBuf, String> {
+    if let Some((_, workspace)) = workspace_at(rpc) {
+        return Ok(workspace);
     }
-    tabs.into_iter()
-        .rev()
-        .find(|tab| *tab != closed)
-        .unwrap_or_default()
+    let endpoint = canonical_endpoint(rpc.to_string());
+    let chain_id = remote_chains()
+        .get(&endpoint)
+        .cloned()
+        .ok_or_else(|| "this node has not answered which network it serves yet".to_string())?;
+    remote_keystore_root(&workspace_config::ducktape_home()?, &chain_id)
 }
 
-/// where the keystore and the prefs live — [`ducktape_home::root`], the same
-/// resolution the node resolves its own workspaces through.
-pub(crate) fn duck_home() -> Result<PathBuf, String> {
-    ducktape_home::root()
+/// `<home>/remotes/<chain id>`. The chain id is a `--name` plus a hash and may
+/// carry a path separator; it is made inert the way
+/// `workspace_config::default_workspace_dir` does for workspaces.
+pub(crate) fn remote_keystore_root(home: &Path, chain_id: &str) -> Result<PathBuf, String> {
+    let name = chain_id.replace(std::path::MAIN_SEPARATOR, "-");
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("chain id {chain_id:?} is not a directory name"));
+    }
+    Ok(home.join("remotes").join(name))
 }
 
-/// One named wallet's key file inside the keystore — THE join, so the charset
-/// check (`[a-z0-9][a-z0-9._-]*`, at most 41 chars) lives here and every caller
-/// inherits it. A name is untrusted even when nobody typed it: the `active`
-/// pointer is an ordinary file anyone can garble, and a `/` or `..` in it would
-/// walk the key path straight out of the keystore.
-pub(crate) fn keystore_key_path(name: &str) -> Result<PathBuf, String> {
+/// Endpoint → chain id, for the remotes this session has reached. Learned
+/// once per endpoint from the node's own status, at the keystore load.
+static REMOTE_CHAINS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+fn remote_chains() -> std::sync::MutexGuard<'static, BTreeMap<String, String>> {
+    REMOTE_CHAINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record which network `rpc` serves, so [`keystore_root`] can name its
+/// keystore. An empty chain id (a node serving no chain yet) records nothing.
+pub(crate) fn note_remote_chain(rpc: &str, chain_id: &str) {
+    if chain_id.is_empty() {
+        return;
+    }
+    remote_chains().insert(canonical_endpoint(rpc.to_string()), chain_id.to_string());
+}
+
+/// One named wallet's key file inside a workspace's keystore — THE join, so
+/// the charset check (`[a-z0-9][a-z0-9._-]*`, at most 41 chars) lives here and
+/// every caller inherits it. A name is untrusted even when nobody typed it:
+/// the `active` pointer is an ordinary file anyone can garble, and a `/` or
+/// `..` in it would walk the key path straight out of the keystore.
+pub(crate) fn keystore_key_path(workspace: &Path, name: &str) -> Result<PathBuf, String> {
     keystore::wallet::valid_name(name)?;
-    Ok(keystore::wallet::key_file(&duck_home()?, name))
+    Ok(keystore::wallet::key_file(workspace, name))
 }
 
-/// The `active` pointer's wallet NAME — empty when the keystore holds none.
-/// The pointer is the one place that decides which key this device signs with.
-pub(crate) fn active_wallet_name() -> Result<String, String> {
-    Ok(keystore::wallet::active_name(&duck_home()?).unwrap_or_default())
+/// The `active` pointer's wallet NAME in a workspace — empty when its keystore
+/// holds none. The pointer is the one place that decides which key signs on
+/// that network.
+pub(crate) fn active_wallet_name(workspace: &Path) -> String {
+    keystore::wallet::active_name(workspace).unwrap_or_default()
 }
 
-/// This session's signing key file: the explicit override, else the keystore's
-/// active wallet. No active wallet is a refusal, not a guess — the launch
-/// window is where one is picked.
-pub(crate) fn user_key_path() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("DUCKTAPE_USER_KEY") {
-        return Ok(path.into());
+/// The signing key file a session on `rpc` reads its identity off: the
+/// explicit `DUCKTAPE_USER_KEY` override, else the active wallet of that
+/// network's keystore ([`keystore_root`]). No active wallet is a refusal, not
+/// a guess — the launch window is where one is picked.
+pub(crate) fn session_key_path(rpc: &str) -> Result<PathBuf, String> {
+    if let Some(path) = env_user_key() {
+        return Ok(path);
     }
-    let name = active_wallet_name()?;
+    let root = keystore_root(rpc)?;
+    let name = active_wallet_name(&root);
     if name.is_empty() {
         return Err("no active wallet — pick one in the launch window".to_string());
     }
-    keystore_key_path(&name)
+    keystore_key_path(&root, &name)
 }
 
-pub(crate) fn ducktape_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("DUCKTAPE_BIN") {
-        return path.into();
-    }
-    if let Ok(current) = std::env::current_exe()
-        && let Some(sibling) = current.parent().map(|parent| parent.join("ducktape"))
-        && sibling.is_file()
-    {
-        return sibling;
-    }
-    PathBuf::from("ducktape")
+/// The rig override: `DUCKTAPE_USER_KEY` names a key file outright, and no
+/// keystore is consulted while it is set.
+pub(crate) fn env_user_key() -> Option<PathBuf> {
+    keystore::wallet::env_user_key()
 }
 
 pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, String> {
@@ -583,19 +697,6 @@ pub(crate) fn user_error(message: String) -> String {
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
     }
-    // The only surviving subprocess is the agent pty — keys, signing, run
-    // scheduling, invite minting and joining a network all happen in this
-    // process now — so this branch matches the ONE sentence that path writes
-    // (`start_agent_terminal`), and names no tool it did not start. Matching
-    // `DUCKTAPE_BIN` instead, as this did, matched nothing at all: every
-    // message that used to carry the variable's name was deleted along with
-    // the subprocess that produced it.
-    let helper_cannot_start = message.contains("could not start the ducktape");
-    if helper_cannot_start {
-        return "Ducktape's helper program could not start. Check the ducktape install in \
-                Settings."
-            .into();
-    }
     let node_slow = message.contains("timed out");
     if node_slow {
         return "The node did not answer in time. Retry in a moment.".into();
@@ -662,25 +763,8 @@ mod tests {
         );
     }
 
-    /// The install sentence must be REACHABLE, and it is the one thing this
-    /// function still says about a subprocess. The app has exactly one left —
-    /// the agent pty — and matching on the variable name `DUCKTAPE_BIN`, as
-    /// this branch did, matched nothing: every message carrying it was deleted
-    /// with the subprocess that wrote it.
-    #[test]
-    fn a_helper_that_cannot_start_names_no_particular_tool() {
-        assert_eq!(
-            user_error(
-                "could not start the ducktape agent terminal: Could not start Claude · raw \
-                 session: No such file or directory (os error 2)"
-                    .into()
-            ),
-            "Ducktape's helper program could not start. Check the ducktape install in Settings."
-        );
-    }
-
-    /// A node that went quiet is not the same event as a helper that would not
-    /// start, and both are reached only after the key causes above them.
+    /// A node that went quiet has its own sentence, reached only after the key
+    /// causes above it.
     #[test]
     fn a_slow_node_keeps_its_own_sentence() {
         assert_eq!(

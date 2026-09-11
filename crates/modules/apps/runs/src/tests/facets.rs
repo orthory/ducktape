@@ -2,26 +2,60 @@ use super::*;
 
 // ---- faceted delivery -------------------------------------------------------
 
-/// a module wired with the forge sink, one watch on "general", one engaged
-/// run for agent "bot" at seq 2.
+/// the canonical PR sink `forge_wrapper`'s tests echo — repo `app`,
+/// `agent/x` onto `main`. real dispatch composes the requested sink INTO
+/// `PendingState` at stage time (#1835); a fixture built via a plain "general"
+/// chat channel commits `Chain` instead (no forge trigger), so anything
+/// exercising `emit_sink`'s OWN gates via an echoed PR sink must commit a
+/// matching one first — see [`commit_sink`].
+fn canonical_forge_sink() -> WireSink {
+    WireSink::Pr {
+        repo: "app".into(),
+        source_branch: "agent/x".into(),
+        target_branch: "main".into(),
+        title: String::new(),
+        body: String::new(),
+    }
+}
+
+/// commit `sink` into a pending fixture run directly — mirrors what a real
+/// forge/dispatch compose would have committed at stage time (#1835): the
+/// dispatch-commitment gate compares an echoed result sink against exactly
+/// this field, so a fixture testing `emit_sink`'s OWN gates (branch state,
+/// duplicate-PR, …) must commit the SAME sink its `RunnerResult` later echoes.
+fn commit_sink(m: &mut RunsModule, run_id: &str, sink: WireSink) {
+    m.pending
+        .get_mut(&dispatch_id_for(run_id))
+        .expect("pending fixture run")
+        .sink = sink;
+}
+
+/// a module wired with the forge sink and one attributed
+/// run for agent "bot" at seq 2, with the canonical PR sink committed
+/// (#1835) so a test's echoed `forge_wrapper`/inline PR sink is accepted.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     let mut m = module().with_sink_forge("forge");
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: "general".into(),
-            policy: TurnPolicy::All,
-        }),
-    )
-    .unwrap();
+    m.models = registry.clone();
     commit(&mut m);
-    engage_post(&mut m, registry, 2, &[]);
+    request_post(&mut m, registry, 2, &[]);
     commit(&mut m);
-    (m, run_id_for("general", 2, "bot"))
+    let run_id = run_id_for("general", 2, "bot");
+    commit_sink(&mut m, &run_id, canonical_forge_sink());
+    (m, run_id)
+}
+
+#[test]
+fn a_snapshot_preserves_the_committed_sink_and_program_identity() {
+    let registry = registry(&["bot"]);
+    let (mut original, run_id) = awaiting_run_with_forge(&registry);
+    commit(&mut original);
+    let bytes = original.snapshot();
+    let mut restored = module().with_sink_forge("forge");
+    restored.install(&bytes, original.root()).unwrap();
+    let dispatch = dispatch_id_for(&run_id);
+    assert_eq!(restored.pending[&dispatch], original.pending[&dispatch]);
+    assert_eq!(restored.pending[&dispatch].sink, canonical_forge_sink());
+    assert_eq!(restored.snapshot(), bytes);
 }
 
 #[test]
@@ -31,13 +65,10 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
     // action is applied (the effects-facet fallback).
     let response_text = String::from_utf8(response_json(
         &["on it"],
-        vec![AgentAction::CreateTask {
-            task_id: "from_prose".into(),
-            title: "prose".into(),
-        }],
+        vec![create_task("from_prose", "prose")],
     ))
     .unwrap();
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -58,6 +89,7 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
         vec![TaskMsg::CreateTask {
             task_id: "from_prose".into(),
             title: "prose".into(),
+            owner: None,
         }],
         "the prose-parsed action is applied"
     );
@@ -70,26 +102,24 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
 }
 
 #[test]
-fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
+fn pr_sink_emits_open_pr_once_both_branches_are_born() {
     // the wire sink echoes title/body — delivery IGNORES them and derives
     // both from the message facet (asserted exactly below).
     let sink = serde_json::json!({
         "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"My PR","body":"details"}
     });
 
-    // (1) GRANTED forge_push (D3 cap) + both branches born → OpenPr emitted.
-    let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
-    let (mut m, run_id) = awaiting_run_with_forge(&granted);
+    let registry = registry(&["bot"]);
+    let (mut m, run_id) = awaiting_run_with_forge(&registry);
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main");
     let oid = "1a".repeat(20);
-    let granted_facets = serde_json::json!({
+    let facets = serde_json::json!({
         "workspace_receipt": {
             "source_prefix": "forge:app",
             "source_snapshot": "2b".repeat(20),
@@ -105,7 +135,7 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", granted_facets))),
+        &result_event(&run_id, Ok(runner_wrapper("done", facets))),
     )
     .unwrap();
     let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
@@ -124,43 +154,26 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
             target_branch: "main".into(),
         }
     );
-
-    // (2) NO forge_push cap → degrade to a breadcrumb, no forge op, no abort.
-    let ungranted = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    let (mut m2, run_id2) = awaiting_run_with_forge(&ungranted);
-    let mut ctx2 = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&ungranted)
-        .with_transcript("general", transcript(2))
-        .with_forge_ref("app", "agent/x");
-    exec(
-        &mut m2,
-        &mut ctx2,
-        &result_event(&run_id2, Ok(runner_wrapper("done", sink))),
-    )
-    .unwrap();
-    assert!(
-        ctx2.msgs.iter().all(|m| m.target != "forge"),
-        "no cap → no forge op"
-    );
-    assert!(
-        ctx2.events
-            .iter()
-            .any(|e| String::from_utf8_lossy(&e.payload).contains("lacks forge_push")),
-        "the breadcrumb names the missing cap"
-    );
-    assert_eq!(
-        ctx2.chat_msgs().len(),
-        1,
-        "the run still delivers its message"
-    );
 }
 
 #[test]
 fn pr_sink_with_empty_required_fields_degrades_without_emitting_forge_op() {
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let registry = registry(&["bot"]);
     let (mut m, run_id) = awaiting_run_with_forge(&registry);
+    // this echo's repo/target_branch differ from the canonical committed
+    // sink — re-commit a matching (equally malformed) one so the test
+    // exercises `emit_sink`'s OWN incomplete-sink gate, not #1835's.
+    commit_sink(
+        &mut m,
+        &run_id,
+        WireSink::Pr {
+            repo: String::new(),
+            source_branch: "agent/x".into(),
+            target_branch: String::new(),
+            title: String::new(),
+            body: String::new(),
+        },
+    );
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -206,15 +219,14 @@ fn pr_sink_with_empty_required_fields_degrades_without_emitting_forge_op() {
 
 #[test]
 fn pr_sink_with_a_deleted_source_branch_degrades_without_aborting() {
-    let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
-    let (mut m, run_id) = awaiting_run_with_forge(&granted);
+    let registry = registry(&["bot"]);
+    let (mut m, run_id) = awaiting_run_with_forge(&registry);
     // The host observed a push, but the source branch was deleted before the
     // result settled, so committed Forge no longer exposes the ref.
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2));
     let oid = "1a".repeat(20);
     exec(
@@ -249,12 +261,12 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
     // refs, and a rejected follow-up aborts the whole delivery block — the
     // sink must skip with a breadcrumb instead (R4). repro: the target (e.g.
     // "dev") was deleted after earlier work, then the item is re-mentioned.
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     // source born, target "main" NOT born.
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x");
     let oid = "1a".repeat(20);
@@ -293,18 +305,32 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.run_id, run_id);
-    assert_eq!(rec.pr_number, None);
+    assert_eq!(rec.pr, None);
 }
 
 #[test]
 fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
     // forge rejects an OpenPr whose source and target are the same branch —
     // degrade with a breadcrumb, never emit the aborting op.
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
+    // this echo's target_branch differs from the canonical committed sink's
+    // ("main") — re-commit a matching one so the test exercises
+    // `emit_sink`'s OWN source==target gate, not #1835's.
+    commit_sink(
+        &mut m,
+        &run_id,
+        WireSink::Pr {
+            repo: "app".into(),
+            source_branch: "agent/x".into(),
+            target_branch: "agent/x".into(),
+            title: String::new(),
+            body: String::new(),
+        },
+    );
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x");
     exec(
@@ -338,10 +364,110 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
 }
 
 #[test]
+fn an_echoed_pr_sink_on_a_chain_run_is_refused() {
+    // #1835: the run's dispatch committed NO sink (a plain chat trigger
+    // requests Chain) — an executing node cannot manufacture a PR sink
+    // after the fact by echoing one in its result. delivered as chain, with
+    // the reason in the breadcrumb; the message still delivers normally.
+    let (mut m, registry, run_id) = awaiting_run();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(
+                "done",
+                serde_json::json!({
+                    "sink": {
+                        "mode": "pr",
+                        "repo": "infra",
+                        "source_branch": "release-1.2",
+                        "target_branch": "main",
+                        "title": "",
+                    }
+                }),
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "an echoed sink that was never committed at dispatch must never open a PR"
+    );
+    assert!(
+        breadcrumbs(&ctx)
+            .iter()
+            .any(|note| note.contains(&format!("run {run_id} sink_mismatch"))),
+        "the breadcrumb names the mismatch: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message, just with the sink refused"
+    );
+}
+
+#[test]
+fn a_receipt_whose_output_commit_is_not_the_branch_tip_is_refused() {
+    // #1835: a receipt cannot name a commit the push lane never landed —
+    // `output_commit` must equal forge's COMMITTED tip of the source
+    // branch, not merely be a well-formed oid.
+    let (mut m, registry, run_id) = forge_push_run();
+    let stale_oid = "1a".repeat(20);
+    let real_tip = "2b".repeat(20);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        // the branch IS born, but its committed tip differs from the
+        // receipt's claimed output_commit.
+        .with_forge_tip("app", "agent/x", &real_tip)
+        .with_forge_ref("app", "main");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&stale_oid),
+                false,
+                None,
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "a receipt naming a commit that is not the branch's committed tip must never open a PR"
+    );
+    assert!(
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: output_commit is not forge's committed tip of agent/x"
+        )),
+        "the breadcrumb names the tip mismatch: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message"
+    );
+}
+
+#[test]
 fn malformed_facet_fails_the_run_without_aborting() {
     // sink is not an object → decode_run_result fails → the run fails
     // deterministically (R4), never a delivery-block abort.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let bad = serde_json::json!({
         "ducktape_runner_result": 1,
         "response_text": "hi",
@@ -377,7 +503,7 @@ fn malformed_facet_fails_the_run_without_aborting() {
 
 #[test]
 fn status_failed_overrides_a_present_message() {
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -421,14 +547,7 @@ fn job_finalize_is_a_delivery_receipt_with_output_ref() {
     });
     // the prose carries the task write (the production path — the oracle never
     // lifts effects; a job run with no action would fail validation).
-    let prose = String::from_utf8(response_json(
-        &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
-    ))
-    .unwrap();
+    let prose = String::from_utf8(response_json(&[], vec![create_task("t1", "todo")])).unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -447,6 +566,7 @@ fn job_finalize_is_a_delivery_receipt_with_output_ref() {
         vec![TaskMsg::CreateTask {
             task_id: "t1".into(),
             title: "todo".into(),
+            owner: None,
         }]
     );
     // the finalize payload is a faceted DeliveryReceipt (not a bare response).
@@ -480,12 +600,9 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
     exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
     commit(&mut m);
     let run_id = job_run_id_for("job-1", "duck", 3);
-    let response = agent::encode_response(&AgentResponse {
+    let response = crate::encode_response(&AgentResponse {
         reply_blocks: Vec::new(),
-        actions: vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
+        actions: vec![create_task("t1", "todo")],
         commit_message: Some("x".repeat(JOB_FINALIZE_PAYLOAD_BYTES * 2)),
     });
     let response = String::from_utf8(response).unwrap();
@@ -545,14 +662,7 @@ fn job_finalize_output_ref_carries_forge_coordinates() {
         },
     });
     // the prose carries the action (job runs with no action fail validation).
-    let prose = String::from_utf8(response_json(
-        &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
-    ))
-    .unwrap();
+    let prose = String::from_utf8(response_json(&[], vec![create_task("t1", "todo")])).unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -602,13 +712,12 @@ fn wire_sink_defaults_to_chain_and_decodes_a_present_pr() {
     assert!(decode_run_result(&serde_json::to_vec(&badv).unwrap()).is_err());
 }
 
-/// a registry whose one agent "bot" may chat and push to "app", plus an
-/// awaiting run — the PR-sink happy-path scaffold.
+/// a registry holding the one agent "bot", plus an awaiting run with the
+/// forge sink — the PR-sink happy-path scaffold.
 fn forge_push_run() -> (RunsModule, Registry, String) {
-    let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
-    let (m, run_id) = awaiting_run_with_forge(&granted);
-    (m, granted, run_id)
+    let registry = registry(&["bot"]);
+    let (m, run_id) = awaiting_run_with_forge(&registry);
+    (m, registry, run_id)
 }
 
 /// Re-key the lightweight sink fixture as a real Forge issue run. Composition
@@ -675,15 +784,15 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
     // body = the whole response facet + receipt breadcrumb (run id,
     // branch@oid, executing node). The Pages-style receipt must not become
     // publication metadata.
-    let (mut m, granted, fixture_run_id) = forge_push_run();
+    let (mut m, registry, fixture_run_id) = forge_push_run();
     let run_id = bind_run_to_forge_issue(&mut m, &fixture_run_id, 7);
     let oid = "1a".repeat(20);
     let saga_id = sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run_id));
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
-        .with_transcript("general", transcript(2))
+        .with_registry(&registry)
+        .with_transcript("forge:app:7", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main")
         .with_forge_item(
@@ -722,12 +831,11 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
             target_branch: "main".into(),
         }
     );
-    // the delivered-runs ring observes the same delivery: the forge
-    // output ref and the number the fresh OpenPr gets (issue #7 → PR #8).
+    // The pushed ref is committed, but the proposed PR has no number yet.
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
-    assert_eq!(rec.pr_number, Some(8));
+    assert_eq!(rec.pr, None);
     assert_eq!(rec.executing_node, "ab".repeat(32));
 }
 
@@ -735,12 +843,12 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
 fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
     // the duplicate-PR guard: an OPEN PR whose source branch matches the
     // sink's ⇒ no OpenPr — the branch update WAS the feedback.
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let oid = "1a".repeat(20);
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
@@ -768,14 +876,20 @@ fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
         "the breadcrumb names the updated PR: {:?}",
         breadcrumbs(&ctx)
     );
-    // the ring records the guard-found PR as this run's pr_number.
+    // the ring records the guard-found PR, repo and number, as this run's PR.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, Some(4));
+    assert_eq!(
+        recent_runs(&m)[0].pr,
+        Some(PrRef {
+            repo: "app".into(),
+            number: 4
+        })
+    );
 }
 
 #[test]
 fn pr_sink_rejects_a_commit_pushed_to_another_repository() {
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let oid = "1a".repeat(20);
     let receipt = serde_json::json!({
         "source_prefix": "forge:other",
@@ -790,7 +904,7 @@ fn pr_sink_rejects_a_commit_pushed_to_another_repository() {
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main");
@@ -827,11 +941,11 @@ fn pr_sink_rejects_a_commit_pushed_to_another_repository() {
 fn pr_sink_never_updates_an_existing_pr_when_nothing_was_pushed() {
     // A stale source ref and open PR are not publication evidence. output:none
     // remains chat/history-only and must not be reported as a PR update.
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
@@ -851,11 +965,11 @@ fn pr_sink_never_updates_an_existing_pr_when_nothing_was_pushed() {
     );
 
     // guard hit + a commit_error receipt: the workspace commit failed.
-    let (mut m2, granted2, run_id2) = forge_push_run();
+    let (mut m2, registry2, run_id2) = forge_push_run();
     let mut ctx2 = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted2)
+        .with_registry(&registry2)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
@@ -889,13 +1003,13 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
     // a CLOSED PR on the same source, an open PR on another source, and an
     // open issue are all non-hits: OpenPr fires (re-proposing existing work
     // after a PR was closed is intended).
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let mut closed = forge_pr(3, "closed", "", "agent/x", "main");
     closed.summary.state = forge::ItemState::Closed;
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main")
@@ -923,21 +1037,20 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
         1,
         "no open PR matches the source — OpenPr fires"
     );
-    // the ring records the number the fresh OpenPr gets: committed max
-    // item number (issue 6) + 1.
+    // A later program call decides whether to open a PR and allocates its id.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, Some(7));
+    assert_eq!(recent_runs(&m)[0].pr, None);
 }
 
 #[test]
 fn output_none_with_a_born_stale_branch_never_opens_a_pr_from_response_prose() {
     // Regression for #102: a review-only output:none result can carry general
     // response prose and point at an old born branch, but neither is a commit.
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main");
@@ -965,12 +1078,12 @@ fn output_none_with_a_born_stale_branch_never_opens_a_pr_from_response_prose() {
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, None);
-    assert_eq!(rec.pr_number, None);
+    assert_eq!(rec.pr, None);
 }
 
 #[test]
 fn a_late_commit_for_a_merged_anchor_stays_chat_and_history_only() {
-    let (mut m, granted, fixture_run_id) = forge_push_run();
+    let (mut m, registry, fixture_run_id) = forge_push_run();
     let run_id = bind_run_to_forge_issue(&mut m, &fixture_run_id, 7);
     let mut merged = forge_pr(7, "Already merged", "", "agent/x", "main");
     merged.summary.state = forge::ItemState::Merged;
@@ -979,7 +1092,7 @@ fn a_late_commit_for_a_merged_anchor_stays_chat_and_history_only() {
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main")
@@ -1004,16 +1117,16 @@ fn a_late_commit_for_a_merged_anchor_stays_chat_and_history_only() {
         "run {run_id} pr sink skipped: bound Forge item is merged"
     )));
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, None);
+    assert_eq!(recent_runs(&m)[0].pr, None);
 }
 
 #[test]
 fn a_success_result_arriving_after_cancellation_cannot_publish() {
-    let (mut m, granted, run_id) = forge_push_run();
+    let (mut m, registry, run_id) = forge_push_run();
     let mut cancelled = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_transcript("general", transcript(2));
     exec(
         &mut m,
@@ -1027,7 +1140,7 @@ fn a_success_result_arriving_after_cancellation_cannot_publish() {
     let mut late = CaptureCtx::new()
         .at(9)
         .with_dispatch_origin()
-        .with_registry(&granted)
+        .with_registry(&registry)
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main");
     exec(
@@ -1063,8 +1176,12 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // pin the executing-node lookup's saga-id mirror against the REAL
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
-    let mut d =
-        dispatch::DispatchModule::new("dispatch", "saga", Box::new(sdk_testkit::MemStore::new()));
+    let mut d = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+    );
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,
@@ -1128,4 +1245,295 @@ fn workspace_receipt_mirror_decodes_the_forge_fields() {
         .workspace_receipt;
     assert_eq!(receipt.branch, None);
     assert_eq!(receipt.output_commit, None);
+}
+
+// ---- forge.open_pr: the run's own proposal ------------------------------------
+
+/// a module wired with the forge sink and one CHAT-origin run for "bot"
+/// (a Chain sink, a duckfs workspace): the run that pushed a branch through
+/// the transport and proposes it.
+fn chat_run_with_forge_push() -> (RunsModule, Registry, String) {
+    let registry = registry(&["bot"]);
+    let mut m = module().with_sink_forge("forge");
+    m.models = registry.clone();
+    commit(&mut m);
+    request_post(&mut m, &registry, 2, &[]);
+    commit(&mut m);
+    (m, registry, run_id_for("general", 2, "bot"))
+}
+
+#[test]
+fn a_forge_open_pr_from_a_chat_run_opens_the_pr_with_the_runs_breadcrumb() {
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["pushed the poem"],
+                vec![forge_open_pr(
+                    "app",
+                    "chiefduck/poem",
+                    "dev",
+                    "Add the poem",
+                    "A poem, as asked.",
+                )],
+            )),
+        ),
+    )
+    .unwrap();
+    let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+    assert_eq!(forge_ops.len(), 1, "one OpenPr proposed");
+    // the model's title and prose, then the run's breadcrumb: a duckfs
+    // receipt has no forge output line, and no saga is seeded.
+    assert_eq!(
+        forge::decode_msg(&forge_ops[0].payload).unwrap(),
+        forge::ForgeMsg::OpenPr {
+            repo: "app".into(),
+            title: "Add the poem".into(),
+            body: format!(
+                "A poem, as asked.\n\n---\nrun: {run_id}\noutput: none (no changes this run)\nnode: unknown"
+            ),
+            source_branch: "chiefduck/poem".into(),
+            target_branch: "dev".into(),
+        }
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run's reply still posts");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
+}
+
+#[test]
+fn a_forge_open_pr_with_fields_forge_would_reject_fails_the_response_not_the_block() {
+    // forge rejects identical branches, an empty title and an over-cap
+    // title; each would abort the delivery block at apply, so each fails the
+    // response by name here.
+    for (source, target, title, reason) in [
+        ("dev", "dev", "Same branch", "same branch"),
+        ("chiefduck/poem", "dev", "   ", "non-empty title"),
+        ("chiefduck/poem", "dev", &"t".repeat(257), "the cap is 256"),
+    ] {
+        let (mut m, registry, run_id) = chat_run_with_forge_push();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "chiefduck/poem")
+            .with_forge_ref("app", "dev");
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(response(
+                    &["done"],
+                    vec![forge_open_pr("app", source, target, title, "")],
+                )),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.notes().iter().any(|n| n.contains(reason)),
+            "{reason}: {:?}",
+            ctx.notes()
+        );
+        assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+        commit(&mut m);
+        assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+    }
+}
+
+#[test]
+fn two_forge_open_pr_of_one_branch_fail_the_response() {
+    // every duplicate probe at delivery reads committed state, so the second
+    // proposal of a branch is refused where the response is validated.
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![
+                    forge_open_pr("app", "chiefduck/poem", "dev", "Add the poem", ""),
+                    forge_open_pr("app", "chiefduck/poem", "main", "Add it again", ""),
+                ],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("proposes app branch chiefduck/poem twice")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+}
+
+#[test]
+fn a_forge_open_pr_of_a_branch_already_under_an_open_pr_links_that_pr() {
+    // the duplicate-PR guard: the push updated the open PR, which becomes the
+    // run's link; no second OpenPr.
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev")
+        .with_forge_item(
+            "app",
+            forge_pr(7, "Add the poem", "", "chiefduck/poem", "dev"),
+        );
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![forge_open_pr(
+                    "app",
+                    "chiefduck/poem",
+                    "dev",
+                    "Add the poem",
+                    "",
+                )],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"), "no second PR");
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("forge.open_pr: updated PR #7")),
+        "{:?}",
+        ctx.notes()
+    );
+    commit(&mut m);
+    assert_eq!(
+        recent_runs(&m)[0].pr,
+        Some(PrRef {
+            repo: "app".into(),
+            number: 7
+        })
+    );
+}
+
+#[test]
+fn a_forge_open_pr_of_an_unborn_target_degrades_without_aborting() {
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![forge_open_pr(
+                    "app",
+                    "chiefduck/poem",
+                    "dev",
+                    "Add the poem",
+                    "",
+                )],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("forge.open_pr skipped: target branch dev not born")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its reply");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
+}
+
+#[test]
+fn a_forge_open_pr_of_the_sinks_own_branch_is_the_sinks_pr() {
+    // a forge-item run whose committed sink already proposes agent/x: the
+    // model's own proposal of that branch is the sink's PR, so exactly one
+    // OpenPr leaves, with the sink's derived title.
+    let (mut m, registry, run_id) = forge_push_run();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
+    let oid = "1a".repeat(20);
+    let facets = serde_json::json!({
+        "workspace_receipt": {
+            "source_prefix": "forge:app",
+            "source_snapshot": "2b".repeat(20),
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": false,
+            "branch": "agent/x",
+            "output_commit": oid,
+        },
+        "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main"},
+    });
+    let prose = String::from_utf8(response_json(
+        &["done"],
+        vec![forge_open_pr("app", "agent/x", "main", "My own title", "")],
+    ))
+    .unwrap();
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(runner_wrapper(&prose, facets))),
+    )
+    .unwrap();
+    let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+    assert_eq!(forge_ops.len(), 1, "the sink's OpenPr, and no second one");
+    let forge::ForgeMsg::OpenPr { title, .. } = forge::decode_msg(&forge_ops[0].payload).unwrap()
+    else {
+        panic!("an OpenPr")
+    };
+    assert_eq!(
+        title, "done",
+        "the sink derives the title; the proposal is skipped"
+    );
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("the run's committed sink already proposes agent/x")),
+        "{:?}",
+        ctx.notes()
+    );
 }

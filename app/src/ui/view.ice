@@ -18,7 +18,6 @@ view
           wallet_selected=hub_wallet_selected
           networks=hub_networks
           selected=hub_selected
-          hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
           steps=provision_steps
@@ -26,10 +25,12 @@ view
           height=block_height
           tier=member_tier(members_rows)
           error=onboarding_error
-          busy=mutation_busy
+          busy=hub_busy
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          drag_launch_window -> drag_launch_window
+          close_launch_window -> close_launch_window
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -47,14 +48,12 @@ view
           restore_submit -> restore_submit _ _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
-          forget_network_submit -> forget_network_submit _ _
+          forget_network_submit -> forget_network_submit _
           go_join -> go_join
           go_networks -> go_networks
-          go_wallets -> go_wallets
           join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
-          restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
         restore_phrase:
           input "" #restore-words <-> restore_words
@@ -87,7 +86,7 @@ view
             disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
-    // docks (see `window_was_closed`); leaving the huddle closes it.
+    // only closes it (see `window_was_closed`); leaving the huddle closes it too.
     if huddle_win == some(window)
       HuddlePanel #huddle
         with
@@ -101,7 +100,6 @@ view
           stage=huddle_stage
           video_live=call_video_live
         events
-          dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
@@ -119,9 +117,9 @@ view
           tab=shell_tab
           bell_count=bell_unread
           bell_sev=bell_worst_severity(bell_items)
-          approvals=open_proposals(gov_rows)
+          approvals=gov_open
           account=account_name
-          agent_live=any_agent_active(agents_rows)
+          agent_live=agents_live
           tier=member_tier(members_rows)
           answered=members_answered
           root_hash=node_root_hash
@@ -184,464 +182,81 @@ view
                         @text-fg
                     button "Dismiss" -> dismiss_error
                       with
-                        h=26.0
                         p=5.0
                         @ghost_action
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
+        // Chat is a MODULE-OWNED VIEW: the facts go in as props — the mutation
+        // lock as a flag, the enums by name — and every act comes back as an
+        // intent the handler signs. The drafts are the view's; the composers
+        // are host surfaces the view leaves slots for (module_view.rs).
         chat:
-          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
-            with
-              endpoint=connected_rpc
-              network_name
-              network_chain_id
-              status
-              block_height
-              search_phase=chat_search_phase
-              search_query=chat_search_query
-              search_hits=chat_search_hits
-              rooms
-              dm_rows
-              channel_create_open
-              connected
-              loading
-              mutation_phase
-              active_channel
-              active_dm_peer
-              active_dm
-              active_channel_name
-              active_channel_archived
-              active_channel_members_only
-              channel_members
-              post_refusal
-              huddle_joined
-              huddle_channel
-              huddle_channel_name
-              huddle_joined_at
-              huddle_now
-              call_muted
-              huddle_popped
-              messages
-              has_older_history
-              history_view
-              history_loading
-              unread_boundary
-              unread_marker_seq
-              selected_message_seq
-              selected_message_rev
-              message_action
-              channel_settings_open
-              active_thread_seq
-              thread_target_seq
-              thread_messages
-              thread_selected_seq
-              thread_selected_rev
-              thread_message_action
-              thread_has_more
-              thread_next_reply_seq
-              thread_loading
-            events
-              search_chat_submit -> search_chat_submit
-              clear_chat_search -> clear_chat_search
-              open_chat_search_hit -> open_chat_search_hit _ _ _
-              toggle_channel_create -> toggle_channel_create
-              choose_channel -> choose_channel _
-              choose_dm -> choose_dm _
-              toggle_channel_settings -> toggle_channel_settings
-              pop_huddle -> pop_huddle
-              focus_huddle -> focus_huddle
-              leave_huddle_here -> leave_huddle_here
-              huddle_go_channel -> huddle_go_channel
-              join_huddle_submit -> join_huddle_submit
-              load_more_history -> load_more_history
-              chat_scrolled -> chat_scrolled _ _ _ _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
-              copy_message_link -> copy_message_link _
-              add_reaction_at -> add_reaction_at _ _
-              remove_reaction_at -> remove_reaction_at _ _
-              open_thread_for -> open_thread_for _
-              open_message_actions -> open_message_actions _ _ _
-              open_message_reactions -> open_message_reactions _ _ _
-              begin_message_edit -> begin_message_edit _ _ _
-              arm_message_delete -> arm_message_delete _ _ _
-              clear_message_selection -> clear_message_selection
-              add_reaction_submit -> add_reaction_submit _
-              edit_message_submit -> edit_message_submit
-              delete_message_submit -> delete_message_submit
-              composer_submitted -> composer_submitted _ _ _
-              rename_channel_submit -> rename_channel_submit
-              archive_channel_submit -> archive_channel_submit
-              unarchive_channel_submit -> unarchive_channel_submit
-              add_channel_member_submit -> add_channel_member_submit
-              remove_channel_member_submit -> remove_channel_member_submit _
-              close_thread -> close_thread
-              open_thread_message_actions -> open_thread_message_actions _ _ _
-              open_thread_message_reactions -> open_thread_message_reactions _ _ _
-              begin_thread_message_edit -> begin_thread_message_edit _ _ _
-              arm_thread_message_delete -> arm_thread_message_delete _ _ _
-              clear_thread_message_selection -> clear_thread_message_selection
-              edit_thread_message_submit -> edit_thread_message_submit
-              delete_thread_message_submit -> delete_thread_message_submit
-              load_more_thread -> load_more_thread
+          extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial, live_agents) #chat -> chat_view_event _
 
-        shell:
-          ShellScreen draft<->shell_chat_draft #shell
-            with
-              surface=shell_surface
-              setup_open=shell_setup_open
-              identity_options=shell_identity_options
-              identity=shell_identity
-              provider=shell_provider
-              credential=shell_credential
-              host_node_options=shell_host_node_options
-              host_node=shell_host_node
-              credentials_loading=shell_credentials_loading
-              terminal=shell_terminal
-              terminal_running=shell_terminal_running
-              terminal_busy=shell_terminal_busy
-              terminal_title=shell_terminal_title
-              terminal_error=shell_terminal_error
-              entries=shell_chat_entries
-              activity=shell_chat_activity
-              chat_busy=shell_chat_busy
-              chat_status=shell_chat_status
-              chat_detail=shell_chat_detail
-              live=shell_chat_live
-              saga_id=shell_chat_saga
-              steps_open=shell_steps_open
-              detached_saga=shell_detached_saga
-              connected
-              dark
-            events
-              shell_surface_changed -> shell_surface_changed _
-              shell_setup_toggled -> shell_setup_toggled
-              shell_identity_changed -> shell_identity_changed _
-              shell_host_node_changed -> shell_host_node_changed _
-              shell_credentials_refresh -> shell_credentials_refresh
-              shell_terminal_start -> shell_terminal_start
-              shell_terminal_stop -> shell_terminal_stop
-              shell_composer_event -> shell_composer_event _
-              shell_chat_reset -> shell_chat_reset
-              shell_chat_detach -> shell_chat_detach
-              shell_chat_reopen -> shell_chat_reopen
-              shell_chat_discard -> shell_chat_discard
-              shell_chat_steps_toggled -> shell_chat_steps_toggled _
-              shell_open_link -> open_message_link _
-
+        // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
+        // strip and the comments rail go in as props; the document is the
+        // app's editor, painted into the view's slot by the host.
         pages:
-          PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
-            with
-              network_chain_id
-              pages
-              page_create_open
-              loading
-              mutation_phase
-              connected
-              connected_rpc
-              password
-              dark
-              active_page
-              active_page_title
-              active_page_parent
-              page_searching
-              page_search_hits
-              page_search_query
-              page_delete_armed
-              block_autosave_status
-              page_refusal
-              doc_tabs
-              blocks
-              commented_block_hits
-              caret_comment_target
-              active_thread_target
-              active_thread_anchor
-              orphaned_comment_drafts
-              block_comments_open
-              block_comment_thread_total
-              block_comment_threads
-              block_comment_rows
-              block_comment_threads_loading
-              block_comment_threads_has_more
-              active_block_comment_thread
-              block_thread_comments
-              block_thread_comments_loading
-              block_thread_comments_has_more
-            events
-              toggle_page_create -> toggle_page_create
-              create_page_submit -> create_page_submit
-              choose_page -> choose_page _
-              search_pages_submit -> search_pages_submit
-              clear_page_search -> clear_page_search
-              arm_page_delete -> arm_page_delete
-              disarm_page_delete -> disarm_page_delete
-              delete_page_submit -> delete_page_submit
-              close_doc_tab -> close_doc_tab _
-              open_page_search_hit -> open_page_search_hit _ _
-              use_orphaned_comment_draft -> use_orphaned_comment_draft _
-              discard_orphaned_comment_draft -> discard_orphaned_comment_draft _
-              page_edited -> page_edited _
-              toggle_block_comments -> toggle_block_comments
-              close_block_comments -> close_block_comments
-              open_block_comment_thread -> open_block_comment_thread _ _
-              load_more_block_threads -> load_more_block_threads
-              close_block_comment_thread -> close_block_comment_thread
-              load_more_block_comments -> load_more_block_comments
-              post_block_comment_submit -> post_block_comment_submit
-              resolve_thread_submit -> resolve_thread_submit _
-              copy_to_clipboard -> copy_to_clipboard _ _
+          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
+        // Files is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the chain among them, because a draft belongs to the
+        // network it was read on — and the view lists the directory, reads
+        // the preview and the history, and writes through `op.submit` for
+        // itself. The pictures, the highlighted reader and the Markdown
+        // document are the app's surfaces, painted into the slots it leaves.
         files:
-          FilesScreen new_name<->fs_new_name draft<->fs_editor
-            with
-              path=fs_path
-              // Do the rows on hand describe the path in the crumb? Every
-              // reading of `entries` on that screen is gated on this.
-              listed=(fs_listed_path == fs_path)
-              entries=fs_entries
-              directories=fs_directories(fs_entries)
-              connected
-              loading=fs_loading
-              preview_path=fs_preview_path
-              preview_entry=fs_preview_entry
-              delete_target=fs_delete_target
-              diff_from=fs_diff_from
-              diff=fs_diff
-              history=fs_history
-              preview_truncated=fs_preview_truncated
-              preview_binary=fs_preview_binary
-              editing=fs_editing
-              preview_text=fs_preview_text
-              preview_picture=fs_preview_picture
-              preview_width=fs_preview_width
-              preview_height=fs_preview_height
-              dark
-            events
-              open_message_link -> open_message_link _
-              fs_open_dir -> fs_open_dir _
-              fs_open_file -> fs_open_file _
-              fs_open_parent -> fs_open_parent
-              fs_new_name_changed -> fs_new_name_changed _
-              fs_mkdir_submit -> fs_mkdir_submit
-              fs_new_file_submit -> fs_new_file_submit
-              fs_arm_delete -> fs_arm_delete _
-              fs_disarm_delete -> fs_disarm_delete
-              fs_delete_submit -> fs_delete_submit
-              fs_close_diff -> fs_close_diff
-              fs_show_diff -> fs_show_diff _
-              fs_begin_edit -> fs_begin_edit
-              fs_cancel_edit -> fs_cancel_edit
-              fs_save_edit -> fs_save_edit
+          extern files_view(dark, connected, network_chain_id, fs_route, fs_route_serial) #files -> files_view_event _
+        // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads the roster off the node itself and
+        // writes through `op.submit` (signed with the seated key). The
+        // app's own `members_rows` stays — it is the SESSION fact of who
+        // this node is on this network, which the rail, the forge gate and
+        // the approvals gate all read.
         members:
-          MembersScreen #members
-            with
-              rows=members_rows
-              admin=members_is_admin(members_rows)
-              connected
-              answered=members_answered
-            events
-              copy_to_clipboard -> copy_to_clipboard _ _
-              agent_set_status -> agent_set_status _ _
-              gov_propose -> gov_propose _ _
+          extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
-          AgentsScreen rows=agents_rows connected answered=agents_answered #agents
+          // Agents is a VIEW ON THE KERNEL CONTRACT: session facts go in —
+          // the signing account and the run another tab opened for the
+          // reader — and the view reads its own register and signs its own
+          // writes through `op.submit`. What comes back is its working
+          // count, a registration, and two navigations.
+          extern agents_view(dark, connected, account_number, agents_open_run, agents_opened) #agents -> agents_view_event _
+        // Forge is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the network's name and chain id, the endpoint, and the
+        // `duck://forge/...` the open plane routed here — and the view reads
+        // its repos, tracker, patches, reviews, discussion and code browse
+        // itself, writing through `op.submit`. What comes back is a
+        // clipboard write, a link to open, or a note written in the host
+        // composer it docked over the item's own channel.
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
-            with
-              org=network_name
-              about=account_bio
-              network_chain_id
-              connected_rpc
-              tier=member_tier(members_rows)
-              repos=forge_repos
-              list_phase=forge_list_phase
-              open_repo=forge_repo
-              repo_menu=forge_repo_menu
-              repo_phase=forge_repo_phase
-              branches=forge_branches
-              tab=forge_tab
-              items=forge_items
-              forge_item_number
-              item_phase=forge_item_phase
-              forge_item_kind
-              forge_item_title
-              forge_item_state
-              forge_item_author
-              forge_item_branches
-              forge_item_body
-              forge_item_blocks
-              forge_item_files_changed
-              forge_item_additions
-              forge_item_deletions
-              forge_item_diff
-              forge_item_diff_truncated
-              forge_item_merge_oid
-              forge_item_source_oid
-              forge_item_channel
-              forge_item_approvals
-              forge_item_change_requests
-              forge_item_reviews
-              merge_conflicts=forge_merge_conflicts
-              merge_busy=forge_merge_busy
-              review_verdict=forge_review_verdict
-              review_busy=forge_review_busy
-              comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
-              staged_comments=forge_comment_staged
-              discussion=forge_discussion
-              discussion_pending=forge_discussion_pending
-              linked_note=forge_linked_note
-              connected
-              loading
-              dark
-            events
-              forge_open_repo -> forge_open_repo _
-              forge_close_repo -> forge_close_repo
-              forge_toggle_repo_menu -> forge_toggle_repo_menu
-              select_forge_tab -> select_forge_tab _
-              forge_open_item -> forge_open_item _
-              forge_close_item -> forge_close_item
-              forge_merge_submit -> forge_merge_submit
-              forge_review_pick -> forge_review_pick _
-              forge_review_submit -> forge_review_submit
-              forge_comment_open -> forge_comment_open _ _ _
-              forge_comment_stage -> forge_comment_stage
-              forge_comment_cancel -> forge_comment_cancel
-              forge_comment_drop -> forge_comment_drop _
-              note_composer_event -> forge_composer_event _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
+          extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_link, forge_link_tick) #forge -> forge_view_event _
+        // Approvals is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads its own register and writes through
+        // `op.submit` (signed with the seated key), and the one event back
+        // is the tab badge — the guest sees no key and no endpoint.
         governance:
-          GovernanceScreen #governance
-            with
-              rows=gov_rows
-              voting=gov_voting
-              admin=members_is_admin(members_rows)
-              connected
-              answered=gov_answered
-            events
-              gov_vote -> gov_vote _ _
-              gov_execute -> gov_execute _
+          extern governance_view(dark, connected, members_is_admin(members_rows)) #governance -> governance_view_event _
+        // Node is a MODULE-OWNED VIEW too: the facts the app holds go in as
+        // props; the tab, the log filter and a clipboard copy come back as
+        // intents. The live log ring stays native — the view leaves a slot
+        // the app paints from `node_log_timeline` (module_view.rs).
         node:
-          NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
-            with
-              node_key
-              node_data_dir
-              members_rows
-              status
-              loading
-              node_tab
-              module_rows
-              node_height
-              node_checkpoint
-              node_last_finalized
-              node_reachable_label
-              node_quorum_label
-              node_version
-              node_root_hash
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-              node_phase_since
-              node_sync_retries
-              node_sync_failures
-              node_sync_last_error
-              node_peers
-            events
-              select_node_tab -> select_node_tab _
-              open_node_modules -> open_node_modules
-              node_log_filter_changed -> node_log_filter_changed _
-              copy_to_clipboard -> copy_to_clipboard _ _
-            activity_log:
-              extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
+          extern node_view(dark, connected, members_is_admin(members_rows), member_tier(members_rows), status, loading, module_rows, node_key, node_data_dir, node_height, node_checkpoint, node_last_finalized, node_reachable_label, node_quorum_label, node_version, node_root_hash, sync_label(node_phase, node_sync_applied, node_sync_target), node_phase_since, node_sync_retries, node_sync_failures, node_sync_last_error, node_peers, wall_now, node_log_timeline, connected_rpc) #node -> node_view_event _
+        // Settings is a MODULE-OWNED VIEW too: the facts go in as props — the
+        // signing seat as a flag, never the password — and every act comes
+        // back as an intent the handler signs. The drafts are the view's.
         settings:
-          SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
-            with
-              account_name
-              network_name
-              connected_rpc
-              account_ceremony_phase
-              account_ceremony_qr
-              account_ceremony_detail
-              account_ceremony_left
-              settings_key_state
-              settings_key_path
-              settings_open_tabs
-              members_rows
-              members_answered
-              account_number
-              account_renaming
-              account_exists
-              account_keys
-              account_key_rows
-              account_busy
-              account_ticket
-              appearance
-              password
-              status
-              loading
-              connected
-              mutation_phase
-            events
-              select_shell_tab -> select_shell_tab _
-              reconnect -> reconnect
-              account_name_draft_changed -> account_name_draft_changed _
-              account_rename_submit -> account_rename_submit
-              account_create_draft_changed -> account_create_draft_changed _
-              account_create_submit -> account_create_submit
-              account_key_draft_changed -> account_key_draft_changed _
-              account_key_label_draft_changed -> account_key_label_draft_changed _
-              account_key_add_submit -> account_key_add_submit
-              account_join_draft_changed -> account_join_draft_changed _
-              account_key_join_submit -> account_key_join_submit
-              account_key_remove -> account_key_remove _
-              account_passkey_submit -> account_passkey_submit
-              account_passkey_desktop -> account_passkey_desktop
-              account_ceremony_cancel -> account_ceremony_cancel
-              account_wallet_submit -> account_wallet_submit
-              account_login_submit -> account_login_submit
-              copy_to_clipboard -> copy_to_clipboard _ _
-              settings_clear_tabs -> settings_clear_tabs
-              switch_network -> switch_network
-              settings_unlock_submit -> settings_unlock_submit _
-              lock_session -> lock_session
-              forget_workspace_submit -> forget_workspace_submit
-              set_appearance_light -> set_appearance_light
-              set_appearance_dark -> set_appearance_dark
+          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
+        // The Explorer is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in — the live head and the sync line among them, because
+        // they are the titlebar's own readings and a second source would
+        // disagree with it — and the view reads the block window and runs its
+        // workspace search through the kernel. A clipboard copy is the one
+        // intent that comes back.
         explorer:
-          ExplorerScreen #explorer(connected_rpc)
-            with
-              connected_rpc
-              connected
-              loading=explorer_loading
-              blocks=explorer_blocks
-              ops=explorer_ops
-              head=block_height
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-            events
-              refresh_explorer -> refresh_explorer
-              copy_to_clipboard -> copy_to_clipboard _ _
-        huddle:
-          box
-            with
-              w=fill
-              h=fill
-              align-x=end
-              align-y=end
-              pr=16.0
-              pb=16.0
-            col
-              // The pill says "you are still in a call elsewhere". It hides while
-              // the huddle has its own window, and where the live pill in the
-              // channel header already says so — the Chat tab, looking at the
-              // huddle's own channel. On every OTHER screen it must show even
-              // when that channel is the selected one, which the missing
-              // `shell_tab` term used to suppress.
-              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
-                HuddleDockedPill
-                  with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                  events
-                    pop_huddle -> pop_huddle
+          extern explorer_view(dark, connected, block_height, sync_label(node_phase, node_sync_applied, node_sync_target)) #explorer -> explorer_view_event _
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with
@@ -733,12 +348,11 @@ view
                               wrap=none
                               @text-meta
                         space w=fill
-                        button "Mark all read" -> mark_bell_read_submit
+                        button "Mark all read" #mark-bell-read -> mark_bell_read_submit
                           with
-                            disabled=(bell_unread <= 0)
-                            h=22.0
+                            disabled=(bell_unread <= 0 || bell_marking)
                             p=4.0
-                            @ghost_action
+                            @ghost_action text-11px leading-snug font-medium
                           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                           hovered bg=elevated text=brand
                           pressed bg=subtle text=brand
@@ -748,24 +362,34 @@ view
                         h=1.0
                         bg=separator
                       space w=1.0 h=1.0
-                    if empty(bell_items)
+                    if !empty(bell_error)
+                      col gap=4.0 p=9.0
+                        text bell_error size=12.0 @text-danger
+                        button "Retry" @ghost_action -> reload_bell
+                    if empty(bell_visible_items(bell_items, account_number, settings_user_key))
                       box
                         with
                           w=fill
                           p=26.0
                           align-x=center
                         text "Nothing yet — mentions and deliveries land here." size=12.0 @text-meta
-                    if !empty(bell_items)
+                    if !empty(bell_visible_items(bell_items, account_number, settings_user_key))
                       scroll
                         with
                           dir=vertical
                           w=fill
                           h=290.0
                           anchor-y=keep
-                        keyed item in bell_items by=item.seq
+                        keyed item in bell_visible_items(bell_items, account_number, settings_user_key) by=item.seq
                           with
-                            virtual-row=58.0
                             w=fill
                             p=5.0
                             gap=1.0
-                          BellRow item=item
+                          button #open-notification -> bell_open_item(connect_generation, account_number, bell_presentation(item, bell_presentations))
+                            with
+                              label=bell_label(item, bell_presentations)
+                              w=fill
+                              p=0.0
+                              disabled=!bell_openable(item, bell_presentations)
+                              @ghost_action
+                            BellRow item=item context=bell_presentation(item, bell_presentations)

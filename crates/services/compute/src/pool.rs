@@ -339,35 +339,42 @@ impl DispatchPool {
                 let attempt_owner = attempt_guard;
                 let admission = {
                     let admission = async {
-                        let reservation = match job.admission {
-                            AdmissionPolicy::Queue => {
-                                let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
-                                let Some(reservation) = ledger
-                                    .reserve_when_available(
-                                        &reservation_key,
-                                        &job.demands,
-                                        &cancellation,
-                                    )
-                                    .await
-                                else {
-                                    return Err(
-                                        "attempt cancelled while waiting for resources".into()
-                                    );
-                                };
-                                reservation
-                            }
-                            AdmissionPolicy::FailFast => {
-                                let mut attempts = inflight.lock().expect("attempts lock");
-                                let Some(running) = attempts.get_mut(&key) else {
+                        // `run()` already stashed a converted Accept claim (or a
+                        // FailFast reservation) on the attempt before spawning;
+                        // only a job with neither — a directly pinned lease that
+                        // was never announced — waits for capacity here.
+                        let already_reserved = {
+                            let mut attempts = inflight.lock().expect("attempts lock");
+                            attempts
+                                .get_mut(&key)
+                                .and_then(|running| running.reservation.take())
+                        };
+                        let reservation = match already_reserved {
+                            Some(reservation) => reservation,
+                            None => match job.admission {
+                                AdmissionPolicy::Queue => {
+                                    let reservation_key =
+                                        format!("{}:{}", job.saga_id, job.attempt);
+                                    let Some(reservation) = ledger
+                                        .reserve_when_available(
+                                            &reservation_key,
+                                            &job.demands,
+                                            &cancellation,
+                                        )
+                                        .await
+                                    else {
+                                        return Err(
+                                            "attempt cancelled while waiting for resources".into(),
+                                        );
+                                    };
+                                    reservation
+                                }
+                                AdmissionPolicy::FailFast => {
                                     return Err(
                                         "attempt disappeared before resource admission".into()
                                     );
-                                };
-                                running
-                                    .reservation
-                                    .take()
-                                    .expect("fail-fast reservation is acquired before spawn")
-                            }
+                                }
+                            },
                         };
                         {
                             let mut attempts = inflight.lock().expect("attempts lock");
@@ -612,7 +619,7 @@ async fn settle_attempt(
 /// fail-closed until the late operation settles and cleanup completes. This
 /// prevents host-side storage work from overlapping a replacement beyond the
 /// node's aggregate resource cap. The model call itself is bounded separately
-/// (X3, in capability-host). Tests shrink the window so a late step is
+/// (X3, in the provider). Tests shrink the window so a late step is
 /// observable without a wall-clock minute.
 fn workspace_step_timeout() -> Duration {
     if cfg!(test) {
@@ -644,20 +651,19 @@ async fn execute(
     let sink = plan.sink;
     let spec = WorkspaceSpec {
         run_id: format!("{}:{}", job.saga_id, job.attempt),
-        // the CONSENSUS id, straight from the envelope — the only id that
-        // resolves the run back in `runs`. it is deliberately NOT derived from
-        // the saga id above: that one exists to key the on-disk workspace dir.
-        // Some on every execution spec (the envelope field is required); the
-        // Option is for the receipt-only specs the provisioners mint.
-        consensus_run_id: Some(plan.consensus_run_id),
-        agent_id: ctx.agent_id.clone(),
-        agent_display_name: Some(plan.agent_display_name),
+        agent: Some(crate::AgentExecution {
+            run_id: plan.consensus_run_id,
+            attempt: job.attempt,
+            agent_id: ctx
+                .agent_id
+                .clone()
+                .ok_or("agent execution has no model identity")?,
+            display_name: plan.agent_display_name,
+        }),
         // the tagged source (duckfs subtree or forge repo@commit) crosses to
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
-        // the committed library grant, straight through to the assembler.
-        library_readable: plan.library_readable,
     };
     // (a)+(b) materialize OUTSIDE storage. A late blocking result releases the
     // provider slot, but keeps this attempt's resource admission until cleanup.
@@ -856,7 +862,7 @@ impl Worker for DispatchPool {
                 Ok(WorkOutcome::Handled(None))
             }
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
-            Gated::Execute(job) => {
+            Gated::Execute(mut job) => {
                 let key: AttemptKey = (job.saga_id.clone(), job.attempt);
                 // Insert before spawning so an assigned job that fits total
                 // capacity is retained while it waits for current occupancy.
@@ -875,7 +881,14 @@ impl Worker for DispatchPool {
                     return Ok(WorkOutcome::Handled(None));
                 }
                 let cancellation = RunCancellation::new();
-                let reservation = if job.admission == AdmissionPolicy::FailFast {
+                // A job carrying its own Accept's pending claim converts it
+                // directly — the demands are already reserved, so re-reserving
+                // here would either double-count them or race the window
+                // between the two. Only a job with no claim (FailFast, or a
+                // directly pinned lease that was never announced) reserves now.
+                let reservation = if let Some(claimed) = job.claimed.take() {
+                    Some(claimed)
+                } else if job.admission == AdmissionPolicy::FailFast {
                     let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
                     let Some(reservation) = self.ledger.try_reserve(&reservation_key, &job.demands)
                     else {
@@ -2277,7 +2290,6 @@ format = "text"
                 {"name":"persona","source_prefix":"/shared/skills/persona","always": true},
                 {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32), "always": false}
             ],
-            "library_readable": false,
             "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
@@ -2352,11 +2364,9 @@ format = "text"
                 "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
-                "branch_born": false,
-                "forge_push": true
+                "branch_born": false
             },
             "skills": [],
-            "library_readable": false,
             "result_contract": {
                 "ducktape_runner_result": 1,
                 "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}
@@ -2910,7 +2920,7 @@ format = "text"
         // the SOUL crosses provisioner → RunContext. it is assembled from the
         // MATERIALIZED skill mounts (only the provisioner can read them), so
         // this hop is the only way the persona ever reaches the model —
-        // capability-host then picks the door (the CLI's auto-load file, or a
+        // the provider then picks the door (the CLI's auto-load file, or a
         // prepend to the stdin prompt).
         assert_eq!(
             ctx.context_doc.as_deref(),
@@ -3086,7 +3096,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        let eff = effect_with_payload("s1", 7, Some(b"me"), &forge_envelope_payload());
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
@@ -3095,9 +3105,16 @@ format = "text"
             .unwrap()
             .clone()
             .expect("the spec was captured");
-        assert_eq!(spec.run_id, "s1:0");
-        assert_eq!(spec.agent_id.as_deref(), Some("bot"));
-        assert_eq!(spec.agent_display_name.as_deref(), Some("BOT"));
+        assert_eq!(spec.run_id, "s1:7");
+        assert_eq!(spec.agent.as_ref().unwrap().attempt, 7);
+        assert_eq!(
+            spec.agent.as_ref().map(|agent| agent.agent_id.as_str()),
+            Some("bot")
+        );
+        assert_eq!(
+            spec.agent.as_ref().map(|agent| agent.display_name.as_str()),
+            Some("BOT")
+        );
         assert_eq!(
             spec.source,
             crate::workspace_source::WorkspaceSource::Forge {
@@ -3106,7 +3123,6 @@ format = "text"
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: true,
             }
         );
     }

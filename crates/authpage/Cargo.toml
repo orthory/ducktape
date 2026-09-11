@@ -15,8 +15,10 @@ identity = { workspace = true }
 sdk = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
-# the relay poll (`Relay::wait`) — blocking, like the listener it sits beside.
+# Asynchronous callback sockets and relay polling.
+tokio = { workspace = true, features = ["net", "io-util"] }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 # `terminal_qr`: the ceremony URL as half-block cells for a headless box's
@@ -25,3 +27,4 @@ qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 keyscheme = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["test-util"] }

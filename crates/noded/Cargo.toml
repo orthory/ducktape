@@ -18,8 +18,21 @@ version.workspace = true
 # loopback threads, for e2e harnesses. dev-only — consumers enable it as a
 # dev-dependency feature, so it never compiles into the shipping node.
 testkit = ["dep:nettest"]
+# forwards to `provider-host/verify` (real TEE quote verification for the
+# airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
+# that arm through `provider-host`'s dispatch worker the same as `ducktape`
+# does, so it needs the same opt-in flag.
+verify = ["provider-host/verify"]
 
 [dependencies]
+# Static Ice view readiness; no graphics or guest execution.
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", features = ["manifest"] }
+wasmtime.workspace = true
+
+node-work = { workspace = true }
+# Committed-block receipt notifications for interactive program actions.
+tokio-tungstenite = "0.24"
+module-artifact = { workspace = true }
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
 # feature (the in-proc daemon's readiness probe), never in a normal build.
 nettest = { path = "../testing/nettest", optional = true }
@@ -29,14 +42,12 @@ bytes = "1"
 statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
-# the ONE module composer (`src/compose.rs`): the topology names each module's
-# shape, wasm-host wraps the component over its backing, and the three native
-# system modules (valset/lifecycle/kv) plus the two odb substrates (files/forge)
-# are the only constructors it calls by name.
+# The composer loads every deployment through wasm-host. Module crates also
+# supply wire types and host-side services; files/forge provide ODB substrates.
 topology = { workspace = true }
 wasm-host = { workspace = true }
 valset = { workspace = true }
-lifecycle = { workspace = true }
+modules = { workspace = true }
 kv = { workspace = true }
 files = { workspace = true }
 chat = { workspace = true }
@@ -48,7 +59,7 @@ gateway = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }
-tagging = { workspace = true }
+attribution = { workspace = true }
 compute-service = { workspace = true }
 # the interactive-terminal wire: this node holds the rings, the ws topics and
 # the admission decisions; the agent daemon on the other end of `wire` holds the
@@ -133,14 +144,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+wat = "1"
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
+# the capability registry: the session-boundary test wires saga with
+# `with_assignment`, so `Accept`'s capability gate needs a real registry to
+# announce a provider into.
+capability = { workspace = true }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
-tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 # isolated storage roots for the admin-token, git-lane and testkit tests.
 tempfile = "3"
+syn = { version = "2", features = ["full"] }

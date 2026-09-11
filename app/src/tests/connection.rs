@@ -74,9 +74,8 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     assert_eq!(failed.error, "node refused");
 
     // AN EMPTY QUERY GATES THE REPLY HANDLERS: no search is standing, so a
-    // reply the dismissal could not invalidate (`close_doc_tab` rides a
-    // decision no lane invalidate can) is dropped on arrival instead of
-    // resurrecting the float and clobbering `error`.
+    // reply the dismissal could not invalidate is dropped on arrival instead
+    // of resurrecting the float and clobbering `error`.
     let (mut dismissed, _) = Ducktape::__boot();
     dismissed.error = "standing error".into();
     let _ = dismissed.__update(__DucktapeMessage::PageSearchLoaded(
@@ -100,13 +99,16 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 
     // THE ARM. The plate may not be keyed on a flag, and may not fire during
     // the round trip its own submit opened.
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     assert!(pages_screen.contains(
         "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
     let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
-    assert!(overlays
-        .contains("if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"));
+    assert!(
+        overlays.contains(
+            "if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"
+        )
+    );
 
     // THE PLATE IS OPAQUE. It is a sibling stack LAYER — over the live document
     // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
@@ -134,7 +136,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 /// opaque card UNDER the document it is supposed to cover.
 #[test]
 fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     // Both needles carry the SAME ten-space indent, and the indent is the
     // sibling pin: re-nesting the plate inside the document arm deepens its
     // indent and its needle stops matching, exactly as hoisting the document
@@ -180,30 +182,31 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
 /// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
 /// runs no handler at all: only `trim(query) == sent_query` can retire the
 /// plate, and the captured string is the only thing that can carry the
-/// comparison. Read off the component's own source because its state is
-/// instance-local and its draft is written by the input widget, not by a
-/// handler the harness could dispatch.
+/// comparison. The Explorer is a module-owned view on the kernel contract, so
+/// the capture, the send and the arm are all the guest's.
 #[test]
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
-    let explorer = inlined(include_str!("../ui/screens/storage.ice"));
-    let submit = ice_handler_body(&explorer, "explorer_search_submit");
-    // CAPTURED AT SUBMIT, AND SENT FROM THE CAPTURE — passing `trim(query)` to
-    // the call a second time would let the string asked about and the string
-    // spoken for drift apart in a later edit.
+    let guest = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
+    let submit = ice_handler_body(&guest, "search_submit");
+    // CAPTURED AT THE SEND, AND KEYED ON THE CAPTURE — the search
+    // subscription takes `sent_query` itself, so the string asked about and
+    // the string spoken for cannot drift apart in a later edit.
     assert!(
         submit.contains("sent_query = trim(query)"),
-        "the submit must capture the query it sends"
+        "the search must capture the query it sends"
     );
     assert!(
-        submit.contains(
-            "run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _"
+        guest.contains(
+            "workspace_search(sent_query, search_serial) when connected && !empty(sent_query)"
         ),
-        "the search must be sent for the captured string itself"
+        "the search must be run for the captured string itself"
     );
     // THE ARM. A flag could never carry this: `searching` is down and the hits
     // are empty for a zero-hit answer no matter what is in the box.
     assert!(
-        explorer.contains(
+        guest.contains(
             "if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)"
         ),
         "the zero-hit plate must be keyed on the query that was sent"
@@ -211,7 +214,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
     // query whose box has been emptied.
     assert!(
-        ice_handler_body(&explorer, "clear_explorer_search").contains("sent_query = \"\""),
+        ice_handler_body(&guest, "clear_explorer_search").contains("sent_query = \"\""),
         "clearing the box must take the standing answer with it"
     );
 }
@@ -230,11 +233,10 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
-        app.chat_search_draft = draft.into();
-        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
-        // nothing.
+        // A DRAFT IS NOT A QUERY: the draft is the view's own, and typing
+        // alone runs nothing and captures nothing.
         assert!(app.chat_search_query.is_empty());
-        let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+        let _ = app.__update(__DucktapeMessage::SearchChatSubmit(draft.into()));
         assert_eq!(app.chat_search_phase, SearchPhase::Searching);
         assert_eq!(
             app.chat_search_query, "zzz",
@@ -247,19 +249,17 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         app
     };
 
-    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY, and one more character
-    // walks the draft away from it with no handler run.
-    let mut empty = answered("  zzz  ", Vec::new());
+    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY — the view retires it
+    // the moment the draft walks away from `search_query`, with no handler
+    // run.
+    let empty = answered("  zzz  ", Vec::new());
     assert!(empty.chat_search_hits.is_empty());
-    assert_eq!(empty.chat_search_draft.trim(), empty.chat_search_query);
-    empty.chat_search_draft = "zzzq".into();
-    assert_ne!(empty.chat_search_draft.trim(), empty.chat_search_query);
+    assert_eq!(empty.chat_search_query, "zzz");
 
     // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
     // keystroke, and the float's gate says so on its own `!empty(search_hits)`
     // term.
-    let mut rows = answered("zzz", vec![stale_chat_hit()]);
-    rows.chat_search_draft = "zzzq".into();
+    let rows = answered("zzz", vec![stale_chat_hit()]);
     assert_eq!(rows.chat_search_hits.len(), 1);
 
     // A FAILED search never ran, so nothing may stand for it.
@@ -290,7 +290,7 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
     // THE GATE. The float stands while the search is out, while hits are in
     // hand, or while the box still holds the string the answer speaks for —
     // and for no other reason, so a zero-hit answer cannot outlive its query.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         chat.contains(
             "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
@@ -319,15 +319,17 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
     // The three arms read it, so none of them can drift from the others.
     for (source, call) in [
         (
-            inlined(include_str!("../ui/screens/pages.ice")),
+            inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice")),
             "search_answer_stands(page_search_query, page_search_draft, page_searching)",
         ),
         (
-            inlined(include_str!("../ui/screens/chat.ice")),
+            inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice")),
             "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
         ),
         (
-            inlined(include_str!("../ui/screens/storage.ice")),
+            inlined(include_str!(
+                "../../../crates/views/explorer/src/ui/app.ice"
+            )),
             "search_answer_stands(sent_query, query, searching)",
         ),
     ] {
@@ -346,20 +348,20 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
 /// authored `.ice` source instead.
 #[test]
 fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
-    // The three surfaces that capture a query. Two app-scope pairs and the
-    // explorer's component-local one; a bare `hits` cannot collide with the
-    // prefixed names, because the match is anchored at the start of the line.
-    const PAIRED: [(&str, &str); 3] = [
+    // The app-scope surfaces that capture a query; a bare `hits` cannot
+    // collide with the prefixed names, because the match is anchored at the
+    // start of the line. A module-owned view keeps its own pair in its own
+    // crate, checked by its own tests.
+    const PAIRED: [(&str, &str); 2] = [
         ("page_search_hits", "page_search_query"),
         ("chat_search_hits", "chat_search_query"),
-        ("hits", "sent_query"),
     ];
     let mut walked = 0;
     for (path, source) in ice_sources() {
         for (handler, body) in ice_handlers(&source) {
             for (hits, query) in PAIRED {
                 // A DROP, not a write: `x = next.hits` is an answer landing.
-                // `keep_` is the conditional drop `close_doc_tab` rides.
+                // `keep_` is a conditional drop.
                 let drops = body.lines().any(|line| {
                     let line = line.trim();
                     line.starts_with(&format!("{hits} = "))
@@ -385,94 +387,8 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
     );
 }
 
-/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM, and the
-/// explorer's search state is the one search state exempt from every app-level
-/// reset: `ExplorerScreen` is `lifetime retained`, so no reconnect and no
-/// network switch reaches inside it. What keeps a reply issued on one network
-/// from rendering as another's is the identity in its INSTANCE KEY —
-/// `#explorer(connected_rpc)` — which the run inherits as its scope at send
-/// time and the reply carries back. Switching networks renders a different
-/// instance, and the answer in flight lands on the one that asked for it.
-///
-/// The key is therefore load-bearing, not decoration: dropped, both networks
-/// share one instance and a cross-network answer renders as the new network's.
-#[test]
-fn an_explorer_answer_lands_on_the_network_that_asked_for_it() {
-    let (mut app, _) = Ducktape::__boot();
-    let console = iced::window::Id::unique();
-    app.console_win = Some(console);
-    app.connected = true;
-    app.loading = false;
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Explorer));
-
-    // A render materializes the instance the mount's key names — this app's own
-    // window and no other's, since the sighting channel is thread-local and a
-    // sibling test on the same thread renders the same mount.
-    let mounted = |app: &mut Ducktape| -> Vec<String> {
-        let _ = app.__view(console);
-        let window = format!("/{console:?}/");
-        app.__ice_test_scopes_explorer_screen()
-            .into_iter()
-            .filter(|scope| scope.contains(&window))
-            .collect()
-    };
-
-    app.connected_rpc = "http://one".into();
-    let one = mounted(&mut app);
-    assert_eq!(one.len(), 1, "one network, one explorer instance");
-    app.connected_rpc = "http://two".into();
-    let both = mounted(&mut app);
-    assert_eq!(
-        both.len(),
-        2,
-        "the explorer instance must be keyed by the network it is reading — one \
-         instance shared across networks is exactly what lets an answer sent on \
-         the first render as the second's"
-    );
-    let first = one[0].clone();
-    let second = both
-        .iter()
-        .find(|scope| **scope != first)
-        .expect("the second network's instance")
-        .clone();
-
-    // THE REPLY IN FLIGHT, delivered to the scope its send captured — the app
-    // is on the second network by now.
-    let _ = app.__update(
-        Ducktape::__ice_test_message_explorer_screen_explorer_results_loaded(
-            first.clone(),
-            backend::ExplorerResults {
-                hits: vec![backend::ExplorerHit {
-                    kind: "page".into(),
-                    code: "pg".into(),
-                    title: "Old".into(),
-                    snippet: "stale".into(),
-                    meta: String::new(),
-                    target: "page".into(),
-                }],
-                kinds: Vec::new(),
-                partial: String::new(),
-            },
-        ),
-    );
-    assert_eq!(
-        app.__ice_test_state_explorer_screen(&first)
-            .expect("the first network's instance answers")
-            .hits
-            .len(),
-        1,
-        "the answer belongs to the network that asked for it"
-    );
-    assert!(
-        app.__ice_test_state_explorer_screen(&second)
-            .is_none_or(|state| state.hits.is_empty()),
-        "a cross-network answer must not render as the new network's"
-    );
-}
-
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
-/// and `pages_mutated` land you somewhere new exactly the way the pickers do,
-/// and `close_doc_tab` does when — and only when — it closes the ACTIVE tab;
+/// and `pages_mutated` land you somewhere new exactly the way the pickers do;
 /// each must take the hits and the standing answer with it (pages: the query;
 /// chat: the phase back to idle), or the results float — the one that actually
 /// occludes the room or page you just landed in — travels along.
@@ -481,7 +397,7 @@ fn an_explorer_answer_lands_on_the_network_that_asked_for_it() {
 /// empty scope and are workspace-wide, so the answer would still be true where
 /// you landed. The reason to drop it is that it is in the way.
 #[test]
-fn the_three_navigation_resets_take_the_hits_and_the_answer() {
+fn the_navigation_resets_take_the_hits_and_the_answer() {
     let pages_mutated = || {
         __DucktapeMessage::PagesMutated(backend::PagesData {
             pages: Vec::new(),
@@ -525,43 +441,6 @@ fn the_three_navigation_resets_take_the_hits_and_the_answer() {
         !mutated.page_searching,
         "the invalidated lane drops the reply; the reset must lower the flag"
     );
-
-    // CLOSING THE ACTIVE TAB LANDS YOU ELSEWHERE — a navigation, so it resets.
-    let (mut active, _) = Ducktape::__boot();
-    active.loading = false;
-    active.doc_tabs = vec!["open".into(), "other".into()];
-    active.active_page = "open".into();
-    active.page_search_query = "zzz".into();
-    active.page_search_hits = vec![stale_page_hit()];
-    active.page_searching = true;
-    let _ = active.__update(__DucktapeMessage::CloseDocTab("open".into()));
-    assert_eq!(active.active_page, "other");
-    assert!(active.page_search_query.is_empty());
-    assert!(active.page_search_hits.is_empty());
-    assert!(!active.page_searching);
-
-    // CLOSING A BACKGROUND TAB DOES NOT. `next_doc_tab` returns `active`
-    // unchanged when the closed tab is not the active one, and an
-    // unconditional reset here would dismiss a truthful plate the user is
-    // still reading. The reset rides that same decision.
-    let (mut background, _) = Ducktape::__boot();
-    background.loading = false;
-    background.doc_tabs = vec!["open".into(), "other".into()];
-    background.active_page = "other".into();
-    background.page_search_query = "zzz".into();
-    background.page_search_hits = vec![stale_page_hit()];
-    background.page_searching = true;
-    let _ = background.__update(__DucktapeMessage::CloseDocTab("open".into()));
-    assert_eq!(background.active_page, "other");
-    assert!(
-        background.page_searching,
-        "the reply still lands and lowers it — the query it answers is standing"
-    );
-    assert_eq!(
-        background.page_search_query, "zzz",
-        "closing a background tab navigates nowhere and must not dismiss the answer"
-    );
-    assert_eq!(background.page_search_hits.len(), 1);
 }
 
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
@@ -738,10 +617,11 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 /// Exemptions are named with their reason, never left implicit.
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
-    /// Settings owns connection repair and Node owns the daemon diagnostics;
-    /// both remain useful while the node is down instead of claiming the
-    /// network's module contents are empty.
-    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
+    /// Settings (which owns connection repair and stays useful with the node
+    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages
+    /// and Forge are module-owned views now and not in this inventory;
+    /// every native data screen answers.
+    const EXEMPT: [&str; 0] = [];
 
     let mut screens: Vec<&str> = SCREENS
         .lines()
@@ -752,20 +632,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
     screens.sort_unstable();
 
     assert_eq!(
-        screens,
-        [
-            "AgentsScreen",
-            "ChatScreen",
-            "ExplorerScreen",
-            "FilesScreen",
-            "ForgeScreen",
-            "GovernanceScreen",
-            "MembersScreen",
-            "NodeScreen",
-            "PagesScreen",
-            "SettingsScreen",
-            "ShellScreen",
-        ],
+        screens, [""; 0],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
@@ -808,14 +675,9 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// rows)` is already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
-    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
+    const EXEMPT: [&str; 0] = [];
 
-    for source in [
-        include_str!("../ui/screens/governance.ice"),
-        include_str!("../ui/screens/roster.ice"),
-        include_str!("../ui/screens/storage.ice"),
-        include_str!("../ui/screens/forge.ice"),
-    ] {
+    for source in [include_str!("../../../crates/views/forge/src/ui/forge.ice")] {
         for chunk in source.split("\ncomponent ").skip(1) {
             let name = chunk.split('(').next().unwrap_or("").trim();
             if !name.ends_with("Screen") || EXEMPT.contains(&name) {
@@ -898,14 +760,11 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         })
         .collect();
     sites.sort_unstable();
-    let mut expected = [
-        "proposals_summary(connected, rows)",
-        "members_summary(connected, rows)",
-        "agents_summary(connected, rows)",
-        "members_summary(connected, members_rows)",
-        "fs_counts_summary(connected, listed, entries)",
-    ];
-    expected.sort_unstable();
+    // Approvals', Members', Agents', Settings' and Files' subtitles are their
+    // module views' now, gated the same way in `crates/views/*` (Settings'
+    // members line is folded host-side, `members_summary` in
+    // `module_view.rs`; Files' crumb tally in its guest's `host.rs`).
+    let expected: [&str; 0] = [];
 
     assert_eq!(
         sites, expected,
@@ -1060,57 +919,21 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         model: String::new(),
         live: true,
     }];
-    app.fs_entries = vec![backend::FsEntry {
-        key: 0,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 0,
-        object: String::new(),
-    }];
-
     app.connected = true;
     assert_eq!(
         backend::members_summary(app.connected, &app.members_rows),
         "1 human · 0 agents"
     );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "1 file · 0 dirs"
-    );
-    // The two registers this boot leaves EMPTY are silent while connected too —
-    // an all-zero subtitle repeats, in digits, the plate that already said
-    // "No agents registered" / "No proposals yet". `a_subtitle_that_is_all_zeros_
-    // says_nothing_at_all` (backend/tests.rs) is where the speaking case is
-    // proved with real rows; here they are empty on purpose.
-    assert_eq!(backend::agents_summary(app.connected, &app.agents_rows), "");
-    assert_eq!(backend::proposals_summary(app.connected, &app.gov_rows), "");
 
-    // The node goes down. Everything above was a reading; none of it is one now.
+    // The node goes down. Everything above was a reading; none of it is one
+    // now. (The Files tally went with its screen into the `files` module
+    // view, where its guest tests hold it to the same rule.)
     app.connected = false;
-    for (screen, meta) in [
-        (
-            "Members",
-            backend::members_summary(app.connected, &app.members_rows),
-        ),
-        (
-            "Agents",
-            backend::agents_summary(app.connected, &app.agents_rows),
-        ),
-        (
-            "Approvals",
-            backend::proposals_summary(app.connected, &app.gov_rows),
-        ),
-        (
-            "Files",
-            backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        ),
-    ] {
-        assert_eq!(
-            meta, "",
-            "{screen} printed `{meta}` off a node that answered nothing"
-        );
-    }
+    assert_eq!(
+        backend::members_summary(app.connected, &app.members_rows),
+        "",
+        "Members printed a count off a node that answered nothing"
+    );
 }
 
 /// A SEARCH THAT ERRORED IS NOT A SEARCH THAT FOUND NOTHING. `search_chat_submit`
@@ -1123,8 +946,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
-    app.chat_search_draft = "ledger".into();
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     assert_eq!(app.chat_search_phase, SearchPhase::Searching);
 
     let _ = app.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
@@ -1140,7 +962,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     assert_eq!(app.error, "rpc unreachable");
 
     // And the empty result IS still reachable — "done" with no hits is the miss.
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
         backend::ChatSearchData { hits: Vec::new() },
     ));
@@ -1161,7 +983,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
 /// answer that still stands for the box means the box is not empty.
 #[test]
 fn the_clear_search_button_survives_a_zero_hit_result() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
         "the clear × must open on the float's discriminant or on a live field"

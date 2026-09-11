@@ -4,7 +4,7 @@
 //! agree the key.
 
 use anyhow::{bail, Result};
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use rand_core::{OsRng, RngCore};
 use hkdf::Hkdf;
@@ -28,13 +28,15 @@ pub fn hkdf32(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
     okm
 }
 
-/// AEAD-seal `msg` under `key`. Layout: `nonce(12) ‖ ct(+16 tag)`.
-pub fn seal(key: &[u8; 32], msg: &[u8]) -> Vec<u8> {
+/// AEAD-seal `msg` under `key`, authenticating `aad` alongside it (not
+/// encrypted, not carried in the blob — the opener must supply the same
+/// bytes). Layout: `nonce(12) ‖ ct(+16 tag)`.
+pub fn seal(key: &[u8; 32], aad: &[u8], msg: &[u8]) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), msg)
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg, aad })
         .expect("ChaCha20-Poly1305 encryption does not fail on valid inputs");
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
@@ -42,14 +44,18 @@ pub fn seal(key: &[u8; 32], msg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Open a `nonce ‖ ct` envelope. Errors on a short, wrong-key, or tampered blob.
-pub fn open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
+/// Open a `nonce ‖ ct` envelope. `aad` must match what `seal` was called with,
+/// or the AEAD tag fails. Errors on a short, wrong-key/aad, or tampered blob.
+pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 12 + 16 {
         bail!("AEAD blob too short: {} bytes", blob.len());
     }
     let nonce: [u8; 12] = blob[..12].try_into().unwrap();
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(&nonce), &blob[12..])
-        .map_err(|_| anyhow::anyhow!("AEAD decryption failed (wrong key or tampered blob)"))
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload { msg: &blob[12..], aad },
+        )
+        .map_err(|_| anyhow::anyhow!("AEAD decryption failed (wrong key, aad, or tampered blob)"))
 }

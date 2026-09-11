@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER way: the NATIVE
 //! `governance` crate is compiled to wasm32 unmodified and adapted to the
-//! `ducktape:module` world through `guest-adapter`, so the module's logic is
+//! `ducktape:module` world through `ducktape-module-sdk`, so the module's logic is
 //! single-sourced (a behavior change in the native crate IS the wasm change).
 //! the packaging cdylib around this port is synthesized by `guest-builder` —
 //! this module is the whole of the guest's hand-written surface.
@@ -31,7 +31,7 @@
 //! * governance exercises every seam the runtime offers at once: sibling
 //!   reads (valset membership, identity account resolution) resolve through
 //!   the memoized replay, and a passing proposal EMITS follow-up msgs
-//!   (valset membership ops, lifecycle upgrade schedules + code swaps) that
+//!   (valset membership ops, module admissions + code swaps) that
 //!   the runtime republishes through the host ctx only after a clean run —
 //!   so a wasm governance still drives the code registry that live-updates
 //!   the other wasm tenants.
@@ -47,12 +47,12 @@
 //! dispatch reads it back through [`load_store_config`] and constructs the
 //! native module with it. the config is consensus state in the store's
 //! merkle root from genesis, and it rides state-sync like any other record.
-//! the valset / lifecycle / identity sibling ids are genesis-constant wiring
+//! the valset / modules / identity sibling ids are genesis-constant wiring
 //! (identical on every network), so they stay compiled in like every other
 //! port's sibling ids.
 
 use crate::Governance;
-use guest_adapter::{WitStore, host, load_store_config};
+use ducktape_module_sdk::{WitStore, host, load_store_config};
 use sdk::genesis_config;
 
 /// the genesis-constant id this module registers under (the native twin's id:
@@ -60,15 +60,13 @@ use sdk::genesis_config;
 const MODULE_ID: &str = "governance";
 /// the sibling ids this instance reads/authorizes through — EXACTLY the
 /// production wiring (`bin/node/src/host_state.rs`): valset for membership
-/// (reads + emitted membership ops), the lifecycle module for wasm-module
-/// code swaps ("lifecycle" == `host::LIFECYCLE_MODULE_ID`), and identity for
+/// (reads + emitted membership ops), the modules registry for wasm-module
+/// code swaps ("modules" == `host::MODULES_ID`), and identity for
 /// account-share resolution.
 const VALSET_ID: &str = "valset";
-const LIFECYCLE_ID: &str = "lifecycle";
+const MODULES_ID: &str = "modules";
 const IDENTITY_ID: &str = "identity";
 const ACL_ID: &str = acl::DEFAULT_ACL_ID;
-/// the genesis-config key carrying this network's invite binding.
-const INVITE_PARAM: &str = "invite";
 
 /// this network's invite binding, decoded from the host-seeded genesis
 /// config. a missing or malformed config is host wiring corruption surfaced
@@ -80,7 +78,7 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
     })?;
     let params = genesis_config::decode_config(&raw)
         .map_err(|e| host::Error::Rejected(format!("governance genesis config: {e}")))?;
-    genesis_config::find(&params, INVITE_PARAM)
+    genesis_config::find(&params, genesis_config::INVITE)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| {
             host::Error::Rejected("governance genesis config carries no invite binding".into())
@@ -88,15 +86,19 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 }
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
 // the per-network invite binding comes from the store-seeded genesis config
 // via the bespoke `invite_binding` above (a bytes param, not the chain_id
 // twins' string).
-guest_adapter::store_guest! {
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Governance,
+    shape: ducktape_module_sdk::host::ModuleShape {
+        config: vec![genesis_config::INVITE.into()],
+        ..ducktape_module_sdk::store_shape()
+    },
     new: Governance::new(MODULE_ID, Box::new(WitStore), VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
-        .with_code_registry(LIFECYCLE_ID)
+        .with_code_registry(MODULES_ID)
         .with_acl(ACL_ID),
 }

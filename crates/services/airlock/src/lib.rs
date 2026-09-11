@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use airlock::seal::SealKeypair;
-use airlock::server::{AttestMode, GatewayConfig, GrantCheck, ReloadCredential};
+use airlock::server::{AttestMode, GatewayConfig, GrantCheck, ReloadCredential, StoreLoad};
 use airlock::wire::{CredentialKind, CredentialPayload};
 
 /// how long a scoped session token this gateway mints stays valid.
@@ -119,14 +119,18 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The lazy store loader the running gateway consults before every session.
+/// The lazy store loader the running gateway consults before every session and
+/// every proxied request.
 ///
-/// It answers `Some` only when the store holds an artifact the live entry was
-/// NOT built from — first sight of a name, or an artifact whose mtime moved
-/// since it was last read. That covers both restart-free cases with one stat:
-/// a credential `cred add` wrote after boot, and a re-login that ROTATED an
-/// existing one (the gateway would otherwise serve the dead token until the
-/// daemon was restarted).
+/// It reports what the store holds for a name against what it last handed over,
+/// in one stat: [`StoreLoad::Loaded`] for an artifact the live entry was NOT
+/// built from (first sight of a name, or one whose mtime moved),
+/// [`StoreLoad::Unchanged`] for the one already being served, and
+/// [`StoreLoad::Absent`] when there is no artifact at all. All three
+/// restart-free cases ride that: a credential `cred add` wrote after boot, a
+/// re-login that ROTATED one in place, and one `cred remove`/`revoke` deleted —
+/// which the gateway must stop serving to the sessions already holding a token
+/// for it.
 ///
 /// ponytail: mtime, not a content hash. A rotation that preserves mtime to the
 /// nanosecond is not a thing a vendor CLI does; hash the artifact if one ever
@@ -138,19 +142,38 @@ fn reload_from_store(root: &Path) -> ReloadCredential {
         // The name is the session's caller-supplied `sub`, and this runs BEFORE
         // the grant gate — so it is a trust boundary. A credential is one plain
         // directory under the store root and nothing else: `..`, an absolute
-        // path or any separator is refused rather than joined.
+        // path or any separator is refused rather than joined. The store holds
+        // nothing under such a name, which is exactly `Absent`.
         if !is_store_dir_name(name) {
-            return None;
+            return StoreLoad::Absent;
         }
         let dir = root.join(name);
-        let stamp = artifact_mtime(&dir)?;
-        let unchanged = seen.lock().ok()?.get(name) == Some(&stamp);
+        let Some(stamp) = artifact_mtime(&dir) else {
+            // No dir, or an empty one: the operator removed or revoked the
+            // credential. Forget the stamp too, so a later re-add of the same
+            // name reads as first sight rather than as an unchanged artifact.
+            if let Ok(mut stamps) = seen.lock() {
+                stamps.remove(name);
+            }
+            return StoreLoad::Absent;
+        };
+        // A poisoned stamp map cannot tell live from stale, and guessing either
+        // way is a credential decision: say nothing changed and serve on.
+        let Ok(mut stamps) = seen.lock() else {
+            return StoreLoad::Unchanged;
+        };
+        let unchanged = stamps.get(name) == Some(&stamp);
         if unchanged {
-            return None;
+            return StoreLoad::Unchanged;
         }
-        let loaded = load_cred_dir(&dir)?;
-        seen.lock().ok()?.insert(name.to_string(), stamp);
-        Some(loaded)
+        // A dir that is there but half-written (no `kind` marker yet, an
+        // artifact mid-rewrite) is not a removal: leave the live entry alone and
+        // leave the stamp unrecorded, so the next call tries again.
+        let Some((kind, payload)) = load_cred_dir(&dir) else {
+            return StoreLoad::Unchanged;
+        };
+        stamps.insert(name.to_string(), stamp);
+        StoreLoad::Loaded(kind, payload)
     })
 }
 
@@ -307,7 +330,10 @@ pub fn load_or_create_seal_keypair(root: &Path) -> Result<SealKeypair, String> {
 }
 
 /// Write secret bytes to a fresh 0600 file (mirrors `userkey::write_user_key_new`).
-fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// `pub` so `bin/node`'s `cred add` can write the vendor OAuth artifact through
+/// the same hardened path `seal.key` uses, instead of `std::fs::copy` (which
+/// replicates the SOURCE file's mode onto the destination).
+pub fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -319,6 +345,22 @@ fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Err(e) = std::io::Write::write_all(&mut file, bytes) {
         let _ = std::fs::remove_file(path);
         return Err(format!("write {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Create a directory only this user can read (mirrors `provider-host`'s
+/// `create_private_dir`). Used for `airlock-creds/` and each credential's
+/// `<name>/` subdirectory: the vendor OAuth artifact inside is worth strictly
+/// more than the seal key beside it, so it gets the same 0700 dir + 0600 file
+/// treatment.
+pub fn create_private_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("restrict {} permissions: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -475,6 +517,26 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_is_0700_and_secret_write_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        let cred_dir = root.join("alice-claude-1");
+        create_private_dir(&root).unwrap();
+        create_private_dir(&cred_dir).unwrap();
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let cred_dir_mode = std::fs::metadata(&cred_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(cred_dir_mode, 0o700);
+
+        let artifact = cred_dir.join(".credentials.json");
+        write_secret_0600(&artifact, b"{}").unwrap();
+        let artifact_mode = std::fs::metadata(&artifact).unwrap().permissions().mode() & 0o777;
+        assert_eq!(artifact_mode, 0o600);
+    }
+
     #[test]
     fn an_empty_store_opens_and_mints_a_stable_seal_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -496,10 +558,15 @@ mod tests {
         let reload = reload_from_store(&root);
 
         // first sight: a credential the gateway has never loaded.
-        let (_, first) = reload("alice-claude-1").expect("a credential is loaded on first sight");
+        let StoreLoad::Loaded(_, first) = reload("alice-claude-1") else {
+            panic!("a credential is loaded on first sight");
+        };
         assert_eq!(refresh_of(&first), "rt-first");
         // unchanged on disk: no reload, so a session costs one stat and no parse.
-        assert!(reload("alice-claude-1").is_none(), "an unchanged credential must not reload");
+        assert!(
+            matches!(reload("alice-claude-1"), StoreLoad::Unchanged),
+            "an unchanged credential must not reload"
+        );
 
         // a re-login ROTATES the artifact. Without this the gateway would serve
         // the dead token until the daemon was restarted.
@@ -510,9 +577,36 @@ mod tests {
         let dir = root.join("alice-claude-1");
         seed_claude(&root, "alice-claude-1", "rt-rotated");
         stamp_forward(&dir.join(".credentials.json"));
-        let (_, rotated) = reload("alice-claude-1").expect("a rotated artifact reloads");
+        let StoreLoad::Loaded(_, rotated) = reload("alice-claude-1") else {
+            panic!("a rotated artifact reloads");
+        };
         assert_eq!(refresh_of(&rotated), "rt-rotated");
-        assert!(reload("alice-claude-1").is_none(), "and then goes quiet again");
+        assert!(
+            matches!(reload("alice-claude-1"), StoreLoad::Unchanged),
+            "and then goes quiet again"
+        );
+    }
+
+    /// `user cred remove` deletes the dir. The loader must say ABSENT, not
+    /// "unchanged" — the gateway evicts on the first answer and keeps serving
+    /// the deleted credential on the second.
+    #[test]
+    fn a_removed_credential_reads_as_absent_and_a_re_add_as_first_sight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        seed_claude(&root, "alice-claude-1", "rt-first");
+        let reload = reload_from_store(&root);
+        assert!(matches!(reload("alice-claude-1"), StoreLoad::Loaded(..)));
+
+        std::fs::remove_dir_all(root.join("alice-claude-1")).unwrap();
+        assert!(matches!(reload("alice-claude-1"), StoreLoad::Absent), "a removed dir is a removal");
+
+        // the same name added again is a credential the gateway does not hold.
+        seed_claude(&root, "alice-claude-1", "rt-second");
+        let StoreLoad::Loaded(_, re_added) = reload("alice-claude-1") else {
+            panic!("a re-added credential loads on first sight");
+        };
+        assert_eq!(refresh_of(&re_added), "rt-second");
     }
 
     #[test]
@@ -521,7 +615,7 @@ mod tests {
         let root = cred_store_root(tmp.path());
         std::fs::create_dir_all(&root).unwrap();
         let reload = reload_from_store(&root);
-        assert!(reload("ghost").is_none());
+        assert!(matches!(reload("ghost"), StoreLoad::Absent));
     }
 
     #[test]

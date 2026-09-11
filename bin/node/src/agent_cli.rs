@@ -90,6 +90,11 @@ pub(crate) struct AgentArgs {
 pub(crate) enum AgentCmd {
     /// attach this terminal to a sandboxed provider (raw pty, resize-aware)
     Pty(PtyArgs),
+    /// print the current default programmable model-user script as JSON
+    ModelProgram {
+        #[arg(value_name = "MODEL_ID")]
+        model_id: String,
+    },
     /// submit a durable headless run pinned to a node; prints its run id
     Sched(SchedArgs),
     /// install the agent CLIs this host's guest image lends to runs
@@ -202,20 +207,27 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
     let AgentArgs { cmd, addr, key } = args;
     let ctx = VerbCtx { addr, key };
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    // `install` fills a directory on THIS host and talks to no node, so the
-    // address ladder is resolved per-verb rather than up front — a machine
-    // with no workspace yet must still be able to install its executors.
+    // `install` fills a directory in the WORKSPACE and talks to no node, so
+    // the ladder is resolved per-verb rather than up front: it answers "which
+    // workspace" for `install` and "which node" for everything else.
     match cmd {
         // pty takes the whole group, not just the resolved base: attaching needs
         // the node's WORKSPACE too (its 0600 service-link token admits the
         // session's ws topic), and only the ladder knows which workspace the
         // address it just resolved belongs to.
+        AgentCmd::ModelProgram { model_id } => cmd_model_program(&model_id),
         AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
-        AgentCmd::Install(install) => crate::executors::run(install),
+        AgentCmd::Install(install) => crate::executors::run(install, &ctx.addr.workspace()?),
         AgentCmd::Cancel(cancel) => cmd_cancel(cancel, &ctx, &mut stdin),
         AgentCmd::Reassign(reassign) => cmd_reassign(reassign, &ctx, &mut stdin),
     }
+}
+
+fn cmd_model_program(model_id: &str) -> AgentResult {
+    runs::validate_agent_id(model_id)?;
+    println!("{}", serde_json::to_string(&runs::model_program(model_id))?);
+    Ok(())
 }
 
 // ============================================================================
@@ -529,7 +541,8 @@ fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentR
         reply_payload: Vec::new(),
         deadline: None,
         max_attempts: 3,
-        lease_views: None,
+        // Provisioning and running a microVM needs the model-work lease.
+        lease_views: Some(runs::RUN_LEASE_VIEWS),
         capability: Some(tag.to_string()),
         demands,
         pinned_assignee: Some(target),

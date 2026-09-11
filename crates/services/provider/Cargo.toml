@@ -9,10 +9,16 @@ version.workspace = true
 # which replicates WHO provides what; this crate is the machine-local half
 # that actually provides it.
 [dependencies]
-# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
-# zero-dependency leaf so every reader of that root agrees about it.
-ducktape-home = { workspace = true }
 async-trait = { workspace = true }
+# the run's node read lane (src/read_lane.rs): a loopback proxy in front of the
+# node's http listener, bound to one run — same server/client pair the run's
+# credential broker next door is built from.
+axum = "0.8"
+futures = { workspace = true }
+# `ModelRecord::permits` and its two duckfs-reply filters: the read lane and the
+# `ducktape mcp` tool plane gate on the SAME predicate on the SAME record, so
+# neither can drift into admitting what the other refuses.
+runs = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
@@ -48,6 +54,11 @@ libc = "0.2"
 # on the backend goes non-exhaustive. the self dev-dependency below is what
 # keeps them in lockstep. no shipped build enables either.
 testkit = ["sandbox-host/testkit"]
+# forwards to `broker-host/verify` (real TEE quote verification, off by
+# default) so a consumer one hop above broker-host — this crate is the only
+# one between node-bin and it — has one flag to opt the whole airlock-attest
+# path in, not two.
+verify = ["broker-host/verify"]
 
 [dev-dependencies]
 # depending on ourselves with `testkit` on is how a test-only feature is turned

@@ -437,3 +437,218 @@ impl Driver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography::ed25519::PrivateKey;
+    use wireguard::{
+        AdmissionRoot, Endpoint, EndpointAdvertisement, MeshVersion, PortPolicy, Root, Transport,
+        X25519PublicKey,
+    };
+
+    use super::*;
+    use crate::contract::{Effect, Event, MachineConfig};
+    use crate::machine::Machine;
+    use crate::store::{self, PersistedMesh};
+
+    const CHAIN: &str = "net#restore";
+
+    fn policy() -> PortPolicy {
+        PortPolicy::production()
+    }
+
+    fn config(octet: u8) -> MachineConfig {
+        let policy = policy();
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet));
+        let endpoint = |port, transport| Endpoint::new(ip, port, transport, &policy).unwrap();
+        MachineConfig {
+            chain_id: CHAIN.into(),
+            wireguard_public: X25519PublicKey([octet; 32]),
+            // the reported node: fully NATed, so it advertises no
+            // WireGuard endpoint of its own.
+            wireguard_advertised: None,
+            control_endpoint: endpoint(443, Transport::Tcp),
+            coordinators: Vec::new(),
+            port_policy: policy,
+            persist: false,
+            gossip_ingress: None,
+        }
+    }
+
+    /// One member's persisted advert, endpoint-less exactly like the
+    /// NATed inviter whose tunnel the restart must reinstall.
+    fn persisted_member(signer: &PrivateKey, epoch: u64) -> PersistedMesh {
+        let record = EndpointRecord {
+            namespace: CHAIN.into(),
+            epoch,
+            valset_root: Root([1; 32]),
+            admission_root: AdmissionRoot([2; 32]),
+            validator_identity: binding::identity_of(&signer.public_key()),
+            wireguard_public_key: X25519PublicKey([20; 32]),
+            control_endpoint: Endpoint::new(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 20)),
+                443,
+                Transport::Tcp,
+                &policy(),
+            )
+            .unwrap(),
+            wireguard_endpoint: None,
+            nonce: 1,
+        };
+        PersistedMesh::new(
+            CHAIN.into(),
+            epoch,
+            vec![EndpointAdvertisement::sign(
+                record,
+                MeshVersion([7; 32]),
+                signer,
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// The restarted RESIDENT's boot: the host hands the persisted mesh with
+    /// this node listed as a STANDBY, and the plane must target that epoch —
+    /// reinstalling the member's tunnel from the persisted record — with no
+    /// live gossip, since every transport it has left rides that tunnel.
+    #[test]
+    fn a_standby_restore_targets_the_plane_and_reinstalls_the_member() {
+        let me = PrivateKey::from_seed(1);
+        let member = PrivateKey::from_seed(2);
+        let mut machine = Machine::new(Box::new(me.clone()), config(1));
+        let bytes = store::encode(&persisted_member(&member, 4)).unwrap();
+
+        let effects = machine
+            .step(
+                Event::Retarget {
+                    event: MeshEpochEvent {
+                        epoch: 4,
+                        members: vec![member.public_key()],
+                        standbys: vec![me.public_key()],
+                        current_view: 1_783,
+                    },
+                    persisted: Some(bytes),
+                },
+                1_000,
+            )
+            .unwrap();
+
+        // the member advertises no endpoint, so nothing resolves: the
+        // restore goes straight to its interface push.
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ResolveStart { .. })),
+            "an endpoint-less record has nothing to resolve"
+        );
+        let (req, peers) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::WgApply { req, peers, .. } => Some((*req, peers.clone())),
+                _ => None,
+            })
+            .expect("the restore pushes the remembered mesh");
+        assert_eq!(peers.len(), 1, "the persisted member's tunnel");
+        assert_eq!(peers[0].wireguard_public_key, X25519PublicKey([20; 32]));
+        assert!(
+            machine.epoch.is_none(),
+            "the epoch is suspended behind the restore"
+        );
+
+        machine
+            .step(
+                Event::WgApplied {
+                    req,
+                    outcome: Ok(()),
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let state = machine
+            .epoch
+            .as_ref()
+            .expect("the restore landed the epoch");
+        assert_eq!(state.role, Role::Standby);
+        assert_eq!(state.epoch, 4);
+        assert!(
+            machine
+                .driver
+                .base_peers
+                .as_ref()
+                .is_some_and(|base| base.contains_key(&binding::identity_of(&member.public_key()))),
+            "the restored mesh is the interface's base"
+        );
+    }
+
+    /// The same boot, one tick earlier: a nudge that arrives while the
+    /// restore is still resolving must NOT count the plane untargeted — the
+    /// epoch lands when the restore settles.
+    #[test]
+    fn a_nudge_inside_the_restore_window_is_not_an_untargeted_plane() {
+        let me = PrivateKey::from_seed(1);
+        let member = PrivateKey::from_seed(2);
+        let mut machine = Machine::new(Box::new(me.clone()), config(1));
+        // an ADVERTISED endpoint parks the restore on a resolve, which is
+        // the window a boot nudge can land in.
+        let mut mesh = persisted_member(&member, 4);
+        mesh.adverts.clear();
+        let record = EndpointRecord {
+            namespace: CHAIN.into(),
+            epoch: 4,
+            valset_root: Root([1; 32]),
+            admission_root: AdmissionRoot([2; 32]),
+            validator_identity: binding::identity_of(&member.public_key()),
+            wireguard_public_key: X25519PublicKey([20; 32]),
+            control_endpoint: Endpoint::new(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 20)),
+                443,
+                Transport::Tcp,
+                &policy(),
+            )
+            .unwrap(),
+            wireguard_endpoint: Some(
+                Endpoint::new(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 20)),
+                    51_820,
+                    Transport::Udp,
+                    &policy(),
+                )
+                .unwrap(),
+            ),
+            nonce: 1,
+        };
+        mesh.adverts.push(EndpointAdvertisement::sign(
+            record,
+            MeshVersion([7; 32]),
+            &member,
+        ));
+        let bytes = store::encode(&mesh).unwrap();
+
+        machine
+            .step(
+                Event::Retarget {
+                    event: MeshEpochEvent {
+                        epoch: 4,
+                        members: vec![member.public_key()],
+                        standbys: vec![me.public_key()],
+                        current_view: 1_783,
+                    },
+                    persisted: Some(bytes),
+                },
+                1_000,
+            )
+            .unwrap();
+        assert!(machine.driver.pending_restore.is_some());
+
+        machine.step(Event::Nudge, 2_000).unwrap();
+        assert_eq!(
+            machine.driver.untargeted_nudges, 0,
+            "a retarget suspended behind its restore IS targeted"
+        );
+    }
+}

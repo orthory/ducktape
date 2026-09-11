@@ -257,7 +257,7 @@ impl Driver {
                 self.finish_readvertisement(state, owner, signed, via, Some(addr));
             }
             Err(reason) => {
-                self.fail_peer(state, owner, &format!("rendezvous fallback: {reason}"));
+                self.fail_rendezvous_fallback(state, owner, &reason);
                 self.finish_readvertisement(state, owner, signed, via, None);
             }
         }

@@ -1,3 +1,108 @@
+// THE PAGES VIEW'S ACTS, one arm per intent (`PagesIntent`). The screen
+// lives in the `pages` view now (crates/views/pages); every handler below
+// this one is reached from here by a `flow` so its body stays where it was.
+// A draft crosses only with the act that reads it: the arm writes it into
+// the app-side field the handler always read, then routes. The three acts
+// that abandon the rail's comment (a pick, a hit, the rail's toggle/close)
+// carry it so the handler can keep it as a recovered draft.
+on pages_view_event(event)
+  match pages_intent(event)
+    PagesIntent.toggle_create
+      page_create_open = !page_create_open
+    PagesIntent.create
+      page_draft = event_text(event, "title")
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> create_page_submit()
+    PagesIntent.choose
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done event_text(event, "id")
+        done -> choose_page _
+    PagesIntent.search
+      page_search_draft = event_text(event, "query")
+      flow
+        from done true
+        done -> search_pages_submit()
+    PagesIntent.clear_search
+      flow
+        from done true
+        done -> clear_page_search()
+    PagesIntent.arm_delete
+      flow
+        from done true
+        done -> arm_page_delete()
+    PagesIntent.disarm_delete
+      flow
+        from done true
+        done -> disarm_page_delete()
+    PagesIntent.delete
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> delete_page_submit()
+    // The same echo the chat plane uses to reach this two-arg handler: a
+    // flow route takes one `_`, a run route takes the literal.
+    PagesIntent.open_hit
+      block_comment_draft = event_text(event, "comment_draft")
+      run every duck_echo_str(event_text(event, "page_id")) -> open_page_search_hit(_, "") | external_url_failed _
+    PagesIntent.use_draft
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done event_text(event, "draft")
+        done -> use_orphaned_comment_draft _
+    PagesIntent.discard_draft
+      flow
+        from done event_text(event, "draft")
+        done -> discard_orphaned_comment_draft _
+    // Recheck the accepted source and instance at the document handler.
+    PagesIntent.edited
+      flow
+        from done event
+        done -> page_edited _
+    PagesIntent.toggle_comments
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> toggle_block_comments()
+    PagesIntent.close_comments
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> close_block_comments()
+    PagesIntent.open_thread
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done event
+        done -> open_block_comment_thread _
+    PagesIntent.resolve
+      flow
+        from done event_flag(event, "resolved")
+        done -> resolve_thread_submit _
+    PagesIntent.more_threads
+      flow
+        from done true
+        done -> load_more_block_threads()
+    PagesIntent.close_thread
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> close_block_comment_thread()
+    PagesIntent.more_comments
+      flow
+        from done true
+        done -> load_more_block_comments()
+    PagesIntent.post
+      block_comment_draft = event_text(event, "text")
+      flow
+        from done true
+        done -> post_block_comment_submit()
+    PagesIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
+
 on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
   page_searching = true
@@ -10,12 +115,10 @@ on search_pages_submit
   run replace lane=page_search search_pages(connected_rpc, "", page_search_query) -> page_search_loaded _ | page_search_failed _
 
 // AN EMPTY QUERY MEANS NO SEARCH IS STANDING — every dismissal path clears
-// `page_search_query`, so this guard is the install decision for a reply the
-// dismissal could not invalidate: `close_doc_tab` rides an active/background
-// decision a lane invalidate cannot ride, and without the guard its late
-// reply restored the hits float over the tab just landed on and clobbered
-// `error` (or, on the failure route, raised a banner for a search nobody is
-// waiting on).
+// `page_search_query`, so this guard drops a late reply the dismissal could
+// not invalidate instead of restoring the hits float over the page just
+// landed on and clobbering `error` (or, on the failure route, raising a
+// banner for a search nobody is waiting on).
 on page_search_loaded(next)
   return if empty(page_search_query)
   page_search_hits = next.hits
@@ -45,6 +148,13 @@ on open_page_search_hit(page_id, _block_id)
   invalidate lane=block_threads
   invalidate lane=block_comments
   palette_open = false
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   shell_tab = ShellTab.pages
   // Same tab-move rule as `select_shell_tab`.
   page_searching = false
@@ -56,6 +166,7 @@ on open_page_search_hit(page_id, _block_id)
   page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -100,7 +211,7 @@ on choose_page(id)
   blocks = keep_blocks(page_moved, [], blocks)
   // The buffer and its baseline move together, always — a blank buffer with a
   // stale baseline would read as dirty and the save tick would write it back.
-  page_editor = installed_page_editor(page_editor, page_moved, "")
+  page_text = installed_page_text(page_text, page_moved, "")
   page_saved_text = keep_str(page_moved, "", page_saved_text)
   buffer_page = keep_str(page_moved, "", buffer_page)
   hydration_generation = hydration_generation + 1
@@ -110,6 +221,7 @@ on choose_page(id)
   page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -143,8 +255,6 @@ on create_page_submit
 
 on toggle_page_create
   page_create_open = !page_create_open
-  return if !page_create_open
-  task widget focus #workspace-tabs/content/pages/new-page window=window_target(console_win)
 
 on arm_page_delete
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
@@ -164,32 +274,19 @@ on delete_page_submit
 on use_orphaned_comment_draft(draft)
   return if loading || mutation_phase != MutationPhase.idle || !empty(trim(block_comment_draft))
   block_comment_draft = draft
+  pages_seed_rev = pages_seed_rev + 1
   block_comments_open = true
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
 
 on discard_orphaned_comment_draft(draft)
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
-// THE COMMENTS RAIL IS DOCUMENT-SCOPED. The artifact lists every comment on the
-// page under one `N comments` label and never involves a block selection
-// (Liquid Glass:940-941). `load_page_threads` asks the node's own plural
-// `ThreadsForTargets` query for the page AND all of its blocks at once, so the
-// rail opens on a page, not on a block.
-//
-// The comment TARGET is therefore the page: a thread opened from here anchors
-// on the document, which the module explicitly allows ("a block or page id",
-// pages/src/interface.rs:278). A thread that some earlier build anchored on a
-// block still LISTS here, but its comment page cannot be opened — the node
-// validates the thread's own target against the one asked for, and `ThreadRow`
-// reaches the app without it.
-// One header control, so one handler: the open state flips first and every
-// rail field is reset from it, then the guard below decides whether there is
-// anything to load. Closing keeps the half-typed comment through the orphan
-// guard, exactly as the rail's own × does.
+// The header opens all comments. Document badges open only their own anchor.
 on toggle_block_comments
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = !block_comments_open
+  inline_comment_target = ""
   block_comments_target = keep_str(block_comments_open, active_page, "")
   block_comment_threads = []
   block_comment_rows = []
@@ -216,6 +313,7 @@ on close_block_comments
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -236,13 +334,24 @@ on close_block_comments
 on block_threads_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   commented_block_hits = commented_targets_of(next.threads, active_page)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
   error = ""
+  return if empty(inline_comment_target)
+  let selected = comment_thread_for_target(block_comment_threads, inline_comment_target, active_block_comment_thread)
+  return if empty(selected) || selected == active_block_comment_thread
+  active_block_comment_thread = selected
+  active_thread_target = inline_comment_target
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = true
+  run replace lane=block_comments load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
 
 // The pagination machinery stays wired, and the document query answers in one
 // page (`has_more` false), so this only fires if that ever changes.
@@ -256,7 +365,7 @@ on load_more_block_threads
 on block_threads_page_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = append_page_comment_threads(block_comment_threads, next.threads)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -268,8 +377,13 @@ on block_threads_failed(cause)
   block_comment_threads_loading = false
   error = cause.message
 
-on open_block_comment_thread(id, target)
+on open_block_comment_thread(event)
+  let id = event_text(event, "id")
+  let target = event_text(event, "target")
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(id)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = id
   // The thread's OWN anchor, not the page: the node validates a comment read
@@ -330,6 +444,11 @@ on thread_resolve_failed(cause)
   error = cause.message
 
 on close_block_comment_thread
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
+  inline_comment_target = ""
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   invalidate lane=block_comments
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = ""
@@ -350,7 +469,8 @@ on post_block_comment_submit
   // A reply stays on its thread's anchor; a NEW comment anchors on the block
   // the caret sits in — the Notion gesture — and on the page from the title
   // line (or before any edit placed the caret).
-  let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  let caret_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  let fresh_target = keep_str(!empty(inline_comment_target), inline_comment_target, caret_target)
   active_thread_target = keep_str(!empty(active_block_comment_thread), active_thread_target, fresh_target)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   block_comments_generation = block_comments_generation + 1
@@ -374,6 +494,7 @@ on block_comment_posted(next)
 
 on block_comment_post_failed(cause)
   block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
+  pages_seed_rev = pages_seed_rev + 1
   pending_block_comment = ""
   mutation_phase = mutation_failure_phase(cause.committed)
   block_thread_comments_loading = false
@@ -392,7 +513,7 @@ on block_comment_post_failed(cause)
 on block_threads_recovered(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -408,6 +529,7 @@ on block_threads_recovery_failed(cause)
 on pages_updated(next)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -432,12 +554,14 @@ on pages_updated(next)
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_text = installed_page_text(page_text, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   // The buffer now holds THIS page. Unconditional on purpose: the install is
   // refused only when the decision already found the page unchanged.
@@ -450,8 +574,6 @@ on pages_updated(next)
   invalidate lane=page_autosave
   loading = false
   error = ""
-  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   // A create/delete moves the selection to another page — a navigation, so the
@@ -478,7 +600,9 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -487,6 +611,7 @@ on pages_mutated(next)
   page_create_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -503,7 +628,7 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_text = installed_page_text(page_text, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   buffer_page = next.active_page
   page_refusal = ""
@@ -513,83 +638,49 @@ on pages_mutated(next)
   page_delete_armed = false
   mutation_phase = MutationPhase.idle
   error = ""
-  // THE SAME TWO LINES `pages_updated` ENDS ON. A mutation moves the selection
-  // exactly as a pick does — a create lands on the page it just made — so the
-  // page it lands on belongs in the tab bar. Without them a created page was
-  // selected in the sidebar and titled in the header while the tab bar still
-  // showed only the documents opened before it. A tab whose page is gone needs
-  // no removal here: `doc_tab_rows` resolves every tab against the live page
-  // list and drops the ones it cannot find.
-  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 
-on doc_tabs_saved(_result)
-
-on doc_tabs_loaded(tabs)
-  doc_tabs = tabs
-
-on close_doc_tab(id)
-  return if loading || mutation_phase != MutationPhase.idle
-  // THE SAME DECISION `next_doc_tab` MAKES, read here before `active_page`
-  // moves under it: that function returns `active` UNCHANGED when the closed
-  // tab is not the active one, so closing a BACKGROUND tab navigates nowhere
-  // and an unconditional dismissal would take down a search answer the user is
-  // still reading. Only the closure that actually moves the selection is a
-  // navigation, and only it dismisses. A lane invalidate cannot ride a
-  // decision, so a reply already in flight is dropped on ARRIVAL instead: both
-  // reply handlers return early on an empty `page_search_query`, and the
-  // active-close empties it below.
-  let closing_active = id == active_page
-  page_searching = keep_bool(closing_active, false, page_searching)
-  page_search_hits = keep_page_hits(closing_active, [], page_search_hits)
-  page_search_query = keep_str(closing_active, "", page_search_query)
-  active_page = next_doc_tab(doc_tabs, id, active_page)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  doc_tabs = doc_tabs_without(doc_tabs, id)
-  // The same prologue as `choose_page`: `active_page` just moved under the
-  // buffer, and without `loading` the next 900ms tick would write the OLD
-  // page's text into the NEW page. `pages_updated` clears it and decides the
-  // install; closing a background tab reloads the same page, which the
-  // install decision keeps harmless for a dirty buffer.
-  invalidate lane=page_autosave
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  loading = true
-  parallel
-    run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-    run replace lane=page_load load_page(connected_rpc, active_page) -> pages_updated _ | failed _
-
-// THE DOCUMENT'S ONE EDIT ROUTE. Every key lands here: `apply_page_action`
-// resolves the list/indent behaviours in the buffer and NOTHING reaches the
-// node — the save tick below is the only write path, which is what keeps
-// typing at buffer speed on a consensus-backed document.
+// Accepted guest edits update the save buffer only after the host resolves
+// their exact canonical reference in the current page and connection.
 on page_edited(event)
-  page_editor = apply_page_event(page_editor, event)
-  caret_comment_target = block_at_line_target(blocks, editor_cursor_line(page_editor))
+  let document = accept_page_document(event, network_chain_id, active_page)
+  return if !document.accepted
+  page_text = document.text
+  page_cursor_line = document.cursor_line
+  caret_comment_target = block_at_line_target(blocks, keep_i64(document.comment_line >= 0, document.comment_line, page_cursor_line))
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""
-  // A margin-badge press opens the comments rail. Every rail field is already
-  // at its reset value whenever the rail is closed (every close path resets
-  // them), so opening is just the flip plus the thread load. A badge press
-  // with the rail already open is a no-op.
-  let page_rail_open = page_opens_comments(event) && !block_comments_open && !loading && mutation_phase == MutationPhase.idle && !empty(active_page)
-  block_comments_generation = block_comments_generation + keep_i64(page_rail_open, 1, 0)
-  block_comments_open = block_comments_open || page_rail_open
-  block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
-  block_comment_threads_loading = block_comment_threads_loading || page_rail_open
-  // A link press goes through the ONE open plane (`open_message_link`), not
-  // straight to the OS: a page cites `duck://` addresses as readily as a chat
-  // message does, and only that plane knows the module table and the
-  // network scope. It never touched the buffer either way. The two runs are
-  // exclusive by event kind; each backend treats an empty argument as "not my
-  // turn" and answers without side effects.
-  let page_link = page_link_of(event)
-  return if empty(page_link) && !page_rail_open
+  let page_link = document.link
+  return if empty(page_link) && document.comment_line < 0
   parallel
     run every duck_echo_str(page_link) -> open_message_link _ | external_url_failed _
-    run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+    flow
+      from done event
+      done -> open_document_comments _
+
+on open_document_comments(event)
+  let document = accept_page_document(event, network_chain_id, active_page)
+  return if !document.accepted || document.comment_line < 0
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, document.comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
+  invalidate lane=block_comments
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = true
+  block_comments_target = active_page
+  let target = block_at_line_target(blocks, document.comment_line)
+  inline_comment_target = keep_str(!empty(target), target, active_page)
+  caret_comment_target = inline_comment_target
+  block_comment_threads_loading = true
+  block_comment_rows = []
+  active_block_comment_thread = ""
+  active_thread_target = inline_comment_target
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_thread_comments = []
+  block_thread_comments_loading = false
+  block_thread_comments_has_more = false
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
 
@@ -597,7 +688,7 @@ on external_url_failed(cause)
   error = cause.message
 
 // THE PAGE SAVES ON A GATED TICK, not per keystroke: the editor's edits land
-// in `page_editor` without passing through a handler on the way to the node,
+// in `page_text` without passing through a handler on the way to the node,
 // so dirtiness is the buffer's drift from `page_saved_text` and the subscribe
 // block's `every` line only exists while that drift does.
 on page_autosave_tick
@@ -612,18 +703,22 @@ on page_autosave_tick
   // had: the page the reader never got to see would be destroyed by the act of
   // failing to open it.
   return if active_page != buffer_page
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  return if !observed.ready
   // One op chain at a time: a multi-op save routinely outlives the 900ms
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
   return if block_autosave_status == AutosaveStatus.saving
-  let text = editor_text(page_editor)
+  let text = page_text
   return if text == page_saved_text
-  // An open ``` swallows every line under it when parsed — the save waits
-  // for the close instead of writing (or refusing) a half-typed fence, and
-  // SAYS SO: a stale "✓ synced" over held-back text would be a lie.
+  // An open ``` swallows every line under it when parsed: the plan would
+  // REMOVE every block below it, and removing a block purges its comment
+  // threads. The save waits for the close — quietly. The status drops to
+  // idle (no "✓ synced" over held-back text), and the next tick after the
+  // close writes; no banner lectures the writer about Markdown mid-sentence.
   let fence_open = has_unclosed_fence(text)
   block_autosave_status = AutosaveStatus.idle
-  page_refusal = keep_str(!fence_open, page_refusal, "the ``` fence is open — close it to save")
   return if fence_open
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -639,7 +734,7 @@ on page_autosave_tick
 on page_document_saved(next)
   pages = next.data.pages
   blocks = next.data.blocks
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent
@@ -652,8 +747,10 @@ on page_document_saved(next)
   // since the tick submitted. Otherwise the buffer is kept (the newest words
   // must survive), the baseline moves to the node's text, and the still-dirty
   // buffer re-plans on the next tick with the refusal line explaining why.
-  let untouched = editor_text(page_editor) == page_inflight_text
-  page_editor = rolled_back_editor(page_editor, untouched, next.document)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let untouched = observed.ready && page_text == page_inflight_text
+  page_text = rolled_back_text(page_text, untouched, next.document)
   // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
   // round trip, and `untouched` above exists because of it. Adopting her
   // unsaved line 0 here would make the document read clean and retire the very

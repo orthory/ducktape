@@ -1,22 +1,14 @@
 // THE WINDOW LAYERS — the bell, the command palette and the block explorer.
 // `global_key_pressed` lives here because the palette is what it opens.
 
-on refresh_explorer
-  return if !connected || explorer_loading
-  explorer_generation = explorer_generation + 1
-  explorer_loading = true
-  run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-
-on explorer_loaded(next)
-  return if next.generation != explorer_generation
-  explorer_loading = false
-  explorer_blocks = next.blocks
-  explorer_ops = next.ops
-
-on explorer_failed(cause)
-  return if cause.generation != explorer_generation
-  explorer_loading = false
-  error = cause.message
+// THE EXPLORER SPEAKS THE KERNEL CONTRACT: it reads the block window and
+// runs its workspace search itself, so the only thing it asks the app for is
+// the clipboard — an OS door no view holds.
+on explorer_view_event(event)
+  return if event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 on close_palette
   invalidate lane=palette_search
@@ -30,21 +22,76 @@ on close_palette
 // painted, and left that button with nothing to do.
 on toggle_bell
   bell_open = !bell_open
+  return if !bell_open
+  bell_error = ""
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
+
+on reload_bell
+  bell_error = ""
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
 
 on close_bell
   bell_open = false
 
 on mark_bell_read_submit
-  return if bell_unread <= 0
-  run every mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+  return if bell_unread <= 0 || bell_marking
+  bell_marking = true
+  bell_error = ""
+  run replace lane=bell_mark mark_bell_read(connected_rpc, password, account_number, bell_head(bell_items)) -> bell_marked connect_generation account_number _ | bell_mark_failed connect_generation account_number _
 
-on bell_loaded(next)
-  bell_unread = next.unread
-  bell_items = next.items
+on bell_loaded(generation, account, next)
+  return if generation != connect_generation || account != account_number
+  bell_error = ""
+  bell_items = merge_bell_loaded(bell_items, next.items, bell_read_through, bell_clear_through)
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, next.presentations)
+  bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
 
-on bell_failed(_cause)
+on bell_context_loaded(generation, account, next)
+  return if generation != connect_generation || account != account_number
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, next)
+  bell_error = ""
 
-on bell_marked(_result)
+on bell_failed(generation, account, cause)
+  return if generation != connect_generation || account != account_number
+  bell_error = cause.message
+
+on bell_marked(generation, account, delta)
+  return if generation != connect_generation || account != account_number
+  bell_marking = false
+  bell_read_through = keep_i64(delta.up_to_seq > bell_read_through, delta.up_to_seq, bell_read_through)
+  bell_items = apply_bell(bell_items, delta)
+  bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
+
+on bell_mark_failed(generation, account, cause)
+  return if generation != connect_generation || account != account_number
+  bell_marking = false
+  bell_error = cause.message
+
+on bell_open_item(generation, account, context)
+  return if generation != connect_generation || account != account_number
+  return if context.target == BellTarget.unavailable || empty(context.object)
+  bell_open = false
+  match context.target
+    BellTarget.run
+      flow
+        from done context.object
+        done -> open_run_panel _
+    BellTarget.page
+      run replace lane=bell_navigation duck_echo_str(context.object) -> open_page_search_hit(_, context.anchor) | external_url_failed _
+    BellTarget.message
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.forge
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.repo
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.unavailable
+      return if true
 
 on global_key_pressed(event)
   // EVERY VERDICT THIS HANDLER CAN ACT ON, RESOLVED FIRST — then the press
@@ -68,7 +115,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)
+  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed)
   // THE COMPOSER'S FORMATTING CHORDS ARE NOT HERE ANY MORE. They land at the
   // widget that has the caret — `RichTextEditor::on_chord` (ducktape-ui#711)
   // is offered exactly the presses the bubble contract releases — so the
@@ -76,9 +123,8 @@ on global_key_pressed(event)
   // needed a `composer_focus` discriminant to guess which one was focused.
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press names no move.
-  let pages_ready = connected && shell_tab == ShellTab.pages && !palette_open && !page_delete_armed
   let palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
-  return if empty(escape_key) && palette_key == "none" && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
+  return if empty(escape_key) && palette_key == "none"
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
   thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
@@ -91,9 +137,6 @@ on global_key_pressed(event)
   message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
   channel_settings_open = channel_settings_open && escape_key != "channel_settings"
   page_delete_armed = page_delete_armed && escape_key != "page_delete"
-  fs_delete_target = keep_str(escape_key == "fs_delete", "", fs_delete_target)
-  forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
-  page_editor = page_history_key(page_editor, page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   invalidate lane=palette_search
@@ -103,35 +146,7 @@ on global_key_pressed(event)
   palette_page_hits = []
   palette_search_phase = SearchPhase.idle
   return if !palette_open
-  task widget focus #workspace-tabs/overlays/palette-input window=window_target(console_win)
-
-// THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no
-// key handling, so Page Down over Settings moved nothing — and neither did
-// Home or End, on any screen. One decide-fn turns the press into a pixel delta
-// and every full-pane content scroll takes the same delta: the shell mounts
-// exactly ONE of these at a time (`match tab` in WorkspaceTabs), and
-// `scroll-by` against a pane that is not on screen is a no-op, so naming them
-// all IS the routing — the same shape as the escape ladder above, where the
-// keepers do the dispatch.
-//
-// `topmost_overlay` is the SAME reading the escape ladder takes, not a second
-// derivation of it: with the palette or the bell up, the pane the reader can
-// see is not the one a `scroll-by` would move, and `content_scroll_step`
-// answers 0.0 for every key while any layer is over the content.
-//
-// The multi-pane screens (chat, pages, files, forge, the explorer) are absent
-// on purpose: they show two or three scrolls side by side and nothing here can
-// say which one the reader means. Giving them a keyboard scroll is a focus
-// design, not a bug fix, and guessing a pane would move the wrong one.
-on content_scroll_key(event)
-  let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu))
-  return if content_scroll == 0.0
-  parallel
-    task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll window=window_target(console_win)
+  task widget focus #workspace-tabs/overlays/palette-input
 
 on palette_changed(next)
   invalidate lane=palette_search

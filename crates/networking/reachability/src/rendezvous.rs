@@ -838,11 +838,15 @@ mod tests {
         // like Δ=1 ≤ ttl. 2.5 s guarantees an integer-second delta ≥ 2.
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
-        // A probe client resolves A (kept alive) but not X (expired).
+        // A probe client resolves A (kept alive) but not X (expired). A
+        // Lookup is only answered to a caller the coordinator has already
+        // bound to its own registered source (#1595) — the probe registers
+        // itself first, exactly like every legitimate lookup caller does.
         let (probe_key, probe_signer) = identity(5);
         let probe = nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
             .await
             .unwrap();
+        probe.register().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
             .await
             .expect("bounded")
@@ -910,11 +914,14 @@ mod tests {
             .expect_err("a silent peer cannot be punched");
         assert!(err.contains("hole-punch failed"), "unexpected error: {err}");
 
-        // A's own registration survived the busy window.
+        // A's own registration survived the busy window. The probe must
+        // register itself first — a Lookup is only answered to a caller
+        // already bound to its own registered source (#1595).
         let (probe_key, probe_signer) = identity(8);
         let probe = nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
             .await
             .unwrap();
+        probe.register().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
             .await
             .expect("bounded")
@@ -972,10 +979,13 @@ mod tests {
         }
 
         // Registration is live at the coordinator: a probe can look A up.
+        // The probe registers itself first — a Lookup is only answered to a
+        // caller already bound to its own registered source (#1595).
         let (probe_key, probe_signer) = identity(11);
         let probe = nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
             .await
             .unwrap();
+        probe.register().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
             .await
             .expect("bounded")

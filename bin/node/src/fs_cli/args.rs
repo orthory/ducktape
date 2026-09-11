@@ -2,7 +2,22 @@
 //! address to. The addressing flags and the resolution ladder itself are
 //! [`crate::cli_args::NodeAddr`] — ONE ladder for every family.
 
+use unicode_normalization::UnicodeNormalization as _;
+
 pub use crate::cli_args::NodeAddr;
+
+/// a clap `value_parser` for every path-shaped argument: NFC-normalize at the
+/// one place an OS string becomes a CLI argument — the same crossing
+/// `duckfs_client::scan::duckfs_join` owns for a scanned name.
+/// `duckfs_core::paths::canonical` stays reject-only downstream (it only ever
+/// rejects a byte sequence, never rewrites one) — a person-typed NFD path
+/// (what macOS hands back for tab-completion, `find`, drag-and-drop on an
+/// HFS+/legacy volume) is rewritten HERE, once, so every verb that takes a
+/// path argument is covered instead of each one normalizing for itself. NFC is
+/// idempotent, so an already-composed argument passes through unchanged.
+pub fn nfc_path(raw: &str) -> Result<String, std::convert::Infallible> {
+    Ok(raw.nfc().collect())
+}
 
 /// a CLI failure carrying the process exit code. code 2 is a usage error (an
 /// unresolved node) and a commit conflict; code 1 is a general operational
@@ -152,6 +167,94 @@ mod tests {
     #[test]
     fn limit_rejects_a_non_number() {
         assert!(parse(&["ls", "/p", "--limit", "abc"]).is_err());
+    }
+
+    /// an NFD-typed path argument — what macOS hands back for tab-completion,
+    /// `find`, or drag-and-drop off an HFS+/legacy volume — is NFC-normalized
+    /// at parse time. one table over every verb that takes a path-shaped
+    /// argument, so a verb whose field skips `nfc_path` fails this test
+    /// instead of silently shipping the gap #1455 reported.
+    #[test]
+    fn path_arguments_are_nfc_normalized() {
+        use unicode_normalization::UnicodeNormalization as _;
+
+        let nfc: String = "/nfd-check/설계.md".nfc().collect();
+        let nfd: String = "/nfd-check/설계.md".nfd().collect();
+        assert_ne!(nfc, nfd, "fixture must actually decompose under NFD");
+
+        // one row per verb: the argv to parse, and how to pull the
+        // normalized path back out of the parsed `FsCmd`.
+        type PathExtractor = Box<dyn Fn(FsCmd) -> String>;
+        let rows: Vec<(Vec<String>, PathExtractor)> = vec![
+            (
+                vec!["ls".into(), nfd.clone()],
+                Box::new(|c| match c {
+                    FsCmd::Ls(a) => a.path,
+                    _ => panic!("expected ls"),
+                }),
+            ),
+            (
+                vec!["cat".into(), nfd.clone()],
+                Box::new(|c| match c {
+                    FsCmd::Cat(a) => a.path,
+                    _ => panic!("expected cat"),
+                }),
+            ),
+            (
+                vec!["stat".into(), nfd.clone()],
+                Box::new(|c| match c {
+                    FsCmd::Stat(a) => a.path,
+                    _ => panic!("expected stat"),
+                }),
+            ),
+            (
+                vec![
+                    "diff".into(),
+                    "s1".into(),
+                    "s2".into(),
+                    "--prefix".into(),
+                    nfd.clone(),
+                ],
+                Box::new(|c| match c {
+                    FsCmd::Diff(a) => a.prefix.unwrap(),
+                    _ => panic!("expected diff"),
+                }),
+            ),
+            (
+                vec!["checkout".into(), nfd.clone(), "wt/dir".into()],
+                Box::new(|c| match c {
+                    FsCmd::Checkout(a) => a.prefix,
+                    _ => panic!("expected checkout"),
+                }),
+            ),
+            (
+                vec!["status".into(), "--path".into(), nfd.clone()],
+                Box::new(|c| match c {
+                    FsCmd::Status(a) => a.paths.into_iter().next().unwrap(),
+                    _ => panic!("expected status"),
+                }),
+            ),
+            (
+                vec![
+                    "commit".into(),
+                    "wt".into(),
+                    "--message".into(),
+                    "m".into(),
+                    "--path".into(),
+                    nfd.clone(),
+                ],
+                Box::new(|c| match c {
+                    FsCmd::Commit(a) => a.paths.into_iter().next().unwrap(),
+                    _ => panic!("expected commit"),
+                }),
+            ),
+        ];
+
+        for (argv, extract) in rows {
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let cmd = parse(&argv_refs).unwrap_or_else(|e| panic!("argv={argv:?}: {e}"));
+            assert_eq!(extract(cmd), nfc, "argv={argv:?}");
+        }
     }
 
     /// `--node` binds through the shared addressing group. The PRECEDENCE it

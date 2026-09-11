@@ -29,6 +29,7 @@ fn ctx(origin: Origin, height: u64) -> TestCtx {
         consensus_time: height,
         origin,
         me: "files".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 
@@ -275,6 +276,11 @@ impl NodeApi for ModuleNode {
             snapshot: snapshot.into(),
             name: name.into(),
         }))?;
+        Ok(())
+    }
+
+    fn unpin(&self, name: &str) -> Result<(), ApiError> {
+        self.exec(encode_msg(&FilesMsg::Unpin { name: name.into() }))?;
         Ok(())
     }
 }

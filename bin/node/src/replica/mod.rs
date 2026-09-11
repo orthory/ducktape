@@ -59,7 +59,7 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 /// validator role continues with — and every other exit is
 /// `std::process::exit`.
 ///
-/// wiring (phase 6a: per-epoch channel bank, reachability standby, join gate)
+/// wiring (phase 6a: the five fixed engine lanes, reachability standby, join gate)
 /// happens in [`wiring::wire`]; the resulting [`wiring::ReplicaChannels`]
 /// feed the park loop (phases 6b–6d: serve state, the loop itself,
 /// promotion) in [`park::park`].
@@ -78,6 +78,7 @@ pub(crate) async fn run(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
+    identity_chain_id: String,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -103,6 +104,7 @@ pub(crate) async fn run(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    remote_sessions: noded::RemoteSessions,
     local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
@@ -164,6 +166,7 @@ pub(crate) async fn run(
         signer,
         label,
         namespace,
+        identity_chain_id,
         peers,
         validators,
         wireguard_listen,
@@ -177,6 +180,7 @@ pub(crate) async fn run(
         gateway_commands,
         session_manager,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports,
         stream_hub,
@@ -323,8 +327,10 @@ mod tests {
                 .expect("signer signs")
             })
             .collect();
+        let attestations = commonware_utils::iter::NonEmpty::try_new(attestations.into_iter())
+            .expect("a quorum is never empty");
         let certificate = schemes[0]
-            .assemble::<_, N3f1>(attestations, &Sequential)
+            .assemble(attestations, &Sequential)
             .expect("quorum assembles");
         Certificate::Finalization(Finalization::<simplex_ed25519::Scheme, Digest> {
             proposal,

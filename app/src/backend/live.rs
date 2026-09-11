@@ -1,6 +1,5 @@
 use super::*;
 use ::chat;
-use ::forge;
 use identity::{AccountView, IdentityQuery, IdentityReply};
 
 /// One UI publication may carry at most this many consecutive chat deltas.
@@ -79,7 +78,13 @@ pub async fn connect(
     }
     let result = async {
         let rpc = rpc_client(&rpc)?;
-        load_workspace(&rpc, None, None, generation).await
+        // the node the module-owned views load their deployments from: the
+        // views load while the workspace does, and this answers with both
+        // in hand, so the tabs it opens onto never draw a view on its way
+        let views = crate::module_view::connected(&rpc);
+        let workspace = load_workspace(&rpc, None, None, generation).await?;
+        views.settled().await;
+        Ok::<_, String>(workspace)
     }
     .await;
     // SAY WHAT ACTUALLY FAILED. This threw the cause away with `|_|` and
@@ -256,11 +261,16 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     // back at the price of carrying a last-height in this state,
                     // and the fold path — the part that actually cost something
                     // — is already unreachable.
-                    Some(Ok(ModuleEvent::Tip { height })) => live_update(
-                        crate::LiveKind::Tip,
-                        &format!("Live · block {height}"),
-                        i64::try_from(height).unwrap_or(i64::MAX),
-                    ),
+                    Some(Ok(ModuleEvent::Tip { height })) => {
+                        // a block may have activated a module's code: the
+                        // module-owned views check their deployments
+                        tokio::spawn(crate::module_view::deployments_checked());
+                        live_update(
+                            crate::LiveKind::Tip,
+                            &format!("Live · block {height}"),
+                            i64::try_from(height).unwrap_or(i64::MAX),
+                        )
+                    }
                     Some(Err(error)) => {
                         state.stream = None;
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
@@ -366,7 +376,6 @@ pub struct ChatLiveFold {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub post_refusal: String,
-    pub forge_discussion: Vec<ChatMessage>,
     /// A huddle roster change in the active channel needs the canonical roster
     /// read that a delta cannot derive.
     pub refresh_chat: bool,
@@ -377,10 +386,8 @@ struct ChatFoldState {
     messages: Vec<ChatMessage>,
     thread_messages: Vec<ChatMessage>,
     channel_members: Vec<ChatMember>,
-    forge_discussion: Vec<ChatMessage>,
     active_channel: String,
     active_thread_seq: i64,
-    forge_item_channel: String,
     history_view: bool,
     messages_changed: bool,
     thread_messages_changed: bool,
@@ -433,13 +440,6 @@ fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64, message:
             message.clone(),
         );
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_posted_message(
-            std::mem::take(&mut state.forge_discussion),
-            message,
-        );
-    }
 }
 
 fn fold_reply(
@@ -468,11 +468,6 @@ fn fold_reply(
             chat::client::bump_reply_summary(std::mem::take(&mut state.thread_messages), root_seq);
         state.thread_messages = chat::client::merge_thread_reply(thread, message);
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion =
-            chat::client::bump_reply_summary(std::mem::take(&mut state.forge_discussion), root_seq);
-    }
 }
 
 fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
@@ -491,14 +486,6 @@ fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message:
             &message,
         );
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_message_edit(
-            std::mem::take(&mut state.forge_discussion),
-            seq,
-            &message,
-        );
-    }
 }
 
 fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
@@ -512,11 +499,6 @@ fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
         state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
         state.thread_messages =
             chat::client::tombstone_message(std::mem::take(&mut state.thread_messages), seq);
-    }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion =
-            chat::client::tombstone_message(std::mem::take(&mut state.forge_discussion), seq);
     }
 }
 
@@ -547,17 +529,6 @@ fn fold_reaction(
         state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
         state.thread_messages = chat::client::merge_message_reaction(
             std::mem::take(&mut state.thread_messages),
-            seq,
-            &emoji,
-            added,
-            &reactor,
-            by_me,
-        );
-    }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_message_reaction(
-            std::mem::take(&mut state.forge_discussion),
             seq,
             &emoji,
             added,
@@ -606,12 +577,11 @@ pub fn fold_live_chat(
     active_thread_seq: i64,
     history_view: bool,
     chat_visible: bool,
+    has_older_history: bool,
     unread_boundary: i64,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
     mut active_channel_members_only: bool,
-    forge_discussion: Vec<ChatMessage>,
-    forge_item_channel: String,
     selected_message_seq: i64,
     selected_message_rev: i64,
     message_action: crate::MessageAction,
@@ -621,15 +591,16 @@ pub fn fold_live_chat(
     thread_message_action: crate::MessageAction,
     thread_edit_draft: String,
 ) -> ChatLiveFold {
+    // Read before the timeline moves into the fold: the floor it ends on is
+    // compared against this to see whether the render window evicted history.
+    let floor_before = oldest_committed_seq(&messages);
     let mut state = ChatFoldState {
         channels,
         messages,
         thread_messages,
         channel_members,
-        forge_discussion,
         active_channel,
         active_thread_seq,
-        forge_item_channel,
         history_view,
         messages_changed: false,
         thread_messages_changed: false,
@@ -689,7 +660,6 @@ pub fn fold_live_chat(
         messages,
         thread_messages,
         channel_members,
-        forge_discussion,
         active_channel,
         history_view,
         messages_changed,
@@ -704,7 +674,7 @@ pub fn fold_live_chat(
         active_channel_archived = channel.archived;
         active_channel_members_only = channel.members_only;
     }
-    let seated = channel_members.iter().any(|member| member.key == me);
+    let seated = seated_in(&channel_members, &me);
     let post_refusal = if active_channel_archived {
         "channel_archived".into()
     } else if active_channel_members_only && !seated {
@@ -737,18 +707,26 @@ pub fn fold_live_chat(
             .find(|message| message.seq > unread_boundary)
             .map_or(0, |message| message.seq)
     };
-    let rooms = chat_sidebar_rooms(
-        channels.clone(),
-        dm_peers.clone(),
-        me,
-        channel_reads.clone(),
-    );
+    let rooms = chat_sidebar_rooms(channels.clone(), dm_peers.clone(), channel_reads.clone());
     let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
 
-    let has_older_history = messages
-        .iter()
-        .find(|message| !message.pending)
-        .is_some_and(|message| message.seq > 1);
+    // THE SERVER OWNS THIS FLAG; THE FOLD MAY ONLY RAISE IT.
+    //
+    // It used to be recomputed here as "the oldest loaded root has seq > 1",
+    // which is a guess and a wrong one: thread replies consume root sequences
+    // without becoming roots, so a channel's very first message routinely sits
+    // at seq 40 and "Load older messages" stood over the true beginning of every
+    // busy room forever. What a live fold DOES know is whether it pushed the
+    // floor up — `bounded_chat_window` evicts from the oldest edge to hold the
+    // render window — and rows this window dropped are older history by
+    // definition, whatever the page load last said.
+    //
+    // A window that held no committed row has no floor to lose: the first live
+    // arrival in an empty room raises the floor from 0 to its own seq, which is
+    // growth, not eviction.
+    let window_had_a_floor = floor_before > 0;
+    let evicted_the_floor = window_had_a_floor && oldest_committed_seq(&messages) > floor_before;
+    let has_older_history = has_older_history || evicted_the_floor;
     let selection = message_selection_after_window_ref(
         &messages,
         selected_message_seq,
@@ -787,7 +765,6 @@ pub fn fold_live_chat(
         active_channel_archived,
         active_channel_members_only,
         post_refusal,
-        forge_discussion,
         refresh_chat,
     }
 }
@@ -827,14 +804,23 @@ pub(crate) async fn folded_update(
     };
     match module {
         "chat" => {
-            let current_user = local_user_key().await;
+            // THE DIRECTORY AS LAST READ, NOT A FRESH READ: this is inside the
+            // live decoder fold, where a query would freeze every subscriber
+            // for as long as the node's select loop is busy (issue #1018). It
+            // is warm by the connect that opened this stream.
+            let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
+            // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
+            // and a DM used to reach nothing but the in-app bell, which is
+            // worth nothing behind another window. Pure decision, cached
+            // reads, no query — see `notify`.
+            notify_chat_op(&payload, op.assigned.as_ref(), facts.names());
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                current_user.as_deref(),
+                facts.reader(),
                 op.height,
             );
             let delta = match folded {
@@ -847,8 +833,8 @@ pub(crate) async fn folded_update(
             let delta = match delta {
                 ChatDelta::ChannelRefresh { channel_id } => {
                     let channel = match load_channel_row(rpc, &channel_id).await {
-                        Ok(channel) => channel,
-                        Err(_) => return Some(live_resync("chat", height)),
+                        Ok(Some(channel)) => channel,
+                        Ok(None) | Err(_) => return Some(live_resync("chat", height)),
                     };
                     ChatDelta::ChannelUpdated {
                         channel_id,
@@ -868,21 +854,22 @@ pub(crate) async fn folded_update(
                 chat: vec![delta],
                 pages: PagesDelta::default(),
                 bell: BellDelta::default(),
-                forge: ForgeRefresh::default(),
                 permit: LivePermit::default(),
             })
         }
         "inbox" => {
-            // the same derivation `local_member` uses: the bell folds only the
-            // ops naming THIS user's queue, and a queue is named for its owner.
-            let member = local_member().await?;
+            // Stream folds use the cached identity directory, with no RPC read.
+            let facts = ReaderFacts::current().await;
+            let key = facts.reader().key?;
+            let account = facts.names().account_of(&hex_encode(key))?;
             let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = inbox::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                &member,
+                account,
+                "attribution",
             );
             match folded {
                 Ok(Some(bell)) => Some(LiveUpdate {
@@ -896,7 +883,6 @@ pub(crate) async fn folded_update(
                     chat: Vec::new(),
                     pages: PagesDelta::default(),
                     bell,
-                    forge: ForgeRefresh::default(),
                     permit: LivePermit::default(),
                 }),
                 Ok(None) => None,
@@ -926,30 +912,10 @@ pub(crate) async fn folded_update(
                     chat: Vec::new(),
                     pages: delta,
                     bell: BellDelta::default(),
-                    forge: ForgeRefresh::default(),
                     permit: LivePermit::default(),
                 })
             }
             Err(_) => Some(live_resync("pages", height)),
-        },
-        "forge" => match forge::client::refresh_from_op(&payload) {
-            Ok(refresh) => Some(LiveUpdate {
-                kind: crate::LiveKind::Forge,
-                status: format!("Live · block {height}"),
-                height,
-                module: "forge".into(),
-                load_chat: false,
-                load_pages: false,
-                // pushes arrive in bursts (one op per ref batch, then the
-                // tracker follow-ups) — coalesce the reloads like pages does.
-                debounce: true,
-                chat: Vec::new(),
-                pages: PagesDelta::default(),
-                bell: BellDelta::default(),
-                forge: refresh,
-                permit: LivePermit::default(),
-            }),
-            Err(_) => Some(live_resync("forge", height)),
         },
         // THE RELOAD PLANES. No client fold exists for these modules and none
         // is worth writing: a validator set changes when someone joins, a
@@ -962,17 +928,11 @@ pub(crate) async fn folded_update(
         // At these rates it is the right trade: no fold to keep correct, and
         // nothing at all on a block that does not touch them.
         //
-        // `runs` rides here for a different reason than the rest: NOTHING ON
-        // SCREEN DRAWS A RUN. The fact it feeds lives in another module's
-        // projection — an `AgentRow.live` is `agents_with_a_run_in_flight`
-        // reading `runs`' pending register, joined onto a row `agent` owns
-        // (`backend/node.rs`) — so there is no local state for a fold to fold
-        // INTO and the op can only be a signal to refetch the agents
-        // projection. It commits at agent-TURN rate (a run claimed, a run
-        // finished), which is the same human rate as the others, so the trade
-        // above holds. Without it the Forge seat's live dot had no off-tab
-        // refresh path at all and stayed dark until Agents was opened.
-        "valset" | "governance" | "identity" | "agent" | "runs" | "files" => {
+        // Model configuration and run activity both refresh the Agents view.
+        // `forge` is here because the app holds no forge state at all: the
+        // plane arm is what tells a module view's `rpc.live` subscription,
+        // and the forge view re-reads exactly what it has open.
+        "valset" | "governance" | "identity" | "agent" | "runs" | "files" | "forge" => {
             Some(live_plane(module, height))
         }
         _ => None,
@@ -982,6 +942,7 @@ pub(crate) async fn folded_update(
 fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
     match kind {
         ducktape_rpc::StreamOriginKind::External => "external",
+        ducktape_rpc::StreamOriginKind::Program => "program",
         ducktape_rpc::StreamOriginKind::Module => "module",
         ducktape_rpc::StreamOriginKind::System => "system",
     }
@@ -995,10 +956,17 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 /// long as the node's select loop is busy writing a checkpoint (issue #1018).
 /// `ChatViewQuery::Channel` reads the same `ChannelInfo` off an MVCC snapshot,
 /// off-loop — identical payload, no checkpoint tax.
-pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
+///
+/// An unseen row is `None`, and the caller turns it into a scoped resync rather
+/// than a banner: the op named a channel this node's index cannot answer for
+/// yet, and a reload is the only thing that heals that.
+pub(crate) async fn load_channel_row(
+    rpc: &str,
+    channel_id: &str,
+) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let (channel, _roster) = load_channel_facts(&rpc, channel_id, None).await?;
-    Ok(channel)
+    let room = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
+    Ok(room.map(|(channel, _roster)| channel))
 }
 
 /// One scoped catch-up load, flag-selected per plane: the chat slices
@@ -1155,21 +1123,6 @@ pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bo
     kind == crate::LiveKind::Plane && module == want
 }
 
-/// Did this live update touch the AGENTS projection — from either module?
-///
-/// TWO MODULES, ONE ROW. `agent` owns the registration and `runs` owns the
-/// liveness: `AgentRow.live` is `agents_with_a_run_in_flight` reading `runs`'
-/// pending register, joined on in `load_agents`. So a run starting or ending
-/// changes what the Forge seat's dot draws while `agent` commits nothing at
-/// all — the reason the dot went dark for a whole turn once the tab move
-/// stopped refetching off-tab.
-///
-/// Named rather than spelled inline for the same reason [`plane_live_hit`] is:
-/// the Ice checker cannot type a subscription payload's field inside a `let`.
-pub fn agents_plane_hit(kind: crate::LiveKind, module: String) -> bool {
-    kind == crate::LiveKind::Plane && (module == "agent" || module == "runs")
-}
-
 /// The planes discriminant for [`live_resync_load`].
 pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
     match (load_chat, load_pages) {
@@ -1189,15 +1142,35 @@ pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
 /// (`keep_channels(loaded, upsert_channel_rows(channels, next), channels)`) the
 /// upsert ran on every pages-only refresh and was thrown away one call later.
 /// Same early-return shape as [`resynced_messages`] below.
+///
+/// EXCEPT ACROSS A NETWORK. `chain_moved` says the list on screen was learned
+/// from a chain this node is no longer on — a workspace switch under a console
+/// that never reconnected, because the endpoint did not change — and a fold has
+/// no way to express "that room does not exist here": it only ever adds. So the
+/// one thing that can be true of the previous network's rooms is that they are
+/// gone, and the answer replaces the list outright.
 pub fn keep_channels(
     loaded: bool,
+    chain_moved: bool,
     next: Vec<ChatChannel>,
     current: Vec<ChatChannel>,
 ) -> Vec<ChatChannel> {
     if !loaded {
         return current;
     }
+    if chain_moved {
+        return next;
+    }
     upsert_channel_rows(current, next)
+}
+
+/// The oldest COMMITTED root's seq, or 0 for a window holding none. Pending
+/// sends carry a negative seq and answer for nothing — the same rule
+/// `oldest_committed` states in `load.rs`.
+fn oldest_committed_seq(rows: &[ChatMessage]) -> i64 {
+    rows.iter()
+        .find(|row| !row.pending && row.seq > 0)
+        .map_or(0, |row| row.seq)
 }
 
 /// The committed `seq` range of a timeline window, or `None` when it holds no
@@ -1243,6 +1216,7 @@ fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
 /// reader loaded.
 pub fn resynced_messages(
     loaded: bool,
+    chain_moved: bool,
     next: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
@@ -1252,6 +1226,12 @@ pub fn resynced_messages(
     // window on screen IS the answer and the merge below is never paid for.
     if !loaded {
         return current;
+    }
+    // ACROSS A NETWORK NOTHING MERGES — see `keep_channels`. The rows on screen
+    // were read from a chain this node is no longer on; a `seq` that overlaps
+    // one in the new network's room is a coincidence, not continuity.
+    if chain_moved {
+        return next;
     }
     let pages_overlap = match (committed_seq_span(&next), committed_seq_span(&current)) {
         (Some((oldest_canonical, _)), Some((_, newest_held))) => oldest_canonical <= newest_held,
@@ -1278,8 +1258,8 @@ pub fn keep_members(
 /// for the five folds that used to spell it out in four lines each.
 ///
 /// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
-/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
-/// other room and every other screen — that is what they are FOR — so reading
+/// THE HUDDLE'S. The huddle window follows you onto every other room and
+/// every other screen — that is what it is FOR — so reading
 /// "am I in a huddle" off the room you happen to be looking at answered no the
 /// moment you clicked a second channel. And that answer is not cosmetic:
 /// `huddle_joined` is the media leg's subscription gate, so a channel click cut
@@ -1336,14 +1316,6 @@ pub fn huddle_after_load(
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
-    if loaded { next } else { current }
-}
-
-pub fn keep_page_hits(
-    loaded: bool,
-    next: Vec<PageSearchHit>,
-    current: Vec<PageSearchHit>,
-) -> Vec<PageSearchHit> {
     if loaded { next } else { current }
 }
 
@@ -1531,14 +1503,6 @@ pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
     if loaded { next } else { current }.to_owned()
 }
 
-pub fn keep_forge_phase(
-    loaded: bool,
-    next: crate::ForgePhase,
-    current: crate::ForgePhase,
-) -> crate::ForgePhase {
-    if loaded { next } else { current }
-}
-
 pub fn keep_bool(loaded: bool, next: bool, current: bool) -> bool {
     if loaded { next } else { current }
 }
@@ -1575,20 +1539,6 @@ pub async fn load_channel_window(
     })
 }
 
-/// The reply a search hit points at, when it points at one at all. A hit on the
-/// thread ROOT is answered by the window around it and needs no second read.
-async fn load_hit_reply(
-    rpc: &RpcClient,
-    channel_id: &str,
-    root_seq: u64,
-    target_seq: u64,
-) -> Result<Option<MsgRow>, String> {
-    if target_seq == root_seq {
-        return Ok(None);
-    }
-    load_message_at(rpc, channel_id, target_seq).await.map(Some)
-}
-
 /// Same generation-carrying failure as [`load_channel_window`], same reason.
 pub async fn load_chat_hit(
     rpc: String,
@@ -1601,16 +1551,23 @@ pub async fn load_chat_hit(
         let root_seq = positive_sequence(root_seq)?;
         let target_seq = positive_sequence(target_seq)?;
         let rpc = rpc_client(&rpc)?;
-        // THREE SEQUENTIAL PHASES, CONCURRENT. This used to re-page the channel
-        // list, walk the channel's live tail, THROW that walk away for a window
-        // around the hit, and only then read the reply — the slowest navigation
-        // in the app, with the pane on the loading plate for all of it. The
-        // window and the reply are independent of the channel's row and its
-        // member roll, so the whole thing is one round trip now.
-        let (mut chat, reply) = tokio::try_join!(
-            load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
-            load_hit_reply(&rpc, &channel_id, root_seq, target_seq)
-        )?;
+        // A URI names only its target seq. Resolve its committed thread before
+        // loading the root-only channel window; a reply is not a root itself.
+        // Search results already carry both addresses and keep their parallel read.
+        let root_is_unresolved = root_seq == target_seq;
+        let (root_seq, mut chat, reply) = if root_is_unresolved {
+            let target = load_message_at(&rpc, &channel_id, target_seq).await?;
+            let root_seq = target.thread.unwrap_or(target.seq);
+            let chat = load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq))
+                .await?;
+            (root_seq, chat, target.thread.map(|_| target))
+        } else {
+            let (chat, reply) = tokio::try_join!(
+                load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
+                load_message_at(&rpc, &channel_id, target_seq)
+            )?;
+            (root_seq, chat, Some(reply))
+        };
         let root = chat
             .messages
             .iter()
@@ -1627,10 +1584,11 @@ pub async fn load_chat_hit(
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
-        let current_user = local_user_key().await;
+        let thread = load_target_thread_data(&rpc, &channel_id, root_seq, target_seq).await?;
         chat.active_thread_seq = root.seq;
-        chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![root, chat_message(reply, current_user.as_deref())];
+        chat.thread_target_seq = thread.target_seq;
+        chat.thread_messages = thread.messages;
+        chat.thread_has_more = thread.has_more;
         Ok(chat)
     }
     .await
@@ -1723,13 +1681,13 @@ pub async fn create_channel(
 /// One peer of the DM directory. There is no `status`: presence has no source
 /// anywhere in the product, and a dot that always reads "offline" is a lie.
 ///
-/// `is_agent` is always false today — see [`load_dm_peers`].
+/// `is_agent` identifies a keyless program account from its control record.
 ///
 /// `channel_id` is the pair's deterministic two-party channel id
 /// (`dm_channel_id(me, key)`), computed once at load time rather than at
 /// every render. The prepared DIRECT projection uses it to attach the row's
 /// scalar unread reading when channels or read cursors move.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct DmPeer {
     pub key: String,
     pub name: String,
@@ -1744,36 +1702,16 @@ pub struct DmPeersData {
     pub peers: Vec<DmPeer>,
 }
 
-/// The people this device can open a DM with, one row per identity account.
-///
-/// Registered agents are NOT here: a DM is a chat channel seated on public
-/// KEYS, and an agent id is an arbitrary string that [`open_dm`]'s
-/// `public_key()` would reject outright. Until an agent is addressable as a
-/// channel member, an agent row in this directory would be a button that
-/// cannot work.
-///
-/// The row is keyed on the account NUMBER (decimal), so every key of a
-/// multi-device account reaches the same row, and the channel id hashes the
-/// PAIR OF ACCOUNT NUMBERS so both ends of one DM land on the same room.
+/// One DM peer per identity account, including keyless program accounts.
+/// The row and deterministic channel are keyed by account number, so a new
+/// device on either account reaches the same room.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await;
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: identity::MAX_QUERY_LIMIT,
-                },
-            )
-            .await?;
-        let accounts = match reply {
-            IdentityReply::Accounts(accounts) => accounts,
-            IdentityReply::Account(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
+        // The same read that refreshes the name directory: an identity op
+        // reloads this directory, and every label on screen moves with it.
+        let accounts = read_accounts(&client).await?;
         // self is the account THIS key is a member of (a key holds at most one).
         let is_mine = |account: &AccountView| {
             me.as_ref()
@@ -1789,6 +1727,10 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 continue;
             }
             let key = account.number.to_string();
+            let is_agent = matches!(
+                account.control,
+                identity::Control::Program { .. } | identity::Control::Revoked { .. }
+            );
             let name = account.name;
             let channel_id = my_number
                 .as_ref()
@@ -1796,12 +1738,16 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 .unwrap_or_default();
             peers.push(DmPeer {
                 initials: initials_of(&name),
-                is_agent: false,
+                is_agent,
                 key,
                 name,
                 channel_id,
             });
         }
+        // THE DM ROOMS RIDE THIS LOAD TOO, for the reason the directory does:
+        // the live decoder cannot ask which rooms are mine without a query
+        // inside the fold, and this load already derived every one of them.
+        note_dm_rooms(&peers);
         Ok(DmPeersData { generation, peers })
     }
     .await
@@ -1840,15 +1786,31 @@ pub fn dm_channel_id(a: String, b: String) -> String {
 /// every landing that assigns `active_channel` from a reply re-derives the peer
 /// through here, and the field cannot disagree with the room again.
 ///
-/// A device with no user key derives no DM id at all, so it holds no DM — the
-/// same answer `chat_sidebar_rooms` gives when `me` is empty.
-pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
-    let peer_owns_the_room =
-        !peer.is_empty() && !me.is_empty() && dm_channel_id(me, peer.clone()) == channel;
+/// THE DIRECTORY'S OWN ID DECIDES, for the reason `chat_sidebar_rooms` gives:
+/// `DmPeer.channel_id` was derived once, in `load_dm_peers`, from the account
+/// number that load resolved for itself. Re-hashing it here against a separate
+/// `account_number` reading made the header disagree with the sidebar whenever
+/// that reading was late or missing — the peer's own room drew as a `#` channel
+/// under his name in DIRECT.
+pub fn dm_peer_of_channel(peer: String, peers: Vec<DmPeer>, channel: String) -> String {
+    let peer_owns_the_room = peers
+        .iter()
+        .any(|row| row.key == peer && !row.channel_id.is_empty() && row.channel_id == channel);
     match peer_owns_the_room {
         true => peer,
         false => String::new(),
     }
+}
+
+/// The room a DIRECT row opens — the id `load_dm_peers` derived for that peer,
+/// empty when the directory does not name him (or names him with no account
+/// number of ours to pair against).
+pub fn dm_room_of_peer(peers: Vec<DmPeer>, peer: String) -> String {
+    peers
+        .into_iter()
+        .find(|row| row.key == peer)
+        .map(|row| row.channel_id)
+        .unwrap_or_default()
 }
 
 /// THE DM HEADER'S OWN ROW, resolved where `active_dm_peer` is written.
@@ -1872,8 +1834,8 @@ pub fn no_dm_peer() -> DmPeer {
 }
 
 /// Open the DM with one peer (an account number): resolve the deterministic
-/// channel when it exists, else create it members-only and seat every key of
-/// the peer's account plus this device's, then load it.
+/// channel when it exists, else create it with the two accounts as members,
+/// then load it. Account membership follows each account's current keys.
 ///
 /// NOT confidential. `MembersOnly` gates who may POST; every node replicates
 /// the channel's plaintext, so a DM is a two-person room, not a private one.
@@ -1882,8 +1844,8 @@ pub fn no_dm_peer() -> DmPeer {
 /// Fails with a generation for the reason [`load_channel_window`] gives: this
 /// is one of the three routes that move the reader between rooms, and a
 /// superseded failure must not land under the room she is in now. The writes it
-/// makes are idempotent by construction — `dm_channel_id` is deterministic and
-/// `SetMembership` is a set — so `committed` had nothing to warn about.
+/// makes are idempotent by construction: `CreateDmChannel` derives the
+/// deterministic channel id and seats both accounts in the same transaction.
 pub async fn open_dm(
     rpc: String,
     password: String,
@@ -1904,7 +1866,7 @@ pub async fn open_dm(
             .await?;
         let mine = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -1920,51 +1882,37 @@ pub async fn open_dm(
             .await?;
         let account = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
         let account = account.ok_or_else(|| format!("account {number} does not exist"))?;
         let peer_name = account.name;
-        // every key of both accounts is seated, so any device of either end
-        // reads and posts in the room.
-        let my_keys = mine.keys.into_iter().map(|key| key.pubkey);
-        let peer_keys = account.keys.into_iter().map(|key| key.pubkey);
-        let members: Vec<Vec<u8>> = my_keys.chain(peer_keys).collect();
+        // The DM op, not a plain `CreateChannel` naming a `dm-` id: the module
+        // reserves that shape and refuses it from anything but this op, which
+        // resolves the creator's own account and derives the very id computed
+        // above (`dm_channel_id(mine, peer)`), members-only by construction.
         signed_write(
             &client,
             "chat",
-            chat::encode_msg(&ChatMsg::CreateChannel {
-                channel_id: channel_id.clone(),
+            chat::encode_msg(&ChatMsg::CreateDmChannel {
+                counterpart: number,
                 name: peer_name.clone(),
-                post_policy: PostPolicy::MembersOnly,
             }),
             password.clone(),
         )
         .await?;
-        let seated = members
-            .iter()
-            .map(|key| {
-                let handle = hex_encode(key);
+        let names = names();
+        let seated = [mine.number, number]
+            .into_iter()
+            .map(|account| {
+                let handle = format!("acct:{account}");
                 ChatMember {
-                    label: short_label(&handle),
+                    label: names.member_label(&handle),
                     key: handle,
                 }
             })
             .collect();
-        for member in members {
-            signed_write(
-                &client,
-                "chat",
-                chat::encode_msg(&ChatMsg::SetMembership {
-                    channel_id: channel_id.clone(),
-                    user: member,
-                    member: true,
-                }),
-                password.clone(),
-            )
-            .await?;
-        }
         let data = load_chat_data(&client, Some(&channel_id)).await?;
         let mut data = landed_on_channel(data, channel_id, peer_name, true, seated);
         data.generation = generation;
@@ -1978,7 +1926,8 @@ pub async fn open_dm(
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when
-/// she may. A members-only channel she is not seated in refuses her post.
+/// she may. A members-only channel she is not seated in refuses her post; a
+/// seat is hers under any key of her account ([`seated_in`]).
 pub fn post_gate(
     archived: bool,
     members_only: bool,
@@ -1988,7 +1937,7 @@ pub fn post_gate(
     if archived {
         return "channel_archived".into();
     }
-    let seated = members.iter().any(|member| member.key == me);
+    let seated = seated_in(&members, &me);
     if members_only && !seated {
         return "members_only".into();
     }

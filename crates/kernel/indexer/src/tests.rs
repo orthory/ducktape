@@ -22,6 +22,29 @@ const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
 /// wait is event-driven, so healthy runs never sit it out.
 const RECV_DEADLINE: Duration = Duration::from_secs(60);
 
+/// a hand-assembled CORE module — `(module (func (export "on_apply")
+/// (result i32) i32.const 0))` — exporting a role entry point but no
+/// `memory`. Readiness (`role list contains on_apply or query`) alone would
+/// pass this; fluent31's own `install_module` (rev 76ba1867,
+/// `crates/fluent31/src/wasm/mod.rs:181-203`) additionally requires a
+/// `memory` export, so this is exactly the shape #1839 describes: loadable
+/// by readiness, refused by install. Assembled by hand rather than pulling
+/// in a `wat` dependency this crate doesn't otherwise need.
+#[rustfmt::skip]
+const NO_MEMORY_MAPPER: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // magic, version
+    // type section: one type, () -> i32
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+    // function section: one function, type 0
+    0x03, 0x02, 0x01, 0x00,
+    // export section: "on_apply" -> func 0
+    0x07, 0x0C, 0x01, 0x08,
+    0x6F, 0x6E, 0x5F, 0x61, 0x70, 0x70, 0x6C, 0x79, // "on_apply"
+    0x00, 0x00,
+    // code section: one body, i32.const 0; end
+    0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0B,
+];
+
 fn bare_store(dir: &Path) -> IndexStore {
     let modules = [IndexModule::bare("chat"), IndexModule::bare("tasks")];
     IndexStore::open(dir, &modules).expect("open store")
@@ -219,8 +242,60 @@ fn scan_pages_with_cursor() {
 }
 
 #[test]
+fn scan_pages_by_byte_budget_not_just_row_count() {
+    // #1809: a page well under MAX_SCAN_LIMIT rows can still be gigabytes —
+    // duckfs stage chunks put megabyte payloads in op rows. three ~1.5 MiB
+    // rows blow the 4 MiB page budget on the third row, so a `limit` of 10
+    // still pages after 2 entries.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let big_payload = vec![b'x'; 3 * 1024 * 1024 / 2];
+    for h in 1..=3 {
+        store
+            .apply_block(&block(h, vec![chat_op(&big_payload)]))
+            .unwrap();
+    }
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(
+        page.entries.len(),
+        2,
+        "stops adding rows once the running total would exceed MAX_INDEX_PAGE_BYTES"
+    );
+    assert!(page.has_more);
+    let cursor = page.next_after.clone().expect("cursor when has_more");
+
+    let rest = store
+        .scan("chat", OP_PREFIX.as_bytes(), Some(cursor.as_bytes()), 10)
+        .unwrap();
+    assert_eq!(
+        rest.entries.len(),
+        1,
+        "the cursor resumes past the budget cut"
+    );
+    assert!(!rest.has_more);
+}
+
+#[test]
+fn scan_never_wedges_on_a_single_row_over_the_byte_budget() {
+    // the budget check only fires once a page already holds a row — a lone
+    // oversized row must still page out instead of returning an empty page
+    // forever.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let huge_payload = vec![b'x'; 5 * 1024 * 1024];
+    store
+        .apply_block(&block(1, vec![chat_op(&huge_payload)]))
+        .unwrap();
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(page.entries.len(), 1, "at least one row always ships");
+    assert!(!page.has_more);
+}
+
+#[test]
 fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
-    // a module admitted after boot (lifecycle register) has no database
+    // a module admitted after boot (modules register) has no database
     // here: its ops write nothing, every declared module's watermark still
     // advances past the block, and the store keeps taking writes.
     let dir = tempfile::tempdir().unwrap();
@@ -241,9 +316,7 @@ fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
         1,
         "quiet declared modules advance past the admitted module's block"
     );
-    store
-        .apply_block(&block(2, vec![chat_op(b"{}")]))
-        .unwrap();
+    store.apply_block(&block(2, vec![chat_op(b"{}")])).unwrap();
     assert_eq!(store.applied_height("chat").unwrap(), 2);
     // asked for BY NAME the undeclared id is still its own error.
     assert!(matches!(
@@ -520,27 +593,23 @@ fn a_mapper_swap_clears_and_refolds_the_read_model() {
     );
 }
 
-/// THE OPEN WAITS THE REFOLD OUT, AND SAYS SO WHEN IT CANNOT FINISH.
+/// THE OPEN WAITS THE REFOLD OUT — BUT A GUEST THAT CANNOT FOLD ITS OWN FEED
+/// NO LONGER TAKES THE WHOLE NODE DOWN WITH IT (#1725/#1726).
 ///
 /// `replay_op_feed` only STAGES its re-writes — the engine folds them on a
-/// background runner — so an `open` that returned at that point would publish
-/// a store whose read model is the keyspace `clear_derived` just emptied:
-/// every view answering "no such row" for the length of the whole feed, which
-/// reads as a workspace that lost its contents rather than one still starting.
-///
-/// This is the deterministic half of that wait. The two refold tests above
-/// assert what a DRAINED store holds, and a fast fixture drains before they
-/// can look, so they cannot fail when the wait is missing. A poisoned op can:
-/// the fold refuses it forever, and the only way `open` ever reports it is by
-/// having stopped for the runner. Both halves come out of the same
-/// `drain_fold` call — it returns on an empty queue or on a queue that will
-/// never empty, and on nothing else.
-///
-/// Refusing the open is deliberate, and matches what a broken artifact already
-/// gets one line earlier at `wasm_entries`: a guest that cannot fold its own
-/// feed has no read model to serve.
+/// background runner — so `open` still waits `drain_fold` out: an open that
+/// returned early would publish a store whose read model is the keyspace
+/// `clear_derived` just emptied, every view answering "no such row" for the
+/// length of the whole feed. But once that wait resolves to `FoldStuck` (a
+/// poisoned op the guest refuses forever, never draining), the derived tier
+/// is node-local and rebuildable, so ONE module's guest rejecting its own
+/// feed must not refuse the whole `open`: `converge_guest` warns and still
+/// writes the marker, leaving the module exactly as stuck as `drain_fold`
+/// found it — visible through `fold_status`, never through `is_poisoned`
+/// (that flag is for HOST-write failures, and a guest-fold error never sets
+/// it) — while `open` succeeds and every other module indexes normally.
 #[test]
-fn a_refold_that_cannot_finish_refuses_the_open() {
+fn a_guest_stuck_at_converge_does_not_refuse_the_open() {
     let dir = tempfile::tempdir().unwrap();
     {
         // no guest, so the feed takes the poison op with nothing folding: the
@@ -551,7 +620,7 @@ fn a_refold_that_cannot_finish_refuses_the_open() {
             .unwrap();
     }
 
-    let opened = IndexStore::open(
+    let store = IndexStore::open(
         dir.path(),
         &[
             IndexModule {
@@ -560,14 +629,59 @@ fn a_refold_that_cannot_finish_refuses_the_open() {
             },
             IndexModule::bare("tasks"),
         ],
+    )
+    .expect("a stuck guest fold must not refuse the open");
+
+    let status = store
+        .fold_status("chat")
+        .unwrap()
+        .expect("chat still folds — its guest just cannot clear its own backlog");
+    assert!(status.pending > 0, "the poison op is still queued");
+    assert!(
+        !store.is_poisoned(),
+        "a guest-fold failure must never poison the host-write path"
+    );
+    // "tasks" shares nothing with chat's stuck fold: its feed watermark still
+    // advances on every block, ops or not (every module's does).
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+}
+
+/// #1725: A FAILED REFOLD MUST RESTORE ITS MARKER TOO, NOT ONLY ON SUCCESS.
+/// Before this fix `refold` dropped `meta/guest` first and put it back only
+/// after `refold_feed` returned `Ok`, so a live guest failure left the
+/// marker permanently absent — the next `open` would find none, replay the
+/// WHOLE feed from scratch to rebuild it, hit the identical failure, and
+/// (pre-#1726 too) refuse to open at all. Restoring the marker on the error
+/// path is what lets a warm boot recognize its own guest and skip that
+/// replay outright instead of re-triggering the same brick.
+#[test]
+fn a_failed_refold_restores_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
+    store.wait_folds_drained().unwrap();
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
+
+    // a poisoned row lands in the feed the same way a join-seam backfill's
+    // would (indexable spec §7) before `repair_read_model` calls `refold`.
+    store
+        .apply_block(&block(2, vec![chat_op(b"boom")]))
+        .unwrap();
+
+    let db = store.db("chat").unwrap();
+    let marker_before = db.get(META_GUEST.as_bytes()).unwrap();
+    assert!(marker_before.is_some(), "converge already wrote one");
+
+    let err = store.refold("chat").unwrap_err();
+    assert!(
+        matches!(err, Error::FoldStuck(_)),
+        "the guest's own Fail is what refold surfaces: {err}"
     );
 
-    let Err(Error::FoldStuck(cause)) = opened else {
-        panic!("a store whose refold cannot complete must refuse to open");
-    };
-    assert!(
-        cause.starts_with("chat: "),
-        "the refusal names the module that could not fold: {cause}"
+    let marker_after = db.get(META_GUEST.as_bytes()).unwrap();
+    assert_eq!(
+        marker_before, marker_after,
+        "the marker must come back even though the refold failed"
     );
 }
 
@@ -643,10 +757,18 @@ fn reopen_without_a_guest_converges_the_database() {
             Err(Error::ViewUnsupported)
         ));
         assert!(store.fold_status("chat").unwrap().is_none());
-        // already-derived rows still serve — the tier is read-available even
-        // without its mapper.
+        // Removing a mapper removes its output; the feed remains available
+        // for any later mapper to derive a fresh view.
         let seen = store.scan("chat", b"seen/", None, 10).unwrap();
-        assert_eq!(seen.entries.len(), 1);
+        assert!(seen.entries.is_empty());
+        assert_eq!(
+            store
+                .scan("chat", OP_PREFIX.as_bytes(), None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
     }
     // and shipping one again REFOLDS: the guest is new to this database, so
     // the rows the previous one left are cleared and re-derived from the feed
@@ -972,7 +1094,7 @@ fn an_interrupted_refold_is_re_run_whole_by_the_next_open() {
         assert_eq!(store.fold_tip("chat").unwrap(), Some((5, 0)));
 
         // the wreckage of a refold that died after its clear.
-        let db = &store.modules.get("chat").expect("chat is open").db;
+        let db = &store.db("chat").expect("chat is open");
         db.delete(META_GUEST).unwrap();
         clear_derived(db).unwrap();
         assert_eq!(
@@ -1067,4 +1189,256 @@ fn user_handle_renders_names_and_keys() {
     assert_eq!(user_handle(&[0xab, 0xcd]), "abcd");
     assert_eq!(user_handle(b""), "");
     assert_eq!(user_handle(b"line\nbreak"), "6c696e650a627265616b");
+}
+
+// ----------------------------------------------------------------------------
+// #1726: the drain's own progress/stall decision, pulled out of `drain_fold`
+// so it is testable without driving fluent31's real retry/backoff timing.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn drain_verdict_calls_a_shrinking_backlog_progress() {
+    assert_eq!(
+        drain_verdict(3, 5, Duration::from_secs(999), Duration::from_secs(60)),
+        DrainVerdict::Progress,
+        "pending below every count seen so far is progress, no matter how long it took"
+    );
+}
+
+#[test]
+fn drain_verdict_waits_out_a_flat_backlog_within_the_stall_budget() {
+    // this is the whole bug: a trigger that just recorded an error but has
+    // not yet had time to retry (fluent31's own 100ms-to-6.4s backoff) looks
+    // exactly like this — flat pending, short elapsed. it must NOT be Stuck.
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_millis(50), Duration::from_secs(60)),
+        DrainVerdict::Waiting
+    );
+}
+
+#[test]
+fn drain_verdict_is_stuck_only_once_the_stall_budget_elapses() {
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_secs(60), Duration::from_secs(60)),
+        DrainVerdict::Stuck,
+        "flat pending for the whole budget is stuck — a permanent guest Fail \
+         the engine retries forever must still surface, just not instantly"
+    );
+}
+
+#[test]
+fn drain_verdict_never_treats_equal_pending_as_progress() {
+    // a boundary check: `<`, not `<=` — an unchanged backlog is not shrinking.
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_millis(1), Duration::from_secs(60)),
+        DrainVerdict::Waiting
+    );
+}
+
+#[test]
+fn a_live_mapper_replacement_refolds_before_reads_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), chat_op(b"two")]))
+        .unwrap();
+    store.wait_folds_drained().unwrap();
+    let restamped = restamped_testmap();
+    store
+        .converge(&[IndexModule {
+            id: "chat",
+            guest: Some(&restamped),
+        }])
+        .unwrap();
+    assert_eq!(store.view("chat", b"count").unwrap(), 2u64.to_be_bytes());
+    assert_eq!(
+        store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 1)));
+    store.converge(&[IndexModule::bare("chat")]).unwrap();
+    assert!(matches!(
+        store.view("chat", b"count"),
+        Err(Error::ViewUnsupported)
+    ));
+    assert!(
+        store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_failed_mapper_replacement_refuses_only_its_own_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(b"not wasm")
+            }])
+            .is_err()
+    );
+    // bad GUEST BYTES are this module's problem alone: the store stays
+    // usable, and the op feed (chat's included) keeps advancing — a mapper
+    // change never affects what the feed saw, only what it means.
+    assert!(
+        !store.is_poisoned(),
+        "a rejected guest must not poison the whole store"
+    );
+    assert!(store.view("chat", b"count").is_err());
+    assert!(store.get("chat", b"count").is_err());
+    assert!(store.scan("chat", b"seen/", None, 10).is_err());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), tasks_op()]))
+        .expect("the op feed is not this module's poison to hold");
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+}
+
+#[test]
+fn validate_guest_requires_memory_export_like_install_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    // readiness (role coverage alone) would pass this; pin it against the
+    // actual activation path so the two can never drift apart again.
+    assert!(
+        store.validate_guest(NO_MEMORY_MAPPER).is_err(),
+        "readiness must refuse a mapper with no `memory` export"
+    );
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(NO_MEMORY_MAPPER),
+            }])
+            .is_err(),
+        "install would refuse the same bytes readiness now also refuses"
+    );
+}
+
+#[test]
+fn an_unchanged_rejection_short_circuits_without_recompiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let spec = || IndexModule {
+        id: "chat",
+        guest: Some(NO_MEMORY_MAPPER),
+    };
+    let first = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        first.to_string().contains("memory"),
+        "the first attempt reports the real reason: {first}"
+    );
+    // the identical candidate reconverged (`converge_host_modules` retries a
+    // stuck deployment every block): a second wasmtime compile of the same
+    // doomed bytes is wasted work, so this must be refused WITHOUT paying
+    // for it — proven by the distinct short-circuit message, since a real
+    // recompile would report "memory" again, not this one.
+    let second = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        second.to_string().contains("previously rejected"),
+        "a repeat of the same rejected bytes must short-circuit: {second}"
+    );
+}
+
+#[test]
+fn a_changed_candidate_after_a_rejection_is_recompiled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    store
+        .converge(&[IndexModule {
+            id: "chat",
+            guest: Some(NO_MEMORY_MAPPER),
+        }])
+        .unwrap_err();
+    // different bytes after a rejection must NOT hit the short-circuit —
+    // only an EXACT repeat of the doomed candidate skips recompiling.
+    let different = store.converge(&[IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    }]);
+    assert!(
+        different.is_ok(),
+        "a real fix must still converge: {different:?}"
+    );
+}
+
+#[test]
+fn a_rejected_mapper_leaves_every_other_module_folding() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IndexStore::open(
+        dir.path(),
+        &[
+            IndexModule::bare("chat"),
+            IndexModule {
+                id: "tasks",
+                guest: Some(TESTMAP),
+            },
+        ],
+    )
+    .unwrap();
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(NO_MEMORY_MAPPER),
+            }])
+            .is_err()
+    );
+    assert!(!store.is_poisoned());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), tasks_op()]))
+        .unwrap();
+    store.wait_folds_drained().unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+    assert_eq!(store.view("tasks", b"count").unwrap(), 1u64.to_be_bytes());
+    assert!(store.view("chat", b"count").is_err());
+}
+
+/// The two engine reads take separate snapshots. Their order and shared
+/// deployment guard prevent a watermark from vouching for unseen rows.
+#[test]
+fn a_view_reads_its_advisory_tip_before_query_under_one_deployment_guard() {
+    let body = include_str!("lib.rs")
+        .split("pub fn view_with_tip(")
+        .nth(1)
+        .unwrap()
+        .split("\n    /// ")
+        .next()
+        .unwrap();
+    let guard = body.find("let _deployment = m.read_deployment()?").unwrap();
+    let tip = body.find("let folded =").unwrap();
+    let view = body.find("let bytes = m.query(req)?").unwrap();
+    assert!(guard < tip && tip < view);
+    assert!(!body[tip..view].contains('?'), "tip errors are advisory");
+    assert!(
+        !body[guard..view].contains("drop("),
+        "the guard spans both reads"
+    );
+}
+
+#[test]
+fn an_unchanged_deployment_converges_while_a_view_holds_its_read_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    let spec = IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    };
+    let code_hash = sha2::Sha256::digest(TESTMAP);
+    store.converge_deployment(&spec, &code_hash).unwrap();
+    let module = store.module("chat").unwrap();
+    let _view = module.read_deployment().unwrap();
+    // A write lock here would wait for this very reader. The unchanged
+    // deployment must complete without taking one or touching mapper bytes.
+    store.converge_deployment(&spec, &code_hash).unwrap();
 }

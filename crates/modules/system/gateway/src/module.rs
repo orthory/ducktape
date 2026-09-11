@@ -568,7 +568,7 @@ impl Gateway {
         )
         .await?;
 
-        let record = statement.record;
+        let mut record = statement.record;
         validate_credential_name(&record.name).map_err(Error::Module)?;
         validate_account_number(record.owner_account).map_err(Error::Module)?;
         if !record.grants.is_empty() {
@@ -606,6 +606,11 @@ impl Gateway {
                 MAX_ROSTER_RECORD_BYTES,
                 "credential roster",
             )?;
+        } else if let Some(current) = existing {
+            // same-owner re-registration: the statement never carries grants
+            // (refused above), so carry the committed grant set forward
+            // instead of wiping it with the fresh, grant-free record.
+            record.grants = current.grants;
         }
         // bounded by construction: scalar metadata + a capped grant set.
         self.store(cred_key(&record.name.clone()), &record);

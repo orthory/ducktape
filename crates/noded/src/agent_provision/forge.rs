@@ -42,6 +42,7 @@ use compute_service::{
 };
 
 use crate::node_link::NodeLink;
+use provider_host::OperatorCredential;
 
 /// the synthetic domain for agent authorship and attribution. DELIBERATELY in
 /// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
@@ -68,13 +69,6 @@ pub(super) struct ForgeLane {
     push_base: String,
     /// the committer identity on every run commit (the node, never the agent).
     committer_name: String,
-    /// the link the push credential is read from, per push and never latched
-    /// (the node re-mints `admin.token` every boot, and this lane outlives a
-    /// node restart): `git-receive-pack` refuses a push carrying neither git's
-    /// own certificate nor that credential (#1292), and a run has no SSH
-    /// signing key to make a certificate with — the NODE is the pusher here,
-    /// which is exactly what the credential says.
-    node: NodeLink,
 }
 
 impl ForgeLane {
@@ -108,7 +102,6 @@ impl ForgeLane {
             repo_base,
             push_base,
             committer_name,
-            node: node.clone(),
         })
     }
 }
@@ -277,6 +270,11 @@ fn run_git_program(
 /// could traverse (`..`), read as a git flag (leading `-`), or escape the
 /// repo base. consensus already normalized these (norm_repo/norm_branch/hex
 /// oids), so a failure here means a corrupt envelope, not a policy gate.
+///
+/// the branch check carries a SECOND wall (#1836): every run-owned push
+/// target lives under `agent/` — a composer that ever named anything else
+/// (a PR's own, attacker-chosen source branch included) would be a defect
+/// this refusal catches before a single git command runs.
 fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String> {
     let repo_ok = !repo.is_empty()
         && repo != "."
@@ -293,15 +291,21 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
             "forge pinned commit {commit:?} is not a 40-hex sha1 oid"
         ));
     }
-    let branch_ok = !branch.is_empty()
+    let branch_is_safe = !branch.is_empty()
         && !branch.starts_with('-')
         && !branch.starts_with('/')
         && branch
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
-    if !branch_ok {
+    if !branch_is_safe {
         return Err(format!(
             "forge work branch {branch:?} is not a safe branch name"
+        ));
+    }
+    let branch_is_agent_scoped = branch.starts_with("agent/") && branch.len() > "agent/".len();
+    if !branch_is_agent_scoped {
+        return Err(format!(
+            "forge work branch {branch:?} is outside the agent/ namespace"
         ));
     }
     Ok(())
@@ -325,7 +329,6 @@ pub(super) async fn provision(
         repo,
         commit,
         branch,
-        forge_push,
         ..
     } = &spec.source
     else {
@@ -334,7 +337,6 @@ pub(super) async fn provision(
     validate_coords(repo, commit, branch)?;
     let repo_dir = lane.repo_base.join(repo);
     let push_url = format!("{}/{repo}", lane.push_base);
-    let push_credential = lane.node.operator_token();
 
     let blocking = ProvisionArgs {
         repo_dir,
@@ -353,12 +355,9 @@ pub(super) async fn provision(
     // git cannot see them at all.
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
         // nothing to mount — but the document still ships (see the duckfs lane):
-        // the tool-plane instruction is ambient, and the library pointer rides
-        // the agent's own read cap. neither is curated.
-        (
-            None,
-            Some(assemble_context_doc(&[], spec.library_readable)?),
-        )
+        // the tool-plane instruction and the library pointer are ambient, not
+        // curated.
+        (None, Some(assemble_context_doc(&[])?))
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
@@ -366,17 +365,14 @@ pub(super) async fn provision(
         // the link outlives the mounts: the session bind below rides the same
         // actor lane.
         let mount_node = node.clone();
-        // the committed library grant (consensus said it; the assembler obeys).
-        let library_readable = spec.library_readable;
         // the same step assembles the run's SOUL from the mounts it just
         // materialized — the only place holding both the curation and the bodies.
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts, library_readable)
-                .inspect_err(|_| {
-                    // W5: a failed provision removes ALL its own debris. the mount
-                    // helper dropped its partial ro tree; the clone goes here.
-                    cleanup_blocking(&run_dir);
-                })
+            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts).inspect_err(|_| {
+                // W5: a failed provision removes ALL its own debris. the mount
+                // helper dropped its partial ro tree; the clone goes here.
+                cleanup_blocking(&run_dir);
+            })
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
@@ -386,23 +382,19 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&node, spec).await;
+    let session = match super::session::open(&node, spec).await {
+        Ok(session) => session,
+        Err(error) => {
+            super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
+            return Err(error);
+        }
+    };
     let mut env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),
         node_url.as_deref(),
         spec,
         session.as_ref(),
-    );
-    let agent_id = spec.agent_id.as_deref().unwrap_or("agent");
-    let agent_name = sanitize_display_name(spec.agent_display_name.as_deref().unwrap_or(agent_id));
-    env.insert("GIT_AUTHOR_NAME".into(), agent_name);
-    env.insert(
-        "GIT_AUTHOR_EMAIL".into(),
-        format!(
-            "{}@{AGENT_EMAIL_DOMAIN}",
-            attribution_email_local_part(agent_id)
-        ),
     );
     env.insert("GIT_COMMITTER_NAME".into(), lane.committer_name.clone());
     env.insert(
@@ -413,11 +405,9 @@ pub(super) async fn provision(
         run_dir: workspace_args.run_dir,
         ro_dir,
         push_url,
-        push_credential,
-        forge_push: *forge_push,
+        node,
         source: spec.source.clone(),
-        agent_id: spec.agent_id.clone(),
-        agent_display_name: spec.agent_display_name.clone(),
+        agent: spec.agent.clone(),
         _session: session,
         committer_name: lane.committer_name.clone(),
         env,
@@ -503,17 +493,19 @@ struct ForgeWorkspace {
     /// (it lives outside the worktree, so git cannot see it either).
     ro_dir: Option<PathBuf>,
     push_url: String,
-    /// the operator credential the push presents (see [`ForgeLane`]).
-    push_credential: Option<String>,
-    /// compose-height `forge_push` verdict; false for old envelopes.
-    forge_push: bool,
+    /// the link the push credential is read from, per push attempt and never
+    /// latched: the node re-mints `admin.token` every boot, and this
+    /// workspace outlives a node restart. `git-receive-pack` refuses a push
+    /// carrying neither git's own certificate nor that credential, and a run
+    /// has no SSH signing key to make a certificate with — the NODE is the
+    /// pusher here, which is exactly what the credential says.
+    node: NodeLink,
     source: WorkspaceSource,
-    agent_id: Option<String>,
-    agent_display_name: Option<String>,
+    agent: Option<compute_service::AgentExecution>,
     committer_name: String,
     env: BTreeMap<String, String>,
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
-    /// `None` when the agent curated no skills. capability-host delivers it.
+    /// `None` when the agent curated no skills. the provider delivers it.
     context_doc: Option<String>,
     /// Owns the scoped signer endpoint for exactly as long as the workspace.
     _session: Option<super::session::RunSession>,
@@ -525,13 +517,9 @@ impl ForgeWorkspace {
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
-            consensus_run_id: None,
-            agent_id: None,
-            agent_display_name: None,
+            agent: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
-            // receipts never assemble a document, so the grant is moot here.
-            library_readable: false,
         }
     }
 
@@ -678,7 +666,7 @@ fn sanitize_agent_git_control(run_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to install a clean local Git config: {e}"))
 }
 
-fn sanitize_display_name(input: &str) -> String {
+pub(super) fn sanitize_display_name(input: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for c in input.chars() {
@@ -707,12 +695,21 @@ fn sanitize_display_name(input: &str) -> String {
 }
 
 /// The agent's address. Consensus admits only DNS-label agent ids
-/// (`agent::validate_agent_id`), and a label fits an RFC 5321 local part
+/// (`runs::validate_agent_id`), and a label fits an RFC 5321 local part
 /// verbatim — so `quackbot` attributes to `quackbot@agents.duck` and the
 /// address round-trips back to the registry key.
 fn attribution_email_local_part(input: &str) -> String {
-    debug_assert!(agent::validate_agent_id(input).is_ok());
+    debug_assert!(runs::validate_agent_id(input).is_ok());
     input.to_owned()
+}
+
+/// the address a run's commits are authored under: the agent's id at
+/// [`AGENT_EMAIL_DOMAIN`].
+pub(super) fn agent_email(agent_id: &str) -> String {
+    format!(
+        "{}@{AGENT_EMAIL_DOMAIN}",
+        attribution_email_local_part(agent_id)
+    )
 }
 
 fn commit_message(run_dir: &Path, oid: &str) -> Result<String, String> {
@@ -831,8 +828,7 @@ fn commit_blocking(
     pinned_commit: &str,
     branch: &str,
     push_url: &str,
-    push_credential: Option<&str>,
-    forge_push: bool,
+    node: &NodeLink,
     response_proposal: Option<&str>,
     item_title: &str,
     identity: &CommitIdentity,
@@ -867,12 +863,7 @@ fn commit_blocking(
         return Ok(CommitOutcome::NoChanges);
     }
     // the run produced something to push — an agent-authored commit, a
-    // working-tree change, or both. the compose-height `forge_push` verdict is
-    // the last gate: a run without the grant may read and mutate its own clone
-    // but never move the shared branch. absent on old envelopes ⇒ false.
-    if !forge_push {
-        return Err("forge workspace changed, but this run has no forge_push grant".into());
-    }
+    // working-tree change, or both.
     if final_tree != head_tree {
         let message = select_commit_message(response_proposal, item_title)?;
         let oid = create_run_commit(
@@ -895,25 +886,29 @@ fn commit_blocking(
     // the interloper's tip stays branch head.
     let refspec = format!("HEAD:refs/heads/{branch}");
     let fetchspec = format!("refs/heads/{branch}");
-    // the credential rides GIT_CONFIG_*, not `-c`: an argv is world-readable
-    // through /proc on Linux, and this is a secret.
-    let header = push_credential
-        .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
-        .unwrap_or_default();
-    let push_env: Vec<(&str, &str)> = match header.is_empty() {
-        true => Vec::new(),
-        false => vec![
-            ("GIT_CONFIG_COUNT", "1"),
-            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
-            ("GIT_CONFIG_VALUE_0", header.as_str()),
-        ],
-    };
     let committer_env = [
         ("GIT_COMMITTER_NAME", identity.committer_name.as_str()),
         ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
     ];
     let mut rebased = false;
     for attempt in 1..=PUSH_ATTEMPTS {
+        // re-read the operator credential on EVERY attempt, never once before
+        // the loop: the node re-mints `admin.token` on a restart, and this
+        // workspace's clone predates any restart that happens mid-run. the
+        // credential rides GIT_CONFIG_*, not `-c` — an argv is world-readable
+        // through /proc on Linux, and this is a secret.
+        let header = node
+            .operator_token()
+            .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
+            .unwrap_or_default();
+        let push_env: Vec<(&str, &str)> = match header.is_empty() {
+            true => Vec::new(),
+            false => vec![
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+                ("GIT_CONFIG_VALUE_0", header.as_str()),
+            ],
+        };
         match run_git(run_dir, &["push", push_url, &refspec], &push_env) {
             Ok(_) => {
                 // re-read AFTER any rebase: the pushed head is the output_commit.
@@ -985,6 +980,10 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         self.context_doc.clone()
     }
 
+    fn operator_credential(&self) -> Option<OperatorCredential> {
+        Some(super::operator_credential(&self.node))
+    }
+
     async fn commit(
         &self,
         _audit_message: &str,
@@ -993,13 +992,11 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let (pinned_commit, branch, item_title) = self.coords();
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
-        let push_credential = self.push_credential.clone();
-        let forge_push = self.forge_push;
-        let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
-        let agent_display_name = self
-            .agent_display_name
-            .clone()
-            .unwrap_or_else(|| agent_id.clone());
+        let node = self.node.clone();
+        let (agent_id, agent_display_name) = match &self.agent {
+            Some(agent) => (agent.agent_id.clone(), agent.display_name.clone()),
+            None => ("agent".into(), "agent".into()),
+        };
         let committer_name = self.committer_name.clone();
         let proposal = proposal.map(str::to_owned);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -1013,8 +1010,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &pinned_commit,
                 &branch,
                 &push_url,
-                push_credential.as_deref(),
-                forge_push,
+                &node,
                 proposal.as_deref(),
                 &item_title,
                 &identity,
@@ -1036,17 +1032,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     }
 
     async fn cleanup(&self) {
-        let run_dir = self.run_dir.clone();
-        // the skill ro root is the run's debris too — it sits beside the
-        // worktree, so `worktree remove` never touches it.
-        let ro_dir = self.ro_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            cleanup_blocking(&run_dir);
-            if let Some(ro) = &ro_dir {
-                let _ = std::fs::remove_dir_all(ro);
-            }
-        })
-        .await;
+        super::cleanup_dirs(self.run_dir.clone(), self.ro_dir.clone()).await;
     }
 }
 

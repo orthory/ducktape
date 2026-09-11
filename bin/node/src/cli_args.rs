@@ -24,7 +24,7 @@ pub enum NodeCmd {
 pub enum OpCmd {
     /// generate or reuse a node identity (prints its pubkey)
     Key(KeyArgs),
-    /// found a new network (default dir: ~/.ducktape/workspaces/<chain-id>)
+    /// found a new network (default dir: ~/.ducktape/<chain-id>)
     Init(InitArgs),
     /// mint a single-use bearer invite blob
     Invite(InviteArgs),
@@ -101,6 +101,10 @@ pub struct LogFilterArgs {
     /// the user key that signs the request (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 /// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
@@ -141,9 +145,11 @@ pub enum WorkCmd {
 /// one account, or the literal `anyone`.
 #[derive(Debug, clap::Args)]
 pub struct WorkTargetArgs {
-    /// an account number, a display name, or the literal `anyone`. `anyone`
-    /// admits every network member — and lets a stranger's workload draw on
-    /// every credential this node has been granted.
+    /// an account NUMBER, or the literal `anyone`. `anyone` admits every
+    /// network member — and lets a stranger's workload draw on every
+    /// credential this node has been granted. A display name is refused: it
+    /// is freely rewritable and not unique, so it cannot name who this node
+    /// trusts (look the number up with `ducktape account show`).
     pub target: String,
     #[command(flatten)]
     pub selector: Selector,
@@ -230,6 +236,79 @@ impl Selector {
 /// Deliberately a different question from [`Selector`], which resolves a
 /// workspace's node.toml PATH for the daemon that IS the node.
 ///
+/// which WORKSPACE a verb reads or edits — the directory itself, for the verb
+/// families whose subject is a file in it (a service grant, a gateway route,
+/// the keystore) rather than a node to dial. An explicit `--workspace` wins,
+/// else `-n/--network` names one under the ducktape home, else the lone
+/// workspace on the box.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WorkspaceArgs {
+    /// this node's config file (`ducktape node run --config`'s twin)
+    #[arg(long, value_name = "FILE", global = true)]
+    pub(crate) config: Option<PathBuf>,
+    /// explicit workspace dir (wins over -n)
+    #[arg(long, value_name = "DIR", global = true)]
+    pub(crate) workspace: Option<PathBuf>,
+    /// a workspace's chain id (`ducktape node list`)
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
+    pub(crate) network: Option<String>,
+}
+
+impl WorkspaceArgs {
+    /// the node config this workspace's node is described by.
+    ///
+    /// `--config` exists because a workspace dir does not always CONTAIN its
+    /// config: the dev shape's workspace is its `storage_dir`, named BY a
+    /// config that lives elsewhere. `ducktape node run --config` has always
+    /// taken the file directly; a daemon serving that node needs the same.
+    pub(crate) fn config_file(&self) -> Result<PathBuf, String> {
+        match &self.config {
+            Some(file) => Ok(file.clone()),
+            None => Ok(self.dir()?.join("node.toml")),
+        }
+    }
+
+    /// the workspace directory — the config's own answer, so the CLI and the
+    /// node can never disagree about which directory a file lives in.
+    pub(crate) fn dir(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.config {
+            // the keyless read: every verb on this group answers "which
+            // workspace?" without ever opening the node's identity.
+            return Ok(config::resolve_service(file)?.workspace);
+        }
+        if let Some(dir) = &self.workspace {
+            return Ok(dir.clone());
+        }
+        if let Some(needle) = &self.network {
+            let (dir, _http) = config::resolve_network(needle)?;
+            return Ok(dir);
+        }
+        // the bottom rung `node run` and `node status` already stand on: with
+        // exactly one workspace on the box there is nothing to disambiguate,
+        // and demanding a selector here made `service list` the only read verb
+        // on the box that refused to answer a machine with one network on it.
+        let mut workspaces = config::list_workspaces()?;
+        match workspaces.len() {
+            // `list_workspaces` yields the node.toml PATH, not the directory —
+            // these verbs want the workspace that CONTAINS it.
+            1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
+            0 => Err(
+                "no workspace: found one with `ducktape node init --name <name>` \
+                      or `ducktape node join <invite>`"
+                    .into(),
+            ),
+            _ => Err(format!(
+                "several workspaces exist — pick one with -n:\n{}",
+                workspaces
+                    .iter()
+                    .map(|(chain_id, _)| format!("  {chain_id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+        }
+    }
+}
+
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
 /// family's host targeting — which PEER runs the work, a raw 64-hex node key —
 /// is `--host-node`, because it is a different type of input.
@@ -391,6 +470,15 @@ fn source_workspace(source: WorkspaceSource) -> Result<PathBuf, String> {
 /// workspace that answers on it. Kept beside the forward lookup so both spell
 /// the base the same way through [`trim_base`]: a normalization that drifted
 /// apart would silently match nothing.
+/// public door onto [`workspace_serving`] for a caller that already has the
+/// resolved http base in hand (a signing verb pinning the node's identity —
+/// see `bin/node/src/node_http.rs::pinned_node_key`) and needs to ask "is this
+/// address one of MY OWN registered nodes", independent of which rung of the
+/// ladder produced it.
+pub fn workspace_for_base(base: &str) -> Result<PathBuf, String> {
+    workspace_serving(base)
+}
+
 fn workspace_serving(base: &str) -> Result<PathBuf, String> {
     let matches = config::list_workspaces()?
         .into_iter()
@@ -544,7 +632,7 @@ pub struct InitArgs {
     /// human-readable network name (the chain id becomes <name>#<salt>)
     #[arg(long, value_name = "NAME")]
     pub name: String,
-    /// found the network here instead of the registry default
+    /// found the network here instead of under the ducktape home
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// the founding set to compose the genesis from: a directory holding every
@@ -552,6 +640,16 @@ pub struct InitArgs {
     /// else the set the build staged beside this binary)
     #[arg(long, value_name = "DIR")]
     pub modules: Option<PathBuf>,
+    /// milliseconds between idle blocks; every consensus timer scales with it.
+    /// FOUNDING parameter, not plumbing: it lands in the network descriptor and
+    /// every joiner inherits it, so `join` has no such flag.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = config::DEFAULT_BLOCK_TIME_MS,
+        value_parser = clap::value_parser!(u64).range(config::MIN_BLOCK_TIME_MS..),
+    )]
+    pub block_time_ms: u64,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }
@@ -591,7 +689,7 @@ pub struct JoinCmd {
     /// blob is read from stdin — paste it at the prompt and press Enter.
     #[arg(value_name = "INVITE-BLOB", num_args = 0..)]
     pub blob: Vec<String>,
-    /// materialize here instead of the registry dir named by the chain id
+    /// materialize here instead of the home dir named by the chain id
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// the network's genesis file (the founder's `<workspace>/genesis`). A
@@ -645,9 +743,24 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
-    /// milliseconds between idle blocks; every consensus timer scales with it
-    #[arg(long, value_name = "MS", hide_short_help = true)]
-    pub block_time_ms: Option<u64>,
+}
+
+impl PlumbingArgs {
+    /// this flag set, named the way [`config::merged_plumbing`] wants them —
+    /// `init` and `join` build the identical struct from their own flags.
+    pub fn overrides(&self) -> config::PlumbingOverrides {
+        config::PlumbingOverrides {
+            listen: self.listen.clone(),
+            advertised: self.advertised.clone(),
+            http: self.http.clone(),
+            gateway: self.gateway.clone(),
+            rpc: self.rpc.clone(),
+            primary_coordinator: self.primary_coordinator.clone(),
+            wireguard_listen: self.wireguard_listen.clone(),
+            wireguard_advertised: self.wireguard_advertised.clone(),
+            invite_listen: self.invite_listen.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -684,6 +797,34 @@ mod tests {
         assert_eq!(ttl_of(&["probe", "invite", "--ttl-days", "365"]), 365);
         assert!(parse(&["probe", "invite", "--ttl-days", "0"]).is_err());
         assert!(parse(&["probe", "invite", "--ttl-days", "366"]).is_err());
+    }
+
+    /// `init --block-time-ms` is refused below the drain-tick floor at parse
+    /// time, mirroring `workspace_config::validate_block_time_ms` — the CLI
+    /// and the descriptor boundary must refuse the exact same beats.
+    #[test]
+    fn init_block_time_ms_is_floored_at_the_drain_tick() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+        let block_time_of = |argv: &[&str]| match parse(argv).expect("parses").op {
+            OpCmd::Init(args) => args.block_time_ms,
+            other => panic!("not an init: {other:?}"),
+        };
+
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo"]),
+            config::DEFAULT_BLOCK_TIME_MS
+        );
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo", "--block-time-ms", "100"]),
+            config::MIN_BLOCK_TIME_MS
+        );
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "99"]).is_err());
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "0"]).is_err());
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,

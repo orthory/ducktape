@@ -15,24 +15,25 @@ expected shape, not as a promise.
 
 | File | Written by | Secret? | Lose it and… |
 | --- | --- | --- | --- |
-| `workspaces/<chain-id>/identity.key` | `node init` / `node join` (`crates/workspace-config/src/identity.rs`: hex ed25519 seed, `create_new`, mode 0600, read without a password so unattended boot works) | **yes** | **This node's seat is gone.** It is the mesh identity, the frame-signing key and the validator-set key. A resident replica rejoins from a new invite with a fresh key. A **validator** cannot: the set still counts the old key, so losing one seat key on an n≤3 network **halts the chain** with no verb left that can vote the seat out — see *Validator count: three seats tolerate nothing* in `node-service.md` for the arithmetic. |
-| `workspaces/<chain-id>/node.toml`, `network.toml` | `node init` / `node join` | no | Regenerable from another member: `node join` a fresh invite into the same directory rewrites both (`crates/workspace-config/src/join.rs`, idempotent on an existing `identity.key`). Back them up anyway — they carry the listeners, `[sandbox]` table and reach hints you tuned. |
-| `workspaces/<chain-id>/storage/` | the node at runtime | no (see airlock below) | Consensus state, checkpoints, the blob store, `mesh-state.json`, forge repos. **Regenerable by state sync** from any current validator — for a resident. For a validator this is the part nobody has rehearsed (below). |
-| `workspaces/<chain-id>/storage/airlock-creds/seal.key` | `ducktape service run airlock` on first boot (`crates/services/airlock/src/lib.rs`, `load_or_create_seal_keypair`, 0600) | **yes** | The seal keypair every credential this node lends is sealed to; its public half is what `user cred add` publishes on chain and borrowers pin. Lose it and every credential in `airlock-creds/` is unreadable and every published seal is stale: re-add every credential (`ducktape user cred add`). |
-| `workspaces/<chain-id>/storage/airlock-creds/*` | `ducktape user cred add` | **yes** | The lent provider credentials (OAuth refresh tokens, API keys), sealed to `seal.key`. Re-addable from the provider. |
-| `workspaces/<chain-id>/service-link.token` | the node at boot (`crates/noded/src/services.rs`, `LINK_TOKEN_FILE`, 0600) | **yes** | The node↔daemon link secret. Regenerated at the next boot; nothing to back up, everything to keep private (a holder can attach as a service daemon). |
-| `workspaces/<chain-id>/wireguard.key` | the node / `node join` (`WireGuardKeypair::load_or_generate`) | yes | The tunnel keypair. Regenerable: peers learn the new public key from the next signed mesh record. Losing it costs one re-assembly of every tunnel. |
-| `workspaces/<chain-id>/services.toml`, `work-admit.toml`, `gateway-routes.json`, `invite-fronts.json` | the `service` / `node work` / `gateway` verbs | no | Operator consent and routing. Re-runnable verbs; back them up to avoid re-consenting. |
-| `workspaces/<chain-id>/coord.cap` | the join flow (`crates/workspace-config/src/lib.rs`, `COORD_CAP_FILE`) | no (a capability, not a secret) | The coordinator admission capability a member was issued. Without it a member behind NAT cannot rendezvous through a private (`--genesis-set`) coordinator until re-issued. |
-| `keys/<name>.key` + `keys/active` | `ducktape wallet new` / `wallet import` (`crates/keystore/src/userkey.rs`: argon2id + XChaCha20-Poly1305 at rest, born 0600 with `create_new`; `wallet.rs` owns only the `keys/<name>.key` naming and the `active` pointer) | **yes** (encrypted) | **Your user identity** — the key your account's ops are signed with. The 24-word mnemonic is the backup, and you are handed it exactly once (*The 24 words*, below). Lose both file and phrase and the account is unreachable until another of its keys adds a new one (`ducktape account key add`); an account with one key is gone. `active` is a one-line pointer, regenerable with `ducktape wallet use`. |
-| `workspaces/<chain-id>/genesis` | `node init` (composed from the founding set), `node join --genesis`, or the node's first boot (fetched off the mesh) | no | The network's wasm: every component and index guest, pinned whole and per component by `network.toml`. The node's blob store keeps a copy under that pin and rewrites a missing file from it; a member that lost both takes any other member's copy — the pin refuses any other bytes. |
-| `modules/*.wasm`, `executors/*`, `guest/*` | `make install-node` (staged beside the binary, copied here by the installer), `ducktape agent install`, `ops/build-guest-rootfs.sh` | no | Rebuildable from the repository at the same commit. `modules/` is the founding set: what `node init` composes a genesis from, and where the netstack guest is read at boot. It pins nothing — a founded network's bytes are its `genesis` file's. |
+| `<chain-id>/identity.key` | `node init` / `node join` (`crates/workspace-config/src/identity.rs`: hex ed25519 seed, `create_new`, mode 0600, read without a password so unattended boot works) | **yes** | **This node's seat is gone.** It is the mesh identity, the frame-signing key and the validator-set key. A resident replica rejoins from a new invite with a fresh key. A **validator** cannot: the set still counts the old key, so losing one seat key on an n≤3 network **halts the chain** with no verb left that can vote the seat out — see *Validator count: three seats tolerate nothing* in `node-service.md` for the arithmetic. |
+| `<chain-id>/node.toml`, `network.toml` | `node init` / `node join` | no | Regenerable from another member: `node join` a fresh invite into the same directory rewrites both (`crates/workspace-config/src/join.rs`, idempotent on an existing `identity.key`). Back them up anyway — they carry the listeners, `[sandbox]` table and reach hints you tuned. |
+| `<chain-id>/storage/` | the node at runtime | no (see airlock below) | Consensus state, checkpoints, the blob store, `mesh-state.json`, forge repos. **Regenerable by state sync** from any current validator — for a resident. For a validator this is the part nobody has rehearsed (below). |
+| `<chain-id>/storage/airlock-creds/seal.key` | `ducktape service run airlock` on first boot (`crates/services/airlock/src/lib.rs`, `load_or_create_seal_keypair`, 0600) | **yes** | The seal keypair every credential this node lends is sealed to; its public half is what `user cred add` publishes on chain and borrowers pin. Lose it and every credential in `airlock-creds/` is unreadable and every published seal is stale: re-add every credential (`ducktape user cred add`). |
+| `<chain-id>/storage/airlock-creds/*` | `ducktape user cred add` | **yes** | The lent provider credentials (OAuth refresh tokens, API keys), sealed to `seal.key`. Re-addable from the provider. |
+| `<chain-id>/service-link.token` | the node at boot (`crates/noded/src/services.rs`, `LINK_TOKEN_FILE`, 0600) | **yes** | The node↔daemon link secret. Regenerated at the next boot; nothing to back up, everything to keep private (a holder can attach as a service daemon). |
+| `<chain-id>/wireguard.key` | the node / `node join` (`WireGuardKeypair::load_or_generate`) | yes | The tunnel keypair. Regenerable: peers learn the new public key from the next signed mesh record. Losing it costs one re-assembly of every tunnel. |
+| `<chain-id>/services.toml`, `work-admit.toml`, `gateway-routes.json`, `invite-fronts.json` | the `service` / `node work` / `gateway` verbs | no | Operator consent and routing. Re-runnable verbs; back them up to avoid re-consenting. |
+| `<chain-id>/coord.cap` | the join flow (`crates/workspace-config/src/lib.rs`, `COORD_CAP_FILE`) | no (a capability, not a secret) | The coordinator admission capability a member was issued. Without it a member behind NAT cannot rendezvous through a private (`--genesis-set`) coordinator until re-issued. |
+| `<chain-id>/keys/<name>.key` + `<chain-id>/keys/active` | `ducktape wallet new` / `wallet import` (`crates/keystore/src/userkey.rs`: argon2id + XChaCha20-Poly1305 at rest, born 0600 with `create_new`; `wallet.rs` owns only the `keys/<name>.key` naming and the `active` pointer, per workspace: a wallet is an identity on one network) | **yes** (encrypted) | **Your user identity on that network** — the key your account's ops are signed with. The 24-word mnemonic is the backup, and you are handed it exactly once (*The 24 words*, below). Lose both file and phrase and the account is unreachable until another of its keys adds a new one (`ducktape account key add`); an account with one key is gone. `active` is a one-line pointer, regenerable with `ducktape wallet use`. |
+| `<chain-id>/genesis` | `node init` (composed from the founding set), `node join --genesis`, or the node's first boot (fetched off the mesh) | no | The network's wasm: every component and index guest, pinned whole and per component by `network.toml`. The node's blob store keeps a copy under that pin and rewrites a missing file from it; a member that lost both takes any other member's copy — the pin refuses any other bytes. |
+| `<chain-id>/executors/*`, `<chain-id>/guest/*` | `ducktape agent install -n <chain-id>`, `OUT=<workspace>/guest ops/build-guest-rootfs.sh` | no | Rebuildable per workspace from the repository at the same commit: the agent CLIs at their pins (`executors.toml` beside the directory records them) and the guest images. |
+| `/usr/local/lib/ducktape/modules/*.wasm` (outside the home) | `make install-node` (staged beside the built binary, copied there by the installer) | no | The founding set: what `node init` composes a genesis from, and where the netstack guest is read at boot. It pins nothing — a founded network's bytes are its `genesis` file's. |
 
 Nothing under `~/.cargo`, `/tmp/dt-vm-*` or `$XDG_RUNTIME_DIR` needs copying.
 
 ### The 24 words
 
-`ducktape wallet import <name>` rebuilds the **key inside** `keys/<name>.key`
+`ducktape wallet import <name>` rebuilds the **key inside** `<chain-id>/keys/<name>.key`
 from the mnemonic, byte for byte — stdin takes the mnemonic line first, then a
 password line (`bin/node/src/wallet_cli.rs`). The **file** is not reproduced
 and never will be: every seal draws a fresh argon2 salt and nonce
@@ -49,7 +50,7 @@ positions — getting those right is what writes the key file, so an abandoned
 ceremony leaves no key behind. Neither surface will show them a second time.
 
 While you still hold the key file *and* its password, `ducktape user key
-reveal --key $DUCKTAPE_HOME/keys/<name>.key` reads the words back out of it.
+reveal --key $DUCKTAPE_HOME/<chain-id>/keys/<name>.key` reads the words back out of it.
 That is the only reveal there is, and it is no help once the disk is gone.
 
 Chat, DMs and members-only channels are **replicated in the clear** to every
@@ -70,11 +71,11 @@ a private channel, and let it expire.
 For **every** host, off-host and encrypted:
 
 ```sh
-W=$DUCKTAPE_HOME/workspaces/<chain-id>
+W=$DUCKTAPE_HOME/<chain-id>
 tar czf - \
   "$W/identity.key" "$W/node.toml" "$W/network.toml" \
   "$W/services.toml" "$W/work-admit.toml" "$W/coord.cap" \
-  "$DUCKTAPE_HOME/keys" 2>/dev/null \
+  "$W/keys" 2>/dev/null \
 | age -r <your-recipient> > ducktape-$(hostname)-$(date +%F).tar.gz.age
 ```
 
@@ -165,5 +166,5 @@ restarting (`node-service.md`, "Restart, stop, upgrade") — the chain has no
 binary version and admits nothing on it. Neither has a rehearsed
 *recovery* procedure for the case where the swap halted the network; the
 live-upgrade e2e (`bin/node/tests/module_upgrade_e2e.rs`) covers a
-lifecycle refusal rolling `Execute` back in-kernel, not an operator
+registry refusal rolling `Execute` back in-kernel, not an operator
 undoing a finalized swap.

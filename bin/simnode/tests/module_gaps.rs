@@ -2,11 +2,11 @@
 //! the app never surfaces — identity's single-use add-key consents and per-key
 //! generations, automations' cross-module abort atomicity (P2), the jobs
 //! authorization matrix and its attempt ceiling, forge's per-branch
-//! compare-and-swap, and tagging's module-origin gate. like `core_scenarios`,
+//! compare-and-swap, and attribution's module-origin gate. like `core_scenarios`,
 //! every rejection asserted here is the REAL module refusing over noded's exact
 //! wire; the sim only decides WHEN a block commits. these paths have no console
 //! action (no identity key ceremony, no jobs board, no raw forge push, no
-//! tagging surface), so neither the TS scenario lane nor fleet live-QA can
+//! attribution surface), so neither the TS scenario lane nor fleet live-QA can
 //! reach them.
 
 mod harness;
@@ -65,7 +65,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     assert!(of_key(&sim, &pub_c).is_null(), "a fresh key has no account");
 
     // key_a consents at gen 0; key_c submits the AddKey as ITS OWN origin.
-    let consent_at_0 = add_ed25519_key(&key_a, &pub_c, 0);
+    let consent_at_0 = add_ed25519_key(&key_a, &pub_c, 0, 1);
     sim.submit_ok("identity", consent_at_0.clone(), Some(&origin_c));
     let acct = of_key(&sim, &pub_c);
     assert_eq!(acct["number"], 1, "key_c joined account 1: {acct}");
@@ -106,7 +106,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     sim.submit_ok("identity", create("b"), Some(&key_origin(&key_b)));
     let stale = sim.submit_rejected(
         "identity",
-        add_ed25519_key(&key_b, &pub_c, 0),
+        add_ed25519_key(&key_b, &pub_c, 0, 2),
         Some(&origin_c),
     );
     assert!(
@@ -115,7 +115,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     );
     sim.submit_ok(
         "identity",
-        add_ed25519_key(&key_b, &pub_c, 1),
+        add_ed25519_key(&key_b, &pub_c, 1, 2),
         Some(&origin_c),
     );
     let acct = of_key(&sim, &pub_c);
@@ -156,11 +156,12 @@ fn removing_the_last_member_key_is_refused() {
 fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let operator = harness::found_account(&sim, "operator", 40);
     // the operator owns the channel — hook registration is the owner's call.
     sim.submit_ok(
         "chat",
         create_channel("general", "General"),
-        Some("operator"),
+        Some(&operator),
     );
 
     // the rival squats the id the rule WILL compose for the next post. the rule
@@ -176,7 +177,7 @@ fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
     sim.submit_ok(
         "chat",
         serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),
-        Some("operator"),
+        Some(&operator),
     );
     sim.submit_ok(
         "automations",
@@ -185,7 +186,7 @@ fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
             "trigger": { "channel_id": "general", "mention": null, "text_contains": "deploy" },
             "action": { "post_message": { "channel_id": "general", "template": "deploy acknowledged" } },
         }}),
-        Some("operator"),
+        Some(&operator),
     );
 
     // the triggering post COMMITS — the probe caught the squatted id and
@@ -234,16 +235,17 @@ fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
 fn a_task_id_collision_aborts_the_entire_triggering_block() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let operator = harness::found_account(&sim, "operator", 40);
     // the operator owns the channel — hook registration is the owner's call.
     sim.submit_ok(
         "chat",
         create_channel("general", "General"),
-        Some("operator"),
+        Some(&operator),
     );
     sim.submit_ok(
         "chat",
         serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),
-        Some("operator"),
+        Some(&operator),
     );
 
     // two rules, SAME task_id_prefix, same trigger: their composed task ids both
@@ -258,7 +260,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
                 "trigger": { "channel_id": "general", "mention": null, "text_contains": "deploy" },
                 "action": { "create_task": { "task_id_prefix": "auto", "title_template": "deploy requested" } },
             }}),
-            Some("operator"),
+            Some(&operator),
         );
     }
 
@@ -310,7 +312,10 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         message["message"].is_null(),
         "the aborted post left no message: {message}"
     );
-    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
+    let tasks = sim.query(
+        "tasks",
+        serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+    );
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
@@ -330,9 +335,9 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
 
 // ── C5 — jobs: the authorization matrix + attempt ceiling ─
 
-/// every guarded transition rejects the wrong actor with its own precise
-/// message: finalize/release are claimant-only, cancel is submitter-only, and
-/// prune only touches terminal jobs.
+/// every guarded transition rejects the wrong actor or state with its own
+/// precise message: finalize/release are claimant-only, cancel is any
+/// member's but pending-only, and prune only touches terminal jobs.
 #[test]
 fn the_jobs_authorization_matrix_gates_every_transition() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -372,24 +377,19 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
         "release gate: {error}"
     );
 
-    // release it back to pending so the CANCEL test hits the submitter gate, not
-    // the pending-only status guard.
-    sim.submit_ok(
-        "tasks",
-        job(serde_json::json!({ "release": { "job_id": "j1" } })),
-        Some("worker-a"),
-    );
+    // cancel is pending-only: while j1 is processing even its submitter is
+    // refused by the status guard, and nothing about who asks changes that.
     let error = sim.submit_rejected(
         "tasks",
         job(serde_json::json!({ "cancel": { "job_id": "j1" } })),
-        Some("worker-a"),
+        Some("poster"),
     );
     assert!(
-        error.contains("only the submitter may cancel"),
+        error.contains("cancel only applies to pending jobs"),
         "cancel gate: {error}"
     );
 
-    // prune only applies to terminal jobs: j1 is pending, so even its own
+    // prune only applies to terminal jobs: j1 is processing, so even its own
     // submitter is refused by the status guard.
     let error = sim.submit_rejected(
         "tasks",
@@ -399,6 +399,24 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
     assert!(
         error.contains("prune only applies to terminal jobs"),
         "prune gate: {error}"
+    );
+
+    // release it back to pending: any member cancels it, and any member
+    // prunes the cancelled record.
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "release": { "job_id": "j1" } })),
+        Some("worker-a"),
+    );
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "cancel": { "job_id": "j1" } })),
+        Some("worker-a"),
+    );
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "prune": { "job_id": "j1" } })),
+        Some("intruder"),
     );
 }
 
@@ -420,10 +438,9 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
 
     let claim = job(serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }));
     let reclaim = job(serde_json::json!({ "reclaim": { "job_id": "j1" } }));
-    let mut fill: u64 = 0;
 
     // walk claim/expiry cycles. each claim bumps `attempt`; the LOGICAL clock is
-    // the lease clock, so inbox filler blocks age the lease past its deadline.
+    // the lease clock, so dispatch nudges age the lease past its deadline.
     // claims 1..MAX requeue on expiry; the MAX-th claim's expiry fails the job.
     for attempt in 1..=tasks::MAX_ATTEMPTS {
         let claimed_at = sim.submit_ok("tasks", claim.clone(), Some("worker"))["height"]
@@ -434,11 +451,10 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
         let deadline = claimed_at + tasks::MIN_LEASE_VIEWS;
         while sim.status()["height"].as_u64().expect("height") < deadline {
             sim.submit_ok(
-                "inbox",
-                serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": fill.to_string() } }),
+                "dispatch",
+                serde_json::json!({ "nudge": {} }),
                 Some("filler"),
             );
-            fill += 1;
         }
         sim.submit_ok("tasks", reclaim.clone(), Some("scavenger"));
 
@@ -562,136 +578,26 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     );
 }
 
-// ── C7 — tagging: the module-origin gate ────────────────
+// ── Attribution publication authenticates the source module ──
 
-/// tagging admits NO external surface: a direct tag op over /v1/submit — even
-/// one naming the genesis-configured direct owner — is refused by origin, the
-/// same shape as a spoofed chat hook.
 #[test]
-fn a_direct_tagging_op_cannot_be_driven_from_outside_a_module() {
+fn attribution_publication_and_subscription_refuse_external_origins() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-
-    // the sim wires `TaggingModule::new("tagging").with_direct_owner("runs")`,
-    // but that grant is a MODULE-to-module routing capability. over /v1/submit
-    // every origin is external, and the tag intake resolves its source from the
-    // dispatch origin, never a payload field — so an external tag has no surface.
-    let error = sim.submit_rejected(
-        "tagging",
-        serde_json::json!({ "tag": {
-            "container": "thread-1",
-            "content_seq": 1,
-            "author": { "user": [1, 2, 3] },
-            "tags": [{ "module": "runs", "entity": "qa-luna" }],
+    for operation in [
+        serde_json::json!({ "attribute": {
+            "object": { "kind": "message", "object": "forged" },
+            "revision": 1,
+            "actor": { "account": 1 },
+            "relations": [],
+            "transfers": [],
         }}),
-        Some("mallory"),
-    );
-    assert!(
-        error.contains("tagging ops are module-origin only"),
-        "spoofed tag: {error}"
-    );
-
-    // the subscription arm is gated identically: no external submitter may
-    // register a subscription on another module's behalf.
-    let error = sim.submit_rejected(
-        "tagging",
-        serde_json::json!({ "subscribe": { "source": "chat", "container": "general" } }),
-        Some("mallory"),
-    );
-    assert!(
-        error.contains("tagging ops are module-origin only"),
-        "spoofed subscribe: {error}"
-    );
-}
-
-// ── C4 — agent session-key ACL (the mid-run write lane) ──
-
-/// an agent's MID-RUN write is refused at the module layer when the action is
-/// outside its committed grant. the session lane is the one door to that ACL
-/// that returns the refusal LOUDLY (the settle path degrades it) — and it is
-/// reachable here precisely because the sim honors a caller-named origin: the
-/// signed-frame lane's two forgeries (the executing node, then the session key)
-/// become legitimate control. so this claims the run's lease via
-/// `SagaMsg::Accept`, opens the session as that assignee, and acts as the bound
-/// key — exercising the exact `allowed_actions` gate #423/#429 put in consensus,
-/// with no mesh, dispatch pool, or provisioner.
-#[test]
-fn an_out_of_acl_agent_action_is_refused_at_the_module_layer() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    // NO --echo-oracle: with no worker the run never settles, so it stays in
-    // flight while we bind a session and act through it.
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
-
-    // an agent granted NOTHING: allowed_actions is empty.
-    sim.submit_ok(
-        "agent",
-        serde_json::json!({ "register_agent": {
-            "agent_id": "scribe",
-            "display_name": "Scribe",
-            "capability": "text",
-            "allowed_actions": [],
-        }}),
-        Some("owner"),
-    );
-    // a channel with an anchor message the run pins its context to.
-    sim.submit_ok("chat", create_channel("room", "Room"), None);
-    sim.submit_ok("chat", post_message("room", "m-1", "please help"), None);
-
-    // an explicit run of the agent against the anchor — creates the pending run
-    // and its dispatch/saga. the sim announces no provider pool, so the saga's
-    // attempt stays UNASSIGNED, claimable by the first Accept.
-    sim.submit_ok(
-        "runs",
-        serde_json::json!({ "request_run": { "agent_id": "scribe", "channel_id": "room", "anchor_seq": 1 } }),
-        Some("requester"),
-    );
-    let pending = sim.query("runs", serde_json::json!("pending_runs"));
-    let entry = &pending["pending_runs"][0];
-    let run_id = entry["run_id"]
-        .as_str()
-        .expect("pending run id")
-        .to_string();
-    let dispatch_id = entry["dispatch_id"]
-        .as_str()
-        .expect("dispatch id")
-        .to_string();
-    // the saga id the dispatch minted for this run (dispatch's own id scheme:
-    // `dispatch\x1f{receiver}\x1f{dispatch_id}`).
-    let saga_id = format!("dispatch\u{1f}runs\u{1f}{dispatch_id}");
-
-    // claim the run's execution lease: the first Accept in consensus order wins
-    // the assignee. over /v1/submit the sim stamps our named origin verbatim, so
-    // the "executing node" is a key we choose.
-    let node = "n".repeat(32);
-    sim.submit_ok(
-        "saga",
-        serde_json::json!({ "accept": { "saga_id": saga_id, "attempt": 0 } }),
-        Some(&node),
-    );
-
-    // the lease-holder binds an ephemeral session key to the run. the key never
-    // has to be a real ed25519 point here — the module only checks its LENGTH on
-    // open and byte-equality on act — so a 32-byte ASCII stand-in lets us name
-    // the same bytes as a UTF-8 origin below.
-    sim.submit_ok(
-        "runs",
-        serde_json::json!({ "open_agent_session": { "run_id": run_id, "session_key": vec![b's'; 32] } }),
-        Some(&node),
-    );
-
-    // the bound key acts mid-run: a chat post the agent was never granted. the
-    // origin IS the session key's bytes, so the module trusts the authorship and
-    // reaches the shared validator — which refuses the ungranted action.
-    let error = sim.submit_rejected(
-        "runs",
-        serde_json::json!({ "agent_action": {
-            "run_id": run_id,
-            "action": { "post_message": { "channel_id": "room", "text": "progress update" } },
-        }}),
-        Some(&"s".repeat(32)),
-    );
-    assert!(
-        error.contains("scribe is not allowed to chat.post_message"),
-        "the out-of-ACL action is refused at the module layer: {error}"
-    );
+        serde_json::json!({ "subscribe": {} }),
+    ] {
+        let error = sim.submit_rejected("attribution", operation, Some("mallory"));
+        assert!(
+            error.contains("attribution ops are module-origin only"),
+            "a caller cannot impersonate an attribution source: {error}"
+        );
+    }
 }
