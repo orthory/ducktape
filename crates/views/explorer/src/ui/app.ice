@@ -1,9 +1,10 @@
-// THE BLOCK EXPLORER, as a module-owned view: the ledger the desktop app
-// pushes — blocks, their ops, the head — plus one workspace search the app
-// runs on the view's behalf. The screen body is the app's own
-// (screens/storage.ice's ExplorerScreen before the port); the search state
-// that used to live in the component is split: the draft, the kind filter
-// and the selected block stay here, the answer comes back as props.
+// THE BLOCK EXPLORER, as a module-owned view on the KERNEL CONTRACT. The
+// kernel pushes session facts only (`session()` — connected, dark, and the
+// two node facts the titlebar already holds: the live head and the sync
+// line). The block window is read here through `rpc.blocks` and re-read on
+// every block (`rpc.live` on the `block` plane); the workspace search fans
+// out over `rpc.query` / `rpc.view` from this view. A clipboard copy is the
+// one act that still leaves as an intent — the OS door is the kernel's.
 app ExplorerView
   title "Explorer"
   palette active_palette
@@ -16,17 +17,24 @@ use "../../../../../app/src/ui/components/icon.ice"
 use "kit.ice"
 
 extern crate::host
-  HostError(message:str)
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
   KindCount(kind:str, label:str, count:i64)
-  ExplorerProps(connected:bool, loading:bool, dark:bool, blocks:[ExplorerBlock], ops:[ExplorerOp], head:i64, sync_line:str, hits:[ExplorerHit], kinds:[KindCount], partial:str, searching:bool, sent_query:str)
-  stream props() -> ExplorerProps ! HostError
-  pure refresh_ledger() -> bool
+  Session(connected:bool, dark:bool, head:i64, sync_line:str)
+  SessionItem(next:Session, error:str)
+  LedgerItem(blocks:[ExplorerBlock], ops:[ExplorerOp], error:str)
+  SearchItem(hits:[ExplorerHit], kinds:[KindCount], partial:str, error:str)
+  subscription session() -> SessionItem
+  // the block window, read by this view: once per serial, then again on
+  // every block
+  subscription ledger(serial:i64) -> LedgerItem
+  // one workspace search, run once per (query, serial) so the same string
+  // asked twice really asks twice
+  subscription workspace_search(query:str, serial:i64) -> SearchItem
+  pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
+  pure loading_after(was_connected:bool, connected:bool, loading:bool) -> bool
   pure copy(text:&str, label:&str) -> bool
-  pure search(query:&str) -> bool
-  pure clear_search() -> bool
   pure icon(name:&str) -> bytes
   pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
   pure height_label(height:i64) -> str
@@ -42,62 +50,93 @@ state
   ops:[ExplorerOp] = []
   head:i64 = 0
   sync_line = ""
-  // the answer to the last search the app ran for this view
+  // moves when the session comes up and on every Refresh: the window is
+  // read afresh
+  ledger_serial:i64 = 0
+  // the answer to the last search this view ran
   hits:[ExplorerHit] = []
   kinds:[KindCount] = []
   partial = ""
   searching = false
-  // the query that answer is speaking for, "" while none stands
+  // the query that answer is speaking for, "" while none stands, and the
+  // serial that makes a repeat of it a second search
   sent_query = ""
+  search_serial:i64 = 0
   // the reader's own: the draft, the kind filter, the block they opened
   query = ""
   kind = "all"
   selected:i64 = 0
   host_error = ""
-  // a write's acknowledgement — `host::notify` returns nothing to bind
+  // an act's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// Subscriptions, not mount tasks, so a replacement restored from this
+// view's state asks for the session, the ledger and the search again on its
+// own.
+subscribe
+  session() -> session_arrived _
+  ledger(ledger_serial) when connected -> ledger_arrived _
+  workspace_search(sent_query, search_serial) when connected && !empty(sent_query) -> search_arrived _
 
-on props_changed(next)
-  connected = next.connected
-  loading = next.loading
-  blocks = next.blocks
-  ops = next.ops
+on session_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   head = next.head
   sync_line = next.sync_line
-  hits = next.hits
-  kinds = next.kinds
-  partial = next.partial
-  searching = next.searching
-  sent_query = next.sent_query
+  ledger_serial = connection_serial_after(connected, next.connected, ledger_serial)
+  loading = loading_after(connected, next.connected, loading)
+  connected = next.connected
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
 
-on props_failed(error)
-  host_error = error.message
+on ledger_arrived(item)
+  loading = false
+  host_error = item.error
+  return if !empty(item.error)
+  blocks = item.blocks
+  ops = item.ops
+
+on search_arrived(item)
+  searching = false
+  host_error = item.error
+  return if !empty(item.error)
+  hits = item.hits
+  kinds = item.kinds
+  partial = item.partial
 
 on refresh
-  sent = refresh_ledger()
+  return if !connected || loading
+  loading = true
+  ledger_serial = ledger_serial + 1
 
 on copy_to_clipboard(text, label)
   sent = copy(text, label)
 
 // ENTER-TO-SUBMIT: the box is two-way bound with no `change=` route, so a
-// keystroke writes `query` and runs nothing; the app runs the search and
-// answers with `hits`, `kinds`, `partial` and the `sent_query` it stands for.
+// keystroke writes `query` and runs nothing; submitting seats the query the
+// search subscription is keyed by, and its answer lands in `hits`, `kinds`
+// and `partial`.
 on search_submit
   let blocked = !connected || searching || empty(trim(query))
   return if blocked
   kind = "all"
-  sent = search(trim(query))
+  hits = []
+  kinds = []
+  partial = ""
+  searching = true
+  search_serial = search_serial + 1
+  sent_query = trim(query)
 
 on clear_explorer_search
   query = ""
   kind = "all"
-  sent = clear_search()
+  hits = []
+  kinds = []
+  partial = ""
+  searching = false
+  sent_query = ""
 
 on pick_explorer_kind(next)
   kind = next

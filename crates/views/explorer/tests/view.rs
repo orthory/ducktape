@@ -1,140 +1,262 @@
-//! The ledger the host pushes is what the screen shows; a search leaves as
-//! an intent and its answer comes back as props, with the zero-hit plate
-//! speaking only for the query that was sent.
+//! The view driven natively through the wire: the kernel pushes session
+//! facts, the view reads the block window itself through `rpc.blocks`,
+//! re-reads it on every `rpc.live` hit for the `block` plane, and runs the
+//! workspace search over `rpc.query` / `rpc.view`. A copy is the one act that
+//! still leaves as an intent.
 
-use explorer_view::host::{
-    Copy, ExplorerBlock, ExplorerHit, ExplorerOp, ExplorerProps, KindCount, Search,
-};
+use explorer_view::host::{Copy, Session};
 use explorer_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{answer, has_text, item, press, refuse, submit, texts, type_into};
+use ui_lang_guest::wire::{Frame, Request};
 
-fn ledger() -> ExplorerProps {
-    ExplorerProps {
-        connected: true,
-        loading: false,
+fn boot() -> Frame {
+    boot_native();
+    tick_native(Vec::new())
+}
+
+fn session(connected: bool) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected,
         dark: false,
-        blocks: vec![ExplorerBlock {
-            height: 84_912,
-            hash: "9f3e".into(),
-            commit: "c0ffee".into(),
-            op_count: 1,
-        }],
-        ops: vec![ExplorerOp {
-            height: 84_912,
-            proposer: "val-1".into(),
-            target: "chat".into(),
-            disposition: "applied".into(),
-            op_hash: "ab12cd34".into(),
-            payload: "post".into(),
-            trace: "chat · 1 msg".into(),
-        }],
         head: 84_912,
         sync_line: "live".into(),
-        hits: Vec::new(),
-        kinds: Vec::new(),
-        partial: String::new(),
-        searching: false,
-        sent_query: String::new(),
-    }
+    })
+    .expect("session encodes")
 }
 
-fn encoded(props: &ExplorerProps) -> Vec<u8> {
-    serde_json::to_vec(props).expect("props encode")
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
 }
 
-/// Boot and push the ledger; returns the subscription id and the frame.
-fn shown(props: &ExplorerProps) -> (u64, Frame) {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests[0].kind, "explorer.props");
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &encoded(props))]);
-    (subscription, frame)
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
 }
 
+/// Every read in flight as `<kind> <target>` — a kernel read names the module
+/// it is for in its payload, and that pair is what a leg of the search IS.
+fn reads(frame: &Frame) -> Vec<String> {
+    let mut reads: Vec<String> = frame
+        .requests
+        .iter()
+        .map(|request| {
+            let ask: serde_json::Value =
+                serde_json::from_slice(&request.payload).unwrap_or_default();
+            match ask["target"].as_str() {
+                Some(target) => format!("{} {target}", request.kind),
+                None => request.kind.clone(),
+            }
+        })
+        .collect();
+    reads.sort();
+    reads
+}
+
+/// One op-carrying block and one op-less follower boundary row, as
+/// `GET /v1/blocks` serves them.
+fn blocks() -> Vec<u8> {
+    serde_json::json!([
+        { "height": 41, "hash": "", "commit_hash": "aa11bb22", "ops": [] },
+        {
+            "height": 84912, "hash": "9f3e".repeat(16), "commit_hash": "c0ffee11".repeat(8),
+            "ops": [{
+                "proposer": "system", "target": "chat", "disposition": "applied",
+                "op_hash": "ab12cd34", "payload": "post",
+                "operations": [{ "module": "chat", "emitted_msgs": 1, "emitted_events": 0 }]
+            }]
+        }
+    ])
+    .to_string()
+    .into_bytes()
+}
+
+/// Boots, connects and answers the first block read: the frame with the
+/// ledger on screen, and the id of the live subscription.
+fn connected_with_ledger() -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "explorer.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let live = request(&frame, "rpc.live").id;
+    let feed = request(&frame, "rpc.blocks").id;
+    (tick_native(vec![answer(feed, &blocks())]), live)
+}
+
+/// At boot the view asks for the session only; connected, it reads the block
+/// window itself and the fold is the whole screen — the op-less boundary row
+/// is not in a list that says every row carried operations.
 #[test]
-fn the_ledger_the_host_pushes_is_what_the_screen_shows_and_a_block_opens_its_ops() {
-    let (_, frame) = shown(&ledger());
-    for expected in ["Explorer", "h 84,912"] {
+fn a_connected_view_reads_its_own_ledger() {
+    let frame = boot();
+    assert_eq!(
+        kinds(&frame.requests),
+        ["explorer.props"],
+        "only the session at boot: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+
+    let (frame, _live) = connected_with_ledger();
+    for expected in ["Explorer", "h 84,912", "live", "1 op"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
     }
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(press(&frame, "Refresh"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    assert_eq!(intent.kind, "explorer.refresh");
+    assert!(
+        !has_text(&frame, "0 ops"),
+        "the follower's boundary row is not a block that carried operations: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        frame.requests.is_empty(),
+        "a folded ledger asks for nothing more: {:?}",
+        frame.requests
+    );
 }
 
+/// A block re-reads the window through the live subscription, and Refresh
+/// asks for the same read by hand.
 #[test]
-fn a_search_leaves_as_an_intent_and_its_answer_comes_back_as_props() {
-    let (subscription, frame) = shown(&ledger());
+fn a_block_and_a_refresh_both_re_read_the_window() {
+    let (frame, live) = connected_with_ledger();
+    let live_frame = tick_native(vec![item(live, b"{}")]);
+    assert_eq!(
+        kinds(&live_frame.requests),
+        ["rpc.blocks"],
+        "{:?}",
+        live_frame.requests
+    );
+
+    let frame = tick_native(press(&frame, "Refresh"));
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.blocks"],
+        "{:?}",
+        frame.requests
+    );
+}
+
+/// A SEARCH COSTS ITS SLOWEST SOURCE, NOT THEIR SUM. Nothing in the fan-out
+/// reads what another leg produced, and a module's first touch runs tens of
+/// seconds against the node client's ceiling — so every round trip the search
+/// opens with must be in flight AT ONCE. Observed from outside: the frame that
+/// carries the submit carries all eight reads (tasks walks three status
+/// pages), and none of them has been answered yet.
+#[test]
+fn a_workspace_search_reaches_its_six_sources_together() {
+    let (frame, _live) = connected_with_ledger();
     let frame = tick_native(type_into(
         &frame,
         "Search messages, pages, issues, files, runs…",
         "  needle  ",
     ));
     assert!(frame.requests.is_empty(), "typing runs no handler");
+
     let frame = tick_native(submit(
         &frame,
         "Search messages, pages, issues, files, runs…",
     ));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    assert_eq!(intent.kind, "explorer.search");
     assert_eq!(
-        serde_json::from_slice::<Search>(&intent.payload).expect("decodes"),
-        Search {
-            query: "needle".into()
-        }
+        reads(&frame),
+        [
+            "rpc.query files",
+            "rpc.query forge",
+            "rpc.view chat",
+            "rpc.view pages",
+            "rpc.view runs",
+            "rpc.view tasks",
+            "rpc.view tasks",
+            "rpc.view tasks",
+        ],
+        "every source of a workspace search is asked at once: {:?}",
+        frame.requests
     );
+    assert!(has_text(&frame, "Searching…"), "{:?}", texts(&frame));
+    // and it asked about the TRIMMED draft
+    let chat: serde_json::Value =
+        serde_json::from_slice(&request(&frame, "rpc.view").payload).expect("a read decodes");
+    assert_eq!(chat["query"]["search"]["text"], "needle");
+}
 
-    // a zero-hit answer stands for the query it was sent for …
-    let answered = ExplorerProps {
-        sent_query: "needle".into(),
-        partial: String::new(),
-        ..ledger()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&answered))]);
+/// A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. The five
+/// that answered land their rows and their chips; the one that refused keeps
+/// no chip — a count of 0 means "nothing matched", never "no loader" — and is
+/// named on screen instead.
+#[test]
+fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
+    let (frame, _live) = connected_with_ledger();
+    let frame = tick_native(type_into(
+        &frame,
+        "Search messages, pages, issues, files, runs…",
+        "needle",
+    ));
+    let frame = tick_native(submit(
+        &frame,
+        "Search messages, pages, issues, files, runs…",
+    ));
+
+    let mut events = Vec::new();
+    for request in &frame.requests {
+        let ask: serde_json::Value =
+            serde_json::from_slice(&request.payload).unwrap_or_default();
+        let reply = match ask["target"].as_str().unwrap_or_default() {
+            "chat" => serde_json::json!({ "hits": [{
+                "channel_id": "general", "seq": 12, "author": "user:48cedb0d1122",
+                "text": "the needle is here"
+            }]}),
+            // the one source that did not answer
+            "files" => {
+                events.push(refuse(request.id, "the files module timed out"));
+                continue;
+            }
+            "forge" => serde_json::json!({ "repos": [] }),
+            "tasks" => serde_json::json!({ "tasks": { "tasks": [] } }),
+            "runs" => serde_json::json!({ "runs": [] }),
+            _ => serde_json::json!({ "hits": [] }),
+        };
+        events.push(answer(request.id, reply.to_string().as_bytes()));
+    }
+    let frame = tick_native(events);
+
+    for expected in [
+        "user 48cedb0…",
+        "the needle is here",
+        "general · #12",
+        "Files did not answer — these results are incomplete.",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let chips = texts(&frame);
     assert!(
-        has_text(&frame, "Nothing matched that query in this workspace."),
-        "{:?}",
-        texts(&frame)
+        !chips.iter().any(|text| text == "Files"),
+        "a refused source keeps no chip: {chips:?}"
     );
-    // … and a hit lists under its kind, with the copy leaving as an intent
-    let hit = ExplorerProps {
-        hits: vec![ExplorerHit {
-            kind: "chat".into(),
-            code: "c".into(),
-            title: "needle in #general".into(),
-            snippet: "the needle".into(),
-            meta: "chat".into(),
-            target: "general".into(),
-        }],
-        kinds: vec![KindCount {
-            kind: "chat".into(),
-            label: "Chat".into(),
-            count: 1,
-        }],
-        ..answered
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&hit))]);
-    assert!(
-        has_text(&frame, "needle in #general"),
-        "{:?}",
-        texts(&frame)
-    );
+    for chip in ["Messages", "Pages", "Code", "Tasks", "Runs"] {
+        assert!(
+            chips.iter().any(|text| text == chip),
+            "missing the {chip} chip in {chips:?}"
+        );
+    }
+
+    // clearing drops the answer and the sentence with it
     let frame = tick_native(press(&frame, "Clear workspace search"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    assert_eq!(intent.kind, "explorer.clear");
+    assert!(
+        !has_text(&frame, "Files did not answer — these results are incomplete."),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 }
 
 /// THE EYE GETS `0x`, THE CLIPBOARD GETS THE KEY. An op hash is the
@@ -143,9 +265,14 @@ fn a_search_leaves_as_an_intent_and_its_answer_comes_back_as_props() {
 /// hand-trimmed first is a copy button that does not work.
 #[test]
 fn an_ops_hash_reads_prefixed_and_copies_bare() {
-    let (_, frame) = shown(&ledger());
+    let (frame, _live) = connected_with_ledger();
     let frame = tick_native(press(&frame, "Inspect block"));
     assert!(has_text(&frame, "0xab12cd34"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "chat · 1 msg · 0 events"),
+        "every count in the trace names what it counts: {:?}",
+        texts(&frame)
+    );
     let frame = tick_native(press(&frame, "Copy op hash"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -169,16 +296,7 @@ fn an_ops_hash_reads_prefixed_and_copies_bare() {
 fn every_digest_reads_whole_and_hex_prefixed_and_copies_the_bare_key() {
     let hash = "9f3e".repeat(16);
     let commit = "c0ffee11".repeat(8);
-    let props = ExplorerProps {
-        blocks: vec![ExplorerBlock {
-            height: 84_912,
-            hash: hash.clone(),
-            commit: commit.clone(),
-            op_count: 1,
-        }],
-        ..ledger()
-    };
-    let (_, frame) = shown(&props);
+    let (frame, _live) = connected_with_ledger();
     let whole = format!("0x{hash}");
     assert!(has_text(&frame, &whole), "{:?}", texts(&frame));
     // and NOTHING on the list is a cut-down version of it — the guard that
@@ -213,14 +331,7 @@ fn every_digest_reads_whole_and_hex_prefixed_and_copies_the_bare_key() {
 /// `module:<id>` or `acct:<account>`, and `0xsystem` names nothing.
 #[test]
 fn a_proposer_that_is_not_a_key_keeps_its_label() {
-    let props = ExplorerProps {
-        ops: vec![ExplorerOp {
-            proposer: "system".into(),
-            ..ledger().ops[0].clone()
-        }],
-        ..ledger()
-    };
-    let (_, frame) = shown(&props);
+    let (frame, _live) = connected_with_ledger();
     let frame = tick_native(press(&frame, "Inspect block"));
     assert!(has_text(&frame, "system"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "0xsystem"), "{:?}", texts(&frame));
