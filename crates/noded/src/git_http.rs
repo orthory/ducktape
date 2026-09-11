@@ -58,8 +58,8 @@ const GIT_UPLOAD_PACK_CAPS: &str =
 /// on top), and nothing retransmits a dropped chunk — a pack past 127 chunks
 /// would not be refused but would hang its pusher for the whole transfer
 /// allowance with the pack pinned in memory. `bin/node/src/relay.rs` pins
-/// this under that backlog; this repository's own full-history pack (83 MiB)
-/// fits.
+/// this under that backlog. A history whose first push packs larger than
+/// this (95.25 MiB) is refused whole; it lands pushed in parts.
 pub const GIT_PACK_BODY_LIMIT: usize = 127 * 768 * 1024;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
