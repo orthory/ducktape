@@ -1794,7 +1794,7 @@ name = "collaboration"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "attribution",
+ "chat",
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
@@ -1803,7 +1803,6 @@ dependencies = [
  "sdk",
  "sdk-testkit",
  "serde",
- "sha2 0.10.9",
  "statesync",
  "tasks",
 ]
@@ -3482,7 +3481,6 @@ dependencies = [
  "authpage",
  "base64 0.22.1",
  "block2 0.5.1",
- "capability",
  "chat",
  "commonware-cryptography",
  "cpal",

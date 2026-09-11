@@ -292,7 +292,7 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // `channel_id` from the account number it resolved itself, and `account_number`
     // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
     // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 8] = [
+    const MIRRORS: [(&str, &[&str]); 7] = [
         ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
         (
@@ -307,7 +307,6 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
             "huddle_rows",
             &["huddle_roster", "call_peers", "call_muted"],
         ),
-        ("fs_preview_entry", &["fs_entries", "fs_preview_path"]),
         (
             "post_refusal",
             &[
@@ -843,10 +842,10 @@ fn live_reply_overlapping_a_page_keeps_one_row_and_the_server_cursor() {
 
 /// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.
 ///
-/// These five modules feed surfaces that were correct only at connect and at
-/// tab-switch time: a validator joining, a proposal being voted, a device being
-/// renamed, an agent registering, a file being committed — none of it reached a
-/// console already looking at the page that shows it.
+/// These modules feed surfaces that were correct only at connect and at
+/// tab-switch time: a validator joining, a device being renamed, a file being
+/// committed — none of it reached a console already looking at the page that
+/// shows it.
 ///
 /// The generation counters ARE the assertion: each is the refetch's own guard,
 /// so one moving means exactly that plane was asked for, and the others holding
@@ -867,20 +866,18 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
         }));
     };
 
-    let (members, agents, account, dm, fs) = (
+    let (members, account, dm) = (
         app.members_generation,
-        app.agents_generation,
         app.account_generation,
         app.dm_peers_generation,
-        app.fs_generation,
     );
 
     plane(&mut app, "valset");
     assert_eq!(app.members_generation, members + 1, "valset feeds members");
-    assert_eq!(app.fs_generation, fs, "and nothing else");
+    assert_eq!(app.account_generation, account, "and nothing else");
 
-    // the governance plane is the governance VIEW's to re-read, through the
-    // kernel's `rpc.live`; no app reading moves for it
+    // the governance and files planes are their VIEWS' to re-read, through
+    // the kernel's `rpc.live`; no app reading moves for either
     plane(&mut app, "governance");
     assert_eq!(
         app.members_generation,
@@ -893,25 +890,15 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
     assert_eq!(app.account_generation, account + 1);
     assert_eq!(app.dm_peers_generation, dm + 1);
 
+    // the agents pair — `agent` for the register, `runs` for the liveness —
+    // is the agents VIEW's to re-read, through the kernel's `rpc.live`; no
+    // app reading moves for either
     plane(&mut app, "agent");
-    assert_eq!(
-        app.agents_generation,
-        agents + 1,
-        "identity refreshes model controller names"
-    );
-
-    // Model configuration and active runs share the runs plane. Generic
-    // program changes do not change the model roster.
     plane(&mut app, "runs");
-    assert_eq!(
-        app.agents_generation,
-        agents + 2,
-        "runs owns model configuration and liveness"
-    );
     assert_eq!(app.account_generation, account + 1, "and nothing else");
 
     plane(&mut app, "files");
-    assert_eq!(app.fs_generation, fs + 1);
+    assert_eq!(app.members_generation, members + 1, "unchanged by files");
 
     // A module with no plane of its own moves nothing.
     let before = app.members_generation;

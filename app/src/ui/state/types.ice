@@ -243,12 +243,11 @@ enum ForgeIntent
   copy
   composer
 
-// what the Agents view asks of the app: an agent's paused state, a record
-// rewritten from the editor's draft, a new agent registered from one, or the
-// journal of a run the reader opened
+// what the Agents view asks of the app: how many of its agents are working
+// (the rail's pulse), a new agent registered from the editor's draft, or a
+// place to open — the reads and the other writes are the view's own
 enum AgentsIntent
-  status
-  save
+  badge
   register
   open_run
   open_link
@@ -260,22 +259,6 @@ enum NodeIntent
   tab
   log_filter
   log_timeline
-
-// what the Files view asks of the app: one variant per act the browser
-// offers, from a navigation to a write
-enum FilesIntent
-  open_dir
-  open_file
-  open_parent
-  mkdir
-  new_file
-  arm_delete
-  disarm_delete
-  delete
-  save
-  show_diff
-  close_diff
-  open_link
 
 // what the Settings view asks of the app: one variant per act the screen
 // offers, each carrying only what the reader typed (a name, a key, a ticket,

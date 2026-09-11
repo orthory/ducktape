@@ -519,15 +519,11 @@ fn thread_state_of(frame: &serde_json::Value) -> Option<(String, ThreadState)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::MessageId;
 
     fn an_offer(text: &str, urgent: bool) -> Offer<'_> {
         Offer {
             text,
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7",
             urgent,
         }
     }

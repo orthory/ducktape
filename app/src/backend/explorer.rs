@@ -110,7 +110,6 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 // surface is flat, and the reading must see every layer at once to name the
 // topmost. Scoping lives HERE rather than in the call sites' argument lists —
 // a conjunction per caller is one guard per rung to forget.
-#[allow(clippy::too_many_arguments)]
 pub fn topmost_overlay(
     shell_tab: crate::ShellTab,
     palette_open: bool,
@@ -119,10 +118,8 @@ pub fn topmost_overlay(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
-    fs_delete_target: &str,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
-    let on_files = shell_tab == crate::ShellTab::Files;
     if palette_open {
         return "palette".into();
     }
@@ -154,15 +151,11 @@ pub fn topmost_overlay(
     if on_chat && channel_settings_open {
         return "channel_settings".into();
     }
-    // The Pages layers are the pages view's own — it holds the keyboard inside
-    // its tab and answers Escape itself. `fs_delete_target` arms a scrim and a
-    // `ConfirmDelete` over duckfs (`screens/storage.ice`), and it had no
-    // keyboard exit either — the state the channel drawer was in before #1132
-    // gave it a rung. A destructive confirm is the LAST layer that should need
-    // the mouse.
-    if on_files && !fs_delete_target.is_empty() {
-        return "fs_delete".into();
-    }
+    // THE PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the keyboard
+    // inside its tab and answers Escape itself, armed delete included — the
+    // guest paints the scrim, so the guest owns the exit. Nothing about those
+    // screens is reachable from this ladder any more.
+    //
     // The forge's repository and branch switchers are the host's own pick
     // lists: the host dismisses their menus itself, so they hold no rung.
     String::new()
@@ -185,7 +178,6 @@ pub fn escape_target(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
-    fs_delete_target: String,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
     let not_escape = logical != Key::Named(Named::Escape);
@@ -200,7 +192,6 @@ pub fn escape_target(
         thread_message_action,
         message_action,
         channel_settings_open,
-        &fs_delete_target,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows
     // Escape, so the ladder yields rather than naming a rung.

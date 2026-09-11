@@ -3,13 +3,12 @@
 // readings arrive as props, interaction-local state stays here, and only
 // application effects leave as named events the view root turns into intents.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, display_omitted:i64, preview_display_clipped:bool)
+component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, omitted:i64, diff_omitted:i64, preview_display_clipped:bool)
   lifetime retained
   emits
     open_message_link(str)
     fs_open_dir(str)
     fs_open_file(str)
-    fs_open_parent()
     fs_mkdir_submit()
     fs_new_file_submit()
     fs_arm_delete(str)
@@ -55,7 +54,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
           h=28.0
           gap=8.0
           align=center
-        button -> emit(fs_open_parent)
+        button -> emit(fs_open_dir, parent)
           with
             label="Parent directory"
             disabled=(loading || path == "/")
@@ -224,7 +223,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
               // THIS path there is nothing to read — the node is down, or the
               // rows still describe the directory you just left — and the main
               // pane already says so.
-              if connected && listed && empty(directories) && display_omitted == 0
+              if connected && listed && empty(directories) && omitted == 0
                 box
                   with
                     w=fill
@@ -297,7 +296,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                       active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle
-                  if empty(diff) && display_omitted == 0
+                  if empty(diff) && diff_omitted == 0
                     text "No differences." size=12.5 @text-caption
                   for entry in diff
                     row
@@ -326,7 +325,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                   // failed. Same trade as the "No differences." arm above.
                   if !empty(history)
                     GroupLabel label="SNAPSHOTS"
-                  if empty(history) && display_omitted == 0
+                  if empty(history) && omitted == 0
                     text "No snapshots yet." size=12.5 @text-caption
                   for snapshot in history
                     box
@@ -380,7 +379,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             // plate that said "Empty directory" or a list of the previous
             // directory's objects would each be a claim about a path nobody
             // has answered for yet.
-            if listed && empty(entries) && display_omitted == 0
+            if listed && empty(entries) && omitted == 0
               box w=fill p=22.0
                 EmptyPlate message="Empty directory — nothing is committed under this path."
             if listed && !empty(entries)

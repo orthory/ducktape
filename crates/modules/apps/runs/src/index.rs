@@ -39,7 +39,7 @@ use index_guest::{Fail, MAX_SCAN_LIMIT, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    OP_AGENT_CALL, OP_CHAT_POST_MESSAGE, OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_SEND,
+    OP_AGENT_CALL, OP_CHAT_POST_MESSAGE, OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER,
     OP_DUCKFS_WRITE_TEXT, OP_JOBS_COMMENT, OP_MODULES_UPDATE, OP_PAGES_COMMENT, OP_PAGES_POST,
     OP_PAGES_SET_CHECKED, OP_REPLY, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS, PageSource, PrRef,
     RunEvent, RunFact, RunOutcome, decode_assigned, delegated_run_id_for, dispatch_id_for,
@@ -153,10 +153,6 @@ pub enum RunPlace {
     /// a module the run proposed an update of.
     Module {
         module_id: String,
-    },
-    /// a collaboration conversation the run messaged or acknowledged in.
-    Conversation {
-        conversation_id: String,
     },
     /// another run: the callee of an `agent.call`, by its dispatch id.
     Run {
@@ -293,8 +289,8 @@ struct ModuleReceipt {
 }
 
 #[derive(Deserialize)]
-struct ConversationReceipt {
-    conversation_id: String,
+struct ChannelReceipt {
+    channel_id: String,
 }
 
 #[derive(Deserialize)]
@@ -364,9 +360,9 @@ fn acted_place(operation: &str, result: &serde_json::Value) -> Option<RunPlace> 
             let ModuleReceipt { module_id } = receipt(result)?;
             Some(RunPlace::Module { module_id })
         }
-        OP_COLLABORATION_SEND | OP_COLLABORATION_ACKNOWLEDGE => {
-            let ConversationReceipt { conversation_id } = receipt(result)?;
-            Some(RunPlace::Conversation { conversation_id })
+        OP_COLLABORATION_DELIVER | OP_COLLABORATION_ACKNOWLEDGE => {
+            let ChannelReceipt { channel_id } = receipt(result)?;
+            Some(RunPlace::Channel { channel_id })
         }
         OP_AGENT_CALL => {
             let DelegationReceipt {

@@ -36,46 +36,6 @@ fn the_rail_seats_collaboration_and_node_operations_separately() {
     );
 }
 
-/// The two folds the mounted surfaces are drawn from — the blob gutter,
-/// and the roster the popped panel keeps.
-#[test]
-fn the_selected_fs_entry_resolves_or_blanks() {
-    let selected = FsEntry {
-        key: 1,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 7,
-        object: "abc".into(),
-    };
-
-    assert_eq!(
-        fs_entry_named(vec![no_fs_entry(), selected.clone()], selected.path.clone(),),
-        selected
-    );
-    assert_eq!(
-        fs_entry_named(Vec::new(), "/shared/missing".into()),
-        no_fs_entry()
-    );
-}
-
-#[test]
-fn directory_rows_are_prepared_from_the_listing() {
-    let entry = |name: &str, kind: &str| FsEntry {
-        key: 0,
-        path: format!("/shared/{name}"),
-        name: name.into(),
-        kind: kind.into(),
-        size: 0,
-        object: String::new(),
-    };
-
-    assert_eq!(
-        fs_directories(&[entry("docs", "dir"), entry("readme", "file")]),
-        vec![entry("docs", "dir")]
-    );
-}
-
 #[test]
 fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() {
     let member = |is_you: bool| HuddleParticipant {
@@ -463,7 +423,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             thread_action,
             action,
             drawer,
-            String::new(),
         )
     };
 
@@ -478,7 +437,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             true,
-            "/shared/q3.md".into(),
         ),
         ""
     );
@@ -580,11 +538,10 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "channel_settings"
     );
-    // THE FILES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
-    // the Files screen — so it is a rung, and it answers only from Files. The
-    // Pages layers are the pages view's own now: it holds the keyboard inside
-    // its tab and answers Escape itself.
-    let armed = |tab: ShellTab, fs_delete: &str| {
+    // NO DELETE CONFIRM IS A RUNG ANY MORE. Pages and Files each paint their
+    // own scrim inside their own tab and answer Escape themselves, so neither
+    // screen reaches this ladder — from any tab.
+    let armed = |tab: ShellTab| {
         escape_target(
             escape.clone(),
             tab,
@@ -594,12 +551,10 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             false,
-            fs_delete.into(),
         )
     };
-    assert_eq!(armed(ShellTab::Files, "/shared/q3.md"), "fs_delete");
-    assert_eq!(armed(ShellTab::Node, "/shared/q3.md"), "");
-    assert_eq!(armed(ShellTab::Pages, "/shared/q3.md"), "");
+    assert_eq!(armed(ShellTab::Pages), "");
+    assert_eq!(armed(ShellTab::Files), "");
 
     // Nothing transient open → Escape is a no-op. The pages block menus are
     // gone with the surfaces they dismissed.
@@ -642,7 +597,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
                 thread_action,
                 action,
                 drawer,
-                "",
             )
         };
     let target = |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction| {
@@ -655,7 +609,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             MessageAction::Toolbar,
             false,
-            String::new(),
         )
     };
 

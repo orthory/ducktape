@@ -23,7 +23,10 @@ extern crate::module_view
   // reads the roster off the node and signs its writes through `op.submit`;
   // the one event back is the clipboard intent
   component members_view(dark:bool, connected:bool, admin:bool) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
+  // Agents speaks it as well: session facts go in — the run another tab
+  // opened for the reader among them, which the kernel has no other door
+  // for — and the view reads and writes the node itself.
+  component agents_view(dark:bool, connected:bool, account:&str, open_run:&str, opened:i64) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool
@@ -40,8 +43,11 @@ extern crate::module_view
   component explorer_view(dark:bool, connected:bool, head:i64, sync_line:&str) -> ModuleViewEvent
   component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
   pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
-  component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64, rpc:&str, chain:&str, connection:i64, preview_base:&str, save_reply:&FsSaveHistory) -> ModuleViewEvent
-  pure files_intent(event:&ModuleViewEvent) -> FilesIntent
+  // Files speaks the KERNEL CONTRACT: session facts go in, the view reads
+  // and writes duckfs through the kernel (`files.get`, `op.submit`), and the
+  // events back are the app's own doors — a link to open, and the directory
+  // a dropped file lands in.
+  component files_view(dark:bool, connected:bool, chain:&str, route:&str, route_serial:i64) -> ModuleViewEvent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
   // Pages speaks the KERNEL CONTRACT: session facts go in — the chain,
   // because a `duck://page/…` address carries it, and the page a link asked

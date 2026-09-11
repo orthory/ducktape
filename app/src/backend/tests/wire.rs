@@ -477,14 +477,13 @@ fn hydration_retry_is_capped() {
     assert_eq!(retry_delay(99), Duration::from_secs(16));
 }
 
-/// A `runs` OP IS A SIGNAL, NOT A FOLD. Nothing on screen draws a run row: the
-/// fact that module feeds is `AgentRow.live`, joined into the AGENTS
-/// projection out of another module's state (`agents_with_a_run_in_flight`).
-/// So there is nothing local to fold into, and the only useful shape is a
-/// plane update naming `runs` — which the handler answers by refetching that
-/// projection, the Forge seat's live dot with it.
+/// A `runs` OP IS A SIGNAL, NOT A FOLD. The app holds no run state at all:
+/// the agents view reads its own register, and what it needs off this op is
+/// only that the plane moved. So the only useful shape is a plane update
+/// naming `runs`, which the lifecycle hands the kernel's `rpc.live` — and
+/// the view re-reads.
 #[tokio::test(flavor = "current_thread")]
-async fn a_runs_op_asks_the_agents_projection_to_refetch() {
+async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let update = folded_update(
         "",
@@ -510,17 +509,19 @@ async fn a_runs_op_asks_the_agents_projection_to_refetch() {
     assert_eq!(update.height, 7);
     assert!(
         !update.load_chat,
-        "the signal buys the agents projection, not a chat slice"
+        "the signal buys a plane hit, not a chat slice"
     );
 }
 
 /// A PLANE WITH NO SUBSCRIPTION IS A DEAD ARM, and a silent one. `folded_update`
 /// can only route an op the stream was asked to deliver, so the subscribe list
 /// and its match arms are one contract kept in two places. `runs` is the case
-/// that proved it: `AgentRow.live` is read from that module, the Forge seat
-/// draws a live dot off the joined row, and nothing ever said the module
-/// changed — so the dot stayed dark for the length of a run. The EXACT list is
-/// the pin, because a topic dropped here fails nothing else.
+/// that proved it: an agent's liveness is committed there, the rail draws a
+/// live dot off it, and nothing ever said the module changed — so the dot
+/// stayed dark for the length of a run. A view on the kernel contract is
+/// told a plane moved through THIS list too (`rpc.live`), so a topic dropped
+/// here silences that view as well. The EXACT list is the pin, because a
+/// topic dropped here fails nothing else.
 #[test]
 fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     const LIVE: &str = include_str!("../live.rs");
@@ -555,27 +556,6 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
             "files",
         ]
     );
-}
-
-/// Model configuration and run activity share the runs plane. Generic program
-/// changes are not model-registry changes.
-#[test]
-fn the_agents_plane_hit_tracks_models_and_current_identity_control() {
-    for (kind, module, want) in [
-        (crate::LiveKind::Plane, "agent", false),
-        (crate::LiveKind::Plane, "runs", true),
-        (crate::LiveKind::Plane, "identity", true),
-        (crate::LiveKind::Plane, "valset", false),
-        (crate::LiveKind::Chat, "agent", false),
-        (crate::LiveKind::Chat, "runs", false),
-        (crate::LiveKind::Resync, "runs", false),
-    ] {
-        assert_eq!(
-            agents_plane_hit(kind, module.into()),
-            want,
-            "{kind:?} / {module}"
-        );
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]

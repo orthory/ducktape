@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::wire::{MessageId, State};
+use crate::wire::State;
 
 /// one item's identity in the journal. The conversation's committed event
 /// sequence is unique within it, so this is the receipt key the collaboration
@@ -55,7 +55,7 @@ pub struct Entry {
     pub participant: String,
     pub binding_generation: u64,
     pub sender: String,
-    pub message_id: MessageId,
+    pub message_id: String,
     pub expires_at: u64,
     /// the canonical request digest, hex. What makes a retry telling apart
     /// from a forgery possible: the SAME id with the SAME bytes is the same
@@ -79,12 +79,6 @@ pub struct Entry {
 pub enum Admission {
     /// not seen before. The caller now owns it, durably.
     Fresh,
-    /// below the conversation's retention floor. The network stopped retaining
-    /// this sequence, so this daemon retired its record — and a delivery
-    /// arriving for it now is a replay of something nobody is entitled to
-    /// re-drive. Refused rather than admitted `Fresh`, which is what the same
-    /// key looks like once its record is gone.
-    Retired,
     /// seen before, byte for byte, and still only `Queued` — so the journal
     /// says no provider has ever been offered it. The caller owns it again and
     /// may offer it, exactly once.
@@ -127,17 +121,6 @@ enum Record {
     /// endpoint, a URL or a listen address, all of which move while the
     /// network stays the same.
     Network { id: String },
-    /// one conversation's retention floor, as the NETWORK reported it.
-    ///
-    /// Durable for the same reason the admissions are: pruning an item without
-    /// remembering WHY it went would leave the key free, and a replayed
-    /// `MsgDeliver` for a sequence below the floor would then admit `Fresh`
-    /// after a restart and be offered to a provider a second time. The floor
-    /// outlives the records it retires.
-    Floor {
-        conversation: String,
-        floor_seq: u64,
-    },
     /// this daemon has taken durable ownership of the item. Written and synced
     /// BEFORE the node is told `Queued`, so queue ownership is never claimed
     /// on the strength of memory alone.
@@ -147,7 +130,7 @@ enum Record {
         participant: String,
         binding_generation: u64,
         sender: String,
-        message_id: MessageId,
+        message_id: String,
         expires_at: u64,
         digest: String,
     },
@@ -191,10 +174,6 @@ struct Journal {
     /// leave every duplicate to be re-executed: this IS the dedup map, and it
     /// is the same one the journal replays into at boot.
     state: BTreeMap<Key, Entry>,
-    /// per-conversation retention floors, monotonic. What a pruned record
-    /// leaves behind, so forgetting an item is not the same as forgetting that
-    /// it existed.
-    floors: BTreeMap<String, u64>,
     /// how many bytes are already durable, so the live file is bounded by the
     /// same ceiling the boot read is. A ceiling checked only at boot bounds
     /// nothing: the run that grows past it never notices.
@@ -274,23 +253,13 @@ const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// the ceiling on tracked items.
 ///
-/// Reached only if [`Outbox::retain`] cannot keep up — a node that never sends
-/// a retention floor will reach it and stay there, refusing admissions, which
-/// is the correct failure: admitting past this point would trade the dedup
-/// record for throughput, and the dedup record is what stops one instruction
-/// being carried out twice.
+/// Reached only where nothing ever expires — a node that never sends a
+/// `MsgTime` gives [`Outbox::retire_expired`] no clock to prune against, so its
+/// journal grows to this and stays there, refusing admissions. That is the
+/// correct failure: admitting past this point would trade the dedup record for
+/// throughput, and the dedup record is what stops one instruction being carried
+/// out twice.
 pub const MAX_TRACKED: usize = 4096;
-
-/// the ceiling on retention floors — one per conversation this daemon has ever
-/// pruned for.
-///
-/// A floor is permanent by design: it is what a deleted record leaves behind,
-/// so it can never be dropped on a timer without un-retiring the sequences it
-/// covers. That makes the SET of them the one structure here that only grows,
-/// and a byte ceiling on the journal does not bound it (a conversation with no
-/// surviving items still costs a line). Bounded here, at the write, for the
-/// same reason and with the same failure as [`MAX_TRACKED`].
-const MAX_FLOORS: usize = 4096;
 
 impl Outbox {
     /// open (creating) the journal at `dir/outbox.jsonl` and fold whatever is
@@ -369,12 +338,10 @@ impl Outbox {
         // which failure it is looking at — and against THIS network, so a
         // directory that once belonged to another one is refused rather than
         // read as if its keys meant the same things.
-        let folded = fold(&existing[..complete], network)?;
-        let recovered = folded.entries;
+        let recovered = fold(&existing[..complete], network)?;
         let mut journal = Journal {
             file,
             state: recovered.clone(),
-            floors: folded.floors,
             bytes: complete as u64,
             network: network.to_string(),
             poisoned: None,
@@ -440,16 +407,6 @@ impl Outbox {
                 reason: existing.reason.clone(),
             });
         }
-        // no record, but that is not the same as never having had one: a
-        // sequence below the floor is one this daemon RETIRED, and admitting
-        // it `Fresh` is how a pruned item gets delivered twice.
-        let retired = journal
-            .floors
-            .get(&key.conversation)
-            .is_some_and(|floor| key.seq < *floor);
-        if retired {
-            return Ok(Admission::Retired);
-        }
         if journal.state.len() >= MAX_TRACKED {
             return Err("outbox is at its tracked-item ceiling".to_string());
         }
@@ -463,7 +420,7 @@ impl Outbox {
                 participant: entry.participant.clone(),
                 binding_generation: entry.binding_generation,
                 sender: entry.sender.clone(),
-                message_id: entry.message_id,
+                message_id: entry.message_id.clone(),
                 expires_at: entry.expires_at,
                 digest: entry.digest.clone(),
             })
@@ -494,20 +451,6 @@ impl Outbox {
         &self.path
     }
 
-    /// drop what the NETWORK no longer retains, and rewrite the journal
-    /// without it. Returns how many items were pruned.
-    ///
-    /// This is the ONLY thing that ever shrinks the dedup record, and the
-    /// condition is deliberately not a local one. Age and count are heuristics
-    /// — pruning on either would eventually forget an item while the network
-    /// could still re-drive it, which is a licence to execute an instruction
-    /// twice. `floor_seq` is the module's own retention floor: below it the
-    /// conversation no longer holds the message at all, so a replay of it
-    /// cannot be admitted upstream and forgetting it locally costs nothing.
-    ///
-    /// Only TERMINAL, UNCLAIMED items go. An item still in flight, or one
-    /// sitting at `DeliveryUnknown` waiting for someone with authority to
-    /// decide, is kept whatever the floor says.
     /// Every item this daemon still tracks for one binding, oldest first.
     ///
     /// A READ of durable state and nothing else — no journal write, no claim,
@@ -539,73 +482,41 @@ impl Outbox {
             .collect())
     }
 
-    pub async fn retain(&self, conversation: &str, floor_seq: u64) -> Result<usize, String> {
+    /// drop every record the agreed clock has aged out, and rewrite the
+    /// journal without them. Returns how many went.
+    ///
+    /// This is the ONLY thing that ever shrinks the dedup record, and the
+    /// condition is deliberately not a local one. Age and count are heuristics
+    /// — pruning on either would eventually forget an item while the network
+    /// could still re-drive it, which is a licence to execute an instruction
+    /// twice. `expires_at` is the message's own deadline on the AGREED clock:
+    /// past it the network holds no delivery record either, so a replay cannot
+    /// be admitted upstream and forgetting it locally costs nothing.
+    ///
+    /// Only TERMINAL, UNCLAIMED items go. An item still in flight, or one
+    /// sitting at `DeliveryUnknown` waiting for someone with authority to
+    /// decide, is kept whatever the clock says.
+    pub async fn retire_expired(&self, now: u64) -> Result<usize, String> {
         let mut journal = self.journal.lock().await;
         journal.usable()?;
-        // monotonic: a floor only ever rises. A reordered or replayed
-        // `MsgRetain` carrying an older value would otherwise un-retire keys
-        // this daemon has already forgotten the records for.
-        let already_higher = journal
-            .floors
-            .get(conversation)
-            .is_some_and(|held| *held >= floor_seq);
-        if already_higher {
-            return Ok(0);
-        }
-        // a floor is what a pruned record leaves behind, so it outlives every
-        // item it retired — which makes an unbounded set of them a leak the
-        // journal's byte ceiling does not catch. A conversation already
-        // tracked can always RAISE its floor; only a new one is refused.
-        let new_conversation = !journal.floors.contains_key(conversation);
-        let at_the_floor_ceiling = new_conversation && journal.floors.len() >= MAX_FLOORS;
-        if at_the_floor_ceiling {
-            return Err(format!(
-                "outbox already tracks {MAX_FLOORS} retention floors; it must be inspected"
-            ));
-        }
         let survivors: BTreeMap<Key, Entry> = journal
             .state
             .iter()
-            .filter(|(key, entry)| {
-                let below_the_floor = key.conversation == conversation && key.seq < floor_seq;
+            .filter(|(_, entry)| {
+                let aged_out = entry.expires_at <= now;
                 let finished = entry.state.terminal() && !entry.claimed;
-                !(below_the_floor && finished)
+                !(aged_out && finished)
             })
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
         let pruned = journal.state.len() - survivors.len();
-
-        // the FLOOR is durable whether or not anything was pruned. A floor
-        // that only lands when there happens to be something to delete is a
-        // floor that silently does not exist on a quiet conversation — and the
-        // next replay below it would admit `Fresh`.
-        let nothing_to_prune = pruned == 0;
-        if nothing_to_prune {
-            journal
-                .append(&Record::Floor {
-                    conversation: conversation.to_string(),
-                    floor_seq,
-                })
-                .await?;
-            journal.floors.insert(conversation.to_string(), floor_seq);
+        // no write at all when nothing qualifies: a clock tick is frequent, and
+        // rewriting the journal on every one would be an fsync storm for no
+        // change.
+        if pruned == 0 {
             return Ok(0);
         }
-        // the rewrite carries every floor, this one included, so the durable
-        // file and the live map move together or not at all.
-        let previous = journal.floors.insert(conversation.to_string(), floor_seq);
-        let installed = self.rewrite(&mut journal, survivors).await;
-        if let Err(error) = installed {
-            // put back EXACTLY what was there. Removing the entry instead
-            // would erase a floor that was already durable, and every sequence
-            // that floor had retired would admit `Fresh` again until the next
-            // restart re-read it — a failed advance turning into a licence to
-            // re-deliver.
-            match previous {
-                Some(held) => journal.floors.insert(conversation.to_string(), held),
-                None => journal.floors.remove(conversation),
-            };
-            return Err(error);
-        }
+        self.rewrite(&mut journal, survivors).await?;
         Ok(pruned)
     }
 
@@ -627,27 +538,13 @@ impl Outbox {
         })
         .map_err(|error| format!("encode compacted network: {error}"))?;
         text.push('\n');
-        // then every floor. A compaction that dropped these would free the
-        // keys it had just retired, and the next replay below one of them
-        // would admit `Fresh`.
-        for (conversation, floor_seq) in &journal.floors {
-            let floor = Record::Floor {
-                conversation: conversation.clone(),
-                floor_seq: *floor_seq,
-            };
-            text.push_str(
-                &serde_json::to_string(&floor)
-                    .map_err(|error| format!("encode compacted floor: {error}"))?,
-            );
-            text.push('\n');
-        }
         for (key, entry) in &survivors {
             let admission = Record::Queued {
                 key: key.clone(),
                 participant: entry.participant.clone(),
                 binding_generation: entry.binding_generation,
                 sender: entry.sender.clone(),
-                message_id: entry.message_id,
+                message_id: entry.message_id.clone(),
                 expires_at: entry.expires_at,
                 digest: entry.digest.clone(),
             };
@@ -834,18 +731,6 @@ impl Outbox {
     }
 }
 
-/// what a journal folds to: what this daemon still tracks, and what it has
-/// already retired.
-///
-/// The floors travel WITH the entries because they answer the same question a
-/// missing entry raises — "was there never one, or did we forget it?" — and
-/// separating them is how a caller ends up enforcing only half the record.
-#[derive(Debug, Default)]
-struct Folded {
-    entries: BTreeMap<Key, Entry>,
-    floors: BTreeMap<String, u64>,
-}
-
 /// make a rename durable by syncing the directory that now names the new file.
 ///
 /// Split out so [`Outbox::rewrite`] has ONE post-rename failure path to poison
@@ -883,9 +768,8 @@ fn remember(state: &mut BTreeMap<Key, Entry>, key: &Key, to: State, reason: Opti
 /// cannot read might be the `Attempting` that is the only thing standing
 /// between an already-executed instruction and an automatic replay, and
 /// skipping it silently recovers that item as `Queued` — deliverable again.
-fn fold(text: &str, network: &str) -> Result<Folded, String> {
+fn fold(text: &str, network: &str) -> Result<BTreeMap<Key, Entry>, String> {
     let mut entries: BTreeMap<Key, Entry> = BTreeMap::new();
-    let mut floors: BTreeMap<String, u64> = BTreeMap::new();
     let mut header_seen = false;
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -919,15 +803,6 @@ fn fold(text: &str, network: &str) -> Result<Folded, String> {
                     );
                 }
                 header_seen = true;
-            }
-            // monotonic on the way back in too, so the order records happen to
-            // sit in cannot lower a floor this daemon already enforced.
-            Record::Floor {
-                conversation,
-                floor_seq,
-            } => {
-                let held = floors.entry(conversation).or_insert(floor_seq);
-                *held = (*held).max(floor_seq);
             }
             Record::Queued {
                 key,
@@ -985,7 +860,7 @@ fn fold(text: &str, network: &str) -> Result<Folded, String> {
             }
         }
     }
-    Ok(Folded { entries, floors })
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -1021,10 +896,7 @@ mod tests {
             participant: "p-recipient".to_string(),
             binding_generation: 3,
             sender: "p-sender".to_string(),
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7".to_string(),
             expires_at: 1_200,
             digest: digest.to_string(),
             state: State::Queued,
@@ -1113,8 +985,7 @@ mod tests {
 
         let (_reopened, recovered) = Outbox::open(&dir, NETWORK).await.expect("reopens");
         let entry = &recovered[&key(7)];
-        assert_eq!(entry.message_id.generation, 2);
-        assert_eq!(entry.message_id.sequence, 1);
+        assert_eq!(entry.message_id, "m-7");
         assert_eq!(entry.sender, "p-sender");
         assert_eq!(entry.binding_generation, 3);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1126,10 +997,7 @@ mod tests {
             participant: "p-recipient".to_string(),
             binding_generation: 3,
             sender: "p-sender".to_string(),
-            message_id: MessageId {
-                generation: 2,
-                sequence: seq,
-            },
+            message_id: format!("m-{seq}"),
             expires_at: 1_200,
             digest: "digest-aaaa".to_string(),
         })
@@ -1176,7 +1044,7 @@ mod tests {
         text.push('\n');
         text.push_str(&serde_json::to_string(&Record::Attempting { key: key(8) }).unwrap());
 
-        let recovered = fold(&text, NETWORK).expect("folds").entries;
+        let recovered = fold(&text, NETWORK).expect("folds");
         assert_eq!(recovered[&key(7)].state, State::Refused);
         assert_eq!(recovered[&key(7)].reason.as_deref(), Some("auth_rejected"));
         assert_eq!(recovered[&key(8)].state, State::DeliveryUnknown);
@@ -1365,38 +1233,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Pruning follows the NETWORK's floor and nothing else — and it keeps
-    /// what is not finished with. An item at `DeliveryUnknown` is waiting for
-    /// someone with authority to decide, so the floor moving past it does not
-    /// make it disposable.
+    /// Retirement follows the message's own DEADLINE on the agreed clock — and
+    /// it keeps what is not finished with. An item at `DeliveryUnknown` is
+    /// waiting for someone with authority to decide, and one a live attempt
+    /// owns is in flight, so neither is disposable whatever the clock says.
     #[tokio::test]
-    async fn retention_drops_only_finished_items_the_network_has_let_go() {
-        let (dir, outbox, _) = scratch("retain").await;
-        // 7: settled and below the floor — the only one that may go.
+    async fn the_clock_retires_only_expired_finished_deliveries() {
+        let (dir, outbox, _) = scratch("retire").await;
+        // 7: settled and past its deadline — the only one that may go.
         outbox.admit(&key(7), &entry()).await.expect("admits");
         outbox.attempting(&key(7)).await.expect("attempting");
         outbox
             .settled(&key(7), State::AdapterAccepted, Some("queued_by_cli"))
             .await
             .expect("settled");
-        // 8: below the floor, but nobody knows whether a model read it.
+        // 8: past its deadline, but nobody knows whether a model read it.
         outbox
             .admit(&key(8), &entry_with("digest-bbbb"))
             .await
             .expect("admits");
         outbox.attempting(&key(8)).await.expect("attempting");
-        // 9: settled, but the network still retains it.
-        outbox
-            .admit(&key(9), &entry_with("digest-cccc"))
-            .await
-            .expect("admits");
+        // 9: settled, but its deadline has not passed.
+        let mut later = entry_with("digest-cccc");
+        later.expires_at = 5_000;
+        outbox.admit(&key(9), &later).await.expect("admits");
         outbox
             .settled(&key(9), State::Refused, Some("queue_refused"))
             .await
             .expect("settled");
+        // 10: finished and past its deadline, but a live attempt owns it.
+        let mut claimed = entry_with("digest-dddd");
+        claimed.state = State::Refused;
+        outbox.admit(&key(10), &claimed).await.expect("admits");
 
-        let pruned = outbox.retain("conv-1", 9).await.expect("compacts");
-        assert_eq!(pruned, 1, "only the settled item below the floor may go");
+        // nothing has aged out yet, so nothing is written either: a clock tick
+        // is frequent, and rewriting on every one would be an fsync storm.
+        let untouched = std::fs::read_to_string(dir.join("outbox.jsonl")).expect("the journal");
+        assert_eq!(outbox.retire_expired(1_199).await.expect("decides"), 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("outbox.jsonl")).expect("the journal"),
+            untouched,
+            "a tick that retires nothing must not rewrite the journal"
+        );
+
+        let pruned = outbox.retire_expired(1_200).await.expect("compacts");
+        assert_eq!(pruned, 1, "only the finished item past its deadline may go");
         assert_eq!(outbox.state_of(&key(7)).await, None);
         assert_eq!(
             outbox.state_of(&key(8)).await,
@@ -1404,6 +1285,11 @@ mod tests {
             "an undecided delivery is not disposable"
         );
         assert_eq!(outbox.state_of(&key(9)).await, Some(State::Refused));
+        assert_eq!(
+            outbox.state_of(&key(10)).await,
+            Some(State::Refused),
+            "an item a live attempt owns is not pruned under it"
+        );
 
         // and the compacted file folds back to exactly that.
         drop(outbox);
@@ -1413,120 +1299,33 @@ mod tests {
         assert_eq!(recovered[&key(9)].state, State::Refused);
         assert_eq!(recovered[&key(9)].reason.as_deref(), Some("queue_refused"));
         assert_eq!(recovered[&key(9)].digest, "digest-cccc");
+        assert_eq!(recovered[&key(10)].state, State::Refused);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Pruning a record must not free its KEY. Forgetting an item and
-    /// forgetting that it existed are different things, and only the first is
-    /// safe: a replayed delivery below the floor would otherwise admit `Fresh`
-    /// and be offered to a provider a second time — a duplicate the pruning
-    /// itself created.
+    /// A compaction that cannot even start must leave every record exactly
+    /// where it was: nothing in memory moves until the new file is the one on
+    /// the disk.
     #[tokio::test]
-    async fn a_retired_sequence_never_admits_again_even_after_a_restart() {
-        let (dir, outbox, _) = scratch("retain-retires").await;
+    async fn a_compaction_that_cannot_start_leaves_every_record_standing() {
+        let (dir, outbox, _) = scratch("retire-rollback").await;
         outbox.admit(&key(7), &entry()).await.expect("admits");
         outbox
             .settled(&key(7), State::Refused, Some("queue_refused"))
-            .await
-            .expect("settled");
-        assert_eq!(outbox.retain("conv-1", 8).await.expect("compacts"), 1);
-        assert_eq!(outbox.state_of(&key(7)).await, None, "the record is gone");
-        assert_eq!(
-            outbox.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired,
-            "a retired sequence is not a free key"
-        );
-
-        // and the floor outlives the process, which is the half a rewrite that
-        // only carried survivors would lose.
-        drop(outbox);
-        let (reopened, recovered) = Outbox::open(&dir, NETWORK).await.expect("reopens");
-        assert!(!recovered.contains_key(&key(7)));
-        assert_eq!(
-            reopened.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A compaction that cannot even start must leave every earlier retirement
-    /// exactly where it was.
-    ///
-    /// The dangerous shape is a floor that was ALREADY durable: advancing it
-    /// and then rolling back by deleting the entry erases the old value too,
-    /// and every sequence it retired admits `Fresh` again until the next
-    /// restart happens to re-read it. A failed advance must not be a licence to
-    /// re-deliver.
-    #[tokio::test]
-    async fn a_compaction_that_cannot_start_leaves_every_retirement_standing() {
-        let (dir, outbox, _) = scratch("retain-rollback").await;
-        outbox.admit(&key(7), &entry()).await.expect("admits");
-        outbox
-            .settled(&key(7), State::Refused, Some("queue_refused"))
-            .await
-            .expect("settled");
-        assert_eq!(outbox.retain("conv-1", 8).await.expect("compacts"), 1);
-
-        // something for a floor of 10 to prune, so the attempt gets as far as
-        // writing a replacement.
-        outbox
-            .admit(&key(9), &entry_with("digest-cccc"))
-            .await
-            .expect("admits");
-        outbox
-            .settled(&key(9), State::Refused, Some("queue_refused"))
             .await
             .expect("settled");
 
         // a directory where the replacement file goes: the compaction fails
         // BEFORE the rename, deterministically and without a privileged fd.
         std::fs::create_dir_all(dir.join("outbox.compacting")).expect("blocks the temp path");
-        let refused = outbox.retain("conv-1", 10).await;
+        let refused = outbox.retire_expired(1_200).await;
         assert!(refused.is_err(), "the compaction must fail: {refused:?}");
-
-        // floor 8 still stands, and nothing was pruned.
-        assert_eq!(
-            outbox.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired,
-            "a failed advance must not erase the floor that was already durable"
-        );
-        assert_eq!(outbox.state_of(&key(9)).await, Some(State::Refused));
+        assert_eq!(outbox.state_of(&key(7)).await, Some(State::Refused));
 
         drop(outbox);
-        let (reopened, recovered) = Outbox::open(&dir, NETWORK).await.expect("reopens");
-        assert_eq!(recovered[&key(9)].state, State::Refused);
-        assert_eq!(
-            reopened.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The floor is durable even when the prune deletes nothing. A floor that
-    /// only lands where there happened to be something to delete does not
-    /// exist on a quiet conversation, and the next replay below it admits.
-    #[tokio::test]
-    async fn a_floor_that_pruned_nothing_is_still_remembered() {
-        let (dir, outbox, _) = scratch("retain-empty").await;
-        assert_eq!(outbox.retain("conv-1", 8).await.expect("advances"), 0);
-        drop(outbox);
-
-        let (reopened, _) = Outbox::open(&dir, NETWORK).await.expect("reopens");
-        assert_eq!(
-            reopened.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired
-        );
-        // and the floor only rises: a replayed older value cannot un-retire it.
-        assert_eq!(reopened.retain("conv-1", 2).await.expect("ignored"), 0);
-        assert_eq!(
-            reopened.admit(&key(7), &entry()).await.expect("decides"),
-            Admission::Retired
-        );
-        // at or above the floor is still an ordinary new item.
-        assert_eq!(
-            reopened.admit(&key(8), &entry()).await.expect("admits"),
-            Admission::Fresh
-        );
+        let (_reopened, recovered) = Outbox::open(&dir, NETWORK).await.expect("reopens");
+        assert_eq!(recovered[&key(7)].state, State::Refused);
+        assert_eq!(recovered[&key(7)].reason.as_deref(), Some("queue_refused"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

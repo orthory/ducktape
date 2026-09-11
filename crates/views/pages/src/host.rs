@@ -1568,3 +1568,20 @@ fn decode_navigation(interaction: &[u8]) -> crate::document_sync::Navigation {
     }
     ui_lang_guest::wire::decode(interaction).unwrap_or_default()
 }
+
+/// The floating comment card's height: capped beside an anchored thread, the
+/// whole pane when the rail is the reader's own full-height list.
+pub fn comment_card_height(thread: &str, anchor_y: f64, viewport_height: f64) -> f64 {
+    let available = (viewport_height - 83.0).max(0.0);
+    if !thread.is_empty() || anchor_y >= 0.0 {
+        available.min(400.0)
+    } else {
+        available
+    }
+}
+
+pub fn comment_card_offset(anchor_y: f64, viewport_height: f64) -> f64 {
+    // The document starts below the 50px header and 1px separator; the card
+    // has a 16px inset. Keep its 400px body above the bottom inset.
+    (anchor_y - 67.0).clamp(0.0, (viewport_height - 483.0).max(0.0))
+}

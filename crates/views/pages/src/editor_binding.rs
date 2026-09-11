@@ -149,22 +149,27 @@ impl BindingState {
             self.menu.close();
         }
         self.history.at_reset(state.reset);
-        let (_, successor) = interaction(
-            &document(state.text, state.cursor),
-            self.menu.clone(),
-            action,
-        );
-        self.menu = successor;
+        let doc = document(state.text, state.cursor);
         let mut navigation = crate::document_sync::Navigation::default();
+        let comment_pick = matches!(action, wire::editor_presentation::EditorInteraction::MenuPick { tag } if tag == "comment");
+        if comment_pick {
+            navigation.comment_line = self
+                .menu
+                .current(&doc)
+                .filter(|menu| menu.items.iter().any(|item| item.0 == "comment"))
+                .and_then(|menu| menu.line)
+                .map(|line| line as u32);
+        }
+        let (_, successor) = interaction(&doc, self.menu.clone(), action);
+        self.menu = successor;
         match action {
             wire::editor_presentation::EditorInteraction::Margin { line } => {
                 navigation.comment_line = Some(*line);
             }
             wire::editor_presentation::EditorInteraction::LinePress { tag: 2, position } => {
                 if let Some(line) = wire::editor_lines(state.text).nth(position.line as usize) {
-                    navigation.link =
-                        crate::inline::document_link_at(line, position.column as usize)
-                            .unwrap_or_default();
+                    navigation.link = crate::inline::document_link_at(line, position.column as usize)
+                        .unwrap_or_default();
                 }
             }
             _ => {}

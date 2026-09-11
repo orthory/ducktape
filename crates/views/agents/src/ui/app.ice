@@ -1,9 +1,12 @@
-// AGENTS, as a module-owned view: the register the host pushes, listed, with
-// the one record the reader opened beside it as an editor. The record is the
-// row: name, executor, the curated skills and the standing, every one
-// editable by the account that controls
-// it and read-only for everyone else. Drafts are the view's; a save hands the
-// app the whole record and the app signs it. The plates are the kit's shapes
+// AGENTS, as a module-owned view on the KERNEL CONTRACT. The kernel pushes
+// session facts only (`session()` — connected, dark, the signing account,
+// and the run another tab opened for the reader); the register, the run
+// tracker and one run's journal are read HERE through `rpc.query` /
+// `rpc.view`, re-read on every `rpc.live` hit for the `runs` and `identity`
+// planes, and a pause or a save leaves as `op.submit` the kernel signs. The
+// record is the row: name, executor, the curated skills and the standing,
+// every one editable by the account that controls it and read-only for
+// everyone else. Drafts are the view's. The plates are the kit's shapes
 // spelled flat in the wire's vocabulary (no named fonts, `wrap=none`, line
 // heights or component uses cross the tree wire); the theme file is the
 // desktop app's own.
@@ -17,7 +20,6 @@ use "../../../../../app/src/ui/theme.ice"
 use "../../../../../app/src/ui/ducktape-ui/recipes.ice"
 
 extern crate::host
-  HostError(message:str)
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
@@ -26,8 +28,26 @@ extern crate::host
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
   LiveActivity(label:str, done:bool)
   LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
-  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, opened:i64, journal:RunJournal, live:LiveRun, capabilities:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool)
-  stream props() -> AgentsProps ! HostError
+  Session(connected:bool, dark:bool, account:str, open_run:str, opened:i64)
+  SessionItem(next:Session, error:str)
+  RegisterItem(rows:[AgentRow], runs:[RunRow], capabilities:[str], error:str)
+  JournalItem(journal:RunJournal, error:str)
+  ActItem(error:str)
+  subscription session() -> SessionItem
+  // the register and the tracker, read by this view: once per connection,
+  // then again on every `runs` or `identity` block
+  subscription register(connection:i64) -> RegisterItem
+  // the open run's journal, on the same cadence
+  subscription run_journal(open_run:str, connection:i64) -> JournalItem
+  // the open run AS IT RUNS, off the node's own output stream: one item per
+  // frame the node sends for that dispatch, folded
+  subscription live_run(open_run:str, connection:i64) -> LiveRun
+  // every write's outcome, as the kernel answers it
+  subscription acts() -> ActItem
+  pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
+  pure drafts_consumed(acted:i64, seeded:i64, creating:bool, rows:&[AgentRow], draft_id:&str) -> bool
+  pure working_agents(rows:&[AgentRow]) -> i64
+  sync badge(working:i64) -> bool
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
   pure runs_summary(runs:&[RunRow]) -> str
   pure run_named(runs:&[RunRow], run_id:&str) -> RunRow
@@ -57,15 +77,21 @@ extern crate::host
   pure pick_skills(condition:bool, then:&[AgentSkill], or:&[AgentSkill]) -> [AgentSkill]
   pure valid_agent_id(id:&str) -> bool
   pure pane_note(pane:&str) -> str
-  pure status(agent_id:&str, paused:bool) -> bool
-  pure save(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
-  pure register(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
+  // the two writes this view signs through the kernel
+  sync status(agent_id:&str, paused:bool) -> bool
+  sync save(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
+  // and the one it still hands the app: a registration provisions the
+  // agent's program account first, and the program bound to it is the runs
+  // module's own composition
+  pure register_agent(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
 
 state
   active_palette:palette[AppTheme] = AppTheme.app
   rows:[AgentRow] = []
   runs:[RunRow] = []
   journal:RunJournal = empty_journal()
+  // the open run's progress, off the node's output stream: absent until a
+  // line arrives, so a settled run draws no panel
   live:LiveRun = empty_live()
   // which panel the reader is on: the registry (who may act) or the runs
   // tracker (what they did, and how it settled). Mutually exclusive by
@@ -85,8 +111,13 @@ state
   opened:i64 = 0
   capabilities:[str] = []
   account = ""
+  // one per write the kernel answered, and the count the drafts were last
+  // seeded at: a difference is a commit this editor has not taken in yet
   committed:i64 = 0
+  seeded:i64 = 0
   connected = false
+  // moves when the session comes up: the register is read afresh
+  connection_serial:i64 = 0
   answered = false
   host_error = ""
   // the record open in the editor, by registry id; "" is none
@@ -107,12 +138,19 @@ state
   skill_prefix = ""
   skill_snapshot = ""
   skill_always = false
-  // a write's acknowledgement — `host::notify` returns nothing to bind, and
-  // the host's answer arrives as the next register
+  // a write's acknowledgement — nothing to bind otherwise; the outcome
+  // arrives on `acts()` and the fresh record on the next register
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// Subscriptions, not mount tasks, so a replacement restored from this
+// view's state asks for the session, the register and the journal again on
+// its own.
+subscribe
+  session() -> session_arrived _
+  register(connection_serial) when connected -> register_arrived _
+  run_journal(open_run, connection_serial) when (connected && !empty(open_run)) -> journal_arrived _
+  live_run(open_run, connection_serial) when (connected && !empty(open_run)) -> live_arrived _
+  acts() -> act_done _
 
 on journal_resized(dx, _dy)
   journal_width = journal_width_after_delta(journal_width, -dx, viewport_width)
@@ -128,11 +166,16 @@ on toggle_receipt(value)
 // these drafts: the New form closes onto the agent it registered, and an
 // open record re-seeds from its fresh row — the drafts were consumed, the
 // row is now the truth.
-on props_changed(next)
-  rows = next.rows
-  runs = next.runs
-  journal = next.journal
-  live = next.live
+// THE SESSION: what the kernel knows and this view cannot — whether there
+// is a network, which account signs, the colour mode, and the run another
+// tab sent the reader to.
+on session_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
+  connection_serial = connection_serial_after(connected, next.connected, connection_serial)
+  connected = next.connected
+  account = next.account
   open_run = next.open_run
   open_row = run_at(runs, open_run)
   // A DOOR LANDS THE READER ON THE TRACKER. A run opened from another tab —
@@ -143,12 +186,26 @@ on props_changed(next)
   let door_pressed = next.opened != opened && !empty(next.open_run)
   opened = next.opened
   panel = pick_str(door_pressed, "runs", panel)
-  capabilities = next.capabilities
-  account = next.account
-  connected = next.connected
-  answered = next.answered
-  let consumed = next.committed != committed
-  committed = next.committed
+  let row = row_named(rows, selected)
+  can_edit = editable(connected, account, row.controller)
+  active_palette = AppTheme.app
+  return if !next.dark
+  active_palette = AppTheme.app_dark
+
+// THE REGISTER, this view's own read. A write that landed since the drafts
+// were seeded consumed them: the New form closes onto the agent it
+// registered, and an open record re-seeds from its fresh row.
+on register_arrived(item)
+  host_error = item.error
+  answered = true
+  return if !empty(item.error)
+  rows = item.rows
+  runs = item.runs
+  capabilities = item.capabilities
+  open_row = run_at(runs, open_run)
+  sent = badge(working_agents(rows))
+  let consumed = drafts_consumed(committed, seeded, creating, rows, draft_id)
+  seeded = committed
   selected = pick_str(consumed && creating, draft_id, selected)
   creating = creating && !consumed
   let row = row_named(rows, selected)
@@ -157,12 +214,25 @@ on props_changed(next)
   draft_name = pick_str(consumed, row.name, draft_name)
   draft_capability = pick_capability(consumed, row.capability, draft_capability)
   draft_skills = pick_skills(consumed, row.skills, draft_skills)
-  active_palette = AppTheme.app
-  return if !next.dark
-  active_palette = AppTheme.app_dark
 
-on props_failed(error)
-  host_error = error.message
+// THE OPEN RUN'S JOURNAL. A journal that names another run is one the
+// reader has already moved off; it is not installed over the one they see.
+on journal_arrived(item)
+  host_error = item.error
+  return if !empty(item.error) || item.journal.dispatch_id != open_run
+  journal = item.journal
+
+// The open run moved: one frame of its output, already folded. The
+// subscription is keyed on the run, so an item is always the open one's.
+on live_arrived(item)
+  live = item
+
+// A write the kernel answered. A refusal is shown in place; a commit means
+// the drafts it carried are spent, which the next register re-seeds from.
+on act_done(item)
+  host_error = item.error
+  return if !empty(item.error)
+  committed = committed + 1
 
 // Open a record: its row seeds every draft.
 on open_agent(id)
@@ -215,6 +285,7 @@ on close_run
   expanded_receipt = ""
   open_run = ""
   open_row = empty_run()
+  journal = empty_journal()
   live = empty_live()
   sent = open_run("")
 
@@ -248,7 +319,7 @@ on submit_save
   sent = save(selected, draft_name, or_empty(draft_capability), draft_skills)
 
 on submit_register
-  sent = register(draft_id, draft_name, or_empty(draft_capability), draft_skills)
+  sent = register_agent(draft_id, draft_name, or_empty(draft_capability), draft_skills)
 
 view
   box #root
@@ -672,9 +743,10 @@ view
                               @text-meta
                               @font-mono
                   // THE RUN AS IT RUNS: its status, the steps it has taken
-                  // and the answer forming, off the node's live reading. The
-                  // chat stream only hints that a run is working under its
-                  // message; this is where the progress is drawn.
+                  // and the answer forming, off the node's own output stream
+                  // for this dispatch (`rpc.stream`, under the seated key).
+                  // The chat stream only hints that a run is working under
+                  // its message; this is where the progress is drawn.
                   if live.present
                     box #live
                       with
@@ -1168,11 +1240,6 @@ view
                         size=12.5
                         @text-fg
                         @font-semibold
-                    text "The capability tag this agent's runs are dispatched on — a node announcing it runs them."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
                     if can_edit
                       pick capability_options(capabilities, or_empty(draft_capability)) draft_capability #agent-capability -> pick_capability_option _
                         with
@@ -1193,11 +1260,6 @@ view
                         size=12.5
                         @text-fg
                         @font-semibold
-                    text "Always-loaded skills are the agent's persona; on-demand skills are indexed and read when a task needs them. A pinned snapshot freezes the source; unpinned follows the committed head."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
                     for skill in draft_skills
                       row w=fill gap=6.0 align=center
                         col w=fill gap=2.0

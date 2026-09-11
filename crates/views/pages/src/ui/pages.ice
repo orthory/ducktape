@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, compose_hint:str, bind block_comment_draft:str)
+component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, comments_offset:f64, comments_height:f64, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -649,11 +649,12 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                 w=fill
                 h=fill
                 p=16.0
-              float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=0.0
+              float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset
                 box #comments-card
                   with
                     w=340.0
-                    h=fill
+                    h=shrink
+                    max-h=comments_height
                     bg=elevated
                     r=12.0
                     shadow=shadow_popover
@@ -662,7 +663,7 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                     border=separator
                     border-w=1.0
                     clip=true
-                  col w=fill h=fill
+                  col w=fill h=shrink
                     box
                       with
                         w=fill
@@ -672,14 +673,13 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                       row
                         with
                           w=fill
-                          h=fill
+                          h=shrink
                           gap=18.0
                           align=center
-                        TabLabel
+                        text keep_str(!empty(active_thread), "Comment thread", "Comments")
                           with
-                            label="Comments"
-                            count=thread_total
-                            active=true
+                            size=13.0
+                            @text-fg
                         space w=fill
                         button -> emit(close_block_comments)
                           with
@@ -712,34 +712,37 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                     col
                       with
                         w=fill
-                        h=fill
+                        h=shrink
                         p=12.0
                         gap=6.0
+                      if threads_loading || comments_loading
+                        text "Loading comments…" size=12.5 @text-muted
                       if empty(active_thread)
-                        scroll
-                          with
-                            dir=vertical
-                            w=fill
-                            h=fill
-                          col w=fill gap=1.0
-                            if empty(comment_rows) && !threads_loading
-                              text "No comments yet"
-                                with
-                                  w=fill
-                                  size=12.5
-                                  align-x=center
-                                  @text-muted
-                            for comment_row in comment_rows
-                              PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
-                                forward
-                                  open_block_comment_thread
+                        box w=fill h=shrink max-h=(comments_height - 150.0)
+                          scroll
+                            with
+                              dir=vertical
+                              w=fill
+                              h=shrink
+                            col w=fill gap=1.0
+                              if empty(comment_rows) && !threads_loading
+                                text "No comments yet"
+                                  with
+                                    w=fill
+                                    size=12.5
+                                    align-x=center
+                                    @text-muted
+                              for comment_row in comment_rows
+                                PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
+                                  forward
+                                    open_block_comment_thread
                       if !empty(active_thread)
                         row
                           with
                             w=fill
                             gap=5.0
                             align=center
-                          button "← Threads" -> emit(close_block_comment_thread)
+                          button "← All comments" -> emit(close_block_comment_thread)
                             with
                               disabled=(comments_loading || busy)
                               p=4.0
@@ -772,14 +775,15 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                               active bg=transparent text=muted r=6.0
                               hovered bg=fg/9 text=fg
                               pressed bg=fg/14
-                        scroll
-                          with
-                            dir=vertical
-                            w=fill
-                            h=fill
-                          col w=fill gap=1.0
-                            for page_comment in comments
-                              PageCommentCard comment=page_comment
+                        box w=fill h=shrink max-h=(comments_height - 150.0)
+                          scroll
+                            with
+                              dir=vertical
+                              w=fill
+                              h=shrink
+                            col w=fill gap=1.0
+                              for page_comment in comments
+                                PageCommentCard comment=page_comment
                       if empty(active_thread)
                         text compose_hint
                           with
@@ -796,7 +800,7 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         input "" #page-comment(active_page) <-> block_comment_draft
                           with
                             label="New page comment"
-                            hint="Add a comment…"
+                            hint=keep_str(!empty(active_thread), "Reply…", "Add a comment…")
                             disabled=(busy || threads_loading || comments_loading)
                             submit=emit(post_block_comment_submit)
                             w=fill

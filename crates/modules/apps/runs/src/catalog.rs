@@ -239,12 +239,13 @@ pub const OP_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
 pub const OP_MODULES_UPDATE: &str = "modules.update";
 /// Open a pull request on a forge repository from a branch the run pushed.
 pub const OP_FORGE_OPEN_PR: &str = "forge.open_pr";
-/// Send one collaboration message as a bound participant. The action reaches
-/// `collaboration` as `Origin::Program(account)`, and that module admits it
-/// only if the participant's owner bound that account to that conversation
-/// under a live credential.
-pub const OP_COLLABORATION_SEND: &str = "collaboration.send";
-/// Record a delivery state for a message the bound participant received.
+/// Ask that a chat message this run's account posted be delivered to one
+/// recipient's bound device. The request reaches `collaboration` as
+/// `Origin::Program(account)`, and that module admits it only if chat says
+/// that origin posted the message and the recipient may read the channel.
+pub const OP_COLLABORATION_DELIVER: &str = "collaboration.deliver";
+/// Record a delivery state for a message delivered to the participant this
+/// account is bound as.
 pub const OP_COLLABORATION_ACKNOWLEDGE: &str = "collaboration.acknowledge";
 /// Call another registered agent while this run is live.
 pub const OP_AGENT_CALL: &str = "agent.call";
@@ -434,56 +435,47 @@ fn specs() -> Vec<Spec> {
             lanes: FINAL_ONLY,
         },
         Spec {
-            name: OP_COLLABORATION_SEND,
-            description: "Send one message in a collaboration conversation, as a participant this run's account is BOUND to. Live lane only: the message reaches collaboration as this account's program origin, and that module refuses it unless the participant's owner bound this account to the conversation under `credential`. Sequence is yours to choose and must be monotonic per credential; resending identical bytes under the same sequence is the same message, not a second one.",
+            name: OP_COLLABORATION_DELIVER,
+            description: "Ask that a chat message this run's account posted be delivered to one recipient's bound device. Live lane only: the request reaches collaboration as this account's program origin, and that module refuses it unless the named message was posted by that origin and the recipient may read the channel. Asking again with identical metadata is the same request, not a second one.",
             target: Some(object(
-                json!({
-                    "conversation_id": {"type": "string"},
-                    "participant_id": {"type": "string", "description": "The participant this account is bound to, and the sender."}
-                }),
-                &["conversation_id", "participant_id"],
+                json!({"channel_id": {"type": "string", "description": "The chat channel the message sits in."}}),
+                &["channel_id"],
             )),
             input: object(
                 json!({
-                    "credential": {"type": "integer", "description": "The binding's credential; also the generation half of the message id."},
-                    "sequence": {"type": "integer", "description": "Monotonic within this credential."},
-                    "recipient_participant_id": {"type": "string"},
+                    "message_id": {"type": "string", "description": "The chat message id this account posted."},
+                    "recipient": {"type": "string", "description": "A party handle: `acct:<number>` or `key:<hex>`."},
                     "kind": {"type": "string", "enum": ["notice", "question", "task_request", "task_update", "result"]},
-                    "body": {"type": "string"},
                     "expires_at": {"type": "integer", "description": "ABSOLUTE consensus time; the network's unit, not seconds."},
-                    "reply_to": {"type": ["integer", "null"], "description": "Conversation sequence this answers."},
-                    "task": {"type": ["object", "null"], "properties": {"id": {"type": "string"}, "expected_attempt": {"type": "integer", "minimum": 0}}, "required": ["id", "expected_attempt"], "additionalProperties": false, "description": "Current task attempt; required for task_update."}
+                    "task": {"type": ["object", "null"], "properties": {"id": {"type": "string"}, "expected_attempt": {"type": "integer", "minimum": 0}}, "required": ["id", "expected_attempt"], "additionalProperties": false, "description": "Current task attempt; required for task_update."},
+                    "references": {"type": "array", "items": {"type": "object"}, "description": "Typed references: {\"commit\":{repo,commit}}, {\"blob\":{hash}}, {\"duck\":{url}}."}
                 }),
-                &[
-                    "credential",
-                    "sequence",
-                    "recipient_participant_id",
-                    "kind",
-                    "body",
-                    "expires_at",
-                ],
+                &["message_id", "recipient", "kind", "expires_at"],
             ),
             result: object(
                 json!({
-                    "conversation_id": {"type": "string"},
-                    "credential": {"type": "integer"},
-                    "sequence": {"type": "integer"}
+                    "channel_id": {"type": "string"},
+                    "message_id": {"type": "string"},
+                    "recipient": {"type": "string"}
                 }),
-                &["conversation_id", "credential", "sequence"],
+                &["channel_id", "message_id", "recipient"],
             ),
             lanes: LIVE_ONLY,
         },
         Spec {
             name: OP_COLLABORATION_ACKNOWLEDGE,
-            description: "Record what happened to a message this bound participant received: queued, adapter_accepted, held, refused, delivery_unknown. Live lane only, same binding rule as collaboration.send. Which participant is reporting is NOT stated here — collaboration reads it off the binding this account holds. `reason` is a stable snake_case token, never prose.",
+            description: "Record what happened to a message delivered to the participant this account is bound as: queued, adapter_accepted, held, refused, delivery_unknown. Live lane only: collaboration admits it only if the participant's owner bound this account to the channel under `credential`. `reason` is a stable snake_case token, never prose.",
             target: Some(object(
-                json!({"conversation_id": {"type": "string"}}),
-                &["conversation_id"],
+                json!({
+                    "channel_id": {"type": "string"},
+                    "participant": {"type": "string", "description": "The recipient this account is bound as: `acct:<number>` or `key:<hex>`."}
+                }),
+                &["channel_id", "participant"],
             )),
             input: object(
                 json!({
                     "credential": {"type": "integer"},
-                    "seq": {"type": "integer", "description": "The conversation sequence the message occupies."},
+                    "seq": {"type": "integer", "description": "The channel sequence the message occupies."},
                     "state": {"type": "string", "enum": ["queued", "adapter_accepted", "held", "refused", "delivery_unknown"]},
                     "reason": {"type": ["string", "null"], "description": "A stable snake_case token."}
                 }),
@@ -491,11 +483,11 @@ fn specs() -> Vec<Spec> {
             ),
             result: object(
                 json!({
-                    "conversation_id": {"type": "string"},
+                    "channel_id": {"type": "string"},
                     "seq": {"type": "integer"},
                     "state": {"type": "string"}
                 }),
-                &["conversation_id", "seq", "state"],
+                &["channel_id", "seq", "state"],
             ),
             lanes: LIVE_ONLY,
         },
@@ -619,20 +611,18 @@ pub(crate) enum Operation {
         text: String,
         base_snapshot: Option<String>,
     },
-    CollaborationSend {
-        conversation_id: String,
-        participant_id: String,
-        credential: u64,
-        sequence: u64,
-        recipient_participant_id: String,
+    CollaborationDeliver {
+        channel_id: String,
+        message_id: String,
+        recipient: collaboration::Party,
         kind: String,
-        body: String,
         expires_at: u64,
-        reply_to: Option<u64>,
         task: Option<collaboration::TaskRef>,
+        references: Vec<collaboration::Reference>,
     },
     CollaborationAcknowledge {
-        conversation_id: String,
+        channel_id: String,
+        participant: collaboration::Party,
         credential: u64,
         seq: u64,
         state: String,
@@ -699,38 +689,38 @@ struct ForgeOpenPrInput {
     body: String,
 }
 
-/// Which conversation, and which of the caller's participants it acts as.
-/// Neither is an authority: `collaboration` verifies both against the binding
-/// the program origin actually holds.
+/// Which chat channel a delivery is asked in. Not an authority: the message
+/// named in the input must sit in this channel and have been posted by the
+/// program origin, which `collaboration` checks against chat.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CollaborationTarget {
-    conversation_id: String,
-    participant_id: String,
+struct CollaborationChannelTarget {
+    channel_id: String,
 }
 
-/// An acknowledgement names only the conversation: the reporting participant
-/// is the one this account's binding names, which only `collaboration` can
-/// resolve.
+/// An acknowledgement names the channel and the participant whose binding
+/// this account holds; `collaboration` judges that binding against the
+/// program origin.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CollaborationAckTarget {
-    conversation_id: String,
+    channel_id: String,
+    /// a party handle: `acct:<number>` or `key:<hex>`.
+    participant: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CollaborationSendInput {
-    credential: u64,
-    sequence: u64,
-    recipient_participant_id: String,
+struct CollaborationDeliverInput {
+    message_id: String,
+    /// a party handle: `acct:<number>` or `key:<hex>`.
+    recipient: String,
     kind: String,
-    body: String,
     expires_at: u64,
     #[serde(default)]
-    reply_to: Option<u64>,
-    #[serde(default)]
     task: Option<collaboration::TaskRef>,
+    #[serde(default)]
+    references: Vec<collaboration::Reference>,
 }
 
 #[derive(Deserialize)]
@@ -951,27 +941,29 @@ impl Operation {
                     base_snapshot: input.base_snapshot,
                 })
             }
-            OP_COLLABORATION_SEND => {
-                let target: CollaborationTarget = decode_target(envelope)?;
-                let input: CollaborationSendInput = decode_input(envelope)?;
-                Ok(Self::CollaborationSend {
-                    conversation_id: target.conversation_id,
-                    participant_id: target.participant_id,
-                    credential: input.credential,
-                    sequence: input.sequence,
-                    recipient_participant_id: input.recipient_participant_id,
+            OP_COLLABORATION_DELIVER => {
+                let target: CollaborationChannelTarget = decode_target(envelope)?;
+                let input: CollaborationDeliverInput = decode_input(envelope)?;
+                let recipient = collaboration::parse_party_handle(&input.recipient)
+                    .map_err(|error| format!("recipient: {error}"))?;
+                Ok(Self::CollaborationDeliver {
+                    channel_id: target.channel_id,
+                    message_id: input.message_id,
+                    recipient,
                     kind: input.kind,
-                    body: input.body,
                     expires_at: input.expires_at,
-                    reply_to: input.reply_to,
                     task: input.task,
+                    references: input.references,
                 })
             }
             OP_COLLABORATION_ACKNOWLEDGE => {
                 let target: CollaborationAckTarget = decode_target(envelope)?;
                 let input: CollaborationAckInput = decode_input(envelope)?;
+                let participant = collaboration::parse_party_handle(&target.participant)
+                    .map_err(|error| format!("participant: {error}"))?;
                 Ok(Self::CollaborationAcknowledge {
-                    conversation_id: target.conversation_id,
+                    channel_id: target.channel_id,
+                    participant,
                     credential: input.credential,
                     seq: input.seq,
                     state: input.state,
@@ -1038,7 +1030,7 @@ impl Operation {
             Self::TasksCreate { .. } => OP_TASKS_CREATE,
             Self::TasksUpdateStatus { .. } => OP_TASKS_UPDATE_STATUS,
             Self::DuckfsWriteText { .. } => OP_DUCKFS_WRITE_TEXT,
-            Self::CollaborationSend { .. } => OP_COLLABORATION_SEND,
+            Self::CollaborationDeliver { .. } => OP_COLLABORATION_DELIVER,
             Self::CollaborationAcknowledge { .. } => OP_COLLABORATION_ACKNOWLEDGE,
             Self::ModulesUpdate(_) => OP_MODULES_UPDATE,
             Self::ForgeOpenPr { .. } => OP_FORGE_OPEN_PR,
@@ -1168,22 +1160,18 @@ mod tests {
                 json!({"instruction": "review", "skills": ["review"]}),
             ),
             envelope(
-                OP_COLLABORATION_SEND,
-                Some(json!({"conversation_id": "c1", "participant_id": "alice"})),
+                OP_COLLABORATION_DELIVER,
+                Some(json!({"channel_id": "c1"})),
                 json!({
-                    "credential": 2,
-                    "sequence": 1,
-                    "recipient_participant_id": "bob",
+                    "message_id": "m1",
+                    "recipient": "acct:7",
                     "kind": "notice",
-                    "body": "hi",
                     "expires_at": 900
                 }),
             ),
-            // the acknowledgement names no participant: collaboration reads the
-            // reporter off the binding the origin holds.
             envelope(
                 OP_COLLABORATION_ACKNOWLEDGE,
-                Some(json!({"conversation_id": "c1"})),
+                Some(json!({"channel_id": "c1", "participant": "acct:7"})),
                 json!({"credential": 2, "seq": 4, "state": "queued"}),
             ),
             envelope(

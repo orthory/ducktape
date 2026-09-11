@@ -77,6 +77,8 @@ extern crate::host
   pure forget_draft(drafts:&[str], draft:&str) -> [str]
   pure navigation_link(interaction:bytes) -> str
   pure navigation_comment_line(interaction:bytes) -> i64
+  pure comment_card_offset(anchor_y:f64, viewport_height:f64) -> f64
+  pure comment_card_height(thread:&str, anchor_y:f64, viewport_height:f64) -> f64
 
 extern crate::editor_binding
   HistoryState(snapshot:bytes)
@@ -99,6 +101,8 @@ extern crate::editor_view
   pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark], focused:bool) -> PreparedPresentation
 
 state
+  pointer_y:f64 = 0.0
+  comment_anchor_y:f64 = -1.0
   document_focused = false
   focus_query:i64 = 0
   document_paint:PreparedPresentation = empty_presentation()
@@ -129,6 +133,7 @@ state
   // she has the `⋯` menu open. Neither leaves this view, and neither is
   // persisted — a fresh window opens on the default again.
   pages_viewport_width = 1280.0
+  pages_viewport_height = 700.0
   sidebar_width = 230.0
   page_menu_open = false
   page_create_open = false
@@ -176,6 +181,7 @@ state
 // Subscriptions, not mount tasks, so a replacement restored from this view's
 // state asks for the session and re-reads the workspace on its own.
 subscribe
+  mouse moved status=any -> comment_pointer_moved _ _
   mouse released status=any -> document_pointer_released _
   keyboard release status=any -> document_key_released _
   window focused -> document_window_focused
@@ -213,6 +219,11 @@ on session_arrived(item)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
+
+// The pointer's last y, so a comment opened off the document floats beside
+// the line it was asked for.
+on comment_pointer_moved(_x, y)
+  pointer_y = y
 
 // A PICK ABANDONS THE RAIL'S DRAFT: it is kept as a recovered draft on the
 // page it belonged to, offered back when the reader returns.
@@ -439,6 +450,7 @@ on discard_orphaned_comment_draft(draft)
 // the flip alone. Closing keeps the half-typed comment through the orphan
 // guard, exactly as the rail's own × does.
 on toggle_block_comments
+  comment_anchor_y = -1.0
   return if !empty(host_error)
   return if loading || busy || empty(active_page)
   orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
@@ -452,6 +464,7 @@ on toggle_block_comments
   comments_loading = false
 
 on close_block_comments
+  comment_anchor_y = -1.0
   orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
   block_comment_draft = ""
   block_comments_open = false
@@ -561,6 +574,10 @@ on document_committed(next)
   page_refusal = ""
   sent = open_link(navigation_link(next.interaction))
   return if comment_line < 0 || block_comments_open || loading || busy || empty(active_page)
+  // THE CARD FLOATS AT THE PRESS, not at the top of the pane: the comment
+  // belongs to the line the reader pointed at, and the pointer is where that
+  // line is on screen.
+  comment_anchor_y = pointer_y
   block_comments_open = true
 
 // The sensor is the window measure the sidebar clamp needs, and it keys
@@ -595,6 +612,8 @@ view
           subpages
           orphaned_comment_drafts
           block_comments_open
+          comments_height=comment_card_height(active_thread, comment_anchor_y, pages_viewport_height)
+          comments_offset=comment_card_offset(comment_anchor_y, pages_viewport_height)
           thread_total
           comment_rows
           threads_loading

@@ -734,24 +734,6 @@ pub(crate) async fn load_thread_data(
     })
 }
 
-/// Collision-free numeric identity for Ice's keyed rows. The language accepts
-/// only copyable numeric keys, while the app's durable identities are strings.
-pub(crate) fn stable_view_key(identity: &str) -> i64 {
-    // ponytail: session-wide interning is collision-free; scope it per workspace
-    // only if retaining every visited row identity becomes measurable.
-    static KEYS: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
-    let mut keys = KEYS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(key) = keys.get(identity) {
-        return *key;
-    }
-    let key = count_i64(keys.len());
-    keys.insert(identity.to_owned(), key);
-    key
-}
-
 pub(crate) async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
     let mut pages = Vec::new();
     let mut after: Option<String> = None;

@@ -570,7 +570,6 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "run every open_external_url(url)",
         "-> open_page_search_hit(_, link.block)",
         "-> open_run_panel _",
-        "-> fs_open_dir _",
         "-> forge_open_repo _",
         "-> choose_channel _",
         "-> open_chat_search_hit(_, link.seq, link.seq)",
@@ -584,6 +583,23 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         !open.contains("run replace"),
         "the open plane owns no lane of its own"
+    );
+    // THE FILES ARM PUSHES THE PATH, it does not navigate to it. The browser
+    // lives in the files VIEW, so the app moves the tab and hands the address
+    // over as a session fact — with a serial, because the same path twice has
+    // to land twice and the path alone would not have changed.
+    let files_arm = open
+        .split_once("DuckKind.files\n")
+        .expect("the files arm")
+        .1
+        .split_once("    DuckKind.")
+        .expect("the next arm follows")
+        .0;
+    assert!(files_arm.contains("shell_tab = ShellTab.files"));
+    assert!(files_arm.contains("fs_route = link.path"));
+    assert!(
+        files_arm.contains("fs_route_serial = fs_route_serial + 1"),
+        "the same duckfs address twice must navigate twice"
     );
     // A CHAT ADDRESS LANDS ON THE CHAT TAB. `choose_channel` is the sidebar's
     // own click and moves no tab, so the channel arm moves it first; the
@@ -627,18 +643,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
             && repo_loaded.contains("run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, forge_tree_rev, forge_tree_path)"),
         "the repo's load consumes the forge focus: an item opens, a file first moves the tree to its directory, pinned to the link's rev"
     );
-    let files = include_str!("../ui/handlers/files.ice");
-    let listed = files
-        .split_once("on fs_listed(next)")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("the handler ends")
-        .0;
-    assert!(
-        listed.contains("return if empty(fs_focus_path)") && listed.contains("-> fs_open_file _"),
-        "the listing consumes the files focus"
-    );
+    // THE FILES BROWSER HAS NO SUCH FOCUS TO CONSUME. It lists the directory
+    // inside its own view now, and nothing carries a duckfs address across the
+    // kernel contract into a mounted view, so the address moves the tab and
+    // stops there — see the files arm above.
     let tree_loaded = forge
         .split_once("on forge_tree_loaded(next)")
         .expect("the handler")

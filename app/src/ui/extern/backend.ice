@@ -54,8 +54,6 @@ extern crate::backend
   AppError(message:str, committed:bool)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
-  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
-  pure live_run_for(rows:&[LiveAgentRow], dispatch_id:&str) -> LiveRun
   LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   task note_window_focus(focused:bool) -> unit
   component forge_markdown(source:str, doc:str, dark:bool) -> str
@@ -173,8 +171,8 @@ extern crate::backend
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, fs_delete_target:&str) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, fs_delete_target:str) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool) -> str
+  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord
@@ -189,11 +187,6 @@ extern crate::backend
   // the physical one is what a non-QWERTY layout still calls Q and W.
   pure command_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> CommandChord
   NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
-  FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
-  FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
-  FsListing(generation:i64, path:str, entries:[FsEntry])
-  FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
-  FsHistory(generation:i64, snapshots:[FsSnapshot])
   DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, block:str, dispatch:str, channel:str, path:str, rev:str, account:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
   pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
@@ -206,29 +199,12 @@ extern crate::backend
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
   duck_echo_f64(value:f64) -> f64 ! AppError
-  pure no_fs_entry() -> FsEntry
-  pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
-  pure fs_directories(entries:&[FsEntry]) -> [FsEntry]
-  pure fs_parent(path:str) -> str
-  pure fs_child(path:str, name:str) -> str
+  // The duckfs browser is the files VIEW's: it reads and writes the module
+  // itself through the kernel. What is left here is the window's own door —
+  // a file DROPPED on it, uploaded into the directory the view says it is
+  // standing in, and the module's write rule previewed for that directory.
   pure files_write_gate(dir:str, me:str) -> str
-  files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
-  files_remove(rpc:str, password:str, path:str) -> bool ! AppError
-  files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError
-  files_save_text(rpc:str, password:str, path:str, base:str, text:str) -> bool ! AppError
-  pure files_network_scope(rpc:str, chain:str) -> str
-  pure files_context(rpc:str, chain:str, connection:i64) -> str
-  FsSaveReply(context:str, namespace:str, request:i64, success:bool, message:str)
-  FsSaveHistory(replies:[FsSaveReply], overflow:str)
-  pure no_fs_save_reply() -> FsSaveHistory
-  pure fs_save_reply(context:str, namespace:str, request:i64, success:bool, message:str, previous:FsSaveHistory) -> FsSaveHistory
   files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
-  FsDiffEntry(path:str, kind:str)
-  FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
-  files_diff(rpc:str, from:str, generation:i64) -> FsDiff ! HydrationError
-  files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
-  files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
-  files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
   pure plural(count:i64, one:&str, many:&str) -> str
   pure reading_pair(left:&str, right:&str) -> str
@@ -345,24 +321,10 @@ extern crate::backend
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
-  AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
-  // the run tracker: every run off the runs journal, and the journal of
-  // the one the reader opened
-  RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
-  RunLink(relation:str, kind:str, label:str, url:str)
-  RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
-  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str])
-  load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
-  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
-  pure empty_run_journal() -> RunJournal
-  pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
-  // the editor's whole draft record, as the Agents view hands it back
-  save_agent(rpc:str, password:str, draft:str) -> bool ! AppError
   // provision the program account under the signing account, then register
+  // — the one agent write the Agents view cannot sign for itself, because
+  // the program it binds is the runs module's own composition
   register_agent(rpc:str, password:str, controller:str, draft:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])
@@ -410,7 +372,6 @@ extern crate::backend
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure plane_live_hit(kind:LiveKind, module:str, want:str) -> bool
-  pure agents_plane_hit(kind:LiveKind, module:str) -> bool
   pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
   pure keep_str(loaded:bool, next:&str, current:&str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool

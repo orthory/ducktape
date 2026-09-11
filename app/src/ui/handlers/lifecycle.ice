@@ -45,13 +45,6 @@ on desktop_notifications_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
-  fs_generation = fs_generation + 1
-  fs_preview_path = ""
-  fs_preview_entry = no_fs_entry()
-  fs_preview_text = ""
-  fs_preview_base = ""
-  fs_write_pending = ""
-  fs_loading = false
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
   account_busy = account_busy && empty(account_ceremony_phase)
@@ -66,7 +59,6 @@ on reconnect
   invalidate lane=thread
   invalidate lane=live_thread
   invalidate lane=live_resync
-  invalidate lane=files_preview
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.idle
@@ -199,16 +191,13 @@ on workspace_connected(next)
   mutation_phase = MutationPhase.idle
   hydration_retry_attempt = 0
   error = ""
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  agents_generation = agents_generation + 1
-  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. The scope
-  // fences stop a stale ANSWER from being installed; they cannot un-draw one
-  // already on screen, and a run journal from the previous network under the
-  // new one's name is exactly the confusion they exist to prevent. It goes,
-  // along with the run that was open in it.
+  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. A run
+  // opened on the previous network, still named under the new one, is
+  // exactly the confusion the scope fences exist to prevent — so the open
+  // run goes, and with it the badge the last network's view reported.
   agents_open_run = ""
-  agents_journal = empty_run_journal()
+  agents_live = false
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
   forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
@@ -219,14 +208,12 @@ on workspace_connected(next)
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
     run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
-    run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     flow
       from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
       try request -> done request
       done -> peers_load_selected _
-    run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
@@ -317,8 +304,6 @@ on live_updated(next)
       members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
       account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
       dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
-      agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
-      fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
       parallel
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
@@ -339,14 +324,6 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
           try request -> done request
           done -> names_moved_selected _
-        flow
-          from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
-          try request -> done request
-          done -> agents_load_selected _
-        flow
-          from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-          try request -> done request
-          done -> files_list_selected _
     LiveKind.resync
       return if !next.load_chat && !forge_live_hit(next.kind, next.module)
       hydration_generation = keep_i64(next.load_chat, hydration_generation + 1, hydration_generation)
@@ -601,7 +578,6 @@ on select_shell_tab(next)
   thread_selected_rev = keep_i64(moved, 0, thread_selected_rev)
   thread_message_action = close_message_action(moved, thread_message_action)
   thread_edit_draft = keep_str(moved, "", thread_edit_draft)
-  fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
@@ -611,17 +587,7 @@ on select_shell_tab(next)
   error = ""
   return if !connected
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
-  // `run replace lane=agents_load` aborts work still running on the lane, but
-  // it cannot retract a completion the runtime has ALREADY queued — and an
-  // unconditional bump here is what makes `agents_loaded` reject exactly that
-  // completion, throwing away a live-plane read that had already answered. The
-  // Forge seat's dot is drawn off those rows on EVERY tab, so opening the
-  // destination pane does not pay the loss back: it waits for the next `agent`
-  // or `runs` op, which for a run that just started is the moment it ends.
-  agents_generation = keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation + 1, agents_generation)
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
   forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
@@ -636,19 +602,10 @@ on select_shell_tab(next)
   // on every members-only room.
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
-  fs_loading = shell_tab == ShellTab.files
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
   parallel
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-      try request -> done request
-      done -> files_list_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, "", fs_generation)
-      try request -> done request
-      done -> files_history_selected _
     flow
       from done load_request(tab_reads_plane(shell_tab, "members"), connected_rpc, "", members_generation)
       try request -> done request
@@ -662,10 +619,6 @@ on select_shell_tab(next)
       try request -> done request
       done -> peers_load_selected _
     flow
-      from done load_request(tab_reads_plane(shell_tab, "agents"), connected_rpc, "", agents_generation)
-      try request -> done request
-      done -> agents_load_selected _
-    flow
       from done load_request(tab_reads_plane(shell_tab, "account"), connected_rpc, "", account_generation)
       try request -> done request
       done -> account_load_selected _
@@ -678,18 +631,6 @@ on select_shell_tab(next)
 // optional `try` emits no message when false. A newer intent, tab, or network
 // can land before the selected message, so each destination rejects an
 // obsolete request before it starts the normal compiler `run replace` lane.
-on files_list_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_list files_ls(request.rpc, request.key, request.generation) -> fs_listed _ | fs_failed _
-
-on files_history_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_history files_history(request.rpc, request.generation) -> fs_history_loaded _ | fs_failed _
-
 on members_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != members_generation
   return if obsolete_request
@@ -706,11 +647,6 @@ on peers_load_selected(request)
   let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview
   return if obsolete_request || unmounted
   run replace lane=peers_load load_peers(request.rpc, request.generation) -> peers_loaded _ | peers_failed _
-
-on agents_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != agents_generation
-  return if obsolete_request
-  run replace lane=agents_load load_agents(request.rpc, request.generation) -> agents_loaded _ | agents_failed _
 
 on account_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != account_generation
@@ -789,7 +725,7 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, fs_delete_target)) -> global_key_pressed _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open)) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows: a close just unregisters the slot (below).
   // The process leaves only when someone says so — the tray's Quit, or ⌘Q.

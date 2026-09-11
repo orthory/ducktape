@@ -117,106 +117,42 @@ pub fn members_view(
     module_view("members", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The Agents tab: the register as the app has it, drawn by the `agents`
-/// view — every record whole, the capability tags the network announces,
-/// the action vocabulary, and the signing account (`account`, its decimal
-/// number) so the view offers the editor to a record's controller; beside
-/// it the run tracker, every run off the runs journal, the journal of the
-/// one the reader opened (`open_run`, its dispatch id) with the chips of
-/// every place it touched, and that run's live progress while it works.
-/// Its intents come back as `status` (`agent_id`, `paused`), `save` and
-/// `register` (both the whole draft record as JSON, `AgentDraft`),
-/// `open_run` (`dispatch_id`, "" to close) and `open_link` (`url`, a chip's
-/// duck:// address for the open plane).
-/// Every committed write bumps `committed`, which tells the view its drafts
-/// were consumed.
-#[allow(clippy::too_many_arguments)]
+/// The Agents tab, drawn by the `agents` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, the signing
+/// account (`account`, its decimal number) and the run another tab opened
+/// for the reader (`open_run`, its dispatch id; `opened` counts the doors)
+/// — and the view reads the register, the run tracker and one run's
+/// journal for itself through `rpc.query` / `rpc.view`, re-reading on
+/// every `rpc.live` hit for the `runs` and `identity` planes. A pause or a
+/// save leaves as `op.submit`, signed here with the seated key.
+///
+/// What still comes back as an intent: `badge` (how many of its agents are
+/// working — the rail's pulse), `register` (a new agent, whose program
+/// account only the app can provision), `open_run` (`dispatch_id`, "" to
+/// close) and `open_link` (`url`, a chip's duck:// address).
 pub fn agents_view(
     dark: bool,
     connected: bool,
-    answered: bool,
     account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
     open_run: &str,
     opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
 ) -> Element<'static, ModuleViewEvent> {
-    module_view(
-        "agents",
-        agents_props(
-            dark,
-            connected,
-            answered,
-            account,
-            committed,
-            rows,
-            runs,
-            open_run,
-            opened,
-            journal,
-            live,
-            capabilities,
-        ),
-    )
-}
-
-/// The exact bytes [`agents_view`] pushes — named so a test can assert what
-/// this app SENDS rather than a shape it wrote out by hand beside it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agents_props(
-    dark: bool,
-    connected: bool,
-    answered: bool,
-    account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
-    open_run: &str,
-    opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
-) -> Vec<u8> {
-    // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
-    // guest draws nothing with, and `link`/`account`/`op` are the fence the app
-    // installs an answer by — a guest cannot check them and has no reason to
-    // see which operation number it is looking at. The reading's error is the
-    // app's banner, not a field the guest re-renders.
-    const APP_ONLY: [&str; 4] = ["rpc", "link", "account", "op"];
-    let mut book = serde_json::to_value(journal).expect("the run journal encodes");
-    if let Some(book) = book.as_object_mut() {
-        for app_only in APP_ONLY.iter().chain(["error"].iter()) {
-            book.remove(*app_only);
-        }
-    }
     let props = serde_json::json!({
-        "rows": rows,
-        "runs": runs,
+        "account": account,
         "open_run": open_run,
         "opened": opened,
-        "journal": book,
-        "live": live,
-        "capabilities": capabilities,
-        "account": account,
-        "committed": committed,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
-    serde_json::to_vec(&props).expect("props encode")
+    module_view("agents", serde_json::to_vec(&props).expect("props encode"))
 }
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
-        "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
         "open_run" => crate::AgentsIntent::OpenRun,
         "open_link" => crate::AgentsIntent::OpenLink,
-        _ => crate::AgentsIntent::Status,
+        _ => crate::AgentsIntent::Badge,
     }
 }
 
@@ -1299,90 +1235,35 @@ pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember])
 
 // ---------- the files seat ----------
 
-/// The Files tab: one directory's listing, the preview open in it, the
-/// snapshot history and the module's write rule, drawn by the `files` view.
-/// Its intents come back one per act (`files_intent`): a navigation carries
-/// a `path`, a write the `name` the reader typed or the `text` of the body
-/// they edited — the drafts are the view's, and `writes` moving tells it a
-/// committed write consumed one. The picture viewer, the highlighted reader
-/// and the Markdown document are host surfaces (`surfaces_of("files")`).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
+/// The Files tab, drawn by the `files` view over the KERNEL CONTRACT: the app
+/// pushes session facts only, and the view lists the directory, reads the
+/// preview, walks the snapshot history and diffs a snapshot for itself through
+/// `files.get` / `rpc.live`, writing through `op.submit` signed here with the
+/// seated key. Two events come back, both OS doors the app owns: `open_link`
+/// for a link the Markdown reader activated, and `at` naming the directory a
+/// file dropped on the window lands in. The picture viewer, the highlighted
+/// reader and the Markdown document are host surfaces (`surfaces_of("files")`).
+///
+/// `route` is the one navigation fact that cannot be the view's: a
+/// `duck://files/<path>` link is resolved by the shell's link plane, which
+/// also moves the tab, so the address arrives as a SESSION fact like any
+/// other. `route_serial` counts the pushes, which is what makes the same path
+/// twice a second navigation rather than a value that never changed.
 pub fn files_view(
     dark: bool,
     connected: bool,
-    path: &str,
-    listed: bool,
-    entries: &[crate::backend::FsEntry],
-    loading: bool,
-    preview_path: &str,
-    preview_entry: &crate::backend::FsEntry,
-    delete_target: &str,
-    diff_from: &str,
-    diff: &[crate::backend::FsDiffEntry],
-    history: &[crate::backend::FsSnapshot],
-    preview_truncated: bool,
-    preview_binary: bool,
-    preview_picture: bool,
-    preview_width: i64,
-    preview_height: i64,
-    preview_text: &str,
-    write_refusal: &str,
-    writes: i64,
-    rpc: &str,
     chain: &str,
-    connection: i64,
-    preview_base: &str,
-    save_reply: &crate::backend::FsSaveHistory,
+    route: &str,
+    route_serial: i64,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
-        "network_scope": crate::backend::files_network_scope(rpc.into(), chain.into()),
-        "context": crate::backend::files_context(rpc.into(), chain.into(), connection),
-        "preview_base": preview_base,
-        "save_reply": save_reply,
-        "path": path,
-        "listed": listed,
-        "entries": entries,
-        "directories": crate::backend::fs_directories(entries),
         "connected": connected,
-        "loading": loading,
-        "preview_path": preview_path,
-        "preview_entry": preview_entry,
-        "delete_target": delete_target,
-        "diff_from": diff_from,
-        "diff": diff,
-        "history": history,
-        "preview_truncated": preview_truncated,
-        "preview_binary": preview_binary,
-        "preview_picture": preview_picture,
-        "preview_width": preview_width,
-        "preview_height": preview_height,
-        "preview_text": preview_text,
         "dark": dark,
-        "write_refusal": write_refusal,
-        "writes": writes,
+        "chain": chain,
+        "route": route,
+        "route_serial": route_serial,
     });
-    module_view("files", display_budget::files(props))
-}
-
-pub fn files_intent(event: &ModuleViewEvent) -> crate::FilesIntent {
-    use crate::FilesIntent as Intent;
-    match event.kind.as_str() {
-        "open_dir" => Intent::OpenDir,
-        "open_file" => Intent::OpenFile,
-        "open_parent" => Intent::OpenParent,
-        "mkdir" => Intent::Mkdir,
-        "new_file" => Intent::NewFile,
-        "arm_delete" => Intent::ArmDelete,
-        "delete" => Intent::Delete,
-        "save" => Intent::Save,
-        "show_diff" => Intent::ShowDiff,
-        "close_diff" => Intent::CloseDiff,
-        "open_link" => Intent::OpenLink,
-        _ => Intent::DisarmDelete,
-    }
+    module_view("files", serde_json::to_vec(&props).expect("files props encode"))
 }
 
 /// The string argument at `index` of a surface's args; "" when the guest
@@ -1532,13 +1413,11 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "governance" => &[],
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
-        "agents" => &[
-            "status",
-            "save",
-            "register",
-            "open_run",
-            "open_link",
-        ],
+        // the agents view speaks the kernel contract: its pause and its save
+        // are `op.submit`. `register` stays an intent because it provisions a
+        // program account before it registers, and `open_run`/`open_link`
+        // navigate other tabs.
+        "agents" => &["register", "open_run", "open_link"],
         "node" => &["copy", "tab", "log_filter"],
         // the explorer view reads and searches through the kernel: the only
         // thing it asks the app for is the clipboard
@@ -1606,20 +1485,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "copy",
             "composer",
         ],
-        "files" => &[
-            "open_dir",
-            "open_file",
-            "open_parent",
-            "mkdir",
-            "new_file",
-            "arm_delete",
-            "disarm_delete",
-            "delete",
-            "save",
-            "show_diff",
-            "close_diff",
-            "open_link",
-        ],
+        // the files view speaks the kernel contract: its reads and writes go
+        // through the kernel, and the two events left are the app's own doors
+        "files" => &["open_link", "at"],
         "settings" => &[
             "tab",
             "reconnect",
@@ -2411,8 +2279,6 @@ struct Guest {
     /// props it was last given on it.
     props_subscription: Option<u64>,
     props_sent: Option<Vec<u8>>,
-    /// Separates Files save acknowledgements across fresh guest instances.
-    files_save_namespace: Option<String>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
     /// The kernel's answers to this guest's node calls, on their way in.
@@ -2420,6 +2286,9 @@ struct Guest {
     /// The guest's `rpc.live` subscriptions, each with the plane it named:
     /// told on every block that moves that plane.
     live_subscriptions: Vec<(u64, String)>,
+    /// The guest's `rpc.stream` subscriptions, each holding the node socket
+    /// the kernel opened for it: retired with the cancel, and with the guest.
+    streams: Vec<(u64, kernel::NodeStream)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3080,11 +2949,10 @@ impl Guest {
             surfaces: surfaces_of(module),
             props_subscription: None,
             props_sent: None,
-            files_save_namespace: (module == "files")
-                .then(|| crate::backend::fresh_operation_id("files-view".into())),
             intents: Vec::new(),
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
+            streams: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3155,16 +3023,9 @@ impl Guest {
             return;
         }
         self.props_sent = props.clone();
-        let mut bytes = props.clone().unwrap_or_default();
-        if let Some(namespace) = &self.files_save_namespace
-            && let Ok(serde_json::Value::Object(mut facts)) = serde_json::from_slice(&bytes)
-        {
-            facts.insert("save_namespace".into(), namespace.clone().into());
-            bytes = serde_json::to_vec(&facts).expect("JSON object serializes");
-        }
         self.pending.push(wire::Event::Response {
             id,
-            result: Ok(bytes),
+            result: Ok(props.clone().unwrap_or_default()),
             done: false,
         });
     }
@@ -3210,6 +3071,9 @@ impl Guest {
                 self.props_subscription = None;
             }
             self.live_subscriptions.retain(|(live, _)| *live != id);
+            // dropping the stream aborts it: the node socket goes with the
+            // subscription the view abandoned
+            self.streams.retain(|(stream, _)| *stream != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -3880,16 +3744,8 @@ pub(crate) mod tests {
     fn only_declared_intents_are_routed() {
         assert!(intents_of("governance").is_empty());
         assert_eq!(intents_of("members"), ["copy"]);
-        assert_eq!(
-            intents_of("agents"),
-            [
-                "status",
-                "save",
-                "register",
-                "open_run",
-                "open_link",
-            ]
-        );
+        // the agents view signs its own pause and save through `op.submit`
+        assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(!chat.contains(&"edit"));
@@ -3918,14 +3774,13 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 7] = [
+        let other_route_only: [(&str, &str, &[&str]); 6] = [
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
             ("pages", "pages_intent", &[]),
             ("chat", "chat_intent", &["composer"]),
-            ("files", "files_intent", &[]),
         ];
         let snake = |variant: &str| -> String {
             let mut word = String::new();
@@ -3984,26 +3839,6 @@ pub(crate) mod tests {
             }
         });
         texts
-    }
-
-    /// The key and input-handler index of the input whose placeholder is
-    /// `hint`.
-    fn input_named(guest: &Guest, hint: &str) -> (String, u32) {
-        let mut root = guest.frame.root.clone().expect("a tree");
-        let mut found = None;
-        root.for_each_mut(&mut |node| {
-            if let wire::Node::Input {
-                key,
-                placeholder,
-                on_input,
-                ..
-            } = node
-                && placeholder == hint
-            {
-                found = Some((key.clone(), *on_input));
-            }
-        });
-        found.expect("an input with that placeholder")
     }
 
     /// The message index the button labelled `name` — by its `label=`, or
@@ -4400,150 +4235,6 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
-    /// The bundled Agents view through the host: offline plate, then the
-    /// register; nothing leaves it until a reader edits a record.
-    #[test]
-    fn the_staged_agents_view_boots_and_takes_the_register() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        guest.redraw(&None);
-        assert!(
-            texts(&guest).iter().any(|text| text == "Not connected"),
-            "{:?}",
-            texts(&guest)
-        );
-        // the props the app ENCODES, not a hand-written shape beside the
-        // encoder: a field the encoder dropped, or the guest stopped taking,
-        // fails here
-        let skill = |name: &str, always: bool| crate::backend::AgentSkill {
-            name: name.into(),
-            source_prefix: format!("/shared/skills/{name}"),
-            source_snapshot: String::new(),
-            always,
-        };
-        let reviewer = crate::backend::AgentRow {
-            id: "reviewer-bot".into(),
-            name: "Reviewer Bot".into(),
-            initials: "RB".into(),
-            capability: "review".into(),
-            status: "paused".into(),
-            owner_handle: "eddy".into(),
-            controller: "7".into(),
-            live: false,
-            skills: vec![
-                skill("review", true),
-                skill("style", false),
-                skill("tests", false),
-            ],
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "",
-            0,
-            &[reviewer],
-            &[],
-            "",
-            0,
-            &crate::backend::RunJournal::default(),
-            &crate::backend::LiveRun::default(),
-            &["claude".into(), "review".into()],
-        ));
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["1 agent · 0 working", "Reviewer Bot", "PAUSED", "eddy"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert!(guest.intents.is_empty());
-        assert!(guest.fault.is_none());
-    }
-
-    #[test]
-    fn the_staged_agents_view_renders_semantic_actions_and_opens_the_exact_target() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        let run = crate::backend::RunRow {
-            run_id: "machine-run-hash".into(),
-            dispatch_id: "machine-dispatch-hash".into(),
-            agent_id: "reviewer".into(),
-            agent_name: "Reviewer".into(),
-            origin: "#Engineering · Message 42".into(),
-            state: "running".into(),
-            dispatched: "h 1".into(),
-            settled: String::new(),
-            attempt: 1,
-            holder: String::new(),
-            actions: 1,
-            degraded: false,
-            reason: String::new(),
-            output_ref: String::new(),
-            pr_number: 0,
-        };
-        let target = crate::backend::RunLink {
-            relation: "target".into(),
-            kind: "chat".into(),
-            label: "#Engineering · Eddy: Bound and scroll".into(),
-            url: "duck://channel/room?net=a1b2c3d4#42".into(),
-        };
-        let journal = crate::backend::RunJournal {
-            dispatch_id: run.dispatch_id.clone(),
-            entries: vec![crate::backend::JournalEntry {
-                height: "h 2".into(),
-                kind: "action".into(),
-                summary: "React 👀".into(),
-                status: "Completed".into(),
-                targets: vec![target.clone()],
-            }],
-            ..Default::default()
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "7",
-            0,
-            &[],
-            std::slice::from_ref(&run),
-            &run.dispatch_id,
-            1,
-            &journal,
-            &crate::backend::LiveRun::default(),
-            &[],
-        ));
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["React 👀", "Completed", &target.label] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected}"
-            );
-        }
-        assert!(
-            !shown
-                .iter()
-                .any(|text| text.contains("machine-dispatch-hash"))
-        );
-        assert!(guest.fault.is_none());
-        guest.deliver(Output::Activate(button_message(&guest, &target.label)));
-        guest.redraw(&props);
-        let intent = guest.intents.last().expect("target navigation");
-        assert_eq!(intent.kind, "open_link");
-        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
-            target.url
-        );
-    }
-
     /// Every host surface in the guest's tree, by name.
     fn surface_names(guest: &Guest) -> Vec<String> {
         fn walk(node: &wire::Node, out: &mut Vec<String>) {
@@ -4866,268 +4557,74 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Files view through the host: the listing, a typed name
-    /// that leaves as a `mkdir` intent, the three preview surfaces in the
-    /// guest's tree, and a link the Markdown reader activates coming back
-    /// through the guest's own route as an `open_link` intent.
+    /// The bundled Files view through the host, on the KERNEL CONTRACT: it
+    /// boots on the offline plate, and once the session says connected it
+    /// lists the directory itself — an `rpc.live` subscription the kernel
+    /// keeps, and a `files.get` the kernel refuses here (no node) — so the
+    /// refusal is what the screen shows, and a block on the files plane makes
+    /// it ask again. Needs `make views`; without the staged component the test
+    /// says so and does nothing.
     #[test]
-    fn the_staged_files_view_boots_takes_the_listing_and_routes_a_link_through_its_surface() {
+    fn the_staged_files_view_boots_and_reads_duckfs_through_the_kernel() {
         let Some(staged) = staged("files") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("files", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = files_facts();
-        guest.redraw(&props);
+        let no_props = None;
+        // the first frame is drawn before any facts, and it settles at once:
+        // with nothing connected the view asks the kernel for nothing
+        assert!(
+            !guest.redraw(&no_props),
+            "the offline plate waits on nothing"
+        );
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+
+        // connected: the view asks the kernel for its own directory
+        let session = files_facts();
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription on its plane"
+        );
+        // no node behind the kernel: the read is refused, and the view says
+        // so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "1 KB"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert_eq!(surface_names(&guest), ["agent_markdown"]);
-        assert!(guest.surfaces.contains_key("agent_markdown"));
-        assert!(guest.surfaces.contains_key("forge_code"));
-        assert!(guest.surfaces.contains_key("picture"));
-
-        // the Markdown reader's link goes back through the guest's route
-        let mut route = None;
-        if let Some(root) = &guest.frame.root {
-            root.clone().for_each_mut(&mut |node| {
-                if let wire::Node::Surface { on_event, .. } = node {
-                    route = *on_event;
-                }
-            });
-        }
-        guest.deliver(Output::Surface {
-            handler: route,
-            value: wire::SurfaceValue::Str("https://duck.example/x".into()),
-        });
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "open_link".into(),
-                detail: r#"{"url":"https://duck.example/x"}"#.into(),
-            }]
-        );
-
-        // a typed name leaves trimmed, as a mkdir under the crumb
-        let (key, handler) = input_named(&guest, "new name…");
-        guest.deliver(Output::Edit {
-            key,
-            handler,
-            text: "  reports  ".into(),
-        });
-        guest.redraw(&props);
-        guest.deliver(Output::Activate(button_message(&guest, "+ Folder")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "mkdir".into(),
-                detail: r#"{"name":"reports"}"#.into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    #[test]
-    fn the_staged_files_draft_keeps_its_original_file_and_save_snapshot() {
-        let staged = staged("files").expect("the actual Files Wasm fixture is required");
-        let mut guest = Guest::load_from("files", &staged).expect("Files loads");
-        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
-        let original_text = format!("X{}", facts["preview_text"].as_str().unwrap());
-        let props = |facts: &serde_json::Value| Some(serde_json::to_vec(facts).unwrap());
-        settle_documents(&mut guest, &None);
-        settle_documents(&mut guest, &props(&facts));
-        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-        settle_documents(&mut guest, &props(&facts));
-        let mut editor = None;
-        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor { key, document, .. } = node {
-                editor = Some((key.clone(), document.reset));
-            }
-        });
-        let (key, reset) = editor.expect("editable document");
-        guest.deliver(Output::EditorAction {
-            key: key.clone(),
-            reset,
-            action: iced::widget::text_editor::Action::Edit(
-                iced::widget::text_editor::Edit::Insert('X'),
-            ),
-        });
-        // EditorAction admits native work; the mounted editor executes it.
-        use iced::advanced::renderer::Headless;
-        use iced_test::runtime::{UserInterface, user_interface};
-        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
-            iced::Font::DEFAULT,
-            iced::Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .unwrap();
-        let mut ui = UserInterface::build(
-            guest.render(),
-            iced::Size::new(1100.0, 700.0),
-            user_interface::Cache::default(),
-            &mut renderer,
-        );
-        let mut outputs = Vec::new();
-        ui.update(
-            &[Event::Window(
-                window::Event::RedrawRequested(Instant::now()),
-            )],
-            mouse::Cursor::Unavailable,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut outputs,
-        );
-        drop(ui);
         assert!(
-            outputs
+            shown
                 .iter()
-                .any(|output| matches!(output, Output::EditorBatch(_)))
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
         );
-        for output in outputs {
-            guest.deliver(output);
-        }
-        settle_documents(&mut guest, &props(&facts));
-        assert_eq!(
-            guest.inputs.editor_document(&key).unwrap().text(),
-            original_text,
-            "the mounted editor must apply X before navigation"
-        );
-        let old_save = button_message(&guest, "Save");
-        facts["network_scope"] = "network-b".into();
-        facts["context"] = "connection-b".into();
-        facts["preview_path"] = "/shared/other.md".into();
-        facts["preview_text"] = "B source".into();
-        settle_documents(&mut guest, &props(&facts));
-        guest.deliver(Output::Activate(old_save));
-        settle_documents(&mut guest, &props(&facts));
-        assert!(guest.intents.is_empty(), "an old Save cannot target B");
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
         assert!(
-            texts(&guest)
-                .iter()
-                .any(|text| text == "Unsaved changes to:")
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
-        assert!(texts(&guest).iter().any(|text| text == "/shared/README.md"));
 
-        facts["network_scope"] = "network-a".into();
-        facts["context"] = "connection-a-reconnected".into();
-        facts["preview_path"] = "/shared/README.md".into();
-        facts["preview_base"] = "external-new-snapshot".into();
-        facts["preview_text"] = "external replacement".into();
-        settle_documents(&mut guest, &props(&facts));
-        let draft_text = |guest: &Guest| {
-            let mut value = None;
-            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { key, .. } = node {
-                    value = guest
-                        .inputs
-                        .editor_document(key)
-                        .map(|doc| doc.text().to_owned());
-                }
-            });
-            value.expect("the retained editor")
-        };
-        assert_eq!(draft_text(&guest), original_text);
-        guest.deliver(Output::Activate(button_message(&guest, "Save")));
-        settle_documents(&mut guest, &props(&facts));
-        let saves = std::mem::take(&mut guest.intents);
-        assert_eq!(saves.len(), 1, "one Save");
-        let save = &saves[0];
-        assert_eq!(save.kind, "save");
-        let payload: serde_json::Value = serde_json::from_str(&save.detail).unwrap();
-        assert_eq!(payload["path"], "/shared/README.md");
-        assert_eq!(payload["text"], original_text);
-        assert_eq!(payload["base"], "snapshot-a");
-        assert_eq!(payload["context"], "connection-a-reconnected");
-        facts["save_reply"] = serde_json::json!({"replies":[{
-            "context": payload["context"], "namespace": payload["namespace"], "request": payload["request"],
-            "success": false, "message": "The file changed elsewhere. Your edits are kept."
-        }], "overflow":""});
-        settle_documents(&mut guest, &props(&facts));
-        assert_eq!(draft_text(&guest), original_text);
-        assert!(
-            texts(&guest)
-                .iter()
-                .any(|text| text == "The file changed elsewhere. Your edits are kept.")
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    #[test]
-    fn fresh_files_wasm_instances_reject_retained_and_late_old_save_successes() {
-        let editor_text = |guest: &Guest| {
-            let mut text = None;
-            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { key, .. } = node {
-                    text = guest
-                        .inputs
-                        .editor_document(key)
-                        .map(|doc| doc.text().to_owned());
-                }
-            });
-            text
-        };
-        let staged = staged("files").expect("actual Files Wasm fixture required");
-        let mut old = Guest::load_from("files", &staged).unwrap();
-        let old_props = files_facts();
-        old.redraw(&None);
-        old.redraw(&old_props);
-        old.deliver(Output::Activate(button_message(&old, "Edit")));
-        old.redraw(&old_props);
-        old.deliver(Output::Activate(button_message(&old, "Save")));
-        old.redraw(&old_props);
-        let old_intents = std::mem::take(&mut old.intents);
-        assert_eq!(old_intents.len(), 1);
-        let old_save: serde_json::Value = serde_json::from_str(&old_intents[0].detail).unwrap();
-        let old_namespace = old_save["namespace"].as_str().unwrap().to_owned();
-        assert_eq!(old_save["request"], 1);
-        for retained in [true, false] {
-            let mut guest = Guest::load_from("files", &staged).unwrap();
-            assert_ne!(guest.files_save_namespace.as_ref().unwrap(), &old_namespace);
-            let mut facts: serde_json::Value =
-                serde_json::from_slice(&files_facts().unwrap()).unwrap();
-            let success = serde_json::json!({"replies":[{"context":"connection-a", "namespace":old_namespace, "request":1, "success":true, "message":""}], "overflow":""});
-            if retained {
-                facts["save_reply"] = success.clone();
-            }
-            let props = |value: &serde_json::Value| Some(serde_json::to_vec(value).unwrap());
-            guest.redraw(&None);
-            guest.redraw(&props(&facts));
-            guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-            guest.redraw(&props(&facts));
-            guest.deliver(Output::Activate(button_message(&guest, "Save")));
-            guest.redraw(&props(&facts));
-            let saves = std::mem::take(&mut guest.intents);
-            assert_eq!(saves.len(), 1);
-            let save: serde_json::Value = serde_json::from_str(&saves[0].detail).unwrap();
-            assert_eq!(save["request"], 1);
-            assert_eq!(
-                save["namespace"],
-                guest.files_save_namespace.as_ref().unwrap().as_str()
-            );
-            facts["save_reply"] = success;
-            // A changed loading prop forces delivery even when the old success was already retained.
-            facts["loading"] = true.into();
-            settle_documents(&mut guest, &props(&facts));
-            assert_eq!(
-                editor_text(&guest),
-                Some(facts["preview_text"].as_str().unwrap().to_owned()),
-                "old instance completion must not close the fresh editor"
-            );
-            facts["save_reply"]["replies"][0]["namespace"] = save["namespace"].clone();
-            facts["loading"] = false.into();
-            guest.redraw(&props(&facts));
-            assert!(
-                editor_text(&guest).is_none(),
-                "its own confirmation closes the editor"
-            );
-            assert!(guest.fault.is_none());
-        }
+        // a block on the files plane: the live item lands and the view reads
+        // again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// A module-owned view has one source, the module's deployment on the
@@ -5675,32 +5172,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// The node's `ls` reply the files view reads for itself through the
+    /// kernel: one directory holding one file.
+    fn files_listing_reply() -> serde_json::Value {
+        serde_json::json!({ "entries": [
+            { "path": "/shared/README.md", "kind": "file", "size": 1024, "object": "bb" }
+        ]})
+    }
+
+    /// The files view's session facts: connected, on a named chain.
     fn files_facts() -> Option<Vec<u8>> {
         Some(
-        serde_json::to_vec(&serde_json::json!({
-            "path": "/shared", "listed": true,
-            "entries": [
-                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
-                {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
-            ],
-            "directories": [
-                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
-            ],
-            "connected": true, "loading": false,
-            "network_scope": "network-a", "context": "connection-a", "preview_base": "snapshot-a",
-            "save_reply": {"replies":[], "overflow":""},
-            "preview_path": "/shared/README.md",
-            "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
-            "delete_target": "", "diff_from": "", "diff": [], "history": [],
-            "preview_truncated": false, "preview_binary": false, "preview_picture": false,
-            "preview_width": 0, "preview_height": 0,
-            "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
-            "preview_display_text": "# Hello\n\n[a link](https://duck.example/x)\n",
-            "preview_display_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
-            "dark": false, "write_refusal": "", "writes": 0
-        }))
-        .expect("props encode"),
-    )
+            serde_json::to_vec(&serde_json::json!({
+                "connected": true, "dark": false, "chain": "chain-a",
+                "route": "", "route_serial": 0
+            }))
+            .expect("props encode"),
+        )
     }
 
     #[test]
@@ -6566,53 +6054,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn files_display_projection_bounds_preview_rows_and_preserves_the_edit_source() {
-        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
-        let source = "한글 preview ".repeat(5_000);
-        facts["preview_text"] = source.clone().into();
-        let entries: Vec<_> = (0..80).map(|n| serde_json::json!({
-            "key": n + 100, "path": format!("/shared/{n}"), "name": format!("entry-{n}-{}", "한".repeat(300)),
-            "kind": "dir", "size": 1, "object": format!("object-{n}")
-        })).collect();
-        facts["entries"] = entries.clone().into();
-        facts["directories"] = entries.into();
-        facts["history"] = (0..80).map(|n| serde_json::json!({"id": format!("s{n}"), "short_id": format!("s{n}"), "author": "duck", "height": n, "message": "history".repeat(300)})).collect::<Vec<_>>().into();
-        facts["diff_from"] = "s0".into();
-        facts["diff"] = (0..80)
-            .map(|n| serde_json::json!({"path": format!("/shared/{n}"), "kind": "added"}))
-            .collect::<Vec<_>>()
-            .into();
-        let bytes = display_budget::files(facts.clone());
-        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(projected["preview_text"], source);
-        assert_eq!(projected["preview_truncated"], false);
-        assert_eq!(projected["preview_display_clipped"], true);
-        assert!(
-            projected["preview_display_text"]
-                .as_str()
-                .unwrap()
-                .starts_with("한글 preview")
-        );
-        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
-        assert_display_projection_survives_wire(
-            "files",
-            &bytes,
-            "Preview shortened for display.",
-            &[],
-        );
-        facts["entries"] = Vec::<serde_json::Value>::new().into();
-        facts["directories"] = Vec::<serde_json::Value>::new().into();
-        facts["diff_from"] = "".into();
-        let history = display_budget::files(facts.clone());
-        assert_display_projection_survives_wire("files", &history, "historyhistory", &["History"]);
-        facts["history"] = Vec::<serde_json::Value>::new().into();
-        facts["diff_from"] = "s0".into();
-        facts["diff"] = (0..80).map(|n| serde_json::json!({"path": format!("/shared/{n}-{}", "long".repeat(200)), "kind": "added"})).collect::<Vec<_>>().into();
-        let diff = display_budget::files(facts);
-        assert_display_projection_survives_wire("files", &diff, "/shared/0-long", &["History"]);
-    }
-
-    #[test]
     fn forge_display_projection_bounds_body_diff_and_newest_notes_together() {
         let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
         facts["open_repo"] = "core".into();
@@ -6780,75 +6221,6 @@ pub(crate) mod tests {
                 .any(|text| text == "Older comments are not shown.")
         );
         assert!(guest.fault.is_none());
-    }
-
-    /// A 60 KB file preview: the reader either sees all of it or is told
-    /// it is cut — never a silently shortened text.
-    #[test]
-    fn a_long_file_preview_says_where_it_is_cut() {
-        let Some(staged) = staged("files") else {
-            return;
-        };
-        let text = format!("{}END-MARK", "y".repeat(60_000));
-        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
-        facts["preview_text"] = text.clone().into();
-        let props = Some(display_budget::files(facts));
-        let projected: serde_json::Value = serde_json::from_slice(props.as_ref().unwrap()).unwrap();
-        assert_eq!(projected["preview_text"], text);
-        assert_eq!(projected["preview_truncated"], false);
-        assert_eq!(projected["preview_display_clipped"], true);
-        let mut guest = Guest::load_from("files", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        let whole = shown.iter().any(|text| text.ends_with("END-MARK"));
-        let told = shown
-            .iter()
-            .any(|text| text == "Preview shortened for display.");
-        assert!(
-            whole || told,
-            "the preview is cut without a word (fault {:?}): {} texts, longest {}",
-            guest.fault,
-            shown.len(),
-            shown.iter().map(String::len).max().unwrap_or(0)
-        );
-        assert!(guest.fault.is_none());
-        // Display clipping does not hide Edit or replace its authoritative seed.
-        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-        settle_documents(&mut guest, &props);
-        let mut root = guest.frame.root.clone().expect("editing tree");
-        let mut editor_source = None;
-        root.for_each_mut(&mut |node| {
-            if let wire::Node::Editor { key, .. } = node {
-                editor_source = guest
-                    .inputs
-                    .editor_document(key)
-                    .map(|doc| doc.text().to_owned());
-            }
-        });
-        assert_eq!(editor_source.as_deref(), Some(text.as_str()));
-        // An oversized identity only hides rendering: it must not reseed or
-        // consume this draft. Returning to the same facts restores the editor.
-        let mut unavailable: serde_json::Value =
-            serde_json::from_slice(props.as_ref().unwrap()).unwrap();
-        unavailable["path"] = "x".repeat(20_000).into();
-        guest.redraw(&Some(display_budget::files(unavailable)));
-        assert!(
-            texts(&guest)
-                .iter()
-                .any(|line| line.starts_with("Too much display data."))
-        );
-        guest.redraw(&props);
-        guest.deliver(Output::Activate(button_message(&guest, "Save")));
-        guest.redraw(&props);
-        let saved = guest
-            .intents
-            .iter()
-            .find(|event| event.kind == "save")
-            .expect("save intent");
-        let payload: serde_json::Value = serde_json::from_str(&saved.detail).unwrap();
-        assert_eq!(payload["text"], text);
-        assert_eq!(payload["path"], "/shared/README.md");
     }
 
     /// `head_within` never cuts inside a char; the discussion budget keeps
@@ -7223,8 +6595,11 @@ pub(crate) mod tests {
                 deployment(&component, "b.svg"),
             );
             let node = FakeDeployment::serving(module, &a);
-            // the governance view reads its register off the node itself
+            // the governance and files views read their own registers off
+            // the node itself
             node.answer_query("governance", proposals_reply());
+            node.answer_files("ls", files_listing_reply());
+            node.answer_files("history", serde_json::json!({ "snapshots": [] }));
             let client = fake_node(node.clone()).await;
 
             let mounted = fresh(module);

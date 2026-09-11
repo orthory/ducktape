@@ -805,15 +805,6 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         model: String::new(),
         live: true,
     }];
-    app.fs_entries = vec![backend::FsEntry {
-        key: 0,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 0,
-        object: String::new(),
-    }];
-
     app.connected = true;
     assert_eq!(
         backend::members_summary(app.connected, &app.members_rows),
