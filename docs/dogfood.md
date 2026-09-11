@@ -182,8 +182,13 @@ curl -s <base>/v1/index/pages/view -X POST -H 'content-type: application/json' \
 
 ## 4. Open the issue with a page link
 
-Forge view → the `ducktape` repo → **Issues** → *New issue*. Put
-`[spec](duck://page/<your-page-id>)` in the body.
+The desktop Forge view lists issues but cannot open one. Open it with forge's
+`open_issue` message through the `submit` helper from step 2, so the issue is
+authored by the node's operator account, and put the page link in its body:
+
+```sh
+submit forge '{"open_issue":{"repo":"ducktape","title":"<title>","body":"[spec](duck://page/<your-page-id>)"}}'
+```
 
 At run compose, every ref found in the trigger message or the injected issue
 body resolves against committed pages state and the page's whole subtree is
@@ -288,11 +293,11 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
 ```
 
 Commit an artifact containing the replacement component to the run's repository.
-The guest can build it offline when its image contains the compiler and the
-repository vendors its dependencies. Its network is limited to host tunnels for
-granted services. The executor consumes committed artifacts; source compilation
-belongs to the run's build tools. The existing replacement fixture is
-`crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
+The guest builds it with the compiler its image carries and fetches dependencies
+through the run's egress proxy (`HTTP_PROXY`/`HTTPS_PROXY`, which dials off the
+host and refuses the host itself). The executor consumes committed artifacts;
+source compilation belongs to the run's build tools. The existing replacement
+fixture is `crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
 
 The model's final JSON response can include:
 
@@ -318,8 +323,11 @@ length prefixes and optional mapper, rather than the component file alone:
 ducktape module pack hello.component.wasm --out hello.module
 ```
 
-Pass `--index <mapper.wasm>` to include a mapper. An artifact without a
-mapper removes the target's existing mapper when it activates. Activation is
+Pass `--index <mapper.wasm>` to include a mapper and `--view <view.wasm>
+--assets <dir>` to include a desktop view. The artifact is the whole deployment:
+one without a mapper or a view removes the target's existing one when it
+activates, so a view-only change still packs the module's current component and
+mapper. Activation is
 at the governance execute height plus `after`, with readiness required from every
 validator.
 
@@ -360,12 +368,14 @@ ops/build-guest-rootfs.sh
 ```
 
 Linux setup requires Bubblewrap with user namespaces, in addition to the base
-image builder's tools. It runs inside the extracted guest root with private,
+image builder's tools. Ubuntu 24.04 denies an unconfined `bwrap` its user
+namespace (`bwrap: setting up uid map: Permission denied`) while
+`kernel.apparmor_restrict_unprivileged_userns` is 1; set it to 0 for the build
+and back afterwards. It runs inside the extracted guest root with private,
 disk-backed scratch and receives no host home, credentials or caches.
 `ROOTFS_SETUP=/path/to/setup.sh` replaces the setup and receives command-line
 arguments; `ROOTFS_SETUP=` builds only the base image. macOS builds the base
-image without this Linux setup hook. Repositories must vendor dependencies for
-offline builds: the run's VM can reach only its host service tunnels.
+image without this Linux setup hook.
 
 Writable run filesystems provide 8 GiB of sparse capacity. Only written blocks
 consume host disk. The read-only input image retains its measured size plus
