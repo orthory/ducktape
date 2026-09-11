@@ -302,7 +302,7 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // `channel_id` from the account number it resolved itself, and `account_number`
     // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
     // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 7] = [
+    const MIRRORS: [(&str, &[&str]); 6] = [
         ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
         // The card's rows are its SCOPE's threads with their anchors resolved,
