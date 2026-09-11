@@ -1,5 +1,4 @@
 use ::chat;
-use ::forge;
 use ::node;
 
 use commonware_cryptography::{Signer as _, ed25519};
@@ -38,20 +37,9 @@ fn a_submit_from_another_box_is_refused_at_delivery() {
 }
 mod messages;
 mod repos;
-mod review;
 mod shell;
 mod status;
 mod wire;
-
-fn stage(staged: Vec<ForgeDraftComment>, line: &str, body: &str) -> Vec<ForgeDraftComment> {
-    stage_forge_comment(
-        staged,
-        "src/main.rs".into(),
-        line.into(),
-        "new".into(),
-        body.into(),
-    )
-}
 
 fn alpha_of(background: iced::Background) -> f32 {
     let iced::Background::Color(color) = background else {

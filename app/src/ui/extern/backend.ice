@@ -61,9 +61,8 @@ extern crate::backend
   pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str, expected_account:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, expected_account:str, up_to_seq:i64) -> BellDelta ! AppError
-  ForgeRefresh(repo:str, number:i64, refs_moved:bool)
-  LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
-  ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, forge_discussion:[ChatMessage], refresh_chat:bool)
+  LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta)
+  ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, refresh_chat:bool)
   AppError(message:str, committed:bool)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
@@ -76,7 +75,7 @@ extern crate::backend
   pure icon(name:&str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
-  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, has_older_history:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, forge_discussion:[ChatMessage], forge_item_channel:str, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
+  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, has_older_history:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
   pure resync_planes(load_chat:bool, load_pages:bool) -> str
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, fold_serial:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
@@ -215,8 +214,9 @@ extern crate::backend
   pure duck_channel_link(channel:str, chain_id:str) -> str
   pure duck_channel_message_link(channel:str, seq:i64, chain_id:str) -> str
   pure startup_duck_url() -> str
-  pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
-  pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
+  // the discussion channel a composer scope names, when the scope belongs
+  // to the connected endpoint — the note composer's whole addressing
+  pure scope_channel(scope:&str, endpoint:&str) -> str
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
   duck_echo_f64(value:f64) -> f64 ! AppError
@@ -298,45 +298,9 @@ extern crate::backend
   pure welcome_door(name_draft:&str) -> WelcomeDoor
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
-  ForgeRepo(name:str, head:str)
-  ForgeBranch(name:str, head:str)
-  ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
-  ForgeData(generation:i64, repos:[ForgeRepo])
-  ForgeRepoData(generation:i64, repo:str, branches:[ForgeBranch], items:[ForgeItem])
-  ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])
-  ForgeReview(author:str, author_name:str, verdict:str, body:str, blocks:[ChatBlock], commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
-  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, blocks:[ChatBlock], author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
-  ForgeDiscussionData(channel_id:str, messages:[ChatMessage], members:[ChatMember])
-  ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
-  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[ForgeBranch], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
-  load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
-  load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
-  load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
-  load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError
-  TreeEntry(name:str, path:str, kind:str)
-  ForgeTreeData(repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
-  BlobView(repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64, picture:bool, width:i64, height:i64)
-  forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError
-  forge_blob(rpc:str, repo:str, rev:str, path:str, net:str) -> BlobView ! AppError
-  ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
-  pure stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
-  pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
-  pure forge_comment_cap_reached(staged:&[ForgeDraftComment]) -> bool
-  pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
-  pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
-  pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  pure forge_parent(path:str) -> str
-  pure forge_branch_head(branches:&[ForgeBranch], name:&str) -> str
-  pure forge_tree_branch(branches:&[ForgeBranch], picked:&str, rev:&str) -> str
-  pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
-  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
-  merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
-  forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:LiveKind, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
-  pure forge_live_hit(kind:LiveKind, module:str) -> bool
-  pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
-  DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
+  // the highlighted code reader, a host surface the files view leaves a
+  // slot for (the forge view leaves the same one through `surfaces_of`)
   component forge_code(source:str, path:str, dark:bool) -> unit
-  pure markdown_path(path:&str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
@@ -360,7 +324,6 @@ extern crate::backend
   pure message_seq_after_failure(current:i64, phase:MutationPhase, committed:bool) -> i64
   pure message_text_after_failure(current:str, phase:MutationPhase, committed:bool) -> str
   pure message_action_after_failure(current:MessageAction, phase:MutationPhase, committed:bool) -> MessageAction
-  pure keep_forge_phase(loaded:bool, next:ForgePhase, current:ForgePhase) -> ForgePhase
   pure refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   pure refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   pure refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
@@ -411,11 +374,6 @@ extern crate::backend
   pure keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
   pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
   pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
-  pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
-  pure keep_branches(loaded:bool, next:[ForgeBranch], current:[ForgeBranch]) -> [ForgeBranch]
-  pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
-  pure keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
-  pure keep_chat_blocks(loaded:bool, next:[ChatBlock], current:[ChatBlock]) -> [ChatBlock]
   pure initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   pure frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
   pure first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
