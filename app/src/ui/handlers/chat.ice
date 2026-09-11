@@ -957,9 +957,12 @@ on copy_message_link(link)
 // cannot check alone — and each kind maps onto navigation the app ALREADY
 // has: the handler a click on the screen itself would reach, handed the
 // link's field through an echo lane (the one way a handler reaches another).
-// A target that needs two steps (a repo, THEN its item or file; a directory,
-// THEN its file) parks a one-shot focus that `forge_repo_loaded` / `fs_listed`
-// consume. The protocol adds addresses, never navigation.
+// A target that needs two steps (a repo, THEN its item or file) parks a
+// one-shot focus that `forge_repo_loaded` consumes. The protocol adds
+// addresses, never navigation.
+// A DUCKFS ADDRESS MOVES THE TAB AND NOTHING ELSE: the browser's directory
+// is the files view's own state, and the kernel contract has no way for the
+// app to hand a mounted view the route it was opened with.
 // A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
 // addresses a store this app is not connected to, so it opens nothing and
 // says which network it belongs to. A link with no `?net=` is the hand-typed

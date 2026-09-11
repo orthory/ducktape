@@ -642,18 +642,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
             && repo_loaded.contains("run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, forge_tree_rev, forge_tree_path)"),
         "the repo's load consumes the forge focus: an item opens, a file first moves the tree to its directory, pinned to the link's rev"
     );
-    let files = include_str!("../ui/handlers/files.ice");
-    let listed = files
-        .split_once("on fs_listed(next)")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("the handler ends")
-        .0;
-    assert!(
-        listed.contains("return if empty(fs_focus_path)") && listed.contains("-> fs_open_file _"),
-        "the listing consumes the files focus"
-    );
+    // THE FILES BROWSER HAS NO SUCH FOCUS TO CONSUME. It lists the directory
+    // inside its own view now, and nothing carries a duckfs address across the
+    // kernel contract into a mounted view, so the address moves the tab and
+    // stops there — see the files arm above.
     let tree_loaded = forge
         .split_once("on forge_tree_loaded(next)")
         .expect("the handler")

@@ -6,13 +6,14 @@
 // the row itself by `11 + depth * 15`px, which needs a depth NUMBER — until
 // `PageItem` carries one the prefix stays as the only hierarchy signal, moved
 // ahead of the icon so it indents the whole row instead of the title alone.
-component PageButton(page:PageItem, selected:bool)
+component PageButton(page:PageItem, selected:bool, frozen:bool)
   emits
     choose_page(str)
   col w=fill
     if selected
       button -> emit(choose_page, page.id)
         with
+          disabled=frozen
           label=page.title
           checked=selected
           w=fill
@@ -48,6 +49,7 @@ component PageButton(page:PageItem, selected:bool)
     if !selected
       button -> emit(choose_page, page.id)
         with
+          disabled=frozen
           label=page.title
           checked=selected
           w=fill
@@ -81,11 +83,12 @@ component PageButton(page:PageItem, selected:bool)
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
 
-component PageSearchResult(hit:PageSearchHit)
+component PageSearchResult(hit:PageSearchHit, frozen:bool)
   emits
     open_page_search_hit(str, str)
   button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
     with
+      disabled=frozen
       label=hit.text
       w=fill
       p=7.0
@@ -138,11 +141,12 @@ component PageSearchResult(hit:PageSearchHit)
 //     Carrying them through is a projection change, not a view change; until
 //     then the right-hand slot shows the ordinal the record does have
 //     (`#3`, `#3 · edited`) rather than an invented age.
-component PageCommentThreadButton(thread:PageCommentThread, anchor:str)
+component PageCommentThreadButton(thread:PageCommentThread, anchor:str, frozen:bool)
   emits
     open_block_comment_thread(str, str)
   button -> emit(open_block_comment_thread, thread.id, thread.target)
     with
+      disabled=frozen
       label=thread.author
       description=thread.meta
       w=fill
