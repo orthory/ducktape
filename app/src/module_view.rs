@@ -6488,6 +6488,263 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pages_floating_comments_preserve_document_layout_and_pointer_routing() {
+        use iced::advanced::renderer::Headless as _;
+        use iced_test::runtime::{UserInterface, user_interface};
+
+        struct Bounds {
+            editor: Option<Rectangle>,
+            focused: bool,
+            post: Option<Rectangle>,
+            card: Option<Rectangle>,
+            card_text: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+                if id
+                    == Some(&iced::widget::Id::from(
+                        "PagesView/root/pages/comments-card",
+                    ))
+                {
+                    self.card = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.editor = Some(bounds);
+                    self.focused = state.is_focused();
+                }
+            }
+            fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "No comments yet" {
+                    self.card_text = Some(bounds);
+                }
+                if text == "Post" {
+                    self.post = Some(bounds);
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let original = (0..80)
+            .map(|n| format!("Paragraph {n}: editable document text.\n"))
+            .collect::<String>();
+        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        facts["comment_seed"] = "A comment".into();
+        facts["seed_rev"] = 1.into();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(1100.0, 700.0);
+        let mut closed_bounds = None;
+        for open in [false, true] {
+            facts["block_comments_open"] = open.into();
+            let props = Some(serde_json::to_vec(&facts).unwrap());
+            settle_documents(&mut guest, &props);
+            let mut ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut bounds = Bounds {
+                editor: None,
+                focused: false,
+                post: None,
+                card: None,
+                card_text: None,
+            };
+            ui.operate(&renderer, &mut bounds);
+            let editor = bounds.editor.expect("document editor");
+            if !open {
+                closed_bounds = Some(editor);
+                continue;
+            }
+            assert_eq!(
+                Some(editor),
+                closed_bounds,
+                "comments must not resize or move the document"
+            );
+            let card = bounds.card.expect("comment card bounds");
+            let translation = Vector::new(size.width - card.x - card.width - 16.0, 0.0);
+            let post = bounds.post.expect("floating Post button").center() + translation;
+            let card_point = bounds.card_text.expect("comment card content").center() + translation;
+            assert!(
+                editor.contains(card_point),
+                "comments must overlap the document, not dock beside it"
+            );
+            let key = "PagesView/root/pages/document";
+            let cursor = guest
+                .inputs
+                .editor_document(key)
+                .unwrap()
+                .reference()
+                .cursor;
+            let mut covered = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(card_point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut covered,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                !bounds.focused,
+                "the card must shield the covered editor from clicks"
+            );
+            for output in covered {
+                guest.deliver(output);
+            }
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(post),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            assert!(
+                guest.intents.iter().any(|event| event.kind == "post"),
+                "the card must receive its own click"
+            );
+            assert_eq!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .reference()
+                    .cursor,
+                cursor,
+                "clicking the card must not move the underlying caret"
+            );
+            let outside = iced::Point::new(editor.x + 60.0, editor.y + 20.0);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                bounds.focused,
+                "the positioning layer must not intercept clicks outside the card"
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character("X".into()),
+                    modified_key: iced::keyboard::Key::Character("X".into()),
+                    physical_key: iced::keyboard::key::Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::default(),
+                    text: Some("X".into()),
+                    repeat: false,
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            assert!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .text()
+                    .contains('X'),
+                "document typing must remain live beside the card"
+            );
+            let capture = |ui: &mut UserInterface<'_, Output, iced::Theme, iced::Renderer>,
+                           renderer: &mut iced::Renderer| {
+                ui.draw(
+                    renderer,
+                    &iced::Theme::Light,
+                    &renderer::Style {
+                        text_color: iced::Color::BLACK,
+                    },
+                    mouse::Cursor::Unavailable,
+                );
+                renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
+            };
+            let before = capture(&mut ui, &mut renderer);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            let after = capture(&mut ui, &mut renderer);
+            let region = |pixels: &[u8], x: usize, width: usize| -> Vec<u8> {
+                (150..500)
+                    .flat_map(|y| {
+                        pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            };
+            assert_ne!(
+                region(&before, editor.x as usize + 10, 220),
+                region(&after, editor.x as usize + 10, 220),
+                "wheel outside the card must scroll the document"
+            );
+            assert_eq!(
+                region(&before, 800, 250),
+                region(&after, 800, 250),
+                "scrolling the document must not scroll the card"
+            );
+            let directory =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
+            std::fs::create_dir_all(&directory).unwrap();
+            image::RgbaImage::from_raw(1100, 700, after)
+                .unwrap()
+                .save(directory.join("floating-comments.png"))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn pages_links_follow_actual_mounted_editor_focus() {
         let _turn = blocking_connection_turn();
         let path = staged("pages").expect("actual Pages Wasm is required");

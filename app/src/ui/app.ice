@@ -95,7 +95,8 @@ daemon Ducktape
   // that never yields, leaving the message column whatever is left. At the
   // old 820 that was 177px — a composer whose Send button fell off the
   // window and a sentence wrapped over eleven lines. 1040 leaves 397, and it
-  // clears every other screen's worst case too (pages 612 + editor, roster
+  // clears every other screen's worst case too (pages sidebar + editor, with
+  // comments floating above the document; roster
   // 74+312, files 74+306). No `responsive` breakpoint: the only honest
   // alternative is suppressing a rail, and a console that silently drops the
   // pane you just opened is worse than one that will not get that small.

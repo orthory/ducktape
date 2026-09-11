@@ -57,7 +57,7 @@ fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
 }
 
 #[test]
-fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_rail_draft() {
+fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_card_draft() {
     let (_, frame) = shown(&facts());
     for expected in [
         "Pages",
@@ -125,7 +125,7 @@ fn a_create_a_search_and_a_post_leave_with_what_was_typed() {
     // the field cleared with the act: the button is dark now
     assert!(
         matches!(
-            ui_lang_guest::testing::find(&frame, "PagesView/root/pages/post"),
+            ui_lang_guest::testing::find(&frame, "PagesView/root/pages/comments-card/post"),
             Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
         ),
         "{:?}",
@@ -438,7 +438,7 @@ fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
     assert!(has_text(&frame, "Pages could not load"));
     assert!(has_text(&frame, "draft from Alpha"));
     assert!(matches!(
-        ui_lang_guest::testing::find(&frame, "PagesView/root/pages/post"),
+        ui_lang_guest::testing::find(&frame, "PagesView/root/pages/comments-card/post"),
         Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
     ));
     for queued in [post, delete, choose] {
