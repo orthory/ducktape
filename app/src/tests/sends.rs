@@ -31,13 +31,12 @@ use super::*;
 /// not exist while anyone is typing. Dropping `when cmd_held` is the regression
 /// — the app would still quit on ⌘Q, and every keystroke would pay for it.
 ///
-/// THE FIFTH IS THE CHAT'S ⌘C, armed by its own copy range AND by the chat tab.
-/// It is a separate route and not an arm on the chord dispatch for exactly the
-/// reason above: the chord's route is armed by ⌘ alone and therefore exists on
-/// every screen, while this one exists only once the reader has actually
-/// selected something — and only where the selection is, so a range left
-/// standing in chat cannot tax a keystroke typed in Pages, Forge or the
-/// console.
+/// THE FIFTH IS THE CHAT'S ⌘C, armed by the chat tab. It is a separate route
+/// and not an arm on the chord dispatch for exactly the reason above: the
+/// chord's route is armed by ⌘ alone and therefore exists on every screen,
+/// while this one exists only where a copy range can be — the selection itself
+/// is the view's now, so a keystroke typed in Pages, Forge or the console
+/// cannot be taxed by it.
 #[test]
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
@@ -51,22 +50,20 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
         [
             "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
             "keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, \
-             palette_open, bell_open, channel_create_open, thread_message_action, \
-             message_action, channel_settings_open, page_delete_armed)) -> \
-             global_key_pressed _",
+             palette_open, bell_open, channel_create_open, \
+             page_delete_armed)) -> global_key_pressed _",
             "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
-            "keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == \
-             ShellTab.chat) -> copy_chord_pressed _",
+            "keyboard press status=ignored when shell_tab == ShellTab.chat -> \
+             copy_chord_pressed _",
         ],
         "a `keyboard press` without `status=` bills every captured key a whole \
          extra view rebuild; the captured half is Escape-only (ducktape-ui#602) \
          and stays gated on an open layer; the command chords' route keeps its \
          `when cmd_held` arming, without which it becomes a fourth STANDING \
          subscription and every keystroke pays for ⌘Q and ⌘W; and the chat's \
-         ⌘C route keeps both terms of its arming, which is why it is not an \
-         arm on the chord dispatch — a reader with nothing selected, or \
-         reading another tab, has no copy route at all, while the chord's own \
-         route, armed by ⌘ alone, runs on every screen"
+         ⌘C route keeps its tab arming, which is why it is not an arm on the \
+         chord dispatch — a reader on another tab has no copy route at all, \
+         while the chord's own route, armed by ⌘ alone, runs on every screen"
     );
 }
 
@@ -87,13 +84,22 @@ fn a_submit_for_a_room_the_reader_has_left_goes_back_to_that_room() {
         &left, "message", "for ops",
     )));
     pump(&mut app, task);
-    assert!(app.messages.is_empty(), "never posted into general");
+    assert!(
+        app.chat_pending_sends.is_empty(),
+        "never posted into general"
+    );
     assert_eq!(composer_stash(&left), "for ops");
     assert!(composer_stash(&composer_scope(&app)).is_empty());
 }
 
+/// SENDS IN FLIGHT ARE INDEPENDENT AND NEVER ERASE THE NEXT DRAFT. The row
+/// the view paints for an unsettled send is the view's own (the app hands the
+/// body over as `chat_pending_sends` and the view folds it at the tail); what
+/// the app is on the hook for is the LIST: one entry per submit, each settled
+/// by the receipt that names it, and the box left free for the next draft in
+/// the meantime.
 #[test]
-fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
+fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -107,99 +113,49 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(composer_text(&composer), "first");
 
     submit_composer(&mut app, &composer, ComposerKind::Message, false);
-    let first_id = app.messages[0].id.clone();
-    let first_view_key = app.messages[0].view_key;
+    let first_id = app.chat_pending_sends[0].id.clone();
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(
         composer_text(&composer).is_empty(),
         "the instance clears itself before it emits"
     );
-    assert_eq!(app.messages.len(), 1);
-    assert!(app.messages[0].pending);
+    assert_eq!(bodies_in_flight(&app), ["first"]);
 
-    submit(&mut app, ComposerKind::Message, "second");
-    let second_id = app.messages[1].id.clone();
-    let second_view_key = app.messages[1].view_key;
+    let second_id = submit(&mut app, ComposerKind::Message, "second");
     assert_ne!(first_id, second_id);
-    assert_eq!(app.messages.len(), 2);
-    assert!(app.messages.iter().all(|message| message.pending));
+    assert_eq!(bodies_in_flight(&app), ["first", "second"]);
 
     type_into(&composer, "third");
-    // the submit receipt itself never touches the list…
+    // THE SECOND SEND'S RECEIPT COMES BACK FIRST. Each entry is settled by the
+    // id that names it — the block it rode is in — so a receipt out of submit
+    // order cannot take the other send's row with it.
+    let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
+        operation_id: second_id.clone(),
+        channel_id: "general".into(),
+    }));
+    assert_eq!(composer_text(&composer), "third");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
+    assert_eq!(bodies_in_flight(&app), ["first"]);
+
     let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
         operation_id: first_id.clone(),
         channel_id: "general".into(),
     }));
-    assert_eq!(app.messages.len(), 2);
-    assert!(app.messages.iter().all(|message| message.pending));
-
-    // The SECOND send commits first. Root confirmation must sort by canonical
-    // seq just like the thread rail while keeping that row's virtual identity.
-    let mut second = message(1, "second", false);
-    second.id = second_id.clone();
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
-        "general", second,
-    )));
-    assert_eq!(composer_text(&composer), "third");
-    assert_eq!(app.mutation_phase, MutationPhase::Idle);
-    assert!(!app.messages[0].pending);
-    assert_eq!(app.messages[0].seq, 1);
-    assert_eq!(app.messages[0].id, second_id);
-    assert_eq!(app.messages[0].view_key, second_view_key);
-    assert_eq!(app.messages[1].id, first_id);
-    assert_eq!(app.messages[1].view_key, first_view_key);
-    assert!(app.messages[1].pending);
-
-    // Then the first send lands at seq 2. Committed rows stay ordered, and
-    // neither virtual key is replaced.
-    let mut first = message(2, "first", false);
-    first.id = first_id.clone();
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
-        "general", first,
-    )));
-    assert!(app.messages.iter().all(|message| !message.pending));
-    assert_eq!(
-        app.messages
-            .iter()
-            .map(|message| (message.id.as_str(), message.seq, message.view_key))
-            .collect::<Vec<_>>(),
-        [
-            (second_id.as_str(), 1, second_view_key),
-            (first_id.as_str(), 2, first_view_key),
-        ]
-    );
-
-    // A canonical reload is allowed to replace rendered content, but not the
-    // client-only identity of the same IDs.
-    let reloaded = backend::merge_pending_messages(
-        vec![message(1, "second", false), message(2, "first", false)]
-            .into_iter()
-            .zip([second_id.clone(), first_id.clone()])
-            .map(|(mut message, id)| {
-                message.id = id;
-                message
-            })
-            .collect(),
-        app.messages.clone(),
-        "general".into(),
-        "general".into(),
-    );
-    assert_eq!(
-        reloaded
-            .iter()
-            .map(|message| message.view_key)
-            .collect::<Vec<_>>(),
-        [second_view_key, first_view_key]
-    );
+    assert!(app.chat_pending_sends.is_empty());
 
     let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat.contains("keyed message in messages by=message.view_key"));
     assert!(!chat.contains("keyed message in messages by=message.seq"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
-    let externs = inlined(include_str!("../ui/extern/backend.ice"));
-    assert!(externs.contains("sync optimistic_message("));
-    assert!(!externs.contains("pure optimistic_message("));
+}
+
+/// The bodies the app is still holding for the view to paint, in order.
+fn bodies_in_flight(app: &Ducktape) -> Vec<&str> {
+    app.chat_pending_sends
+        .iter()
+        .map(|send| send.body.as_str())
+        .collect()
 }
 
 /// A TERM IN THE GUARD THAT THE BUTTON DOES NOT WEAR IS A DEAD CONTROL.
@@ -222,10 +178,11 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
     const HANDLERS: &str = include_str!("../ui/handlers/chat.ice");
     const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
 
-    // The rail's plate is drawn under `if active_thread_seq > 0` and
-    // `open_thread_for` refuses an empty channel, so its re-read may name
-    // both without the mount wearing them — the STRUCTURE shows them.
-    const ANSWERED_BY_THE_MOUNT: [&str; 2] = ["active_thread_seq <= 0", "empty(active_channel)"];
+    // The rail's plate is drawn under the view's own open thread, and the
+    // thread a reply belongs to reaches the app in the SCOPE it was written
+    // in, so the re-read may name both without the mount wearing them — the
+    // structure shows them.
+    const ANSWERED_BY_THE_MOUNT: [&str; 2] = ["thread_seq <= 0", "empty(active_channel)"];
 
     // Arguments split at top-level commas, so `post_gate(a, b)` stays whole.
     fn split_top(source: &str) -> Vec<&str> {
@@ -293,8 +250,10 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
                 .enumerate()
                 .filter_map(|(index, argument)| match index {
                     // busy, connected, channel, refusal, seated — spelled as
-                    // the terms a mount's `blocked=` would carry.
-                    0 => Some(argument.to_owned()),
+                    // the terms a mount's `blocked=` would carry. A literal
+                    // stands for a term the arm deliberately does not have:
+                    // the rail's readiness is the view's, not this plane's.
+                    0 if argument != "false" => Some(argument.to_owned()),
                     1 => Some(format!("!{argument}")),
                     2 => Some(format!("empty({argument})")),
                     3 => Some(format!("!empty({argument})")),
@@ -345,11 +304,7 @@ fn a_resync_never_eats_the_message_being_typed() {
     let composer = composer_scope(&app);
     type_into(&composer, "half a paragraph, mid-word");
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        4,
-        "general",
-        vec![message(7, "somebody else posted", false)],
-        "",
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(4, "general", "",
         Vec::new(),
     )));
 
@@ -359,9 +314,8 @@ fn a_resync_never_eats_the_message_being_typed() {
         "a resync must never eat keystrokes either"
     );
     assert_eq!(
-        app.messages.len(),
-        1,
-        "and it still installs the timeline it answered with"
+        app.active_channel, "general",
+        "and it still installs the room it answered with"
     );
 }
 
@@ -403,9 +357,8 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "private-ops".into();
-    app.active_thread_seq = 3;
     let ops = composer_scope(&app);
-    let ops_rail = reply_composer_scope(&app);
+    let ops_rail = reply_composer_scope(&app, RAIL_THREAD_SEQ);
     type_into(&ops, "the incident started at");
     type_into(&ops_rail, "half a reply");
 
@@ -436,11 +389,11 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
         "it is waiting in the room she was writing it in"
     );
 
-    let _ = app.__update(__DucktapeMessage::OpenThreadFor(3));
     assert_eq!(
         composer_text(&ops_rail),
         "half a reply",
-        "and the rail the reconnect closed kept its reply too"
+        "and the rail the reconnect closed kept its reply too — the box is the \
+         thread's own instance, waiting under its key for the rail to reopen"
     );
 }
 
@@ -476,11 +429,7 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     // and it carries the inline edit's text: nothing is being edited here, so
     // there is no body for it to hand anyone.
     let general = composer_scope(&app);
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "dm-with-alice",
-        Vec::new(),
-        "",
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation, "dm-with-alice", "",
         Vec::new(),
     )));
 
@@ -569,18 +518,17 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         let stream = composer_scope(&app);
         submit(&mut app, ComposerKind::Message, "into the void");
         assert!(
-            app.messages.is_empty(),
+            app.chat_pending_sends.is_empty(),
             "the main composer must refuse a {reason} channel at apply time"
         );
         // The words are still hers — #general's own plate holds what
         // #general's box let go of.
         assert_eq!(composer_stash(&stream), "into the void");
 
-        app.active_thread_seq = 7;
-        let rail = reply_composer_scope(&app);
+        let rail = reply_composer_scope(&app, RAIL_THREAD_SEQ);
         submit(&mut app, ComposerKind::Reply, "into the void");
         assert!(
-            app.thread_messages.is_empty(),
+            app.chat_pending_sends.is_empty(),
             "the reply composer must refuse a {reason} channel at apply time"
         );
         assert_eq!(composer_stash(&rail), "into the void");
@@ -620,15 +568,15 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     );
 
     submit(&mut app, ComposerKind::Message, "hello");
-    assert_eq!(app.messages.len(), 1, "a seated member still posts");
+    assert_eq!(bodies_in_flight(&app), ["hello"], "a seated member posts");
 
-    app.active_thread_seq = 7;
     submit(&mut app, ComposerKind::Reply, "hello back");
     assert_eq!(
-        app.thread_messages.len(),
-        1,
+        bodies_in_flight(&app),
+        ["hello", "hello back"],
         "a seated member still replies"
     );
+    assert_eq!(app.chat_pending_sends[1].thread_seq, RAIL_THREAD_SEQ);
 }
 
 /// A FORMATTING CHORD LANDS IN THE COMPOSER THAT HAS THE CARET, and nothing
@@ -701,9 +649,8 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
     app.loading = false;
     app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
-    app.active_thread_seq = 7;
     let stream = composer_scope(&app);
-    let rail = reply_composer_scope(&app);
+    let rail = reply_composer_scope(&app, RAIL_THREAD_SEQ);
     type_into(&stream, "channel draft");
     type_into(&rail, "reply draft");
 
@@ -805,10 +752,10 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
     assert!(!app.palette_open, "Escape still closes it");
 
-    app.channel_settings_open = true;
+    app.channel_create_open = true;
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
     assert!(
-        !app.channel_settings_open,
+        !app.channel_create_open,
         "and the escape ladder still runs below the guard"
     );
 
@@ -844,7 +791,7 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     let composer = composer_scope(&app);
     type_into(&composer, "retry me");
     submit_composer(&mut app, &composer, ComposerKind::Message, false);
-    let operation_id = app.messages[0].id.clone();
+    let operation_id = app.chat_pending_sends[0].id.clone();
     let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
@@ -858,7 +805,7 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     pump(&mut app, task);
 
     assert_eq!(composer_stash(&composer), "retry me");
-    assert!(app.messages.is_empty());
+    assert!(app.chat_pending_sends.is_empty());
     assert_eq!(app.error, "rejected");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
@@ -869,8 +816,7 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
-    submit(&mut app, ComposerKind::Message, "first");
-    let operation_id = app.messages[0].id.clone();
+    let operation_id = submit(&mut app, ComposerKind::Message, "first");
     let composer = composer_scope(&app);
     type_into(&composer, "second");
     let task = app.__update(__DucktapeMessage::MessageSendFailed(
@@ -943,10 +889,11 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     let general = composer_scope(&app);
     type_into(&general, "the deploy is at 4pm");
     submit_composer(&mut app, &general, ComposerKind::Message, false);
-    let operation_id = app.messages[0].id.clone();
+    let operation_id = app.chat_pending_sends[0].id.clone();
 
     // She switches rooms while the write is in flight, and starts a new message
-    // there. `choose_channel` blanks the timeline; the pending row is gone.
+    // there. `choose_channel` moves the room the view reads; the pending row
+    // goes with it.
     let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
     let random = composer_scope(&app);
     type_into(&random, "different thought");
@@ -980,24 +927,22 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
         "and the box she is typing in is untouched either way"
     );
 
-    // THE SAME HOLE ON THE REPLY PATH, and wider: `close_thread` empties
-    // `thread_messages`, so merely closing the rail under an in-flight reply
-    // made the pending check fail and dropped the failure whole. `thread_seq`
-    // is what carries the reply home once the rail has moved on: the room
-    // alone cannot name which of its threads let the words go.
+    // THE SAME HOLE ON THE REPLY PATH, and wider: closing the rail under an
+    // in-flight reply made the pending check fail and dropped the failure
+    // whole. `thread_seq` is what carries the reply home once the rail has
+    // moved on: the room alone cannot name which of its threads let the words
+    // go, and the rail itself is the view's — the app never sees it close.
     let (mut rail, _) = Ducktape::__boot();
     rail.connected = true;
     rail.loading = false;
     rail.active_channel = "general".into();
-    rail.active_thread_seq = 7;
     // Through the rail's own box, for the reason #general's half is: a sighted
     // instance holds no state until a message reaches it, and a slice delivers
     // only to instances that do.
-    let rail_composer = reply_composer_scope(&rail);
+    let rail_composer = reply_composer_scope(&rail, 7);
     type_into(&rail_composer, "on it");
     submit_composer(&mut rail, &rail_composer, ComposerKind::Reply, false);
-    let reply_id = rail.thread_messages[0].id.clone();
-    let _ = rail.__update(__DucktapeMessage::CloseThread);
+    let reply_id = rail.chat_pending_sends[0].id.clone();
     let task = rail.__update(__DucktapeMessage::ThreadReplySendFailed(
         backend::OptimisticMutationError {
             message: "reply rejected".into(),
@@ -1019,53 +964,6 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     );
 }
 
-/// A PENDING ROW HAS NO SEQ, SO IT CANNOT ANSWER FOR THE TOP OF THE TIMELINE.
-///
-/// `optimistic_message` mints a descending negative seq, which sorts ahead of
-/// every real message. Sorting it numerically into a prepended page put an
-/// in-flight send at the top of months-old scrollback, and `oldest_message_seq`
-/// then handed the loader that `-1` as its cursor — the pending send locked the
-/// reader out of her own history until it settled.
-#[test]
-fn a_pending_send_survives_a_history_page_without_poisoning_it() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-    app.mutation_phase = MutationPhase::Idle;
-    app.active_channel = "general".into();
-    app.messages = vec![message(40, "the oldest loaded root", false)];
-    app.has_older_history = true;
-    submit(&mut app, ComposerKind::Message, "still sending");
-    assert!(app.messages[1].pending, "the send is in flight at the tail");
-
-    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
-    assert!(
-        app.history_loading,
-        "an in-flight send must not block paging"
-    );
-    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        channel_id: "general".into(),
-        messages: vec![message(20, "older", false)],
-        has_more: true,
-    }));
-
-    let ordering: Vec<i64> = app.messages.iter().map(|message| message.seq).collect();
-    assert_eq!(
-        ordering,
-        vec![20, 40, -1],
-        "the page prepends, the pending row stays at the tail"
-    );
-    assert!(
-        app.has_older_history,
-        "seq 20 is not the channel's first message, so `Load older` stays live"
-    );
-    assert_eq!(
-        backend::oldest_message_seq(app.messages.clone()),
-        20,
-        "and the next page is asked for from the oldest COMMITTED row"
-    );
-}
-
 #[test]
 fn committed_mutation_keeps_optimistic_state_until_refresh() {
     let (mut app, _) = Ducktape::__boot();
@@ -1073,8 +971,7 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
-    submit(&mut app, ComposerKind::Message, "committed once");
-    let operation_id = app.messages[0].id.clone();
+    let operation_id = submit(&mut app, ComposerKind::Message, "committed once");
     let composer = composer_scope(&app);
     let _ = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
@@ -1096,12 +993,15 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
         composer_stash(&composer).is_empty(),
         "a COMMITTED body is not unsent — the plate must not offer it back"
     );
-    assert_eq!(app.messages.len(), 1);
-    assert!(app.messages[0].pending);
+    assert_eq!(
+        bodies_in_flight(&app),
+        ["committed once"],
+        "a committed send stays in flight until the read that settles it lands"
+    );
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 
     submit(&mut app, ComposerKind::Message, "still available");
-    assert_eq!(app.messages.len(), 2);
+    assert_eq!(bodies_in_flight(&app), ["committed once", "still available"]);
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
@@ -1110,10 +1010,8 @@ fn committed_message_change_cannot_be_submitted_twice() {
     let (mut app, _) = Ducktape::__boot();
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
-    app.selected_message_seq = 7;
-    app.selected_message_rev = 2;
-    app.message_action = MessageAction::Editing;
-    app.message_edit_draft = "committed edit".into();
+    app.chat_edit_seq = 7;
+    app.chat_edit_rev = 2;
     app.mutation_phase = MutationPhase::MessageEdit;
 
     let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
@@ -1121,10 +1019,8 @@ fn committed_message_change_cannot_be_submitted_twice() {
         committed: true,
     }));
 
-    assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.message_action, MessageAction::Toolbar);
-    assert!(app.message_edit_draft.is_empty());
+    assert_eq!(app.chat_edit_seq, 0);
+    assert_eq!(app.chat_edit_rev, 0);
     assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 }
 
@@ -1152,11 +1048,7 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
     assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 
     // a resync belonging to an abandoned chain answers for nothing
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        app.hydration_generation - 1,
-        "general",
-        Vec::new(),
-        "",
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation - 1, "general", "",
         Vec::new(),
     )));
     assert_eq!(
@@ -1165,11 +1057,7 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
         "a stale answer is not it"
     );
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "general",
-        Vec::new(),
-        "",
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation, "general", "",
         Vec::new(),
     )));
     assert_eq!(
@@ -1262,7 +1150,7 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
     let ops = composer_scope(&app);
     type_into(&ops, "the incident started at");
 
-    let mut created = chat_data("new-channel", Vec::new());
+    let mut created = chat_data("new-channel");
     created.generation = app.chat_generation;
     created.channels = vec![room("private-ops", 10), room("new-channel", 0)];
     let _ = app.__update(__DucktapeMessage::ChannelCreated(created));

@@ -25,16 +25,13 @@ use zeroize::Zeroizing;
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
     CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, append_thread_page,
-    author_display, bounded_chat_window, bounded_thread_window, chat_message,
-    contains_pending_message, handle_char, mark_message_groups, merge_landing_messages,
-    merge_message_send_result, merge_pending_messages, merge_thread_refresh,
-    rollback_pending_message, short_label,
+    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, author_display,
+    chat_message, handle_char, mark_message_groups, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{BoundAccount, THREAD_HOT_WINDOW_LIMIT, author_name, paragraph_blocks};
+pub use ::chat::client::{BoundAccount, author_name, paragraph_blocks};
 pub use inbox::client::{BellDelta, BellItem};
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
@@ -63,8 +60,6 @@ pub struct ChatData {
     /// history, and search reads own separate compiler delivery lanes.
     pub generation: i64,
     pub channels: Vec<ChatChannel>,
-    pub messages: Vec<ChatMessage>,
-    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
@@ -72,13 +67,6 @@ pub struct ChatData {
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
-    pub selected_message_seq: i64,
-    pub selected_message_rev: i64,
-    pub selected_message_body: String,
-    pub active_thread_seq: i64,
-    pub thread_target_seq: i64,
-    pub thread_messages: Vec<ChatMessage>,
-    pub thread_has_more: bool,
 }
 
 /// The submit receipt of an optimistic send: the client-minted operation id
@@ -88,40 +76,6 @@ pub struct ChatData {
 pub struct SendReceipt {
     pub operation_id: String,
     pub channel_id: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub(crate) struct ThreadData {
-    pub root_seq: i64,
-    pub target_seq: i64,
-    pub messages: Vec<ChatMessage>,
-    pub next_reply_seq: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ThreadLoadData {
-    pub generation: i64,
-    pub root_seq: i64,
-    pub target_seq: i64,
-    pub messages: Vec<ChatMessage>,
-    pub next_reply_seq: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ThreadPageData {
-    pub generation: i64,
-    pub messages: Vec<ChatMessage>,
-    pub next_reply_seq: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct LiveThreadData {
-    pub channel_id: String,
-    pub root_seq: i64,
-    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
@@ -235,8 +189,6 @@ pub struct WorkspaceData {
     pub status: String,
     pub height: i64,
     pub channels: Vec<ChatChannel>,
-    pub messages: Vec<ChatMessage>,
-    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
@@ -402,7 +354,7 @@ pub use explorer::*;
 pub use forge::*;
 pub use hub::*;
 pub use live::*;
-pub use load::*;
+pub(crate) use load::*;
 pub use model::*;
 pub use node::*;
 pub use notify::*;

@@ -392,14 +392,10 @@ on network_entered
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-  invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
   invalidate lane=chat_load
   invalidate lane=page_load
-  invalidate lane=history
-  invalidate lane=thread
-  invalidate lane=live_thread
   invalidate lane=block_threads
   invalidate lane=live_resync
   invalidate lane=page_autosave
@@ -421,15 +417,14 @@ on network_entered
   channels = []
   rooms = []
   dm_rows = []
-  messages = []
   // A new network mounts a fresh timeline at its tail — see `state/chat.ice`.
   chat_at_tail = true
-  // The old network's history lane was invalidated above, so a socket that
-  // never answers cannot keep "Load older" disabled in the new network.
-  history_loading = false
+  chat_land_seq = 0
+  chat_pending_sends = []
+  chat_edit_seq = 0
+  chat_edit_rev = 0
   channel_reads = []
   unread_boundary = 0
-  unread_marker_seq = 0
   active_channel = ""
   // Same two readings of the room as `reconnect`, and this one points at a
   // DIFFERENT node: a peer from the network she left names nothing here.
@@ -441,29 +436,13 @@ on network_entered
   active_channel_members_only = false
   channel_members = []
   post_refusal = ""
-  channel_settings_open = false
-  channel_draft = ""
-  selected_message_seq = 0
-  selected_message_rev = 0
-  message_action = MessageAction.toolbar
-  message_edit_draft = ""
   // NO COMPOSER LINES HERE, AND THE NETWORK IS WHY THEY ARE NOT NEEDED: every
   // composer instance keys on `(endpoint, room)` (ducktape-ui#697), so network
   // A's `#general` and network B's `#general` are two instances. The park store
   // this replaced shared one key per channel id and had to be emptied by hand
   // right here, or a sentence typed on one node was handed back on ANOTHER.
-  active_thread_seq = 0
-  thread_target_seq = 0
-  thread_messages = []
-  thread_next_reply_seq = 0
-  thread_has_more = false
-  thread_generation = thread_generation + 1
-  invalidate lane=live_thread
-  thread_loading = false
+  channel_draft = ""
   pending_channel = ""
-  chat_search_hits = []
-  chat_search_phase = SearchPhase.idle
-  chat_search_query = ""
   pages = []
   blocks = []
   active_page = ""

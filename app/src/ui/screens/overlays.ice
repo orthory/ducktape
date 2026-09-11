@@ -13,7 +13,7 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
     dismiss_toast()
     close_palette()
     palette_changed(str)
-    open_chat_search_hit(str, i64, i64)
+    open_chat_search_hit(str, i64)
     open_page_search_hit(str, str)
   stack w=fill h=fill
     // THE CHANNEL MODAL. The artifact picks VISIBILITY here; the chat
@@ -353,7 +353,7 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                             @text-muted
                       col w=fill gap=1.0
                         for hit in chat_hits
-                          button -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
+                          button -> emit(open_chat_search_hit, hit.channel_id, hit.seq)
                             with
                               label="Open message"
                               w=fill

@@ -22,8 +22,6 @@ pub(crate) async fn load_workspace(
         status: tip.status,
         height: tip.height,
         channels: chat.channels,
-        messages: chat.messages,
-        has_older_history: chat.has_older_history,
         active_channel: chat.active_channel,
         active_channel_name: chat.active_channel_name,
         active_channel_archived: chat.active_channel_archived,
@@ -151,44 +149,24 @@ pub(crate) async fn load_chat_data(
     let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
         huddle_roster(&info.channel.huddle, facts.reader())
     });
-    // Both read only the active channel, which is decided above — the member
-    // roll has no business sitting in front of the timeline. `local_user_key`
-    // is awaited before this so the cached identity is warm for both legs
-    // (there is no single-flight; two cold callers would each spawn the CLI).
-    let (channel_members, message_page) = match active_channel.is_empty() {
-        true => (Vec::new(), RootPage::default()),
-        false => tokio::try_join!(
-            load_channel_members(rpc, &active_channel, facts.names()),
-            load_messages(rpc, &active_channel)
-        )?,
+    // NO TIMELINE. The chat view reads its own room's messages off the index;
+    // what the app still needs of a room is its record, its huddle roster and
+    // its member roll — the roster the call's media leg hangs on, and the roll
+    // the composers complete mentions against.
+    let channel_members = match active_channel.is_empty() {
+        true => Vec::new(),
+        false => load_channel_members(rpc, &active_channel, facts.names()).await?,
     };
     Ok(ChatData {
         generation: 0,
         channels,
-        messages: message_page.messages,
-        has_older_history: message_page.has_more,
         active_channel,
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,
         huddle_roster,
         channel_members,
-        selected_message_seq: 0,
-        selected_message_rev: 0,
-        selected_message_body: String::new(),
-        active_thread_seq: 0,
-        thread_target_seq: 0,
-        thread_messages: Vec::new(),
-        thread_has_more: false,
     })
-}
-
-/// Which rows a channel window opens on: the live tail, or a page centred on
-/// one older message a search hit named.
-#[derive(Clone, Copy)]
-pub(crate) enum MessageWindow {
-    Tail,
-    Around(u64),
 }
 
 /// One channel's row and its huddle roster, read from the index view. The
@@ -246,10 +224,10 @@ pub(crate) async fn load_channel_facts(
 /// re-paging it put a whole extra round trip — more on a workspace past one
 /// page — in front of the first row the reader was waiting for.
 ///
-/// What is left is three INDEPENDENT reads: the channel's own row (for the
-/// huddle roster), the member roll, and the messages. They run concurrently,
-/// so a switch costs one round trip: the timeline leg is one root-index page,
-/// independent of the number of replies in the channel.
+/// What is left is two INDEPENDENT reads: the channel's own row (for the
+/// huddle roster) and the member roll. They run concurrently, so a switch
+/// costs one round trip — and no timeline: the chat view reads its own room's
+/// messages off the index, on the kernel contract.
 ///
 /// The answer CARRIES BACK ONLY THE ROW THIS REFRESHED. Handing the pre-click
 /// channel snapshot back would have the reducer revert every delta the live
@@ -270,27 +248,14 @@ pub(crate) async fn load_channel_facts(
 pub(crate) async fn load_channel_window_data(
     rpc: &RpcClient,
     channel_id: &str,
-    window: MessageWindow,
 ) -> Result<ChatData, String> {
     // Awaited before the fan-out so the cached identity is warm for every leg:
-    // there is no single-flight, and three cold callers would each spawn the
-    // CLI. Same reason `load_chat_data` awaits it above its own join.
+    // there is no single-flight, and two cold callers would each spawn the
+    // CLI. Same reason `load_chat_data` awaits it above its own read.
     let facts = ReaderFacts::current().await;
-    let messages_leg = async {
-        match window {
-            MessageWindow::Tail => load_messages(rpc, channel_id).await,
-            MessageWindow::Around(seq) => {
-                let messages = load_messages_around(rpc, channel_id, seq).await?;
-                let floor = oldest_committed(&messages).map_or(0, |message| message.seq);
-                let has_more = older_roots_exist(rpc, channel_id, floor).await?;
-                Ok(RootPage { messages, has_more })
-            }
-        }
-    };
-    let (room, channel_members, message_page) = tokio::try_join!(
+    let (room, channel_members) = tokio::try_join!(
         load_channel_facts(rpc, channel_id, facts.reader()),
-        load_channel_members(rpc, channel_id, facts.names()),
-        messages_leg
+        load_channel_members(rpc, channel_id, facts.names())
     )?;
     let Some((channel, huddle_roster)) = room else {
         return load_chat_data(rpc, None).await;
@@ -298,21 +263,12 @@ pub(crate) async fn load_channel_window_data(
     Ok(ChatData {
         generation: 0,
         channels: vec![channel.clone()],
-        messages: message_page.messages,
-        has_older_history: message_page.has_more,
         active_channel: channel.id,
         active_channel_name: channel.name,
         active_channel_archived: channel.archived,
         active_channel_members_only: channel.members_only,
         huddle_roster,
         channel_members,
-        selected_message_seq: 0,
-        selected_message_rev: 0,
-        selected_message_body: String::new(),
-        active_thread_seq: 0,
-        thread_target_seq: 0,
-        thread_messages: Vec::new(),
-        thread_has_more: false,
     })
 }
 
@@ -369,134 +325,15 @@ pub(crate) fn member_id(user: &str) -> &str {
     user.strip_prefix("user:").unwrap_or(user)
 }
 
-pub async fn load_older_messages(
-    rpc: String,
-    channel_id: String,
-    before_seq: i64,
-) -> Result<HistoryPageData, AppError> {
-    let result = async {
-        let rpc = rpc_client(&rpc)?;
-        let before = u64::try_from(before_seq).unwrap_or(0);
-        let page = query_roots(&rpc, &channel_id, Some(before)).await?;
-        let facts = ReaderFacts::current().await;
-        let messages: Vec<ChatMessage> = page
-            .roots
-            .into_iter()
-            .map(|row| chat_message(row, facts.reader()))
-            .collect();
-        Ok((messages, page.has_more))
-    }
-    .await;
-    result
-        .map(|(messages, has_more)| HistoryPageData {
-            channel_id,
-            messages,
-            has_more,
-        })
-        .map_err(app_error)
-}
-
-pub(crate) async fn load_messages_around(
-    rpc: &RpcClient,
-    channel_id: &str,
-    seq: u64,
-) -> Result<Vec<ChatMessage>, String> {
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::MessagesAround {
-                channel_id: channel_id.to_string(),
-                seq,
-                limit: Some(CHAT_VIEW_PAGE_LIMIT),
-            },
-        )
-        .await?;
-    let ChatViewReply::Messages(rows) = reply else {
-        return Err("node returned an invalid message window".into());
-    };
-    let facts = ReaderFacts::current().await;
-    Ok(rows
-        .into_iter()
-        .filter(|row| row.thread.is_none())
-        .map(|row| chat_message(row, facts.reader()))
-        .collect())
-}
-
-pub(crate) async fn load_message_at(
-    rpc: &RpcClient,
-    channel_id: &str,
-    seq: u64,
-) -> Result<MsgRow, String> {
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::MessagesAround {
-                channel_id: channel_id.to_string(),
-                seq,
-                limit: Some(1),
-            },
-        )
-        .await?;
-    let ChatViewReply::Messages(rows) = reply else {
-        return Err("node returned an invalid message window".into());
-    };
-    rows.into_iter()
-        .find(|row| row.seq == seq)
-        .ok_or_else(|| "message was not found".into())
-}
-
-#[derive(Default)]
-pub(crate) struct RootPage {
-    pub(crate) messages: Vec<ChatMessage>,
-    pub(crate) has_more: bool,
-}
-
-struct RootRows {
-    roots: Vec<MsgRow>,
-    has_more: bool,
-}
-
-/// IS THERE ANY ROOT OLDER THAN `floor` — the server's answer, for a window the
-/// server was never asked to page.
-///
-/// The tail and older-page loads carry the index's own `has_more` back with
-/// them. A search-hit window does not: `MessagesAround` is a slice centred on
-/// one message and says nothing about what lies before it, and the guess that
-/// stood in for it — "the oldest row's seq is greater than 1" — is wrong on
-/// every real channel. Root sequences have HOLES: a thread reply consumes a seq
-/// without ever becoming a root, so the first message in a busy channel can sit
-/// at seq 40 and "Load older messages" stood forever over a timeline with
-/// nothing older, paging an empty answer on every click.
-///
-/// One root before the floor is the whole question, so the page is one row.
-async fn older_roots_exist(rpc: &RpcClient, channel_id: &str, floor: i64) -> Result<bool, String> {
-    let Ok(floor) = u64::try_from(floor) else {
-        return Ok(false);
-    };
-    if floor == 0 {
-        return Ok(false);
-    }
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::Roots {
-                channel_id: channel_id.to_string(),
-                before_seq: Some(floor),
-                limit: Some(1),
-            },
-        )
-        .await?;
-    let ChatViewReply::Roots { roots, .. } = reply else {
-        return Err("node returned an invalid root page".into());
-    };
-    Ok(!roots.is_empty())
-}
-
+/// ONE ROOT-INDEX PAGE, with the cursor the node handed back verified against
+/// the rows it came with. The chat TAB reads its own windows now; what is left
+/// on this side is the forge item's discussion, which is a channel's newest
+/// page and nothing else.
 async fn query_roots(
     rpc: &RpcClient,
     channel_id: &str,
     before_seq: Option<u64>,
-) -> Result<RootRows, String> {
+) -> Result<Vec<MsgRow>, String> {
     let reply: ChatViewReply = rpc
         .view(
             "chat",
@@ -534,225 +371,21 @@ async fn query_roots(
     {
         return Err("node returned an invalid root cursor".into());
     }
-    Ok(RootRows { roots, has_more })
+    Ok(roots)
 }
 
-pub(crate) async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<RootPage, String> {
-    let page = query_roots(rpc, channel_id, None).await?;
+pub(crate) async fn load_messages(
+    rpc: &RpcClient,
+    channel_id: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    let roots = query_roots(rpc, channel_id, None).await?;
     let facts = ReaderFacts::current().await;
-    let mut messages: Vec<ChatMessage> = page
-        .roots
+    let mut messages: Vec<ChatMessage> = roots
         .into_iter()
         .map(|row| chat_message(row, facts.reader()))
         .collect();
     mark_message_groups(&mut messages);
-    Ok(RootPage {
-        messages,
-        has_more: page.has_more,
-    })
-}
-
-/// One page of older history, returned with the channel that requested it.
-/// The compiler-owned `history` lane drops superseded replies; the channel
-/// identity still guards a page whose room changed without another history run.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct HistoryPageData {
-    pub channel_id: String,
-    pub messages: Vec<ChatMessage>,
-    pub has_more: bool,
-}
-
-/// The oldest COMMITTED row — the only kind that answers for history.
-///
-/// A pending optimistic row carries a negative seq, which sorts ahead of every
-/// real message. Reading `first()` blindly made an in-flight send answer for
-/// the top of the timeline: `oldest_message_seq` handed the loader a `-1` that
-/// floors to an empty server cursor.
-fn oldest_committed(messages: &[ChatMessage]) -> Option<&ChatMessage> {
-    messages.iter().find(|message| !message.pending)
-}
-
-/// The seq of the oldest loaded root (the ceiling for the next older page).
-pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
-    oldest_committed(&messages).map_or(0, |message| message.seq)
-}
-
-/// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
-/// oldest-first, and re-grouped so the seam between pages regroups correctly.
-///
-/// Pending rows are partitioned out and re-appended at the tail, exactly as
-/// [`merge_message_send_result`] does: they have no seq to sort by, and sorting
-/// them numerically hoisted an in-flight send to the top of a months-old
-/// scrollback.
-pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    const SEAM_ROWS: usize = 64;
-
-    let (mut pending, committed): (Vec<ChatMessage>, Vec<ChatMessage>) =
-        messages.into_iter().partition(|message| message.pending);
-    let known: BTreeSet<i64> = committed.iter().map(|message| message.seq).collect();
-    let mut older: Vec<ChatMessage> = older
-        .into_iter()
-        .filter(|message| !message.pending && !known.contains(&message.seq))
-        .collect();
-    older.sort_by_key(|message| message.seq);
-
-    if pending.len() > CHAT_HOT_WINDOW_LIMIT {
-        pending.drain(..pending.len() - CHAT_HOT_WINDOW_LIMIT);
-    }
-    let committed_limit = CHAT_HOT_WINDOW_LIMIT.saturating_sub(pending.len());
-    let seam_rows = committed.len().min(SEAM_ROWS).min(committed_limit);
-    let older_limit = committed_limit - seam_rows;
-    if older.len() > older_limit {
-        older.drain(..older.len() - older_limit);
-    }
-
-    // Keep the oldest edge of the old window beside the newest edge of the
-    // page just loaded. This retains several viewports across the prepend
-    // seam, while the next cursor still starts at the first retained row and
-    // can reach every row discarded from the older edge on its next walk.
-    let mut merged = older;
-    let current_limit = committed_limit - merged.len();
-    merged.extend(committed.into_iter().take(current_limit));
-    merged.extend(pending);
-    mark_message_groups(&mut merged);
-    merged
-}
-
-/// One cursor page of a thread. The view already exposes the exact server
-/// cursor; fetching the complete run and slicing it locally made page N
-/// re-download pages 0..N-1.
-pub(crate) struct ThreadPage {
-    pub(crate) root: MsgRow,
-    pub(crate) replies: Vec<MsgRow>,
-    pub(crate) has_more: bool,
-    pub(crate) next_reply_seq: Option<u64>,
-}
-
-pub(crate) async fn query_thread_page(
-    rpc: &RpcClient,
-    channel_id: &str,
-    root_seq: u64,
-    after_reply_seq: Option<u64>,
-) -> Result<ThreadPage, String> {
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::Thread {
-                channel_id: channel_id.to_string(),
-                root_seq,
-                after_reply_seq,
-                limit: Some(CHAT_VIEW_PAGE_LIMIT),
-            },
-        )
-        .await?;
-    let ChatViewReply::Thread {
-        root,
-        replies,
-        has_more,
-        next_reply_seq,
-    } = reply
-    else {
-        return Err("thread was not found".into());
-    };
-    let root = root.ok_or_else(|| "thread was not found".to_string())?;
-    let expected_cursor = if has_more {
-        replies.last().map(|row| row.seq)
-    } else {
-        None
-    };
-    let replies_are_strictly_ordered = replies.windows(2).all(|pair| pair[0].seq < pair[1].seq);
-    let replies_follow_request =
-        after_reply_seq.is_none_or(|after| replies.iter().all(|row| row.seq > after));
-    let replies_belong_to_root = replies.iter().all(|row| row.thread == Some(root_seq));
-    let page_has_a_cursor_source = !has_more || !replies.is_empty();
-    let cursor_is_valid = next_reply_seq == expected_cursor;
-    if root.thread.is_some()
-        || !replies_are_strictly_ordered
-        || !replies_follow_request
-        || !replies_belong_to_root
-        || !page_has_a_cursor_source
-        || !cursor_is_valid
-    {
-        return Err("node returned an invalid thread cursor".into());
-    }
-    Ok(ThreadPage {
-        root,
-        replies,
-        has_more,
-        next_reply_seq,
-    })
-}
-
-pub(crate) async fn load_target_thread_data(
-    rpc: &RpcClient,
-    channel_id: &str,
-    root_seq: u64,
-    target_seq: u64,
-) -> Result<ThreadData, String> {
-    let target = load_message_at(rpc, channel_id, target_seq).await?;
-    if target.thread != Some(root_seq) {
-        return Err("search result does not belong to the selected thread".into());
-    }
-    let mut thread = load_thread_data(rpc, channel_id, root_seq).await?;
-    let facts = ReaderFacts::current().await;
-    // Keep the conversation contiguous, including the page after a target
-    // at a page boundary. The cursor still offers any remaining replies.
-    while thread.has_more && thread.next_reply_seq <= number_i64(target_seq) {
-        let page = query_thread_page(
-            rpc,
-            channel_id,
-            root_seq,
-            Some(thread.next_reply_seq as u64),
-        )
-        .await?;
-        thread.messages.extend(
-            page.replies
-                .into_iter()
-                .map(|row| chat_message(row, facts.reader())),
-        );
-        thread.next_reply_seq = number_i64(page.next_reply_seq.unwrap_or(0));
-        thread.has_more = page.has_more;
-    }
-    mark_message_groups(&mut thread.messages[1..]);
-    thread.target_seq = number_i64(target_seq);
-    Ok(thread)
-}
-
-pub(crate) async fn load_thread_data(
-    rpc: &RpcClient,
-    channel_id: &str,
-    root_seq: u64,
-) -> Result<ThreadData, String> {
-    if channel_id.is_empty() || root_seq == 0 {
-        return Ok(ThreadData {
-            root_seq: 0,
-            target_seq: 0,
-            messages: Vec::new(),
-            next_reply_seq: 0,
-            has_more: false,
-        });
-    }
-
-    let thread = query_thread_page(rpc, channel_id, root_seq, None).await?;
-    let facts = ReaderFacts::current().await;
-    let root = chat_message(thread.root, facts.reader());
-    let mut replies: Vec<ChatMessage> = thread
-        .replies
-        .into_iter()
-        .map(|row| chat_message(row, facts.reader()))
-        .collect();
-    // The rail draws the stream's run rhythm now, so replies group the same
-    // way — but the ROOT renders as its own divided block, so the run starts
-    // at the first reply rather than folding it under the root's author.
-    mark_message_groups(&mut replies);
-    let messages = std::iter::once(root).chain(replies).collect();
-    Ok(ThreadData {
-        root_seq: number_i64(root_seq),
-        target_seq: 0,
-        messages,
-        next_reply_seq: number_i64(thread.next_reply_seq.unwrap_or(0)),
-        has_more: thread.has_more,
-    })
+    Ok(messages)
 }
 
 /// ONE THREAD WITH ITS WHOLE CONVERSATION. The grouped page query already
