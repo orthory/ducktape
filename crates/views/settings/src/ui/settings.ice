@@ -13,7 +13,7 @@ enum SettingsPane
   account
   security
 
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
   emits
     show_tab(str)
     reconnect()
@@ -477,7 +477,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         with
                           label="New display name"
                           hint="rename account…"
-                          disabled=account_renaming
+                          disabled=account_busy
                           w=150.0
                           p=5.0
                           text-size=13.0
@@ -488,7 +488,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         disabled bg=muted_bg/54 value=muted
                       button "Rename" -> emit(account_rename_submit)
                         with
-                          disabled=(account_renaming || empty(trim(account_name_draft)))
+                          disabled=(account_busy || empty(trim(account_name_draft)))
                           p=5.0
                           @secondary_action
                     // NO ACCOUNT YET: this key founds one, or joins one another
