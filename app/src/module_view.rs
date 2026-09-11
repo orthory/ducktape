@@ -6496,6 +6496,7 @@ pub(crate) mod tests {
             editor: Option<Rectangle>,
             focused: bool,
             post: Option<Rectangle>,
+            card_text: Option<Rectangle>,
         }
         impl Operation for Bounds {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -6513,6 +6514,9 @@ pub(crate) mod tests {
                 }
             }
             fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "No comments yet" {
+                    self.card_text = Some(bounds);
+                }
                 if text == "Post" {
                     self.post = Some(bounds);
                 }
@@ -6548,6 +6552,7 @@ pub(crate) mod tests {
                 editor: None,
                 focused: false,
                 post: None,
+                card_text: None,
             };
             ui.operate(&renderer, &mut bounds);
             let editor = bounds.editor.expect("document editor");
@@ -6561,8 +6566,9 @@ pub(crate) mod tests {
                 "comments must not resize or move the document"
             );
             let post = bounds.post.expect("floating Post button").center();
+            let card_point = bounds.card_text.expect("comment card content").center();
             assert!(
-                editor.contains(post),
+                editor.contains(card_point),
                 "comments must overlap the document, not dock beside it"
             );
             let key = "PagesView/root/pages/document";
@@ -6572,6 +6578,25 @@ pub(crate) mod tests {
                 .unwrap()
                 .reference()
                 .cursor;
+            let mut covered = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(card_point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut covered,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                !bounds.focused,
+                "the card must shield the covered editor from clicks"
+            );
+            for output in covered {
+                guest.deliver(output);
+            }
             let mut outputs = Vec::new();
             ui.update(
                 &[

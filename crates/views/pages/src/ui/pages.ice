@@ -643,27 +643,10 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                   shadow-y=8.0
                   shadow-blur=24.0
                 EmptyPlate message="No pages matched that search."
-          // COMMENTS FLOAT OVER THE DOCUMENT; THEY DO NOT DOCK BESIDE IT. A
-          // rail took its width off the document for as long as it stayed
-          // open, so pressing a count reflowed every line the reader was
-          // reading. This card drops over the right edge of the page instead
-          // and the document keeps its width and its place underneath.
-          //
-          // DECLARED AFTER THE DOCUMENT ARM, for the same reason as the two
-          // search floats above — a stack draws its layers in declaration
-          // order, first at the BOTTOM, so declared earlier the card would
-          // paint under the text it covers and the editor would own the
-          // pointer straight through it.
-          //
-          // NOT AN `overlay`: an overlay layer rides a backdrop that eats
-          // every press outside it, and comments are read WHILE the document
-          // is read and typed in. The page underneath stays live and only the
-          // × closes the card — which is also why `escape_target` gives it no
-          // rung, the compose field holds a half-typed draft.
-          //
-          // 340 FIXED, not a fraction: ice has no `max-w=fill`, and the
-          // console never gets narrow enough to want one — `min-size 1040`
-          // leaves this pane 734px, and the `clip=true` stack is the backstop.
+          // A stack layer keeps the document's size and scroll position.
+          // Only the card intercepts the pointer: its idle cursor shields
+          // blank areas from the editor below while child controls keep theirs.
+          // The positioning box has no backdrop, so the rest of the page stays live.
           if connected && !empty(active_page) && block_comments_open
             box
               with
@@ -671,187 +654,188 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                 h=fill
                 p=16.0
                 align-x=end
-              box
-                with
-                  w=340.0
-                  h=fill
-                  bg=elevated
-                  r=12.0
-                  shadow=shadow_popover
-                  shadow-y=8.0
-                  shadow-blur=24.0
-                  border=separator
-                  border-w=1.0
-                  clip=true
-                col w=fill h=fill
-                  box
-                    with
-                      w=fill
-                      h=50.0
-                      pl=16.0
-                      pr=16.0
-                    row
+              mouse cursor=idle
+                box
+                  with
+                    w=340.0
+                    h=fill
+                    bg=elevated
+                    r=12.0
+                    shadow=shadow_popover
+                    shadow-y=8.0
+                    shadow-blur=24.0
+                    border=separator
+                    border-w=1.0
+                    clip=true
+                  col w=fill h=fill
+                    box
+                      with
+                        w=fill
+                        h=50.0
+                        pl=16.0
+                        pr=16.0
+                      row
+                        with
+                          w=fill
+                          h=fill
+                          gap=18.0
+                          align=center
+                        TabLabel
+                          with
+                            label="Comments"
+                            count=thread_total
+                            active=true
+                        space w=fill
+                        button -> emit(close_block_comments)
+                          with
+                            label="Close comments"
+                            disabled=(busy)
+                            w=24.0
+                            h=24.0
+                            p=4.0
+                            @icon_action
+                          box
+                            with
+                              w=fill
+                              h=fill
+                              align-x=center
+                              align-y=center
+                            text "×"
+                              with
+                                size=13.0
+                                wrap=none
+                                @text-muted
+                          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+                          hovered bg=subtle text=fg
+                          pressed bg=separator text=fg
+                    box
+                      with
+                        w=fill
+                        h=1.0
+                        bg=separator
+                      space w=1.0 h=1.0
+                    col
                       with
                         w=fill
                         h=fill
-                        gap=18.0
-                        align=center
-                      TabLabel
-                        with
-                          label="Comments"
-                          count=thread_total
-                          active=true
-                      space w=fill
-                      button -> emit(close_block_comments)
-                        with
-                          label="Close comments"
-                          disabled=(busy)
-                          w=24.0
-                          h=24.0
-                          p=4.0
-                          @icon_action
-                        box
+                        p=12.0
+                        gap=6.0
+                      if empty(active_thread)
+                        scroll
                           with
+                            dir=vertical
                             w=fill
                             h=fill
-                            align-x=center
-                            align-y=center
-                          text "×"
+                          col w=fill gap=1.0
+                            if empty(comment_rows) && !threads_loading
+                              text "No comments yet"
+                                with
+                                  w=fill
+                                  size=12.5
+                                  align-x=center
+                                  @text-muted
+                            for comment_row in comment_rows
+                              PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
+                                forward
+                                  open_block_comment_thread
+                            if threads_has_more
+                              button "More" -> emit(load_more_block_threads)
+                                with
+                                  disabled=(threads_loading || busy)
+                                  p=4.0
+                                  @secondary_action text-11px leading-snug font-medium
+                                active bg=transparent text=muted r=6.0
+                                hovered bg=fg/9 text=fg
+                                pressed bg=fg/14
+                      if !empty(active_thread)
+                        row
+                          with
+                            w=fill
+                            gap=5.0
+                            align=center
+                          button "← Threads" -> emit(close_block_comment_thread)
                             with
-                              size=13.0
+                              disabled=(comments_loading || busy)
+                              p=4.0
+                              @secondary_action text-11px leading-snug font-medium
+                            active bg=transparent text=muted r=6.0
+                            hovered bg=fg/9 text=fg
+                            pressed bg=fg/14
+                          text active_thread_anchor
+                            with
+                              w=fill
+                              size=10.5
                               wrap=none
-                              @text-muted
-                        active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                        hovered bg=subtle text=fg
-                        pressed bg=separator text=fg
-                  box
-                    with
-                      w=fill
-                      h=1.0
-                      bg=separator
-                    space w=1.0 h=1.0
-                  col
-                    with
-                      w=fill
-                      h=fill
-                      p=12.0
-                      gap=6.0
-                    if empty(active_thread)
-                      scroll
-                        with
-                          dir=vertical
-                          w=fill
-                          h=fill
-                        col w=fill gap=1.0
-                          if empty(comment_rows) && !threads_loading
-                            text "No comments yet"
+                              font=code_medium
+                              @text-hint
+                          if !thread_resolved
+                            button "Resolve" -> emit(resolve_thread_submit, true)
                               with
-                                w=fill
-                                size=12.5
-                                align-x=center
-                                @text-muted
-                          for comment_row in comment_rows
-                            PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
-                              forward
-                                open_block_comment_thread
-                          if threads_has_more
-                            button "More" -> emit(load_more_block_threads)
-                              with
-                                disabled=(threads_loading || busy)
+                                disabled=(busy)
                                 p=4.0
                                 @secondary_action text-11px leading-snug font-medium
                               active bg=transparent text=muted r=6.0
                               hovered bg=fg/9 text=fg
                               pressed bg=fg/14
-                    if !empty(active_thread)
-                      row
-                        with
-                          w=fill
-                          gap=5.0
-                          align=center
-                        button "← Threads" -> emit(close_block_comment_thread)
+                          if thread_resolved
+                            button "Reopen" -> emit(resolve_thread_submit, false)
+                              with
+                                disabled=(busy)
+                                p=4.0
+                                @secondary_action text-11px leading-snug font-medium
+                              active bg=transparent text=muted r=6.0
+                              hovered bg=fg/9 text=fg
+                              pressed bg=fg/14
+                        scroll
                           with
-                            disabled=(comments_loading || busy)
-                            p=4.0
-                            @secondary_action text-11px leading-snug font-medium
-                          active bg=transparent text=muted r=6.0
-                          hovered bg=fg/9 text=fg
-                          pressed bg=fg/14
-                        text active_thread_anchor
+                            dir=vertical
+                            w=fill
+                            h=fill
+                          col w=fill gap=1.0
+                            for page_comment in comments
+                              PageCommentCard comment=page_comment
+                            if comments_has_more
+                              button "More" -> emit(load_more_block_comments)
+                                with
+                                  disabled=(comments_loading || busy)
+                                  p=4.0
+                                  @secondary_action text-11px leading-snug font-medium
+                                active bg=transparent text=muted r=6.0
+                                hovered bg=fg/9 text=fg
+                                pressed bg=fg/14
+                      if empty(active_thread)
+                        text compose_hint
                           with
                             w=fill
                             size=10.5
                             wrap=none
                             font=code_medium
                             @text-hint
-                        if !thread_resolved
-                          button "Resolve" -> emit(resolve_thread_submit, true)
-                            with
-                              disabled=(busy)
-                              p=4.0
-                              @secondary_action text-11px leading-snug font-medium
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/9 text=fg
-                            pressed bg=fg/14
-                        if thread_resolved
-                          button "Reopen" -> emit(resolve_thread_submit, false)
-                            with
-                              disabled=(busy)
-                              p=4.0
-                              @secondary_action text-11px leading-snug font-medium
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/9 text=fg
-                            pressed bg=fg/14
-                      scroll
-                        with
-                          dir=vertical
-                          w=fill
-                          h=fill
-                        col w=fill gap=1.0
-                          for page_comment in comments
-                            PageCommentCard comment=page_comment
-                          if comments_has_more
-                            button "More" -> emit(load_more_block_comments)
-                              with
-                                disabled=(comments_loading || busy)
-                                p=4.0
-                                @secondary_action text-11px leading-snug font-medium
-                              active bg=transparent text=muted r=6.0
-                              hovered bg=fg/9 text=fg
-                              pressed bg=fg/14
-                    if empty(active_thread)
-                      text compose_hint
+                      row
                         with
                           w=fill
-                          size=10.5
-                          wrap=none
-                          font=code_medium
-                          @text-hint
-                    row
-                      with
-                        w=fill
-                        gap=5.0
-                        align=center
-                      input "" #page-comment(active_page) <-> block_comment_draft
-                        with
-                          label="New page comment"
-                          hint="Add a comment…"
-                          disabled=(busy || threads_loading || comments_loading)
-                          submit=emit(post_block_comment_submit)
-                          w=fill
-                          p=6.2
-                          text-size=13.0
-                          line-h=1.2
-                          @control
-                        active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                        hovered bg=fg/4 border=fg/11
-                        focused bg=fg/4 border=ring
-                        disabled value=muted
-                      button "Post" #post -> emit(post_block_comment_submit)
-                        with
-                          disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
-                          p=5.0
-                          @primary_action
+                          gap=5.0
+                          align=center
+                        input "" #page-comment(active_page) <-> block_comment_draft
+                          with
+                            label="New page comment"
+                            hint="Add a comment…"
+                            disabled=(busy || threads_loading || comments_loading)
+                            submit=emit(post_block_comment_submit)
+                            w=fill
+                            p=6.2
+                            text-size=13.0
+                            line-h=1.2
+                            @control
+                          active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                          hovered bg=fg/4 border=fg/11
+                          focused bg=fg/4 border=ring
+                          disabled value=muted
+                        button "Post" #post -> emit(post_block_comment_submit)
+                          with
+                            disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
+                            p=5.0
+                            @primary_action
           // THE ACTIONS MENU, hanging under the header's `⋯`. It is an
           // `overlay` and not a floating box for the reason the modal below
           // carries: only an overlay takes the pointer, so pressing anywhere

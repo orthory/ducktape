@@ -534,6 +534,7 @@ fn block_comments_float_a_card_over_the_document() {
         .1;
     let mut opening = card.lines().map(str::trim);
     assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0 align-x=end"));
+    assert_eq!(opening.next(), Some("mouse cursor=idle"));
     assert_eq!(
         opening.next(),
         Some(
