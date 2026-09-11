@@ -1,5 +1,9 @@
-//! `ducktape collab` — the operator's seam onto a collaboration conversation:
-//! attach a personal provider session to it, and read its protected state.
+//! `ducktape collab` — the operator's seam onto agent messaging over a chat
+//! channel: attach a personal provider session to it, ask for a delivery,
+//! report one, and read the module's protected state.
+//!
+//! A participant is a chat party, spelled as a handle everywhere on this CLI:
+//! `acct:<number>` for an account, `key:<hex>` for a bare signing key.
 //!
 //! ## the whole design, in one sentence
 //!
@@ -9,7 +13,7 @@
 //!
 //! ## why an attachment is a chain write and not a session
 //!
-//! A binding names WHICH conversation a device will receive, and it has to
+//! A binding names WHICH channel a device will receive, and it has to
 //! outlive every process involved — that is the difference between a mailbox
 //! and a terminal. The interactive plane cannot hold one: `agent-service`'s
 //! `Sessions::close_all` ends every live pty the moment the daemon's ws link to
@@ -72,10 +76,11 @@ pub(crate) enum CollabCmd {
     /// this device's scoped service key for one binding: mint it if absent,
     /// then print its PUBLIC half for the `Bind` that authorizes it
     Key(KeyArgs),
-    /// attach this device to a conversation: mint the scoped service key and
+    /// attach this device to a chat channel: mint the scoped service key and
     /// submit the OWNER-signed `Bind` that authorizes it
     Attach(AttachArgs),
-    /// send one message, signed by the binding's scoped service key
+    /// post one chat message and ask that it be delivered to one recipient,
+    /// both signed by the binding's scoped service key
     Send(SendArgs),
     /// report a delivery state for one message, signed by the scoped key
     Ack(AckArgs),
@@ -89,9 +94,11 @@ pub(crate) enum CollabCmd {
 /// scoped by anything.
 #[derive(Debug, clap::Args)]
 pub(crate) struct AttachArgs {
+    /// the chat channel this attachment will receive
     #[arg(long, value_name = "ID")]
-    conversation: String,
-    #[arg(long, value_name = "ID")]
+    channel: String,
+    /// the participant this device is attaching for: `acct:<n>` or `key:<hex>`
+    #[arg(long, value_name = "HANDLE")]
     participant: String,
     /// an opaque label for this device, for a human reading the roster. NEVER
     /// a socket path, a url or a provider session id — a device label is
@@ -99,36 +106,32 @@ pub(crate) struct AttachArgs {
     #[arg(long, value_name = "LABEL")]
     device: String,
     /// the credential being REPLACED: 0 for a first attachment, otherwise the
-    /// current `binding_credential` from `Access`. A mismatch is refused, which
-    /// is what stops two devices both claiming the one input binding.
+    /// current `credential` from the `Binding` read. A mismatch is refused,
+    /// which is what stops two devices both claiming the one input binding.
     #[arg(long, value_name = "N", default_value_t = 0)]
     expect: u64,
 }
 
-/// `collab send` — one message, under the binding's scoped credential.
+/// `collab send` — one chat message, and the request that it be delivered.
 #[derive(Debug, clap::Args)]
 pub(crate) struct SendArgs {
+    /// the chat channel the message is posted in
     #[arg(long, value_name = "ID")]
-    conversation: String,
-    /// the participant this device is sending AS. Checked against the
-    /// authenticated origin: naming somebody else sends nothing.
-    #[arg(long, value_name = "ID")]
+    channel: String,
+    /// the participant whose binding this device holds — it selects the scoped
+    /// key that signs both the post and the delivery request.
+    #[arg(long, value_name = "HANDLE")]
     participant: String,
-    #[arg(long, value_name = "ID")]
+    /// the recipient: `acct:<n>` or `key:<hex>`
+    #[arg(long, value_name = "HANDLE")]
     to: String,
     #[arg(long, value_enum, default_value_t = Kind::Notice)]
     kind: Kind,
-    /// the credential this send authenticates under — the binding's
-    /// `binding_credential` from `Access`.
-    #[arg(long, value_name = "N")]
-    credential: u64,
-    /// the monotonic sequence within that credential.
-    ///
-    /// Explicit on purpose: the SENDER SERVICE owns this counter, and a CLI
-    /// that minted its own would race the attached daemon's and burn ids under
-    /// the same credential. Read the last one back with the `send_state` query.
-    #[arg(long, value_name = "N")]
-    seq: u64,
+    /// the chat message id to post under. Minted at random when absent; name
+    /// one to retry a post the network may already hold — chat refuses a
+    /// second body under the same id, and the delivery request is idempotent.
+    #[arg(long, value_name = "ID")]
+    message_id: Option<String>,
     /// how long this message stays deliverable, as a seconds INTENT converted
     /// into the network's own `consensus_time` unit — never a laptop clock.
     ///
@@ -175,13 +178,14 @@ pub(crate) enum AckState {
 /// `collab ack` — the bound service reports a delivery state.
 #[derive(Debug, clap::Args)]
 pub(crate) struct AckArgs {
+    /// the chat channel the message sits in
     #[arg(long, value_name = "ID")]
-    conversation: String,
+    channel: String,
     /// the participant whose binding this device holds — it selects the scoped
     /// key that signs, and the module checks that key against the binding.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "HANDLE")]
     participant: String,
-    /// the conversation sequence of the message being reported on
+    /// the channel sequence of the message being reported on
     #[arg(long, value_name = "N")]
     seq: u64,
     /// the binding credential this report is made under. A stale one is
@@ -199,11 +203,11 @@ pub(crate) struct AckArgs {
 /// Names one binding — the pair the module keys a `Binding` on.
 #[derive(Debug, clap::Args)]
 pub(crate) struct KeyArgs {
-    /// the conversation this attachment will receive
+    /// the chat channel this attachment will receive
     #[arg(long, value_name = "ID")]
-    conversation: String,
-    /// the participant this device is attaching for
-    #[arg(long, value_name = "ID")]
+    channel: String,
+    /// the participant this device is attaching for: `acct:<n>` or `key:<hex>`
+    #[arg(long, value_name = "HANDLE")]
     participant: String,
     /// print the key only if it already exists, never mint one — for checking
     /// whether this device holds the binding at all
@@ -220,10 +224,10 @@ pub(crate) struct KeyArgs {
 ///
 /// ```text
 /// ducktape collab query --target collaboration \
-///   '{"read":{"participant_id":"p1","read":{"events":{"conversation_id":"c1","from_seq":0,"limit":50}}}}'
+///   '{"read":{"participant":{"account":7},"via":null,"read":{"events":{"channel_id":"c1","from_seq":0,"limit":50}}}}'
 /// ```
 ///
-/// `via` names the conversation whose binding authorizes the read when you are
+/// `via` names the channel whose binding authorizes the read when you are
 /// signing with that binding's scoped service key rather than the owner key.
 #[derive(Debug, clap::Args)]
 pub(crate) struct QueryArgs {
@@ -256,7 +260,7 @@ pub(crate) fn run(args: CollabArgs) -> CollabResult {
 /// The module every verb here submits to and reads from.
 const COLLABORATION: &str = "collaboration";
 
-/// Submit one collaboration op as a frame `signer` signs, and print the height.
+/// Submit one collaboration op as a frame `signer` signs; answers the height.
 ///
 /// `/v1/submit/frame` is the whole authorization: the frame's verified signer
 /// becomes the op's `Origin::External`, and the module admits or refuses it.
@@ -278,13 +282,30 @@ fn submit(
     signer: &commonware_cryptography::ed25519::PrivateKey,
     network: &str,
     op: collaboration::CollaborationMsg,
-) -> CollabResult {
+) -> Result<u64, Box<dyn std::error::Error>> {
     let request = collaboration::Request::new(network, op);
     let frame =
         crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(&request));
-    let height = crate::node_http::submit_frame(base, &frame)?;
-    println!("{height}");
-    Ok(())
+    Ok(crate::node_http::submit_frame(base, &frame)?)
+}
+
+/// Submit one chat op the same way. A chat op carries no network name of its
+/// own; the delivery request that follows it does, and refers to the message
+/// by an id that only exists on the chain it was posted to.
+fn submit_chat(
+    base: &str,
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    op: chat::ChatMsg,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let frame =
+        crate::userkey_cli::user_frame(signer, chat::DEFAULT_CHAT_TARGET, chat::encode_msg(&op));
+    Ok(crate::node_http::submit_frame(base, &frame)?)
+}
+
+/// A participant flag as the party it names, or a refusal naming the flag.
+fn party(flag: &str, handle: &str) -> Result<collaboration::Party, Box<dyn std::error::Error>> {
+    collaboration::parse_party_handle(handle)
+        .map_err(|error| format!("--{flag} {handle}: {error}").into())
 }
 
 /// The network a workspace belongs to, off its own `network.toml`.
@@ -365,19 +386,19 @@ fn agreed_network(
 fn scoped_key(
     ctx: &VerbCtx,
     network: &str,
-    conversation: &str,
+    channel: &str,
     participant: &str,
 ) -> Result<commonware_cryptography::ed25519::PrivateKey, Box<dyn std::error::Error>> {
     let workspace = ctx.addr.workspace()?;
     let binding = crate::collab_keys::BindingRef {
         network,
-        conversation,
+        conversation: channel,
         participant,
     };
     crate::collab_keys::load(&workspace, binding)?.ok_or_else(|| {
         format!(
             "this device holds no service key for participant {participant} in \
-             conversation {conversation} — run `ducktape collab attach` first"
+             channel {channel} — run `ducktape collab attach` first"
         )
         .into()
     })
@@ -395,9 +416,10 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
     // agreed BEFORE the key is minted: a key minted for a network this node is
     // not on would be named by an owner-signed `Bind` that network never sees.
     let network = agreed_network(&base, &workspace)?;
+    let participant = party("participant", &args.participant)?;
     let binding = crate::collab_keys::BindingRef {
         network: &network,
-        conversation: &args.conversation,
+        conversation: &args.channel,
         participant: &args.participant,
     };
     let service = crate::collab_keys::ensure(&workspace, binding)?;
@@ -416,65 +438,85 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
 
     // the OWNER signs: a scoped credential cannot authorize itself.
     let owner = crate::userkey_cli::load_user_signer(&ctx.key_path()?, stdin)?;
-    submit(
+    let height = submit(
         &base,
         &owner,
         &network,
         collaboration::CollaborationMsg::Bind {
-            conversation_id: args.conversation,
-            participant_id: args.participant,
+            channel_id: args.channel,
+            participant,
             device: args.device,
             principal,
             expected_credential: args.expect,
         },
-    )
+    )?;
+    println!("{height}");
+    Ok(())
 }
 
 /// `collab send` — signed by the scoped key, so no wallet password is needed.
+///
+/// Two ops, in this order: the chat post that IS the message, then the
+/// delivery request that names it. The module admits the request only from
+/// the origin that posted, which is why both are signed by the one key.
 fn cmd_send(args: SendArgs, ctx: &VerbCtx) -> CollabResult {
     let base = ctx.http_base()?;
     let network = agreed_network(&base, &ctx.addr.workspace()?)?;
-    let service = scoped_key(ctx, &network, &args.conversation, &args.participant)?;
+    let service = scoped_key(ctx, &network, &args.channel, &args.participant)?;
+    let recipient = party("to", &args.to)?;
     let expires_at = deadline(&base, args.ttl_secs)?;
-    submit(
+    let message_id = args
+        .message_id
+        .unwrap_or_else(|| crate::config::hex_bytes(&rand::random::<[u8; 16]>()));
+    let posted = submit_chat(
+        &base,
+        &service,
+        chat::ChatMsg::PostMessage {
+            channel_id: args.channel.clone(),
+            message_id: message_id.clone(),
+            blocks: vec![chat::Block::paragraph(args.body)],
+            thread: None,
+        },
+    )?;
+    let requested = submit(
         &base,
         &service,
         &network,
-        collaboration::CollaborationMsg::Send(collaboration::SendRequest {
-            conversation_id: args.conversation,
-            sender_participant_id: args.participant,
-            message_id: collaboration::MessageId {
-                generation: args.credential,
-                sequence: args.seq,
-            },
-            recipient_participant_id: args.to,
+        collaboration::CollaborationMsg::Deliver(collaboration::DeliverRequest {
+            channel_id: args.channel,
+            message_id: message_id.clone(),
+            recipient,
             kind: args.kind.into(),
-            reply_to: None,
             task: None,
-            body: args.body,
             references: Vec::new(),
             expires_at,
         }),
-    )
+    )?;
+    println!("{message_id} posted at {posted}, delivery requested at {requested}");
+    Ok(())
 }
 
 /// `collab ack` — the bound service reports what its provider did.
 fn cmd_ack(args: AckArgs, ctx: &VerbCtx) -> CollabResult {
     let base = ctx.http_base()?;
     let network = agreed_network(&base, &ctx.addr.workspace()?)?;
-    let service = scoped_key(ctx, &network, &args.conversation, &args.participant)?;
-    submit(
+    let service = scoped_key(ctx, &network, &args.channel, &args.participant)?;
+    let recipient = party("participant", &args.participant)?;
+    let height = submit(
         &base,
         &service,
         &network,
         collaboration::CollaborationMsg::Acknowledge {
-            conversation_id: args.conversation,
+            channel_id: args.channel,
             seq: args.seq,
+            recipient,
             binding_credential: args.credential,
             state: args.state.into(),
             reason: args.reason,
         },
-    )
+    )?;
+    println!("{height}");
+    Ok(())
 }
 
 /// The absolute `expires_at` a message sent now carries, in the NETWORK's
@@ -573,7 +615,7 @@ impl From<AckState> for collaboration::DeliveryState {
     }
 }
 
-/// `collab key --conversation <id> --participant <id>` — the scoped service key
+/// `collab key --channel <id> --participant <handle>` — the scoped service key
 /// this device signs that binding's delivery receipts with.
 ///
 /// Prints the PUBLIC half, because that is the only part anything else needs:
@@ -595,14 +637,14 @@ fn cmd_key(args: KeyArgs, ctx: &VerbCtx) -> CollabResult {
     let network = chain_id(&workspace)?;
     let binding = crate::collab_keys::BindingRef {
         network: &network,
-        conversation: &args.conversation,
+        conversation: &args.channel,
         participant: &args.participant,
     };
     let key = match args.existing_only {
         true => crate::collab_keys::load(&workspace, binding)?.ok_or_else(|| {
             format!(
-                "this device holds no binding for participant {} in conversation {}",
-                args.participant, args.conversation
+                "this device holds no binding for participant {} in channel {}",
+                args.participant, args.channel
             )
         })?,
         false => crate::collab_keys::ensure(&workspace, binding)?,
@@ -654,13 +696,13 @@ mod tests {
             "query",
             "--target",
             "collaboration",
-            r#"{"conversation":{"conversation_id":"c1"}}"#,
+            r#"{"read":{"participant":{"account":7},"via":null,"read":{"binding":{"channel_id":"c1"}}}}"#,
         ]);
         let CollabCmd::Query(args) = parsed.cmd else {
             panic!("query parses to the query verb");
         };
         assert_eq!(args.target, "collaboration");
-        assert!(args.query.contains("conversation_id"));
+        assert!(args.query.contains("channel_id"));
     }
 
     #[test]
@@ -668,17 +710,17 @@ mod tests {
         let parsed = Harness::parse_from([
             "collab",
             "key",
-            "--conversation",
+            "--channel",
             "c1",
             "--participant",
-            "p1",
+            "acct:7",
         ]);
         let CollabCmd::Key(args) = parsed.cmd else {
             panic!("key parses to the key verb");
         };
         assert_eq!(
-            (args.conversation.as_str(), args.participant.as_str()),
-            ("c1", "p1")
+            (args.channel.as_str(), args.participant.as_str()),
+            ("c1", "acct:7")
         );
         assert!(
             !args.existing_only,
@@ -976,15 +1018,16 @@ mod tests {
         // one owner-signed op and one service-signed op: root's requirement is
         // that BOTH bind the chain id, not just the owner's.
         let owner_op = collaboration::CollaborationMsg::Bind {
-            conversation_id: "c1".into(),
-            participant_id: "p1".into(),
+            channel_id: "c1".into(),
+            participant: collaboration::Party::Account(7),
             device: "laptop".into(),
             principal: collaboration::BoundPrincipal::ServiceKey(vec![9; 32]),
             expected_credential: 0,
         };
         let service_op = collaboration::CollaborationMsg::Acknowledge {
-            conversation_id: "c1".into(),
+            channel_id: "c1".into(),
             seq: 1,
+            recipient: collaboration::Party::Account(7),
             binding_credential: 3,
             state: collaboration::DeliveryState::Queued,
             reason: None,

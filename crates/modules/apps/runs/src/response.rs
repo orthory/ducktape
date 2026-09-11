@@ -256,7 +256,7 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 }
 
 /// the catalog spelling of a collaboration message kind. The `enum` list in
-/// the `collaboration.send` input schema is this map's domain; the two move
+/// the `collaboration.deliver` input schema is this map's domain; the two move
 /// together or the schema advertises a kind the composer refuses.
 fn message_kind(name: &str) -> Option<collaboration::MessageKind> {
     match name {
@@ -1002,7 +1002,7 @@ impl RunsModule {
                 // exists only after the account's program claims this proposal.
                 // Probing collaboration from here would ask under the
                 // SUBMITTER's origin and answer about the wrong principal.
-                Operation::CollaborationSend { .. }
+                Operation::CollaborationDeliver { .. }
                 | Operation::CollaborationAcknowledge { .. } => {
                     self.collaboration_msg(operation)?;
                 }
@@ -1925,7 +1925,7 @@ impl RunsModule {
             | Operation::DuckfsWriteText { .. }
             | Operation::ModulesUpdate(_)
             | Operation::ForgeOpenPr { .. }
-            | Operation::CollaborationSend { .. }
+            | Operation::CollaborationDeliver { .. }
             | Operation::CollaborationAcknowledge { .. }
             | Operation::AgentCall { .. }
             | Operation::Submit { .. } => {
@@ -1987,17 +1987,14 @@ impl RunsModule {
         // payload cannot be re-submitted on another one.
         let request = |op| collaboration::Request::new(self.chain_id.clone(), op);
         match operation {
-            Operation::CollaborationSend {
-                conversation_id,
-                participant_id,
-                credential,
-                sequence,
-                recipient_participant_id,
+            Operation::CollaborationDeliver {
+                channel_id,
+                message_id,
+                recipient,
                 kind,
-                body,
                 expires_at,
-                reply_to,
                 task,
+                references,
             } => {
                 let kind =
                     message_kind(kind).ok_or_else(|| format!("unknown message kind: {kind}"))?;
@@ -2005,33 +2002,30 @@ impl RunsModule {
                     Msg {
                         target,
                         payload: collaboration::encode_msg(&request(
-                            collaboration::CollaborationMsg::Send(collaboration::SendRequest {
-                                conversation_id: conversation_id.clone(),
-                                sender_participant_id: participant_id.clone(),
-                                message_id: collaboration::MessageId {
-                                    generation: *credential,
-                                    sequence: *sequence,
+                            collaboration::CollaborationMsg::Deliver(
+                                collaboration::DeliverRequest {
+                                    channel_id: channel_id.clone(),
+                                    message_id: message_id.clone(),
+                                    recipient: recipient.clone(),
+                                    kind,
+                                    task: task.clone(),
+                                    references: references.clone(),
+                                    expires_at: *expires_at,
                                 },
-                                recipient_participant_id: recipient_participant_id.clone(),
-                                kind,
-                                reply_to: *reply_to,
-                                task: task.clone(),
-                                body: body.clone(),
-                                references: Vec::new(),
-                                expires_at: *expires_at,
-                            }),
+                            ),
                         )),
                     },
                     operation.name(),
                     serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "credential": credential,
-                        "sequence": sequence,
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                        "recipient": collaboration::party_handle(recipient),
                     }),
                 ))
             }
             Operation::CollaborationAcknowledge {
-                conversation_id,
+                channel_id,
+                participant,
                 credential,
                 seq,
                 state,
@@ -2044,8 +2038,9 @@ impl RunsModule {
                         target,
                         payload: collaboration::encode_msg(&request(
                             collaboration::CollaborationMsg::Acknowledge {
-                                conversation_id: conversation_id.clone(),
+                                channel_id: channel_id.clone(),
                                 seq: *seq,
+                                recipient: participant.clone(),
                                 binding_credential: *credential,
                                 state: delivery,
                                 reason: reason.clone(),
@@ -2054,7 +2049,7 @@ impl RunsModule {
                     },
                     operation.name(),
                     serde_json::json!({
-                        "conversation_id": conversation_id,
+                        "channel_id": channel_id,
                         "seq": seq,
                         "state": state,
                     }),

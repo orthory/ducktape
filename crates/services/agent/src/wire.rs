@@ -86,20 +86,6 @@ pub enum Command {
     /// offline provider for a day would still look fresh. The node pushes the
     /// agreed value as it advances, and the daemon takes the larger of the two.
     MsgTime { network_now: u64 },
-    /// a conversation's retention floor has advanced: the network no longer
-    /// retains anything below `floor_seq`, so this daemon need not either.
-    ///
-    /// The daemon's dedup record is the only thing standing between a retry
-    /// and a duplicated instruction, so it is never pruned on a local
-    /// heuristic — not by age, not by count. It is pruned only where the
-    /// NETWORK has already stopped retaining the message, because below that
-    /// line a replay cannot be admitted upstream in the first place. This
-    /// field is the module's `Conversation::floor_seq`, and it is what turns a
-    /// bounded tracking table from a permanent refusal into a working one.
-    MsgRetain {
-        conversation: String,
-        floor_seq: u64,
-    },
     /// re-report every delivery state this daemon durably holds for one
     /// binding, oldest sequence first. Answered by one [`Event::MsgDelivery`]
     /// per tracked item.
@@ -216,15 +202,14 @@ pub struct Deliver {
     /// this message's position in the conversation's committed event sequence.
     /// With `conversation` it is the receipt key the module acknowledges on.
     pub seq: u64,
-    /// the recipient BINDING generation this delivery is for — not the
-    /// sender's credential generation, which lives in `message_id`. A delivery
+    /// the recipient BINDING generation this delivery is for. A delivery
     /// naming a generation the daemon no longer holds is fenced, so a message
     /// aimed at a replaced attachment never reaches the device that replaced
     /// it.
     pub binding_generation: u64,
-    /// {sender credential generation, sender sequence} — the sender-side dedup
-    /// key, echoed on every receipt so two senders' sequence 1 stay distinct.
-    pub message_id: MessageId,
+    /// the chat message id, stable across every retry of this delivery. Echoed
+    /// on every receipt, so a reader can tell which send it answers.
+    pub message_id: String,
     /// the sender participant, as the authenticated envelope resolved it. It
     /// reaches the model inside a wrapper, as peer-supplied content — never as
     /// an instruction with the standing of its operator.
@@ -249,15 +234,6 @@ pub struct Deliver {
     /// may steer an ACTIVE turn where the adapter supports it. Unsupported
     /// steering stays visibly queued; it never falls back to keystrokes.
     pub urgent: bool,
-}
-
-/// {sender credential generation, sender sequence} — the sender-side identity
-/// of a message, stable across every retry of it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct MessageId {
-    pub generation: u64,
-    pub sequence: u64,
 }
 
 /// what a message is for. Mirrors the collaboration module's `MessageKind`.
@@ -404,7 +380,7 @@ pub enum Event {
     ///
     /// Self-describing on purpose: `conversation` + `seq` is the module's
     /// receipt key, and `sender` + `message_id` name WHICH send this answers,
-    /// so two senders' sequence 1 can never be confused for one another.
+    /// so a reader correlating its own outstanding sends never mixes two up.
     /// `binding_generation` is the attachment that produced it — the module
     /// refuses one from a generation older than the record's own, so a
     /// returning stale device cannot overwrite the current state.
@@ -414,7 +390,7 @@ pub enum Event {
         seq: u64,
         binding_generation: u64,
         sender: String,
-        message_id: MessageId,
+        message_id: String,
         state: State,
         /// a stable snake_case token, or `null`. Never prose, never a path,
         /// never a token, never a body excerpt.
@@ -623,10 +599,7 @@ mod tests {
             participant: "p-recipient".into(),
             seq: 7,
             binding_generation: 3,
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7".into(),
             sender: "p-sender".into(),
             kind: Kind::Question,
             task: Some(TaskRef {
@@ -661,10 +634,6 @@ mod tests {
             },
             Command::MsgDeliver(Box::new(a_deliver())),
             Command::MsgTime { network_now: 1_000 },
-            Command::MsgRetain {
-                conversation: "conv-1".into(),
-                floor_seq: 12,
-            },
             Command::MsgReplay {
                 conversation: "conv-1".into(),
                 participant: "p-recipient".into(),
@@ -701,10 +670,7 @@ mod tests {
                 seq: 7,
                 binding_generation: 3,
                 sender: "p-sender".into(),
-                message_id: MessageId {
-                    generation: 2,
-                    sequence: 1,
-                },
+                message_id: "m-7".into(),
                 state: State::DeliveryUnknown,
                 reason: Some("no_acceptance_signal".into()),
             },
@@ -786,9 +752,8 @@ mod tests {
     }
 
     /// A receipt names the send it answers — both halves. `conversation`+`seq`
-    /// is the module's receipt key; `sender`+`message_id` is what keeps two
-    /// senders' sequence 1 apart when a reader correlates its own outstanding
-    /// sends.
+    /// is the module's receipt key; `sender`+`message_id` is what a reader
+    /// correlates its own outstanding sends against.
     #[test]
     fn a_receipt_names_which_send_it_answers() {
         let text = serde_json::to_string(&Event::MsgDelivery {
@@ -797,10 +762,7 @@ mod tests {
             seq: 7,
             binding_generation: 3,
             sender: "p-sender".into(),
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7".into(),
             state: State::Held,
             reason: Some("provider_hold".into()),
         })
@@ -810,8 +772,7 @@ mod tests {
             r#""seq":7"#,
             r#""binding_generation":3"#,
             r#""sender":"p-sender""#,
-            r#""generation":2"#,
-            r#""sequence":1"#,
+            r#""message_id":"m-7""#,
             r#""state":"held""#,
         ] {
             assert!(text.contains(named), "a receipt must carry {named}: {text}");
