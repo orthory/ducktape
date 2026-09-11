@@ -38,6 +38,7 @@ extern crate::host
   pure filter_members(rows:&[MemberRow], filter:MembersFilter) -> [MemberRow]
   pure initials_of(name:&str) -> str
   pure initial_of(name:&str) -> str
+  pure member_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   sync copy(text:&str, label:&str) -> bool
   sync agent_status(agent_id:&str, paused:bool) -> bool
   sync propose(action:&str, key:&str, height:i64) -> bool
@@ -60,6 +61,8 @@ state
   acting = ""
   // a clipboard write's acknowledgement — an intent returns nothing to bind
   sent = false
+  viewport_width = 1280.0
+  member_width = 312.0
 
 // Subscriptions, not mount tasks, so a replacement restored from this
 // view's state asks for the session and the roster again on its own.
@@ -99,6 +102,13 @@ on open_member(key)
 on copy_key(text, label)
   sent = copy(text, label)
 
+on member_resized(dx, _dy)
+  member_width = member_width_after_delta(member_width, -dx, viewport_width)
+
+on viewport_changed(width, _height)
+  viewport_width = width
+  member_width = member_width_after_delta(member_width, 0.0, width)
+
 // One signed write at a time: the kernel's answer frees the next.
 on set_agent_status(agent_id, paused)
   return if !connected || !empty(acting)
@@ -113,11 +123,11 @@ on open_ballot(action, key)
   let _sent = propose(action, key, height)
 
 view
-  box #root
-    with
-      w=fill
-      h=fill
-      bg=bg
+  stack #root w=fill h=fill
+    box w=fill h=fill bg=bg
+      space w=1.0 h=1.0
+    sensor show=viewport_changed resize=viewport_changed
+      space w=fill h=fill
     row w=fill h=fill
       col w=fill h=fill
         box
@@ -535,20 +545,23 @@ view
                         space w=1.0 h=1.0
                     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
                     hovered bg=row_hover text=fg
-      // The 312px member record. `admin` gates the membership proposals, not
+      // The resizable member record. `admin` gates the membership proposals, not
       // the panel: a non-admin still sees WHY the writes are refused.
       if connected && !empty(selected)
         for member in rows
           if member.key == selected
-            box
-              with
-                w=1.0
-                h=fill
-                bg=separator
-              space w=1.0 h=1.0
+            resize-handle #member-resize drag=member_resized cursor=resize-horizontal
+              box #member-divider
+                with
+                  w=10.0
+                  h=fill
+                  bg=sidebar
+                  align-x=center
+                box w=2.0 h=fill bg=separator
+                  space w=2.0 h=1.0
             box #member
               with
-                w=312.0
+                w=member_width
                 h=fill
                 bg=sidebar
               col w=fill h=fill

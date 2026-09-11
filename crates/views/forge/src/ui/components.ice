@@ -197,7 +197,7 @@ component RepoCrumb(org:str)
 
 // ── CODE ──────────────────────────────────────────────────────────────────
 
-// The Code tab is TWO panes: a 258px FILES tree on `sidebar` behind a
+// The Code tab is TWO panes: a reader-sized FILES tree on `sidebar` behind a
 // `separator` rule, and the reader on `surface`. `ForgeCodeTab` owns both, and
 // takes each pane's rows through a named slot — the tree row's click target is
 // `forge_toggle_dir(path)` / `forge_open_file(path)` and the reader's content
@@ -221,7 +221,7 @@ component RepoCrumb(org:str)
 // anchoring gutter number the button, and `submit_forge_review` sends the
 // staged drafts as the review's `ReviewComment`s. See `DiffRow` below.
 
-// The two-pane frame. 258px of `sidebar` under the FILES eyebrow, the
+// The two-pane frame. A resizable `sidebar` under the FILES eyebrow, the
 // `separator` rule, then the reader's header over its own scroll region.
 //
 // `message` / `author` / `stamp` are the header's per-path commit meta and are
@@ -229,11 +229,13 @@ component RepoCrumb(org:str)
 // yet resolves the last commit under a path. Each slot is guarded, so an
 // unanswered fact prints nothing rather than a placeholder — when a per-path
 // log lands, the header fills without a layout change.
-component ForgeCodeTab(path:str, message:str, author:str, stamp:str)
+component ForgeCodeTab(tree_width:f64, path:str, message:str, author:str, stamp:str)
+  emits
+    resize_tree(f64, f64)
   row #root w=fill h=fill
-    box
+    box #tree-pane
       with
-        w=258.0
+        w=tree_width
         h=fill
         bg=sidebar
       scroll
@@ -260,12 +262,14 @@ component ForgeCodeTab(path:str, message:str, author:str, stamp:str)
                 font=code_semibold
                 @text-label
           slot files
-    box
-      with
-        w=1.0
-        h=fill
-        bg=separator
-      space w=1.0 h=1.0
+    resize-handle #tree-resize drag=emit(resize_tree, _, _) cursor=resize-horizontal
+      box #tree-divider
+        with
+          w=10.0
+          h=fill
+          align-x=start
+        box w=1.0 h=fill bg=separator
+          space w=1.0 h=1.0
     col w=fill h=fill
       ForgeCodeHeader
         with

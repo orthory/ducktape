@@ -100,6 +100,7 @@ extern crate::host
   pure forge_branch_moved(next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(dropped:bool) -> str
   pure keep_draft(consumed:bool, draft:&str) -> str
+  pure tree_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure landed_seq_of(fresh:bool, seq:i64) -> i64
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure appearance_of(dark:bool) -> Appearance
@@ -223,6 +224,8 @@ state
   host_error = ""
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
+  viewport_width = 1280.0
+  tree_width = 258.0
 
 // Subscriptions, not mount tasks, so a replacement restored from this
 // view's state asks for everything again on its own. Each is keyed by what
@@ -640,8 +643,17 @@ on open_message_link(url)
 on copy_to_clipboard(text, label)
   sent = copy(text, label)
 
+on tree_resized(dx, _dy)
+  tree_width = tree_width_after_delta(tree_width, dx, viewport_width)
+
+on viewport_changed(width, _height)
+  viewport_width = width
+  tree_width = tree_width_after_delta(tree_width, 0.0, width)
+
 view
   col w=fill h=fill
+    sensor show=viewport_changed resize=viewport_changed
+      space w=fill h=0.0
     if !empty(host_error) && empty(repos)
       box w=fill h=fill p=22.0
         EmptyState
@@ -654,6 +666,7 @@ view
       col w=fill h=fill
         ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
           with
+            tree_width
             org
             about
             tier
@@ -736,3 +749,4 @@ view
             forge_open_file -> forge_open_file _
             open_message_link -> open_message_link _
             copy_to_clipboard -> copy_to_clipboard _ _
+            resize_tree -> tree_resized _ _

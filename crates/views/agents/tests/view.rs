@@ -612,6 +612,46 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
     );
 }
 
+#[test]
+fn the_agent_editor_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
+    use ui_lang_guest::wire::{Length, mouse};
+
+    fn node_ending(frame: &Frame, suffix: &str) -> Node {
+        fn find(node: &Node, suffix: &str) -> Option<Node> {
+            if node.key().is_some_and(|key| key.ends_with(suffix)) {
+                return Some(node.clone());
+            }
+            node.children().iter().find_map(|child| find(child, suffix))
+        }
+        find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+    }
+    let (frame, _) = registered("7");
+    let frame = tick_native(press(&frame, "Reviewer Bot"));
+    let width = |frame: &Frame| match node_ending(frame, "/editor") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed editor pane: {node:?}"),
+    };
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&frame, "/editor-resize")
+    else {
+        panic!("editor resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    assert_eq!(width(&frame), 400.0);
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: -70.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 470.0);
+}
+
 /// THE RUN AS IT RUNS. The open run's progress is the node's own output
 /// stream for that dispatch, opened through `rpc.stream` and folded HERE:
 /// the tool it is using, the steps it took, the answer forming. A run the

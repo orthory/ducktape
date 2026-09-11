@@ -421,6 +421,60 @@ fn a_thread_drag_tracks_the_pointer_until_release_without_step_buttons() {
     });
 }
 
+#[test]
+fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
+    on_a_deep_stack(|| {
+        use ui_lang_guest::wire::{Event, Length, mouse};
+
+        fn node_ending(frame: &Frame, suffix: &str) -> Node {
+            fn find(node: &Node, suffix: &str) -> Option<Node> {
+                if node.key().is_some_and(|key| key.ends_with(suffix)) {
+                    return Some(node.clone());
+                }
+                node.children().iter().find_map(|child| find(child, suffix))
+            }
+            find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+        }
+        let width = |frame: &Frame, suffix: &str| match node_ending(frame, suffix) {
+            Node::Container {
+                width: Some(Length::Fixed(width)),
+                ..
+            } => width,
+            node => panic!("fixed pane {suffix}: {node:?}"),
+        };
+        let drag = |frame: &Frame, suffix: &str, dx: f64| {
+            let Node::ResizeHandle {
+                on_drag: Some(handler),
+                cursor,
+                ..
+            } = node_ending(frame, suffix)
+            else {
+                panic!("resize handle {suffix}")
+            };
+            assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+            tick_native(vec![Event::Drag {
+                handler,
+                dx,
+                dy: 0.0,
+            }])
+        };
+
+        let (_, frame) = shown(&facts());
+        assert_eq!(width(&frame, "/channel-sidebar"), 236.0);
+        let frame = drag(&frame, "/sidebar-resize", 50.0);
+        assert_eq!(width(&frame, "/channel-sidebar"), 286.0);
+
+        let props = ChatProps {
+            channel_settings_open: true,
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
+        assert_eq!(width(&frame, "/details-pane"), 320.0);
+        let frame = drag(&frame, "/details-resize", -50.0);
+        assert_eq!(width(&frame, "/details-pane"), 370.0);
+    });
+}
+
 fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
     fn walk<'a>(node: &'a Node, suffix: &str) -> Option<&'a Node> {
         if node.key().is_some_and(|key| key.ends_with(suffix)) {

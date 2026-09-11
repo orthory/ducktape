@@ -7,7 +7,17 @@
 use explorer_view::host::{Copy, Session};
 use explorer_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{answer, has_text, item, press, refuse, submit, texts, type_into};
-use ui_lang_guest::wire::{Frame, Request};
+use ui_lang_guest::wire::{Event, Frame, Node, Request};
+
+fn node_ending(frame: &Frame, suffix: &str) -> Node {
+    fn find(node: &Node, suffix: &str) -> Option<Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node.clone());
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
 
 fn boot() -> Frame {
     boot_native();
@@ -119,6 +129,36 @@ fn a_connected_view_reads_its_own_ledger() {
         "a folded ledger asks for nothing more: {:?}",
         frame.requests
     );
+}
+
+#[test]
+fn the_ledger_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
+    use ui_lang_guest::wire::{Length, mouse};
+
+    let (frame, _) = connected_with_ledger();
+    let width = |frame: &Frame| match node_ending(frame, "/ledger-pane") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed ledger: {node:?}"),
+    };
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&frame, "/ledger-resize")
+    else {
+        panic!("ledger resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    assert_eq!(width(&frame), 340.0);
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: 60.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 400.0);
 }
 
 /// A block re-reads the window through the live subscription, and Refresh

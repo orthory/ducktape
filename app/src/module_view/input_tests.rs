@@ -402,8 +402,8 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
         );
         assert_eq!(
             width(),
-            634.0,
-            "channel/sidebar and the 10px divider retain their minimum widths"
+            624.0,
+            "channel/sidebar and both 10px dividers retain their minimum widths"
         );
         let right = iced::Point::new(1190.0, start.y);
         dispatch(
