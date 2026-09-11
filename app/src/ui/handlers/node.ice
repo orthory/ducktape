@@ -1,31 +1,14 @@
-// THIS NODE — the facts /v1/status publishes, its peers, its log stream, and
-// the dedicated operator screen that draws them.
-
-on node_log_line(line)
-  node_log_timeline = node_log_timeline_push(node_log_timeline, line)
-
+// THIS NODE — the facts /v1/status publishes, and the operator screen that
+// draws them.
+//
+// The Node view speaks the kernel contract for everything it reads and for
+// the one thing it writes; the clipboard is the one OS door left, and it is
+// the same act as `copy_to_clipboard`.
 on node_view_event(event)
-  match node_intent(event)
-    NodeIntent.copy
-      toast = event_text(event, "label")
-      toast_age = 0
-      task clipboard write event_text(event, "text")
-    NodeIntent.tab
-      node_tab = node_event_tab(event)
-      return if node_tab != NodeTab.modules || !connected
-      run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
-    NodeIntent.log_filter
-      node_log_filter = event_text(event, "filter")
-      node_log_timeline = node_log_timeline_filter(node_log_timeline, node_log_filter)
-    NodeIntent.log_timeline
-      node_log_timeline = node_log_timeline_drain(node_log_timeline)
-
-on peers_loaded(next)
-  return if next.generation != node_peers_generation
-  node_peers = next.peers
-
-on peers_failed(cause)
-  return if cause.generation != node_peers_generation
+  return if event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 // The consensus facts /v1/status already publishes and the console dropped:
 // app-hash, view, quorum, reachable validators, finality and the gc watermark.
@@ -98,12 +81,6 @@ on node_status_pushed(next)
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
 
-// The peers table's own push, from the tab-gated subscription beside it.
-on node_peers_pushed(next)
-  node_peers = next.peers
-
-// Overview | Permissions | Activity | Modules on the Node rail surface. The
-// log stream subscribes only while its tab is visible.
 on settings_loaded(next)
   return if next.generation != settings_generation
   node_data_dir = next.data_dir
@@ -303,12 +280,3 @@ on toast_tick
   return if toast_age < 9
   toast = ""
   toast_age = 0
-
-// The Modules tab picks its own seat AND fetches its own reading — a tab whose
-// list is only filled by a refresh somewhere else opens empty on first click.
-on modules_loaded(next)
-  module_rows = next.rows
-  error = ""
-
-on modules_failed(cause)
-  error = cause.message

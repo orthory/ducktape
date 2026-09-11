@@ -33,6 +33,11 @@
 //! - `op.submit` `{target, payload}` — one module op, signed with the
 //!   SEATED key and submitted; answered with the block height. The view
 //!   never carries a password, an endpoint or a key.
+//! - `rpc.admin` `{route, payload}` — one POST to a `/v1` route that
+//!   mutates THE NODE rather than module state, signed with the SEATED key
+//!   exactly as the `ducktape node` verbs sign theirs; answered with the
+//!   node's own reply text, or its refusal. The kernel names no route —
+//!   the node's operator gate decides what this key may ask for.
 //! - `host.badge` `<count>` — the tab badge, handed to the app as the
 //!   `badge` event with `{"count": N}` in its detail.
 //!
@@ -174,6 +179,7 @@ pub(super) fn answer(
             }
         }
         ("op", "submit") => spawn(guest, id, payload, submit),
+        ("rpc", "admin") => spawn(guest, id, payload, admin),
         ("host", "badge") => {
             let count = std::str::from_utf8(payload)
                 .ok()
@@ -640,6 +646,65 @@ fn submit(
     })
 }
 
+/// `{route, payload}` read once: the `/v1` route to POST and the bytes to
+/// sign with it. The route is an ABSOLUTE path in plain tokens and carries
+/// no query — the signature covers exactly the string the request sends, so
+/// anything that would have to be escaped is REFUSED rather than escaped,
+/// the way [`stream_ask`] refuses one. A string payload is the body
+/// verbatim (`/v1/log-filter` takes a bare filter); anything else is its
+/// JSON.
+fn admin_ask(ask: &serde_json::Value) -> Result<(String, Vec<u8>), String> {
+    let route = ask["route"].as_str().unwrap_or_default();
+    let plain_path = route.starts_with("/v1/")
+        && !route.contains("..")
+        && route
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:~".contains(&byte));
+    if !plain_path {
+        return Err("`rpc.admin` names no plain `/v1` route".into());
+    }
+    let body = match &ask["payload"] {
+        serde_json::Value::String(text) => text.clone().into_bytes(),
+        other => serde_json::to_vec(other).map_err(|error| error.to_string())?,
+    };
+    Ok((route.to_owned(), body))
+}
+
+/// One node-level POST under the SEATED key. The proof is the one
+/// `ducktape node log-filter` mints — `signed_req::request_headers` over the
+/// method, the path and the body, bound to this node's key — reached through
+/// the app's own [`crate::backend::seated_request_headers`], so nothing here
+/// signs anything itself. The node's operator gate is the decider: a key it
+/// does not admit gets the node's refusal, not the kernel's.
+fn admin(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let (route, body) = admin_ask(&ask)?;
+        let node_key = crate::backend::node_public_key(client.origin()).await?;
+        let signed = crate::backend::seated_request_headers("POST", &route, &node_key, &body)
+            .await
+            .ok_or_else(|| "`rpc.admin` needs the session key unlocked".to_owned())?;
+        let mut request = reqwest::Client::new()
+            .post(format!("{}{route}", client.origin()))
+            .body(body);
+        for (name, value) in signed {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("could not reach the node: {error}"))?;
+        let code = response.status();
+        let text = response.text().await.unwrap_or_default();
+        match code.is_success() {
+            true => Ok(text.into_bytes()),
+            false => Err(format!("{route} rejected ({code}): {text}")),
+        }
+    })
+}
+
 /// The plane every block moves: a view that reads the feed itself
 /// subscribes to it.
 const BLOCK_PLANE: &str = "block";
@@ -765,6 +830,66 @@ mod tests {
                 (7, Ok(vec![7, 8]), false),
                 (7, Ok(Vec::new()), true),
             ]
+        );
+        assert!(!replies.any_in_flight());
+    }
+
+    /// The route and the body a `rpc.admin` ask becomes, and what it
+    /// refuses: the signature covers exactly the path string the POST
+    /// carries, so a route that is not a plain absolute `/v1` path is
+    /// refused instead of escaped. A string payload is the body verbatim —
+    /// `/v1/log-filter` takes a bare filter, not JSON.
+    #[test]
+    fn an_admin_ask_becomes_one_route_and_one_body_or_a_refusal() {
+        let ask = serde_json::json!({"route": "/v1/log-filter", "payload": "info,ducktape::join=debug"});
+        assert_eq!(
+            admin_ask(&ask).expect("a plain ask"),
+            (
+                "/v1/log-filter".to_owned(),
+                b"info,ducktape::join=debug".to_vec()
+            )
+        );
+        let structured = serde_json::json!({"route": "/v1/invite", "payload": {"ttl": 60}});
+        assert_eq!(
+            admin_ask(&structured).expect("a json ask"),
+            ("/v1/invite".to_owned(), br#"{"ttl":60}"#.to_vec())
+        );
+        assert!(admin_ask(&serde_json::json!({"payload": "info"})).is_err());
+        assert!(admin_ask(&serde_json::json!({"route": "v1/log-filter"})).is_err());
+        assert!(admin_ask(&serde_json::json!({"route": "/v1/../admin/keys"})).is_err());
+        let smuggled = serde_json::json!({"route": "/v1/log-filter?admin=1"});
+        assert!(
+            admin_ask(&smuggled).is_err(),
+            "a route that would need escaping is refused, never escaped"
+        );
+    }
+
+    /// A refused ask never reaches the node, and the answer lands in
+    /// [`Replies`] like every other: the test waits on the in-flight count,
+    /// never on a clock.
+    #[test]
+    fn a_refused_admin_ask_lands_as_one_answer_and_reaches_no_node() {
+        let replies = std::sync::Arc::new(Replies::default());
+        replies.in_flight.fetch_add(1, Ordering::SeqCst);
+        let running = replies.clone();
+        // port 1 is nothing's: a call that reached the network here would
+        // fail with a transport error instead of the refusal asserted below
+        let client = ducktape_rpc::Client::new("http://127.0.0.1:1").expect("a client");
+        runtime().spawn(async move {
+            let result = admin(client, serde_json::json!({"route": "/etc/passwd"})).await;
+            running.deliver(11, result);
+        });
+
+        replies.wait_idle();
+        let mut landed = Vec::new();
+        replies.drain_into(&mut landed);
+        assert_eq!(
+            landed,
+            vec![wire::Event::Response {
+                id: 11,
+                result: Err("`rpc.admin` names no plain `/v1` route".into()),
+                done: true,
+            }]
         );
         assert!(!replies.any_in_flight());
     }

@@ -40,27 +40,6 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
 }
 
 #[test]
-fn a_log_line_splits_into_time_level_and_message() {
-    let parts =
-        split_log_line("2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident".into());
-    assert_eq!(parts.time, "2026-07-27T09:12:44.918Z");
-    assert_eq!(parts.level, "INFO");
-    assert_eq!(parts.message, "ducktape::join: admitted resident");
-
-    let micro =
-        split_log_line("2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into());
-    assert_eq!(
-        micro.time, "2026-08-14T01:02:03.918Z",
-        "the ring's microsecond timer is trimmed to the column's millisecond width"
-    );
-    assert_eq!(micro.level, "DEBUG");
-
-    let prose = split_log_line("no level here".into());
-    assert_eq!(prose.level, "");
-    assert_eq!(prose.message, "no level here");
-}
-
-#[test]
 fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");

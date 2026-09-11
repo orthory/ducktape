@@ -236,12 +236,17 @@ view
         // is the tab badge — the guest sees no key and no endpoint.
         governance:
           extern governance_view(dark, connected, members_is_admin(members_rows)) #governance -> governance_view_event _
-        // Node is a MODULE-OWNED VIEW too: the facts the app holds go in as
-        // props; the tab, the log filter and a clipboard copy come back as
-        // intents. The live log ring stays native — the view leaves a slot
-        // the app paints from `node_log_timeline` (module_view.rs).
+        // Node is a MODULE-OWNED VIEW on the KERNEL CONTRACT: the only facts
+        // that go in are the ones no `/v1` route publishes — this seat's
+        // standing on the network, the app's own connection reading, the
+        // workspace directory the daemon runs out of, and the clock. The
+        // status document, the peers sample, the code registry and the
+        // node's LOG RING are the view's own reads (`rpc.status`,
+        // `rpc.peers`, `rpc.query`, `rpc.stream`), and the live tracing
+        // filter goes back as `rpc.admin`. A clipboard copy is the one
+        // intent that comes back.
         node:
-          extern node_view(dark, connected, members_is_admin(members_rows), member_tier(members_rows), status, loading, module_rows, node_key, node_data_dir, node_height, node_checkpoint, node_last_finalized, node_reachable_label, node_quorum_label, node_version, node_root_hash, sync_label(node_phase, node_sync_applied, node_sync_target), node_phase_since, node_sync_retries, node_sync_failures, node_sync_last_error, node_peers, wall_now, node_log_timeline, connected_rpc) #node -> node_view_event _
+          extern node_view(dark, connected, members_is_admin(members_rows), member_tier(members_rows), status, node_data_dir, wall_now) #node -> node_view_event _
         // Settings is a MODULE-OWNED VIEW too: the facts go in as props — the
         // signing seat as a flag, never the password — and every act comes
         // back as an intent the handler signs. The drafts are the view's.

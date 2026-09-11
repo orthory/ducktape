@@ -252,7 +252,6 @@ on workspace_connected(next)
   forge_generation = forge_generation + 1
   forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
   settings_generation = settings_generation + 1
-  node_peers_generation = node_peers_generation + 1
   dm_peers_generation = dm_peers_generation + 1
   parallel
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
@@ -260,10 +259,6 @@ on workspace_connected(next)
     run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
-    flow
-      from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
-      try request -> done request
-      done -> peers_load_selected _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
@@ -776,7 +771,6 @@ on select_shell_tab(next)
   // session, which `post_gate` reads as "not seated", refusing the composer
   // on every members-only room.
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
-  node_peers_generation = node_peers_generation + 1
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
@@ -789,10 +783,6 @@ on select_shell_tab(next)
       from done load_request(shell_tab == ShellTab.settings, connected_rpc, "", settings_generation)
       try request -> done request
       done -> settings_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
-      try request -> done request
-      done -> peers_load_selected _
     flow
       from done load_request(tab_reads_plane(shell_tab, "account"), connected_rpc, "", account_generation)
       try request -> done request
@@ -816,12 +806,6 @@ on settings_load_selected(request)
   let unmounted = shell_tab != ShellTab.settings
   return if obsolete_request || unmounted
   run replace lane=settings_load load_settings_facts(request.rpc, request.generation) -> settings_loaded _ | settings_failed _
-
-on peers_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != node_peers_generation
-  let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview
-  return if obsolete_request || unmounted
-  run replace lane=peers_load load_peers(request.rpc, request.generation) -> peers_loaded _ | peers_failed _
 
 on account_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != account_generation
@@ -930,25 +914,20 @@ subscribe
   // banners a mention only for a reader who is elsewhere.
   window focused with-id -> window_focused _
   window unfocused with-id -> window_unfocused _
-  run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
-  // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
-  // them — nothing in the index names a mesh connection or a checkpoint height
-  // — so no module topic can carry them, which is why they were the last two
-  // surfaces the console left cold, refreshed only by a connect or a tab
-  // switch.
+  // THE NODE'S OWN STATUS. It has no op behind it — nothing in the index
+  // names a checkpoint height — so no module topic can carry it, which is
+  // why it was one of the last surfaces the console left cold.
   //
-  // Not a poll. The node re-samples these only while this subscription is
-  // held, so THIS GATE IS THE BUDGET: `/v1/peers` composes its sample by
-  // encoding the whole metrics registry (485 KB, ~10 ms a call, measured), and
-  // leaving the tab stops that at the source rather than throttling it here.
-  // STATUS RIDES EVERYWHERE. The node answers it from a cell it publishes at
-  // each boundary, so a console holding it on every tab costs one read per
-  // heartbeat — and the node's phase is a fact about the NODE, not about the
-  // surface the reader happens to have open.
+  // Not a poll, and it RIDES EVERYWHERE: the node answers status from a cell
+  // it publishes at each boundary, so a console holding it on every tab costs
+  // one read per heartbeat — and the node's phase is a fact about the NODE,
+  // not about the surface the reader happens to have open. The titlebar draws
+  // it on every tab, which is what makes it a session fact.
+  //
+  // The peers sample is the Node view's own read now (`rpc.peers`, held only
+  // while its overview is open), because each one encodes the node's whole
+  // metrics registry and that gate is the budget.
   run node_status_live(connected_rpc) when connected -> node_status_pushed _
-  // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
-  // gate is the budget: leaving the tab stops the encode at the source.
-  run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _
   // THE AGENT RUNS IN FLIGHT, for the NODE rather than for a room. A room
   // switch is not a lifecycle event at all — `encode_chat_props` picks this
   // room's rows out of the node's set on the way to the view — so the only
