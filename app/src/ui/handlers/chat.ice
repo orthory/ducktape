@@ -692,7 +692,7 @@ on chat_hit_loaded(next)
   // own composer instance, words intact (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_next_reply_seq = 0
+  thread_next_reply_seq = thread_page_cursor(next.thread_messages, next.thread_has_more)
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
   invalidate lane=live_thread

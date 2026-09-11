@@ -1584,10 +1584,11 @@ pub async fn load_chat_hit(
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
-        let facts = ReaderFacts::current().await;
+        let thread = load_target_thread_data(&rpc, &channel_id, root_seq, target_seq).await?;
         chat.active_thread_seq = root.seq;
-        chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![root, chat_message(reply, facts.reader())];
+        chat.thread_target_seq = thread.target_seq;
+        chat.thread_messages = thread.messages;
+        chat.thread_has_more = thread.has_more;
         Ok(chat)
     }
     .await
