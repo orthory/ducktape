@@ -15,8 +15,8 @@ use ::chat::{ChatMsg, PostPolicy};
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::{FutureExt as _, StreamExt as _};
-use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
-use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
+use pages::index::{CommentRow, PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
+use pages::{BlockKind, NewBlock, PageMsg};
 use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
@@ -192,6 +192,10 @@ pub struct PageCommentThread {
     pub meta: String,
     pub resolved: bool,
     pub comment_count: i64,
+    /// THE WHOLE CONVERSATION, oldest first. The node's one page-threads
+    /// query already returns every thread WITH its comments, so the card
+    /// draws them expanded off this list and never asks per thread.
+    pub comments: Vec<PageComment>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
@@ -207,22 +211,10 @@ pub struct PageComment {
 pub struct BlockThreadListData {
     pub generation: i64,
     pub target: String,
-    pub from: i64,
     pub threads: Vec<PageCommentThread>,
+    /// The OPEN threads on the page — what the header chip and the page-scope
+    /// title count. A resolved thread is filed away, not outstanding.
     pub total: i64,
-    pub next_from: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockCommentData {
-    pub generation: i64,
-    pub target: String,
-    pub thread_id: String,
-    pub from: i64,
-    pub comments: Vec<PageComment>,
-    pub next_from: i64,
-    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]

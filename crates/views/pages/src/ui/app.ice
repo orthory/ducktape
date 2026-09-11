@@ -15,10 +15,11 @@ extern crate::host
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   Subpage(id:str, title:str)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
-  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
-  PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
+  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64, comments:[PageComment])
+  PageCommentThreadRow(thread:PageCommentThread, anchor:str)
+  PageCommentGroup(target:str, anchor:str, threads:[PageCommentThread])
+  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, scope_target:str, scope_pinned:bool, scope_label:str, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
   pure edited(source:bytes, reference:bytes, navigation:bytes, comment_draft:&str) -> bool
@@ -37,12 +38,10 @@ extern crate::host
   pure discard_draft(draft:&str) -> bool
   pure toggle_comments(comment_draft:&str) -> bool
   pure close_comments(comment_draft:&str) -> bool
-  pure open_thread(id:&str, target:&str, comment_draft:&str) -> bool
-  pure resolve(resolved:bool) -> bool
-  pure more_threads() -> bool
-  pure close_thread(comment_draft:&str) -> bool
-  pure more_comments() -> bool
-  pure post(text:&str) -> bool
+  pure narrow(target:&str) -> bool
+  pure widen() -> bool
+  pure resolve(id:&str, resolved:bool) -> bool
+  pure post(text:&str, thread_id:&str) -> bool
   pure copy(text:&str, label:&str) -> bool
   pure icon(name:&str) -> bytes
   pure count_label(count:i64) -> str
@@ -53,7 +52,17 @@ extern crate::host
   pure comment_anchor_after_navigation(opens:bool, pointer:f64, anchor:f64) -> f64
   pure comment_navigation(navigation:bytes) -> bool
   pure comment_card_offset(anchor_y:f64, viewport_height:f64) -> f64
-  pure comment_card_height(thread:&str, anchor_y:f64, viewport_height:f64) -> f64
+  pure comment_card_height(anchor_y:f64, viewport_height:f64) -> f64
+  pure comment_groups(rows:[PageCommentThreadRow], page_id:&str) -> [PageCommentGroup]
+  pure resolved_rows(rows:[PageCommentThreadRow]) -> [PageCommentThreadRow]
+  pure resolved_label(rows:&[PageCommentThreadRow]) -> str
+  pure empty_scope_label(scope:&str) -> str
+  pure opener_text(thread:&PageCommentThread) -> str
+  pure thread_replies(thread:&PageCommentThread, expanded:bool) -> [PageComment]
+  pure reply_toggle_label(thread:&PageCommentThread, expanded:bool) -> str
+  pure reply_thread_after_press(current:&str, pressed:&str) -> str
+  pure expanded(ids:&[str], id:&str) -> bool
+  pure toggled(ids:[str], id:&str) -> [str]
   pure seeded(moved:bool, seed:&str, draft:&str) -> str
 
 extern crate::editor_binding
@@ -124,23 +133,28 @@ state
   subpages:[Subpage] = []
   orphaned_comment_drafts:[str] = []
   block_comments_open = false
+  scope_target = ""
+  scope_pinned = false
+  scope_label = ""
   thread_total:i64 = 0
   comment_rows:[PageCommentThreadRow] = []
+  comment_groups:[PageCommentGroup] = []
+  resolved_comment_rows:[PageCommentThreadRow] = []
   threads_loading = false
-  threads_has_more = false
-  active_thread = ""
-  thread_resolved = false
-  active_thread_anchor = ""
-  comments:[PageComment] = []
-  comments_loading = false
-  comments_has_more = false
   compose_hint = ""
+  // CARD CHROME, THE READER'S OWN: which thread's reply box is open, which
+  // threads she unfolded, and whether the settled ones are showing. None of
+  // it leaves the view — the app holds no opinion about any of them.
+  reply_thread = ""
+  expanded_threads:[str] = []
+  resolved_open = false
   // the last seed the app pushed: the count moves once per hand-back
   seed_rev:i64 = 0
-  // the reader's own: the three drafts the screen edits
+  // the reader's own: the four drafts the screen edits
   page_draft = ""
   page_search_draft = ""
   block_comment_draft = ""
+  reply_draft = ""
   host_error = ""
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
@@ -213,6 +227,12 @@ on props_arrived(item)
   pages = next.pages
   page_create_open = next.page_create_open
   comment_anchor_y = comment_anchor_after_props(active_page, next.active_page, next.block_comments_open, comment_anchor_y)
+  // A REPLY IN PROGRESS BELONGS TO ONE CARD ON ONE PAGE. The card closing, or
+  // the selection moving, takes the half-typed reply with it — read BEFORE
+  // `active_page` moves, the same place the anchor is read.
+  let comments_carry = active_page == next.active_page && next.block_comments_open
+  reply_thread = keep_str(comments_carry, reply_thread, "")
+  reply_draft = keep_str(comments_carry, reply_draft, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
@@ -225,24 +245,26 @@ on props_arrived(item)
   subpages = next.subpages
   orphaned_comment_drafts = next.orphaned_comment_drafts
   block_comments_open = next.block_comments_open
+  scope_target = next.scope_target
+  scope_pinned = next.scope_pinned
+  scope_label = next.scope_label
   thread_total = next.thread_total
+  // MIRRORED ONCE PER PUSH, not per frame: the split and the grouping are the
+  // same answer for every frame the rows stand for.
   comment_rows = next.comment_rows
+  comment_groups = comment_groups(next.comment_rows, next.active_page)
+  resolved_comment_rows = resolved_rows(next.comment_rows)
   threads_loading = next.threads_loading
-  threads_has_more = next.threads_has_more
-  active_thread = next.active_thread
-  thread_resolved = next.thread_resolved
-  active_thread_anchor = next.active_thread_anchor
-  comments = next.comments
-  comments_loading = next.comments_loading
-  comments_has_more = next.comments_has_more
   compose_hint = next.compose_hint
   // THE APP HANDS A DRAFT BACK ONLY WHEN THE SEED MOVED — a recovered
   // comment taken up, a failed post returned, a failed page create
-  // returned. Every other push leaves the reader's fields alone.
+  // returned. Every other push leaves the reader's fields alone. A refused
+  // post lands back in the box it left: the reply's thread, or the composer.
   let moved = next.seed_rev != seed_rev
   seed_rev = next.seed_rev
   page_draft = seeded(moved, next.page_seed, page_draft)
-  block_comment_draft = seeded(moved, next.comment_seed, block_comment_draft)
+  block_comment_draft = seeded(moved && empty(reply_thread), next.comment_seed, block_comment_draft)
+  reply_draft = seeded(moved && !empty(reply_thread), next.comment_seed, reply_draft)
   document_source_ref = source_reference(next.document_source)
   document_source_error = next.document_error
   document_dark = next.dark
@@ -317,6 +339,8 @@ on discard_orphaned_comment_draft(draft)
 
 on toggle_block_comments
   comment_anchor_y = -1.0
+  reply_thread = ""
+  reply_draft = ""
   return if !empty(host_error)
   return if loading || busy || empty(active_page)
   sent = toggle_comments(block_comment_draft)
@@ -324,37 +348,58 @@ on toggle_block_comments
 
 on close_block_comments
   comment_anchor_y = -1.0
+  reply_thread = ""
+  reply_draft = ""
   return if !empty(host_error)
   sent = close_comments(block_comment_draft)
   block_comment_draft = ""
 
-on open_block_comment_thread(id, target)
+// Narrowing and widening re-slice threads already in hand — the reply in
+// progress belongs to a thread that may be about to leave the list.
+on narrow_comment_scope(target)
+  reply_thread = ""
+  reply_draft = ""
   return if !empty(host_error)
-  sent = open_thread(id, target, block_comment_draft)
+  return if loading || busy
+  sent = narrow(target)
 
-on resolve_thread_submit(resolved)
+on widen_comment_scope
+  reply_thread = ""
+  reply_draft = ""
   return if !empty(host_error)
-  sent = resolve(resolved)
+  return if loading || busy
+  sent = widen()
 
-on load_more_block_threads
+on resolve_thread_submit(id, resolved)
   return if !empty(host_error)
-  sent = more_threads()
+  sent = resolve(id, resolved)
 
-on close_block_comment_thread
-  comment_anchor_y = -1.0
+// THE READER PICKS WHICH THREAD SHE IS ANSWERING, and a second press on the
+// same one puts the box away. One box holds a draft at a time, so moving it
+// is what drops the last one.
+on select_reply_thread(id)
+  reply_draft = ""
+  reply_thread = reply_thread_after_press(reply_thread, id)
+
+on toggle_thread_replies(id)
+  expanded_threads = toggled(expanded_threads, id)
+
+on toggle_resolved_comments
+  resolved_open = !resolved_open
+
+// A REPLY NAMES ITS THREAD; the composer at the card's foot names none, and
+// the app opens a new thread on the card's scope for it. Either way the words
+// leave with the act and the field clears — a refused post hands them back.
+on post_thread_reply(id)
   return if !empty(host_error)
-  sent = close_thread(block_comment_draft)
+  return if busy || threads_loading || empty(trim(reply_draft))
+  sent = post(trim(reply_draft), id)
+  reply_draft = ""
 
-on load_more_block_comments
-  return if !empty(host_error)
-  sent = more_comments()
-
-// The comment leaves with the act and the field clears, as the app's
-// handler used to clear it; a post the node refused hands it back as a seed.
 on post_block_comment_submit
   return if !empty(host_error)
-  return if busy || threads_loading || comments_loading || empty(trim(block_comment_draft))
-  sent = post(trim(block_comment_draft))
+  return if busy || threads_loading || empty(trim(block_comment_draft))
+  sent = post(trim(block_comment_draft), "")
   block_comment_draft = ""
 
 on copy_to_clipboard(text, label)
@@ -394,7 +439,7 @@ view
         w=fill
         h=fill
         bg=bg
-      PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft block_comment_draft<->block_comment_draft #pages
+      PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft block_comment_draft<->block_comment_draft reply_draft<->reply_draft #pages
         with
           host_error
           page_link
@@ -417,18 +462,18 @@ view
           subpages
           orphaned_comment_drafts
           block_comments_open
-          comments_height=comment_card_height(active_thread, comment_anchor_y, pages_viewport_height)
+          comments_height=comment_card_height(comment_anchor_y, pages_viewport_height)
           comments_offset=comment_card_offset(comment_anchor_y, pages_viewport_height)
+          scope_target
+          scope_pinned
+          scope_label
           thread_total
-          comment_rows
+          comment_groups
+          resolved_comment_rows
+          resolved_open
+          reply_thread
+          expanded_threads
           threads_loading
-          threads_has_more
-          active_thread
-          thread_resolved
-          active_thread_anchor
-          comments
-          comments_loading
-          comments_has_more
           compose_hint
         events
           toggle_page_create -> toggle_page_create
@@ -447,11 +492,13 @@ view
           discard_orphaned_comment_draft -> discard_orphaned_comment_draft _
           toggle_block_comments -> toggle_block_comments
           close_block_comments -> close_block_comments
-          open_block_comment_thread -> open_block_comment_thread _ _
-          resolve_thread_submit -> resolve_thread_submit _
-          load_more_block_threads -> load_more_block_threads
-          close_block_comment_thread -> close_block_comment_thread
-          load_more_block_comments -> load_more_block_comments
+          narrow_comment_scope -> narrow_comment_scope _
+          widen_comment_scope -> widen_comment_scope
+          resolve_thread_submit -> resolve_thread_submit _ _
+          select_reply_thread -> select_reply_thread _
+          toggle_thread_replies -> toggle_thread_replies _
+          toggle_resolved_comments -> toggle_resolved_comments
+          post_thread_reply -> post_thread_reply _
           post_block_comment_submit -> post_block_comment_submit
           copy_to_clipboard -> copy_to_clipboard _ _
         document:

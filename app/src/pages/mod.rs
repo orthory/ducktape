@@ -44,24 +44,42 @@ pub fn commented_lines(blocks: &[crate::backend::PageBlock], targets: &[String])
 /// Where a comment thread anchors, in the reader's own words: the opening of
 /// the block it marks, quoted, or the page itself. No line number — the
 /// editor draws none, so "line 3" named nothing the reader could find.
-/// The composer's own caption: where a NEW comment will anchor.
+/// THE COMPOSER AT THE CARD'S FOOT ALWAYS OPENS A NEW THREAD on the scope the
+/// card is showing — never a reply, which has its own box inside its thread.
+/// `scope` is a block id, or empty (or the page's own id) for the page.
 pub fn comment_compose_hint(
     blocks: &[crate::backend::PageBlock],
-    target: &str,
+    scope: &str,
     page_id: &str,
 ) -> String {
+    if is_page_scope(scope, page_id) {
+        return "Comment on this page".into();
+    }
     format!(
-        "New comment on {}",
-        anchor_label(&comment_anchor_labels(blocks), target, page_id)
+        "New thread on {}",
+        anchor_label(&comment_anchor_labels(blocks), scope, page_id)
     )
 }
 
-pub fn comment_anchor_label(
-    blocks: Vec<crate::backend::PageBlock>,
-    target: String,
-    page_id: String,
+/// The card's title: the block it is scoped to, quoted, or the page and how
+/// many open threads it is carrying.
+pub fn comment_scope_label(
+    blocks: &[crate::backend::PageBlock],
+    scope: &str,
+    page_id: &str,
+    open_threads: i64,
 ) -> String {
-    anchor_label(&comment_anchor_labels(&blocks), &target, &page_id)
+    if !is_page_scope(scope, page_id) {
+        return anchor_label(&comment_anchor_labels(blocks), scope, page_id);
+    }
+    match open_threads {
+        1 => "This page · 1 thread".into(),
+        count => format!("This page · {count} threads"),
+    }
+}
+
+fn is_page_scope(scope: &str, page_id: &str) -> bool {
+    scope.is_empty() || scope == page_id
 }
 
 /// One thread-list row with its document anchor already resolved. The Ice
@@ -86,22 +104,6 @@ pub fn page_comment_thread_rows(
             thread,
         })
         .collect()
-}
-
-/// Prefer the selected thread, then an unresolved thread, within one anchor.
-pub fn comment_thread_for_target(
-    threads: Vec<crate::backend::PageCommentThread>,
-    target: String,
-    selected: String,
-) -> String {
-    let mut matching = threads.iter().filter(|thread| thread.target == target);
-    matching
-        .clone()
-        .find(|thread| thread.id == selected)
-        .or_else(|| matching.clone().find(|thread| !thread.resolved))
-        .or_else(|| matching.next())
-        .map(|thread| thread.id.clone())
-        .unwrap_or_default()
 }
 
 pub fn comment_rows_for_target(
@@ -177,18 +179,49 @@ mod tests {
             child_count: 0,
         };
         let blocks = vec![block("Text", "para"), block("Code", "a\nb")];
+        // The card's title names the scope it is showing: the page and its
+        // outstanding count, or the block's opening, quoted.
         assert_eq!(
-            comment_anchor_label(blocks.clone(), "page-id".into(), "page-id".into()),
-            "this page"
+            comment_scope_label(&blocks, "page-id", "page-id", 4),
+            "This page · 4 threads"
         );
         assert_eq!(
-            comment_anchor_label(blocks.clone(), "para".into(), "page-id".into()),
-            "“para”"
+            comment_scope_label(&blocks, "", "page-id", 1),
+            "This page · 1 thread"
         );
+        assert_eq!(comment_scope_label(&blocks, "para", "page-id", 9), "“para”");
         assert_eq!(
-            comment_anchor_label(blocks.clone(), "gone".into(), "page-id".into()),
+            comment_scope_label(&blocks, "gone", "page-id", 9),
             "a removed block"
         );
+        // The composer at the card's foot always opens a NEW thread on that
+        // same scope — never a reply, which composes inside its own thread.
+        assert_eq!(
+            comment_compose_hint(&blocks, "", "page-id"),
+            "Comment on this page"
+        );
+        assert_eq!(
+            comment_compose_hint(&blocks, "para", "page-id"),
+            "New thread on “para”"
+        );
+        // A thread row still quotes the block it anchors to, page threads
+        // included — that is the group header in page scope.
+        let thread = |target: &str| crate::backend::PageCommentThread {
+            id: "t".into(),
+            target: target.into(),
+            author: "Reader".into(),
+            meta: String::new(),
+            resolved: false,
+            comment_count: 0,
+            comments: Vec::new(),
+        };
+        let rows = page_comment_thread_rows(
+            blocks.clone(),
+            vec![thread("page-id"), thread("para")],
+            "page-id".into(),
+        );
+        assert_eq!(rows[0].anchor, "this page");
+        assert_eq!(rows[1].anchor, "“para”");
         // The code block owns lines 2..=5 (fence, two body lines, fence).
         assert_eq!(commented_lines(&blocks, &["a\nb".into()]), vec![2, 3, 4, 5]);
         // A caret line inside the code body anchors a comment on that block —
@@ -235,5 +268,30 @@ mod tests {
         assert_eq!(comment_marks(&blocks, &[]), Vec::new());
         // A hit naming a block that is gone marks nothing.
         assert_eq!(comment_marks(&blocks, &hits(&["deleted"])), Vec::new());
+
+        // AND THE BADGE COUNTS WHAT IS OPEN. A resolved thread is filed away
+        // behind the card's own toggle, so it must not keep a mark burning in
+        // the margin: the fold that builds `hits` drops it before it is
+        // counted, and the page's own threads mark no line at all.
+        let thread = |target: &str, resolved: bool| crate::backend::PageCommentThread {
+            id: format!("{target}-{resolved}"),
+            target: target.into(),
+            author: "Reader".into(),
+            meta: String::new(),
+            resolved,
+            comment_count: 1,
+            comments: Vec::new(),
+        };
+        let open_hits = crate::backend::commented_targets_of(
+            vec![
+                thread("a\nb", false),
+                thread("a\nb", true),
+                thread("page-id", false),
+                thread("para", false),
+            ],
+            "page-id".into(),
+        );
+        assert_eq!(open_hits, ["a\nb", "para"]);
+        assert_eq!(comment_marks(&blocks, &open_hits), vec![(1, 1), (2, 1)]);
     }
 }

@@ -198,7 +198,7 @@ view
         // strip and the comments rail go in as props; the document is the
         // app's editor, painted into the view's slot by the host.
         pages:
-          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
+          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, inline_comment_target, block_comments_pinned, block_comment_thread_total, block_comment_rows, block_comment_threads_loading) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW: the listing, the preview, the
         // history and the write refusal go in as props; every navigation

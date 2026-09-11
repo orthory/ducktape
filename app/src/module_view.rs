@@ -786,21 +786,15 @@ pub fn pages_view(
     page_refusal: &str,
     blocks: &[crate::backend::PageBlock],
     commented_block_hits: &[String],
-    caret_comment_target: &str,
-    active_thread_anchor: &str,
     orphaned_comment_drafts: &[String],
     page_text: &str,
     buffer_page: &str,
     block_comments_open: bool,
+    scope_target: &str,
+    scope_pinned: bool,
     thread_total: i64,
-    threads: &[crate::backend::PageCommentThread],
     comment_rows: &[crate::pages::PageCommentThreadRow],
     threads_loading: bool,
-    threads_has_more: bool,
-    active_thread: &str,
-    comments: &[crate::backend::PageComment],
-    comments_loading: bool,
-    comments_has_more: bool,
 ) -> Element<'static, ModuleViewEvent> {
     let source = if loading || active_page.is_empty() || buffer_page != active_page {
         Ok(Vec::new())
@@ -850,17 +844,13 @@ pub fn pages_view(
         "subpages": subpages,
         "orphaned_comment_drafts": orphaned_comment_drafts,
         "block_comments_open": block_comments_open,
+        "scope_target": scope_target,
+        "scope_pinned": scope_pinned,
+        "scope_label": crate::pages::comment_scope_label(blocks, scope_target, active_page, thread_total),
         "thread_total": thread_total,
         "comment_rows": comment_rows,
         "threads_loading": threads_loading,
-        "threads_has_more": threads_has_more,
-        "active_thread": active_thread,
-        "thread_resolved": crate::backend::thread_is_resolved(threads, active_thread),
-        "active_thread_anchor": active_thread_anchor,
-        "comments": comments,
-        "comments_loading": comments_loading,
-        "comments_has_more": comments_has_more,
-        "compose_hint": crate::pages::comment_compose_hint(blocks, caret_comment_target, active_page),
+        "compose_hint": crate::pages::comment_compose_hint(blocks, scope_target, active_page),
         "seed_rev": seed_rev,
         "page_seed": page_draft,
         "comment_seed": block_comment_draft,
@@ -885,11 +875,9 @@ pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
         "edited" => Intent::Edited,
         "toggle_comments" => Intent::ToggleComments,
         "close_comments" => Intent::CloseComments,
-        "open_thread" => Intent::OpenThread,
+        "narrow" => Intent::NarrowComments,
+        "widen" => Intent::WidenComments,
         "resolve" => Intent::Resolve,
-        "more_threads" => Intent::MoreThreads,
-        "close_thread" => Intent::CloseThread,
-        "more_comments" => Intent::MoreComments,
         "post" => Intent::Post,
         _ => Intent::Copy,
     }
@@ -1703,11 +1691,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "discard_draft",
             "toggle_comments",
             "close_comments",
-            "open_thread",
+            "narrow",
+            "widen",
             "resolve",
-            "more_threads",
-            "close_thread",
-            "more_comments",
             "post",
             "copy",
         ],
@@ -6159,10 +6145,10 @@ pub(crate) mod tests {
                 }
             }
             fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
-                if text == "No comments yet" {
+                if text == "This paragraph reads backwards." {
                     self.card_text = Some(bounds);
                 }
-                if text == "Post" {
+                if text == "Post" && self.post.is_none() {
                     self.post = Some(bounds);
                 }
             }
@@ -6178,6 +6164,64 @@ pub(crate) mod tests {
         facts["document_source"] = serde_json::json!(source);
         facts["comment_seed"] = "A comment".into();
         facts["seed_rev"] = 1.into();
+        // THE EVIDENCE FIXTURE IS THE DESIGN: a margin badge on Paragraph 7
+        // opened the card, so the scope is that block and pinned to it; the
+        // block carries TWO open threads — one of them a conversation with
+        // two replies — and a settled one waiting behind its own toggle.
+        let comment = |ordinal: i64, author: &str, text: &str| {
+            serde_json::json!({
+                "id": format!("comment-{author}-{ordinal}"), "ordinal": ordinal,
+                "author": author, "meta": format!("#{ordinal}"), "text": text
+            })
+        };
+        // `meta` is spelled the way `page_comment_thread` spells it, so the
+        // evidence shows the sentence the node's own projection produces.
+        let thread = |id: &str, resolved: bool, comments: serde_json::Value| {
+            let count = comments.as_array().unwrap().len();
+            let counted = match count {
+                1 => "1 comment".to_string(),
+                many => format!("{many} comments"),
+            };
+            serde_json::json!({
+                "thread": {
+                    "id": id, "target": "block-7",
+                    "author": comments[0]["author"],
+                    "meta": match resolved {
+                        true => format!("{counted} · resolved"),
+                        false => counted,
+                    },
+                    "resolved": resolved, "comment_count": count,
+                    "comments": comments
+                },
+                "anchor": "“Paragraph 7”"
+            })
+        };
+        facts["scope_target"] = "block-7".into();
+        facts["scope_pinned"] = true.into();
+        facts["scope_label"] = "“Paragraph 7: editable document text.”".into();
+        facts["compose_hint"] = "New thread on “Paragraph 7: editable document text.”".into();
+        facts["thread_total"] = 2.into();
+        facts["comment_rows"] = serde_json::json!([
+            thread(
+                "thread-a",
+                false,
+                serde_json::json!([
+                    comment(1, "Ada Lovelace", "This paragraph reads backwards."),
+                    comment(2, "Bo Chen", "Agreed — the clause order is inverted."),
+                    comment(3, "Ada Lovelace", "I'll rewrite it this afternoon."),
+                ])
+            ),
+            thread(
+                "thread-b",
+                false,
+                serde_json::json!([comment(1, "Cy Okafor", "And the number is wrong.")])
+            ),
+            thread(
+                "thread-done",
+                true,
+                serde_json::json!([comment(1, "Dee Park", "Settled last week.")])
+            ),
+        ]);
         let path = staged("pages").expect("actual Pages Wasm is required");
         let mut guest = Guest::load_from("pages", &path).unwrap();
         let mut renderer = crate::frame_probe::headless_renderer();
@@ -6400,12 +6444,13 @@ pub(crate) mod tests {
                 .unwrap()
                 .save(directory.join("floating-comments.png"))
                 .unwrap();
-            facts["active_thread"] = "thread-b".into();
-            facts["active_thread_anchor"] = "“Paragraph 7”".into();
-            facts["comments"] = serde_json::json!([{
-                "id": "reply-b", "ordinal": 1, "author": "Reader",
-                "meta": "just now", "text": "Only this thread is shown here."
-            }]);
+            // THE SAME CARD WIDENED to the page: the same threads, now under
+            // the group header that names the block they mark, with the way
+            // back into that block's own scope on it.
+            facts["scope_target"] = "".into();
+            facts["scope_pinned"] = false.into();
+            facts["scope_label"] = "This page · 2 threads".into();
+            facts["compose_hint"] = "Comment on this page".into();
             let props = Some(serde_json::to_vec(&facts).unwrap());
             settle_documents(&mut guest, &props);
             ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
@@ -6417,15 +6462,14 @@ pub(crate) mod tests {
                 &mut Vec::new(),
             );
             ui.operate(&renderer, &mut bounds);
-            assert_eq!(bounds.editor, closed_bounds);
-            assert!(
-                bounds.card.unwrap().height < 400.0,
-                "individual threads fit their content within a bounded card"
+            assert_eq!(
+                bounds.editor, closed_bounds,
+                "widening the scope must not resize or move the document"
             );
             let frame = capture(&mut ui, &mut renderer);
             image::RgbaImage::from_raw(1100, 700, frame)
                 .unwrap()
-                .save(directory.join("individual-comment.png"))
+                .save(directory.join("page-scope-comments.png"))
                 .unwrap();
         }
     }
@@ -7289,10 +7333,9 @@ pub(crate) mod tests {
                 "page_searching": false, "page_search_hits": [], "page_search_query": "",
                 "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
                 "subpages": [], "orphaned_comment_drafts": [],
-                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
-                "threads_loading": false, "threads_has_more": false, "active_thread": "",
-                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
-                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
+                "block_comments_open": false, "scope_target": "", "scope_pinned": false,
+                "scope_label": "This page · 0 threads", "thread_total": 0,
+                "comment_rows": [], "threads_loading": false, "compose_hint": "",
                 "seed_rev": 0, "page_seed": "", "comment_seed": ""
             }))
             .expect("props encode"),

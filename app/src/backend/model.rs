@@ -67,32 +67,6 @@ pub fn merge_pending_blocks(
     merged
 }
 
-pub fn append_page_comment_threads(
-    threads: Vec<PageCommentThread>,
-    next: Vec<PageCommentThread>,
-) -> Vec<PageCommentThread> {
-    threads
-        .into_iter()
-        .chain(next)
-        .map(|thread| (thread.id.clone(), thread))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
-pub fn append_page_comments(
-    comments: Vec<PageComment>,
-    next: Vec<PageComment>,
-) -> Vec<PageComment> {
-    comments
-        .into_iter()
-        .chain(next)
-        .map(|comment| (comment.ordinal, comment))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
     if keep_pending {
         return current;
@@ -785,12 +759,25 @@ pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) ->
     targets
 }
 
-/// The open thread's resolved flag, read off the rail's own list.
-pub fn thread_is_resolved(threads: &[PageCommentThread], id: &str) -> bool {
+/// WHERE A COMMENT LANDS. An empty `thread_id` is the card's new-thread
+/// composer and anchors on the scope it is showing; a thread id is a reply and
+/// MUST anchor on that thread's own target — the node validates the pair, so a
+/// block-anchored thread replied to with the page id is refused. A thread id
+/// the list does not carry (a stale card) answers `""`, which the submit
+/// refuses rather than posting somewhere else.
+pub fn comment_post_target(
+    threads: Vec<PageCommentThread>,
+    thread_id: String,
+    scope: String,
+) -> String {
+    if thread_id.is_empty() {
+        return scope;
+    }
     threads
-        .iter()
-        .find(|thread| thread.id == id)
-        .is_some_and(|thread| thread.resolved)
+        .into_iter()
+        .find(|thread| thread.id == thread_id)
+        .map(|thread| thread.target)
+        .unwrap_or_default()
 }
 
 pub fn retain_selected_string(value: String, selected_id: String) -> String {
@@ -813,17 +800,6 @@ pub fn retain_selected_comment_threads(
         Vec::new()
     } else {
         threads
-    }
-}
-
-pub fn retain_selected_comments(
-    comments: Vec<PageComment>,
-    selected_id: String,
-) -> Vec<PageComment> {
-    if selected_id.is_empty() {
-        Vec::new()
-    } else {
-        comments
     }
 }
 

@@ -744,54 +744,17 @@ pub(crate) async fn load_thread_data(
     })
 }
 
-pub(crate) async fn query_block_comment_page(
-    rpc: &RpcClient,
-    target: &str,
-    thread_id: &str,
-    from: u32,
-    generation: i64,
-) -> Result<Option<BlockCommentData>, String> {
-    let reply: PageReply = rpc
-        .query(
-            "pages",
-            &PageQuery::CommentThread {
-                thread_id: thread_id.to_string(),
-            },
-        )
-        .await?;
-    let names = names();
-    let PageReply::CommentThread(thread) = reply else {
-        return Err("node returned an invalid comment page".into());
-    };
-    let Some(view) = thread else {
-        return Ok(None);
-    };
-    let is_expected_thread = view.thread.id == thread_id && view.thread.target == target;
-    if !is_expected_thread {
-        return Err("node returned comments for another block".into());
-    }
-    // the committed read returns the whole live comment list; the UI's page
-    // ordinals are 1-based positions in it, sliced from `from`.
-    let comments = view
+/// ONE THREAD WITH ITS WHOLE CONVERSATION. The grouped page query already
+/// carries every comment, so the card never asks a second time.
+pub(crate) fn page_comment_thread(thread: ThreadRow, names: &NameDirectory) -> PageCommentThread {
+    let comments: Vec<PageComment> = thread
         .comments
         .into_iter()
+        .filter(|comment| !comment.deleted)
         .enumerate()
-        .skip(from as usize)
-        .map(|(index, comment)| page_comment(index + 1, comment, &names))
+        .map(|(index, comment)| page_comment(index + 1, comment, names))
         .collect();
-    Ok(Some(BlockCommentData {
-        generation,
-        target: view.thread.target,
-        thread_id: view.thread.id,
-        from: i64::from(from),
-        comments,
-        next_from: 0,
-        has_more: false,
-    }))
-}
-
-pub(crate) fn page_comment_thread(thread: ThreadRow, names: &NameDirectory) -> PageCommentThread {
-    let comment_count = count_i64(thread.comments.iter().filter(|c| !c.deleted).count());
+    let comment_count = count_i64(comments.len());
     let count_label = if comment_count == 1 {
         "1 comment".to_string()
     } else {
@@ -808,16 +771,21 @@ pub(crate) fn page_comment_thread(thread: ThreadRow, names: &NameDirectory) -> P
         },
         resolved: thread.resolved,
         comment_count,
+        comments,
     }
 }
 
-fn page_comment(ordinal: usize, comment: pages::Comment, names: &NameDirectory) -> PageComment {
+/// `created_at` is a block HEIGHT on a validator network and unix millis on a
+/// single-writer noded (the same hybrid `ChatMessage::time` carries), so the
+/// slot beside an author cannot be an age. It names the comment's place in
+/// its thread instead, and says when one was edited.
+fn page_comment(ordinal: usize, comment: CommentRow, names: &NameDirectory) -> PageComment {
     let edited = comment.edited_at.is_some();
     let ordinal = count_i64(ordinal);
     PageComment {
         id: comment.id,
         ordinal,
-        author: page_author_name(&comment.author, names),
+        author: author_display(&comment.author, names),
         meta: if edited {
             format!("#{ordinal} · edited")
         } else {
@@ -825,18 +793,6 @@ fn page_comment(ordinal: usize, comment: pages::Comment, names: &NameDirectory) 
         },
         text: comment.text,
     }
-}
-
-/// A page comment's author, named the way every other surface names one: a
-/// person by the account the directory binds to their key, else by handle.
-fn page_author_name(author: &pages::Party, names: &NameDirectory) -> String {
-    let handle = match author {
-        pages::Party::Account(account) => format!("acct:{account}"),
-        pages::Party::Key(key) => format!("user:{}", hex_encode(key)),
-        pages::Party::Module(module) => format!("module:{module}"),
-        pages::Party::System => "system".into(),
-    };
-    author_display(&handle, names)
 }
 
 pub(crate) async fn load_pages_data(
@@ -881,7 +837,10 @@ pub(crate) async fn load_pages_data(
     // moment the page opens, not only after the rail is.
     let block_ids: Vec<String> = blocks.iter().map(|block| block.id.clone()).collect();
     let threads = query_page_thread_rows(rpc, &active_page, &block_ids).await?;
-    let comment_thread_total = count_i64(threads.len());
+    // THE CHIP COUNTS WHAT IS OUTSTANDING. A resolved thread is filed away —
+    // the card keeps it behind its own toggle — so counting it here made the
+    // header disagree with every margin badge under it.
+    let comment_thread_total = count_i64(threads.iter().filter(|row| !row.resolved).count());
     let commented_block_hits = commented_targets(&active_page, &threads);
     Ok(PagesData {
         pages,

@@ -33,7 +33,19 @@ pub struct PageSearchHit {
     pub text: String,
 }
 
-/// One comment thread on the open page.
+/// One comment of a thread.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PageComment {
+    pub id: String,
+    pub ordinal: i64,
+    pub author: String,
+    pub meta: String,
+    pub text: String,
+}
+
+/// One comment thread on the open page, WITH its whole conversation: the node
+/// answers threads and comments in one query, so the card draws every thread
+/// expanded and never asks per thread.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PageCommentThread {
     pub id: String,
@@ -42,6 +54,7 @@ pub struct PageCommentThread {
     pub meta: String,
     pub resolved: bool,
     pub comment_count: i64,
+    pub comments: Vec<PageComment>,
 }
 
 /// A thread with the label of the block it anchors on.
@@ -51,14 +64,14 @@ pub struct PageCommentThreadRow {
     pub anchor: String,
 }
 
-/// One comment of the open thread.
+/// The open threads sharing one anchor, under the quote that names it. In page
+/// scope the card lists a group per commented block; in block scope there is
+/// only ever the one.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
-pub struct PageComment {
-    pub id: String,
-    pub ordinal: i64,
-    pub author: String,
-    pub meta: String,
-    pub text: String,
+pub struct PageCommentGroup {
+    pub target: String,
+    pub anchor: String,
+    pub threads: Vec<PageCommentThread>,
 }
 
 /// The screen's facts, as the app holds them. Document bytes arrive through a
@@ -90,16 +103,14 @@ pub struct PagesProps {
     pub subpages: Vec<Subpage>,
     pub orphaned_comment_drafts: Vec<String>,
     pub block_comments_open: bool,
+    /// The block the card is scoped to, or empty for the whole page.
+    pub scope_target: String,
+    /// A badge-opened card is its block's, whole: no way back out to the page.
+    pub scope_pinned: bool,
+    pub scope_label: String,
     pub thread_total: i64,
     pub comment_rows: Vec<PageCommentThreadRow>,
     pub threads_loading: bool,
-    pub threads_has_more: bool,
-    pub active_thread: String,
-    pub thread_resolved: bool,
-    pub active_thread_anchor: String,
-    pub comments: Vec<PageComment>,
-    pub comments_loading: bool,
-    pub comments_has_more: bool,
     pub compose_hint: String,
     pub seed_rev: i64,
     pub page_seed: String,
@@ -179,25 +190,26 @@ pub struct Rail {
     pub comment_draft: String,
 }
 
-/// `pages.open_thread` — open one comment thread on its own anchor.
+/// `pages.narrow` — scope the card to one block's threads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenThread {
-    pub comment_draft: String,
-    pub id: String,
+pub struct Narrow {
     pub target: String,
 }
 
-/// `pages.resolve` — resolve (or reopen) the open thread.
+/// `pages.resolve` — resolve (or reopen) one named thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolve {
+    pub id: String,
     pub resolved: bool,
 }
 
-/// `pages.post` — post `text` as a comment on the caret's block or the
-/// open thread.
+/// `pages.post` — a REPLY when `thread_id` names a thread, which anchors it on
+/// that thread's own target; an empty `thread_id` opens a new thread on the
+/// scope the card is showing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Post {
     pub text: String,
+    pub thread_id: String,
 }
 
 /// `pages.copy` — put `text` on the clipboard and toast `label`.
@@ -319,37 +331,38 @@ pub fn close_comments(comment_draft: &str) -> bool {
     )
 }
 
-pub fn open_thread(id: &str, target: &str, comment_draft: &str) -> bool {
+pub fn narrow(target: &str) -> bool {
     notify(
-        "pages.open_thread",
-        &OpenThread {
-            comment_draft: comment_draft.into(),
-            id: id.into(),
+        "pages.narrow",
+        &Narrow {
             target: target.into(),
         },
     )
 }
 
-pub fn resolve(resolved: bool) -> bool {
-    notify("pages.resolve", &Resolve { resolved })
-}
-
-pub fn more_threads() -> bool {
-    host::notify("pages.more_threads", &[]);
+pub fn widen() -> bool {
+    host::notify("pages.widen", &[]);
     true
 }
 
-pub fn close_thread(comment_draft: &str) -> bool {
-    notify("pages.close_thread", &Rail { comment_draft: comment_draft.into() })
+pub fn resolve(id: &str, resolved: bool) -> bool {
+    notify(
+        "pages.resolve",
+        &Resolve {
+            id: id.into(),
+            resolved,
+        },
+    )
 }
 
-pub fn more_comments() -> bool {
-    host::notify("pages.more_comments", &[]);
-    true
-}
-
-pub fn post(text: &str) -> bool {
-    notify("pages.post", &Post { text: text.into() })
+pub fn post(text: &str, thread_id: &str) -> bool {
+    notify(
+        "pages.post",
+        &Post {
+            text: text.into(),
+            thread_id: thread_id.into(),
+        },
+    )
 }
 
 pub fn copy(text: &str, label: &str) -> bool {
@@ -431,7 +444,12 @@ pub fn seeded(moved: bool, seed: &str, draft: &str) -> String {
 
 /// Only the accepted canonical reference crosses back. The app resolves its
 /// bytes from the matching host editor and keeps the ordinary save/CAS path.
-pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>, comment_draft: &str) -> bool {
+pub fn edited(
+    source: Vec<u8>,
+    reference: Vec<u8>,
+    navigation: Vec<u8>,
+    comment_draft: &str,
+) -> bool {
     host::notify(
         "pages.edited",
         &serde_json::to_vec(&crate::document_source::Accepted {
@@ -469,13 +487,116 @@ pub fn comment_navigation(navigation: Vec<u8>) -> bool {
         .is_ok_and(|navigation| navigation.comment_line.is_some())
 }
 
-pub fn comment_card_height(thread: &str, anchor_y: f64, viewport_height: f64) -> f64 {
+/// A card the reader opened AT A LINE stays near that line, so it is bounded;
+/// the header chip's card is the page's whole conversation and takes the room.
+pub fn comment_card_height(anchor_y: f64, viewport_height: f64) -> f64 {
     let available = (viewport_height - 83.0).max(0.0);
-    if !thread.is_empty() || anchor_y >= 0.0 {
-        available.min(400.0)
-    } else {
-        available
+    match anchor_y >= 0.0 {
+        true => available.min(400.0),
+        false => available,
     }
+}
+
+/// Replies a thread card keeps visible before it folds the rest away. Three
+/// is the Docs threshold: enough to read the shape of a conversation, few
+/// enough that one long thread cannot push every other one off the card.
+const VISIBLE_REPLIES: usize = 3;
+
+/// The words the thread was opened with — the body the card draws under its
+/// author, above the replies. A thread whose every comment was deleted keeps
+/// its row and says so rather than drawing a blank card.
+pub fn opener_text(thread: &PageCommentThread) -> String {
+    match thread.comments.first() {
+        Some(opener) => opener.text.clone(),
+        None => "This comment was deleted.".into(),
+    }
+}
+
+/// The replies under it, held to [`VISIBLE_REPLIES`] until the reader asks.
+pub fn thread_replies(thread: &PageCommentThread, expanded: bool) -> Vec<PageComment> {
+    let replies = thread.comments.iter().skip(1);
+    match expanded {
+        true => replies.cloned().collect(),
+        false => replies.take(VISIBLE_REPLIES).cloned().collect(),
+    }
+}
+
+/// What the fold's own button says, or `""` when there is nothing to fold.
+pub fn reply_toggle_label(thread: &PageCommentThread, expanded: bool) -> String {
+    let hidden = thread.comments.len().saturating_sub(1 + VISIBLE_REPLIES);
+    if hidden == 0 {
+        return String::new();
+    }
+    match expanded {
+        true => "Fewer replies".into(),
+        false => format!("{hidden} more replies"),
+    }
+}
+
+/// The open threads in the card's scope, grouped under the block they anchor
+/// to in the order the document met them — the page's own threads first, since
+/// the grouped query asks for the page before any of its blocks.
+pub fn comment_groups(rows: Vec<PageCommentThreadRow>, page_id: &str) -> Vec<PageCommentGroup> {
+    let mut groups: Vec<PageCommentGroup> = Vec::new();
+    for row in rows.into_iter().filter(|row| !row.thread.resolved) {
+        let anchors_to_page = row.thread.target == page_id || row.thread.target.is_empty();
+        let target = row.thread.target.clone();
+        match groups.iter_mut().find(|group| group.target == target) {
+            Some(group) => group.threads.push(row.thread),
+            None => groups.push(PageCommentGroup {
+                target,
+                anchor: match anchors_to_page {
+                    true => "This page".into(),
+                    false => row.anchor,
+                },
+                threads: vec![row.thread],
+            }),
+        }
+    }
+    groups
+}
+
+/// The settled threads, kept out of the list and behind their own toggle.
+pub fn resolved_rows(rows: Vec<PageCommentThreadRow>) -> Vec<PageCommentThreadRow> {
+    rows.into_iter().filter(|row| row.thread.resolved).collect()
+}
+
+pub fn resolved_label(rows: &[PageCommentThreadRow]) -> String {
+    format!(
+        "Resolved · {}",
+        rows.iter().filter(|row| row.thread.resolved).count()
+    )
+}
+
+/// What an empty scope says, naming the scope rather than the whole document.
+pub fn empty_scope_label(scope: &str) -> String {
+    match scope.is_empty() {
+        true => "No comments on this page yet".into(),
+        false => "No comments on this block yet".into(),
+    }
+}
+
+/// The reply box follows the thread the reader picked, and a second press on
+/// the same thread puts it away.
+pub fn reply_thread_after_press(current: &str, pressed: &str) -> String {
+    match current == pressed {
+        true => String::new(),
+        false => pressed.to_owned(),
+    }
+}
+
+/// View-local fold state, as a set of thread ids.
+pub fn expanded(ids: &[String], id: &str) -> bool {
+    ids.iter().any(|held| held == id)
+}
+
+pub fn toggled(ids: Vec<String>, id: &str) -> Vec<String> {
+    if ids.iter().any(|held| held == id) {
+        return ids.into_iter().filter(|held| held != id).collect();
+    }
+    let mut ids = ids;
+    ids.push(id.to_owned());
+    ids
 }
 
 pub fn comment_card_offset(anchor_y: f64, viewport_height: f64) -> f64 {

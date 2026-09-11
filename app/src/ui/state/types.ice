@@ -326,11 +326,9 @@ enum PagesIntent
   edited
   toggle_comments
   close_comments
-  open_thread
+  narrow_comments
+  widen_comments
   resolve
-  more_threads
-  close_thread
-  more_comments
   post
   copy
 // what the Chat view asks of the app: one variant per act the screen offers,

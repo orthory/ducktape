@@ -13,20 +13,23 @@ state
   pending_page = ""
 
   block_comments_open = false
+  // The page the standing thread load answers for — a reply naming another
+  // page is a load the reader has already clicked past.
   block_comments_target = ""
+  // THE CARD'S SCOPE: the block whose conversation it is showing, or "" for
+  // the whole page. A margin badge opens a block; the header chip opens the
+  // page and a group header narrows to a block from there.
   inline_comment_target = ""
+  // A BADGE-OPENED CARD IS THE BLOCK'S, whole: it offers no way back out to
+  // the page, because the page was never what the reader asked for.
+  block_comments_pinned = false
   block_comments_generation:i64 = 0
   block_comment_threads:[PageCommentThread] = []
+  // The scope's threads with their anchors resolved — a mirror, so the view
+  // never clones the block list once per thread (see tests/stream.rs).
   block_comment_rows:[PageCommentThreadRow] = []
   block_comment_thread_total:i64 = 0
-  block_comment_threads_next_from:i64 = 0
-  block_comment_threads_has_more = false
   block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  block_thread_comments:[PageComment] = []
-  block_thread_comments_next_from:i64 = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
 
@@ -37,9 +40,6 @@ state
   page_saved_text = ""
   buffer_page = ""
   commented_block_hits:[str] = []
-  caret_comment_target = ""
-  active_thread_target = ""
-  active_thread_anchor = ""
   page_inflight_text = ""
   page_refusal = ""
   block_autosave_status:AutosaveStatus = AutosaveStatus.idle

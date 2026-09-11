@@ -3,7 +3,8 @@
 //! lands in the field only when the seed moved.
 
 use pages_view::host::{
-    Choose, Create, PageItem, PagesProps, Post, Search, sidebar_width_after_delta,
+    Choose, Create, Narrow, PageComment, PageCommentThread, PageCommentThreadRow, PageItem,
+    PagesProps, Post, Resolve, Search, sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{find, has_text, item, press, submit, texts, type_into};
@@ -30,9 +31,101 @@ fn facts() -> PagesProps {
         active_page_title: "Alpha".into(),
         autosave: "saved".into(),
         block_comments_open: true,
-        compose_hint: "Comment on the page".into(),
+        scope_label: "This page · 0 threads".into(),
+        compose_hint: "Comment on this page".into(),
         ..PagesProps::default()
     }
+}
+
+fn comment(ordinal: i64, author: &str, text: &str) -> PageComment {
+    PageComment {
+        id: format!("comment-{ordinal}-{author}"),
+        ordinal,
+        author: author.into(),
+        meta: format!("#{ordinal}"),
+        text: text.into(),
+    }
+}
+
+fn thread(id: &str, target: &str, resolved: bool, comments: Vec<PageComment>) -> PageCommentThread {
+    PageCommentThread {
+        id: id.into(),
+        target: target.into(),
+        author: comments
+            .first()
+            .map(|first| first.author.clone())
+            .unwrap_or_default(),
+        meta: format!("{} comments", comments.len()),
+        resolved,
+        comment_count: comments.len() as i64,
+        comments,
+    }
+}
+
+fn row(thread: PageCommentThread, anchor: &str) -> PageCommentThreadRow {
+    PageCommentThreadRow {
+        thread,
+        anchor: anchor.into(),
+    }
+}
+
+/// Two open threads on one block — one of them a conversation with five
+/// replies — a thread on another block, one on the page, and a settled one.
+fn conversation() -> Vec<PageCommentThreadRow> {
+    vec![
+        row(
+            thread(
+                "page-thread",
+                "alpha",
+                false,
+                vec![comment(1, "Ines", "Is the whole page ready?")],
+            ),
+            "this page",
+        ),
+        row(
+            thread(
+                "seven-a",
+                "block-7",
+                false,
+                vec![
+                    comment(1, "Ada", "This paragraph reads backwards."),
+                    comment(2, "Bo", "reply one"),
+                    comment(3, "Ada", "reply two"),
+                    comment(4, "Bo", "reply three"),
+                    comment(5, "Ada", "reply four"),
+                    comment(6, "Bo", "reply five"),
+                ],
+            ),
+            "“Paragraph 7”",
+        ),
+        row(
+            thread(
+                "seven-b",
+                "block-7",
+                false,
+                vec![comment(1, "Cy", "And the number is wrong.")],
+            ),
+            "“Paragraph 7”",
+        ),
+        row(
+            thread(
+                "seven-done",
+                "block-7",
+                true,
+                vec![comment(1, "Dee", "Settled long ago.")],
+            ),
+            "“Paragraph 7”",
+        ),
+        row(
+            thread(
+                "nine",
+                "block-9",
+                false,
+                vec![comment(1, "Eve", "Elsewhere entirely.")],
+            ),
+            "“Paragraph 9”",
+        ),
+    ]
 }
 
 fn encoded(props: &PagesProps) -> Vec<u8> {
@@ -65,7 +158,7 @@ fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_ca
         "Beta",
         "✓ synced",
         "Comments",
-        "No comments yet",
+        "No comments on this page yet",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -74,7 +167,7 @@ fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_ca
         );
     }
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(type_into(&frame, "Add a comment…", "half a thought"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "half a thought"));
     assert!(frame.requests.is_empty(), "typing runs no handler");
     let frame = tick_native(press(&frame, "Beta"));
     let intent = one_intent(&frame);
@@ -93,7 +186,7 @@ fn a_create_a_search_and_a_post_leave_with_what_was_typed() {
     let (_, frame) = shown(&facts());
     let frame = tick_native(type_into(&frame, "New page", "  Gamma  "));
     let frame = tick_native(type_into(&frame, "Search pages…", "quorum"));
-    let frame = tick_native(type_into(&frame, "Add a comment…", "looks right"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "looks right"));
     let frame = tick_native(submit(&frame, "New page"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "pages.create");
@@ -119,7 +212,8 @@ fn a_create_a_search_and_a_post_leave_with_what_was_typed() {
     assert_eq!(
         serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
         Post {
-            text: "looks right".into()
+            text: "looks right".into(),
+            thread_id: String::new()
         }
     );
     // the field cleared with the act: the button is dark now
@@ -136,14 +230,15 @@ fn a_create_a_search_and_a_post_leave_with_what_was_typed() {
 #[test]
 fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
     let (subscription, frame) = shown(&facts());
-    let _ = tick_native(type_into(&frame, "Add a comment…", "mine"));
+    let _ = tick_native(type_into(&frame, "Start a thread…", "mine"));
     // the same seed pushed again changes nothing …
     let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
     let frame = tick_native(press(&frame, "Post"));
     assert_eq!(
         serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
         Post {
-            text: "mine".into()
+            text: "mine".into(),
+            thread_id: String::new()
         }
     );
     // … a moved seed replaces the field
@@ -157,7 +252,8 @@ fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
     assert_eq!(
         serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
         Post {
-            text: "the refused one".into()
+            text: "the refused one".into(),
+            thread_id: String::new()
         }
     );
 }
@@ -398,7 +494,7 @@ fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
     );
     let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
     assert!(!has_text(&frame, "Pages could not load"));
-    let _ = tick_native(type_into(&frame, "Add a comment…", "keep this draft"));
+    let _ = tick_native(type_into(&frame, "Start a thread…", "keep this draft"));
     let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
     assert!(has_text(&frame, "Pages could not load"));
     assert!(
@@ -424,7 +520,7 @@ fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
 #[test]
 fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
     let (subscription, frame) = shown(&facts());
-    let frame = tick_native(type_into(&frame, "Add a comment…", "draft from Alpha"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "draft from Alpha"));
     let post = press(&frame, "Post");
     // The delete is a named item in the header menu now, so open the menu
     // while the facts still stand and queue the press from inside it.
@@ -464,4 +560,206 @@ fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
             .text,
         "draft from Alpha"
     );
+}
+
+/// Keys of every button on the frame — how a test names the one it wants when
+/// several carry the same words.
+fn button_keys(frame: &Frame) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut walk = |node: &mut Node| {
+        if let Node::Button { key, .. } = node {
+            keys.push(key.clone());
+        }
+    };
+    frame.root.clone().unwrap().for_each_mut(&mut walk);
+    keys
+}
+
+#[test]
+fn page_scope_groups_the_threads_under_the_block_each_one_marks() {
+    let props = PagesProps {
+        comment_rows: conversation(),
+        thread_total: 4,
+        scope_label: "This page · 4 threads".into(),
+        ..facts()
+    };
+    let (_, frame) = shown(&props);
+    let shown_texts = texts(&frame);
+    // One group header per commented block, plus the page's own threads under
+    // a plain "This page" — and every open thread is already expanded.
+    for expected in [
+        "This page",
+        "“Paragraph 7”",
+        "“Paragraph 9”",
+        "Is the whole page ready?",
+        "This paragraph reads backwards.",
+        "And the number is wrong.",
+        "Elsewhere entirely.",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {shown_texts:?}"
+        );
+    }
+    // The two threads on Paragraph 7 are independent cards, not one merged
+    // conversation, and the group is drawn once for both.
+    assert_eq!(
+        shown_texts
+            .iter()
+            .filter(|text| *text == "“Paragraph 7”")
+            .count(),
+        1,
+        "{shown_texts:?}"
+    );
+    // A thread with five replies shows three and folds the rest.
+    assert!(has_text(&frame, "reply three"), "{shown_texts:?}");
+    assert!(!has_text(&frame, "reply four"), "{shown_texts:?}");
+    assert!(has_text(&frame, "2 more replies"), "{shown_texts:?}");
+    let frame = tick_native(press(&frame, "Show every reply"));
+    assert!(frame.requests.is_empty(), "folding a thread is view-local");
+    assert!(has_text(&frame, "reply five"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "Fewer replies"), "{:?}", texts(&frame));
+
+    // A group header is the way IN to that block's own scope. The page's own
+    // group is not one: it is already the scope the card is showing.
+    let frame = tick_native(press(&frame, "Comments on this block"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "pages.narrow");
+    assert_eq!(
+        serde_json::from_slice::<Narrow>(&intent.payload).expect("decodes"),
+        Narrow {
+            target: "block-7".into()
+        }
+    );
+}
+
+#[test]
+fn a_settled_thread_waits_behind_its_own_toggle() {
+    let props = PagesProps {
+        comment_rows: conversation(),
+        scope_label: "This page · 4 threads".into(),
+        ..facts()
+    };
+    let (_, frame) = shown(&props);
+    assert!(has_text(&frame, "Resolved · 1"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "Settled long ago."),
+        "a resolved thread is not in the list: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Resolved threads"));
+    assert!(frame.requests.is_empty(), "the toggle is view-local");
+    assert!(has_text(&frame, "Settled long ago."), "{:?}", texts(&frame));
+    // …and it offers Reopen rather than Resolve, with no reply box.
+    assert!(has_text(&frame, "Reopen"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Reopen thread"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "pages.resolve");
+    assert_eq!(
+        serde_json::from_slice::<Resolve>(&intent.payload).expect("decodes"),
+        Resolve {
+            id: "seven-done".into(),
+            resolved: false
+        }
+    );
+}
+
+#[test]
+fn a_badge_opened_block_scope_is_the_whole_card_and_its_replies_name_their_thread() {
+    // What the host pushes when a margin badge on Paragraph 7 is pressed: the
+    // scope is that block, pinned, and the rows are already narrowed to it.
+    let rows: Vec<PageCommentThreadRow> = conversation()
+        .into_iter()
+        .filter(|row| row.thread.target == "block-7")
+        .collect();
+    let props = PagesProps {
+        comment_rows: rows,
+        scope_target: "block-7".into(),
+        scope_pinned: true,
+        scope_label: "“Paragraph 7”".into(),
+        compose_hint: "New thread on “Paragraph 7”".into(),
+        thread_total: 4,
+        ..facts()
+    };
+    let (subscription, frame) = shown(&props);
+    let shown_texts = texts(&frame);
+    // BOTH open threads on the block, each expanded, and nothing from any
+    // other block.
+    assert!(
+        has_text(&frame, "This paragraph reads backwards."),
+        "{shown_texts:?}"
+    );
+    assert!(
+        has_text(&frame, "And the number is wrong."),
+        "{shown_texts:?}"
+    );
+    assert!(!has_text(&frame, "Elsewhere entirely."), "{shown_texts:?}");
+    assert!(
+        !has_text(&frame, "Is the whole page ready?"),
+        "{shown_texts:?}"
+    );
+    // A badge-opened card offers no way out to the page, and needs no group
+    // header: the card's own title already names the block.
+    assert!(!has_text(&frame, "← This page"), "{shown_texts:?}");
+    assert!(
+        shown_texts
+            .iter()
+            .filter(|text| *text == "“Paragraph 7”")
+            .count()
+            == 1,
+        "the title names the scope once: {shown_texts:?}"
+    );
+
+    // A REPLY NAMES ITS THREAD. The resting line becomes the box when pressed.
+    let reply_keys: Vec<String> = button_keys(&frame)
+        .into_iter()
+        .filter(|key| key.contains("reply-on"))
+        .collect();
+    assert_eq!(reply_keys.len(), 2, "one reply affordance per open thread");
+    let frame = tick_native(press(&frame, &reply_keys[1]));
+    assert!(frame.requests.is_empty(), "picking a thread is view-local");
+    let frame = tick_native(type_into(&frame, "Reply…", "  seconded  "));
+    let frame = tick_native(press(&frame, "Post reply"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "pages.post");
+    assert_eq!(
+        serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
+        Post {
+            text: "seconded".into(),
+            thread_id: "seven-b".into()
+        }
+    );
+
+    // THE COMPOSER AT THE FOOT OPENS A NEW THREAD on the same scope — an
+    // empty thread id — which is how a third thread on this block is started.
+    let frame = tick_native(vec![item(subscription, &encoded(&props))]);
+    let frame = tick_native(type_into(&frame, "Start a thread…", "a third point"));
+    let frame = tick_native(press(&frame, "PagesView/root/pages/comments-card/post"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "pages.post");
+    assert_eq!(
+        serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
+        Post {
+            text: "a third point".into(),
+            thread_id: String::new()
+        }
+    );
+}
+
+#[test]
+fn a_chip_opened_card_narrowed_to_a_block_can_widen_back() {
+    let props = PagesProps {
+        comment_rows: conversation()
+            .into_iter()
+            .filter(|row| row.thread.target == "block-7")
+            .collect(),
+        scope_target: "block-7".into(),
+        scope_pinned: false,
+        scope_label: "“Paragraph 7”".into(),
+        ..facts()
+    };
+    let (_, frame) = shown(&props);
+    assert!(has_text(&frame, "← This page"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "All comments on this page"));
+    assert_eq!(one_intent(&frame).kind, "pages.widen");
 }

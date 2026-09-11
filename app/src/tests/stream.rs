@@ -302,16 +302,20 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // `channel_id` from the account number it resolved itself, and `account_number`
     // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
     // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 8] = [
+    const MIRRORS: [(&str, &[&str]); 7] = [
         ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
+        // The card's rows are its SCOPE's threads with their anchors resolved,
+        // so narrowing and widening invalidate the mirror exactly as a new
+        // thread list or a moved page does.
         (
             "block_comment_rows",
-            &["blocks", "block_comment_threads", "active_page"],
-        ),
-        (
-            "active_thread_anchor",
-            &["blocks", "active_thread_target", "active_page"],
+            &[
+                "blocks",
+                "block_comment_threads",
+                "active_page",
+                "inline_comment_target",
+            ],
         ),
         (
             "huddle_rows",
