@@ -1,18 +1,45 @@
-//! The register the host pushes, the readings the screen folds off it, the
-//! editor's draft arithmetic, and the intents a save leaves with.
+//! What the view asks of the host kernel, the readings it folds off the
+//! register it reads for itself, the editor's draft arithmetic, and the ops
+//! it leaves with.
+//!
+//! The kernel pushes SESSION FACTS ONLY (`agents.props`: connected, dark,
+//! the signing account, and the run the app has opened for the reader from
+//! another tab). Everything module-shaped is this view's own: the register,
+//! the run tracker and one run's journal are read through `rpc.query` /
+//! `rpc.view`, re-read on every `rpc.live` hit for the `runs` and `identity`
+//! planes, and a pause, a resume or a save leaves as `op.submit` carrying
+//! the runs message the kernel signs with the SEATED key — the view never
+//! sees the key, the endpoint or the password.
 
-use iced::futures::{Stream, StreamExt};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
+use iced::futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use ui_lang_guest::host;
+
+/// The planes the register follows: `runs` carries every model record and
+/// every run fact, `identity` the controllers and their names.
+const RUNS_PLANE: &[u8] = b"runs";
+const IDENTITY_PLANE: &[u8] = b"identity";
+
+/// One page of the identity roster, the size the module serves.
+const IDENTITY_PAGE: u64 = 256;
+
+/// Refresh work and its per-refresh caches share this bound. Older facts
+/// remain on chain.
+const JOURNAL_ENTRY_LIMIT: usize = 128;
+
+/// How many touched places one run's chip row draws.
+const MAX_TOUCHED_PLACES: usize = 128;
 
 pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
     (width + delta).clamp(280.0, maximum)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HostError {
-    pub message: String,
 }
 
 /// One curated skill: a duckfs subtree, pinned at a snapshot or tracking the
@@ -26,8 +53,8 @@ pub struct AgentSkill {
     pub always: bool,
 }
 
-/// One registered agent — the whole record the desktop app read, with its
-/// live-run fact and its controller.
+/// One registered agent — the whole record, with its live-run fact and its
+/// controller.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRow {
     pub id: String,
@@ -42,9 +69,8 @@ pub struct AgentRow {
     pub skills: Vec<AgentSkill>,
 }
 
-/// One run of an agent — a dispatch and what became of it — as the app
-/// read it off the runs journal. Every stamp is pre-rendered: the view
-/// owns no clock and no chain height.
+/// One run of an agent — a dispatch and what became of it — as the runs
+/// journal lists it. Every stamp is pre-rendered: the view owns no clock.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRow {
     pub run_id: String,
@@ -77,8 +103,8 @@ pub struct RunRow {
 pub struct JournalEntry {
     /// the commit height, rendered
     pub height: String,
-    /// the fact's kind: `dispatched`, `session opened`, `acted`, `settled`,
-    /// `result action refused`, `pr linked`
+    /// the fact's kind: `dispatched`, `session opened`, `action`, `settled`,
+    /// `result action refused`, `pr linked`, `history`
     pub kind: String,
     pub summary: String,
     pub status: String,
@@ -99,9 +125,9 @@ pub struct RunLink {
     pub url: String,
 }
 
-/// The journal of one run, as the app last read it. `dispatch_id` names the
-/// run it belongs to, so a journal that arrives after the reader moved on
-/// is told apart from the one they are looking at.
+/// The journal of one run. `dispatch_id` names the run it belongs to, so a
+/// journal that arrives after the reader moved on is told apart from the one
+/// they are looking at.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunJournal {
     pub dispatch_id: String,
@@ -110,60 +136,1478 @@ pub struct RunJournal {
     pub links: Vec<RunLink>,
 }
 
-/// One step of a running agent: what it is doing, and whether it finished.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveActivity {
-    pub label: String,
-    pub done: bool,
-}
+// ---------- the session ----------
 
-/// The open run's progress off the node's live reading, while it runs:
-/// absent (`present` false) for a run that settled or never opened here.
+/// The session facts the kernel pushes, one item per change. `open_run` and
+/// `opened` are the app's NAVIGATION: a chat hint, a bell or a `duck://run`
+/// link opens a run from another tab, and the kernel has no other door to
+/// tell a view what its reader was sent to.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveRun {
-    pub present: bool,
-    pub status: String,
-    pub activity: Vec<LiveActivity>,
-    pub answer_preview: String,
-}
-
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentsProps {
-    pub rows: Vec<AgentRow>,
-    /// every agent's runs, newest dispatch first
-    pub runs: Vec<RunRow>,
-    /// the run the app has open for the reader, by dispatch id; "" is none.
-    /// The app owns it because a run is opened from other tabs too — a chat
-    /// hint, a bell, a duck://run link — and the panel follows.
-    pub open_run: String,
-    /// the doors the app has opened a run through, counted — a chat hint's
-    /// "View run", a bell, a duck://run link, the runs list. The tracker is
-    /// landed on at every bump, so a door onto the run already open still
-    /// brings the reader to it from whichever panel they were on.
-    pub opened: i64,
-    /// the journal of the run the app has open for the reader
-    pub journal: RunJournal,
-    /// the open run's progress while it is still running
-    pub live: LiveRun,
-    /// every capability tag a node on the network announces
-    pub capabilities: Vec<String>,
+pub struct Session {
+    pub connected: bool,
+    pub dark: bool,
     /// the signing account's number, decimal; "" when the app has none
     pub account: String,
-    /// bumped by the app on every committed agent write
-    pub committed: i64,
-    pub connected: bool,
-    pub answered: bool,
-    pub dark: bool,
+    /// the run the app has open for the reader, by dispatch id; "" is none
+    pub open_run: String,
+    /// one per door a run was opened through, counted
+    pub opened: i64,
 }
 
-/// The register now, and again on every change the host sees.
-pub fn props() -> impl Stream<Item = Result<AgentsProps, HostError>> + Send + 'static {
-    host::subscribe("agents.props", &[]).map(|answer| {
-        let bytes = answer.map_err(|message| HostError { message })?;
-        serde_json::from_slice(&bytes).map_err(|error| HostError {
-            message: error.to_string(),
+/// One item of the session subscription: the facts, or why not.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SessionItem {
+    pub next: Session,
+    pub error: String,
+}
+
+/// The session now, and again on every change the kernel sees.
+pub fn session() -> iced::Subscription<SessionItem> {
+    iced::Subscription::run(|| {
+        host::subscribe("agents.props", &[]).map(|answer| {
+            let read = answer.and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+            });
+            match read {
+                Ok(next) => SessionItem {
+                    next,
+                    error: String::new(),
+                },
+                Err(error) => SessionItem {
+                    next: Session::default(),
+                    error,
+                },
+            }
         })
     })
+}
+
+/// The serial the register subscription is keyed by: it moves when the
+/// session comes up, so a reconnect reads the register afresh.
+pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64) -> i64 {
+    let came_up = connected && !was_connected;
+    match came_up {
+        true => serial + 1,
+        false => serial,
+    }
+}
+
+// ---------- what the kernel is asked ----------
+
+async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+async fn query(target: &str, ask_for: serde_json::Value) -> Result<serde_json::Value, String> {
+    ask(
+        "rpc.query",
+        &serde_json::json!({ "target": target, "query": ask_for }),
+    )
+    .await
+}
+
+async fn view(target: &str, ask_for: serde_json::Value) -> Result<serde_json::Value, String> {
+    ask(
+        "rpc.view",
+        &serde_json::json!({ "target": target, "query": ask_for }),
+    )
+    .await
+}
+
+/// The `?net=` digest every duck:// chip is spelled with, so a chip opened
+/// later on another network refuses instead of resolving its ids against
+/// the wrong store: the chain id's hash half, the part after its `#`. A
+/// status that cannot be read spells no network, which is what an address
+/// with no `net` means.
+async fn chain_digest() -> String {
+    let Ok(status) = ask("rpc.status", &serde_json::json!({})).await else {
+        return String::new();
+    };
+    let chain_id = status["chain_id"].as_str().unwrap_or_default();
+    chain_id
+        .rsplit_once('#')
+        .map(|(_, digest)| digest)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+// ---------- the name directory ----------
+
+/// The network's accounts as this read found them: what names a controller,
+/// what names a key, and which account controls which program.
+#[derive(Clone, Debug, Default)]
+struct Names {
+    by_account: BTreeMap<u64, String>,
+    by_key: BTreeMap<String, String>,
+    controllers: BTreeMap<u64, u64>,
+}
+
+impl Names {
+    fn take(&mut self, account: &serde_json::Value) {
+        let Some(number) = account["number"].as_u64() else {
+            return;
+        };
+        let name = account["name"].as_str().unwrap_or_default().to_owned();
+        for key in account["keys"].as_array().cloned().unwrap_or_default() {
+            self.by_key
+                .insert(hex_encode(&json_bytes(&key["pubkey"])), name.clone());
+        }
+        if let Some(controller) = controller_of(&account["control"]) {
+            self.controllers.insert(number, controller);
+        }
+        self.by_account.insert(number, name);
+    }
+
+    /// An account by its bound name, or by its number when the directory
+    /// does not hold it.
+    fn account_label(&self, number: u64) -> String {
+        match self.by_account.get(&number) {
+            Some(name) => name.clone(),
+            None => format!("account {number}"),
+        }
+    }
+
+    /// A rendered author (`user:{key}`, `acct:{n}`, `module:{id}`, `system`)
+    /// as a person reads it.
+    fn author_label(&self, author: &str) -> String {
+        let Some((kind, id)) = author.split_once(':') else {
+            return "system".into();
+        };
+        match kind {
+            "acct" => match id.parse::<u64>() {
+                Ok(number) => self.account_label(number),
+                Err(_) => format!("account {id}"),
+            },
+            "user" => match self.by_key.get(id) {
+                Some(name) => name.clone(),
+                None => format!("user {}", short_label(id)),
+            },
+            "module" => id.to_owned(),
+            _ => "system".into(),
+        }
+    }
+}
+
+/// A program account's controller: the account that may change its record.
+fn controller_of(control: &serde_json::Value) -> Option<u64> {
+    control["program"]["controller"]
+        .as_u64()
+        .or_else(|| control["revoked"]["controller"].as_u64())
+}
+
+/// Every identity account, paged the way the module serves them: numbered
+/// from 1 with no gaps, at most one page at a time.
+async fn read_accounts() -> Result<Names, String> {
+    let mut names = Names::default();
+    let mut from = 0u64;
+    loop {
+        let reply = query(
+            "identity",
+            serde_json::json!({ "all": { "from": from, "limit": IDENTITY_PAGE } }),
+        )
+        .await?;
+        let page = reply["accounts"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| "the identity module returned the wrong reply".to_string())?;
+        let page_is_last = page.len() < IDENTITY_PAGE as usize;
+        let Some(last) = page.last().and_then(|account| account["number"].as_u64()) else {
+            break;
+        };
+        for account in &page {
+            names.take(account);
+        }
+        if page_is_last {
+            break;
+        }
+        from = last + 1;
+    }
+    Ok(names)
+}
+
+// ---------- the register ----------
+
+/// One item of the register subscription: the whole screen's reading, or
+/// why not.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct RegisterItem {
+    pub rows: Vec<AgentRow>,
+    pub runs: Vec<RunRow>,
+    pub capabilities: Vec<String>,
+    pub error: String,
+}
+
+/// The register now and after every block that moved it: read once at
+/// start, then again on each `rpc.live` hit for the `runs` or `identity`
+/// plane — the two planes an agent record is folded from.
+pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
+    iced::Subscription::run_with(connection, |_| {
+        let live = stream::select(
+            host::subscribe("rpc.live", RUNS_PLANE),
+            host::subscribe("rpc.live", IDENTITY_PLANE),
+        );
+        stream::once(load_register()).chain(live.then(|_| load_register()))
+    })
+}
+
+async fn load_register() -> RegisterItem {
+    match read_register().await {
+        Ok(item) => item,
+        Err(error) => RegisterItem {
+            error,
+            ..RegisterItem::default()
+        },
+    }
+}
+
+async fn read_register() -> Result<RegisterItem, String> {
+    let reply = query("runs", serde_json::json!({ "model": { "query": "agents" } })).await?;
+    let records = reply["model"]["agents"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "the runs module returned the wrong model roster reply".to_string())?;
+    let names = read_accounts().await?;
+    let working = agents_with_a_run_in_flight().await;
+    let rows = fold_agents(&records, &names, &working)?;
+    // the tracker names agents the way the register does. A node whose runs
+    // journal cannot answer (no mapper installed, a fold still catching up)
+    // lists no runs rather than losing the register.
+    let named: BTreeMap<String, String> = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.name.clone()))
+        .collect();
+    let runs = fold_runs(recent_runs().await.unwrap_or_default(), &named).await;
+    Ok(RegisterItem {
+        rows,
+        runs,
+        capabilities: announced_capabilities().await,
+        error: String::new(),
+    })
+}
+
+/// The agents holding a run in flight, from the runs module's pending
+/// register — the ONLY place that knows an agent is working. A node that
+/// cannot answer reports nobody working, never everybody.
+async fn agents_with_a_run_in_flight() -> BTreeSet<String> {
+    let Ok(reply) = query("runs", serde_json::json!("pending_runs")).await else {
+        return BTreeSet::new();
+    };
+    reply["pending_runs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|run| run["agent_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Every capability tag some node announces, sorted and deduped — the
+/// executors a record can name and be dispatched on. A node that cannot
+/// answer the registry offers none, never a guess.
+async fn announced_capabilities() -> Vec<String> {
+    let Ok(reply) = query("capability", serde_json::json!("all")).await else {
+        return Vec::new();
+    };
+    reply["all"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|entry| string_list(&entry[1]))
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// Every run the journal lists, newest dispatch first.
+async fn recent_runs() -> Result<Vec<serde_json::Value>, String> {
+    let reply = view(
+        "runs",
+        serde_json::json!({ "recent": { "agent_id": null, "limit": null } }),
+    )
+    .await?;
+    reply["runs"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "the runs journal returned the wrong reply to a recent-runs read".into())
+}
+
+fn fold_agents(
+    records: &[serde_json::Value],
+    names: &Names,
+    working: &BTreeSet<String>,
+) -> Result<Vec<AgentRow>, String> {
+    records
+        .iter()
+        .map(|record| {
+            let account = record["account"].as_u64().unwrap_or_default();
+            let controller = names
+                .controllers
+                .get(&account)
+                .ok_or_else(|| "the model account has no program controller".to_string())?;
+            let name = record["display_name"].as_str().unwrap_or_default().to_owned();
+            Ok(AgentRow {
+                id: record["agent_id"].as_str().unwrap_or_default().to_owned(),
+                initials: initials_of(&name),
+                capability: record["capability"].as_str().unwrap_or_default().to_owned(),
+                status: tagged_name(&record["status"]),
+                owner_handle: names.account_label(*controller),
+                controller: controller.to_string(),
+                live: working.contains(record["agent_id"].as_str().unwrap_or_default()),
+                skills: fold_skills(&record["skills"]),
+                name,
+            })
+        })
+        .collect()
+}
+
+fn fold_skills(skills: &serde_json::Value) -> Vec<AgentSkill> {
+    skills
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|skill| AgentSkill {
+            name: skill["name"].as_str().unwrap_or_default().to_owned(),
+            source_prefix: skill["source_prefix"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            source_snapshot: skill["source_snapshot"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            always: skill["load"].as_str() == Some("always"),
+        })
+        .collect()
+}
+
+/// The tracker's rows. A chat-born run is named by its room, which costs
+/// one channel read per distinct room in the list.
+async fn fold_runs(
+    runs: Vec<serde_json::Value>,
+    named: &BTreeMap<String, String>,
+) -> Vec<RunRow> {
+    let mut rooms: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(runs.len());
+    for run in runs {
+        let channel = run["channel_id"].as_str().unwrap_or_default().to_owned();
+        let chat_origin = run["origin"]["kind"].as_str() == Some("chat_message");
+        if chat_origin && !rooms.contains_key(&channel) {
+            rooms.insert(channel.clone(), channel_name(&channel).await);
+        }
+        let mut row = fold_run(&run, named);
+        if let Some(Some(name)) = rooms.get(&channel) {
+            row.origin = format!("#{name} · {}", row.origin);
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn fold_run(run: &serde_json::Value, named: &BTreeMap<String, String>) -> RunRow {
+    let agent_id = run["agent_id"].as_str().unwrap_or_default().to_owned();
+    let agent_name = named
+        .get(&agent_id)
+        .cloned()
+        .unwrap_or_else(|| agent_id.clone());
+    // the only forge item among a run's touched places is the PR its sink
+    // opened or updated; the item it was called on is its origin
+    let pr_number = run["places"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .find(|place| place["kind"].as_str() == Some("forge_item"))
+        .and_then(|place| place["number"].as_i64())
+        .unwrap_or(0);
+    let mut row = RunRow {
+        run_id: run["run_id"].as_str().unwrap_or_default().to_owned(),
+        dispatch_id: run["dispatch_id"].as_str().unwrap_or_default().to_owned(),
+        agent_id,
+        agent_name,
+        origin: run_origin(run),
+        state: "dispatched".into(),
+        dispatched: height_label_short(run["dispatched"]["height"].as_i64().unwrap_or(0)),
+        settled: String::new(),
+        attempt: 0,
+        holder: String::new(),
+        actions: run["actions"].as_i64().unwrap_or(0),
+        degraded: false,
+        reason: String::new(),
+        output_ref: String::new(),
+        pr_number,
+    };
+    let state = &run["state"];
+    match tagged_name(state).as_str() {
+        "running" => {
+            let running = &state["running"];
+            row.state = "running".into();
+            row.attempt = running["attempt"].as_i64().unwrap_or(0);
+            row.holder = short_pubkey(running["holder"].as_str().unwrap_or_default());
+        }
+        "settled" => {
+            let settled = &state["settled"];
+            row.state = outcome_word(settled["outcome"].as_str().unwrap_or_default()).into();
+            row.settled = height_label_short(settled["at"]["height"].as_i64().unwrap_or(0));
+            row.holder = short_pubkey(settled["executing_node"].as_str().unwrap_or_default());
+            row.degraded = settled["degraded"].as_bool().unwrap_or(false);
+            row.reason = settled["reason"].as_str().unwrap_or_default().to_owned();
+            row.output_ref = settled["output_ref"].as_str().unwrap_or_default().to_owned();
+        }
+        _ => {}
+    }
+    row
+}
+
+/// What a run answers, in the tracker's words.
+fn run_origin(run: &serde_json::Value) -> String {
+    if run["job_id"].is_string() {
+        return "Scheduled job".into();
+    }
+    if run["delegation_id"].is_string() {
+        return "Agent delegation".into();
+    }
+    format!("Message {}", run["anchor_seq"].as_i64().unwrap_or(0))
+}
+
+fn outcome_word(outcome: &str) -> &'static str {
+    match outcome {
+        "result_accepted" => "accepted",
+        "action_rejected" => "rejected",
+        _ => "failed",
+    }
+}
+
+/// One channel's name off chat's view lane; `None` when the index has none.
+async fn channel_name(channel_id: &str) -> Option<String> {
+    let reply = view(
+        "chat",
+        serde_json::json!({ "channel": { "channel_id": channel_id } }),
+    )
+    .await
+    .ok()?;
+    reply["channel"]["name"].as_str().map(str::to_owned)
+}
+
+// ---------- the journal ----------
+
+/// One item of the journal subscription: the run's journal, or why not.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct JournalItem {
+    pub journal: RunJournal,
+    pub error: String,
+}
+
+/// The open run's journal now, and again on every `runs` block: the facts
+/// it committed and the chips of every place it touched.
+pub fn run_journal(open_run: String, connection: i64) -> iced::Subscription<JournalItem> {
+    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+        let open_run = open_run.clone();
+        let again = open_run.clone();
+        let live = host::subscribe("rpc.live", RUNS_PLANE);
+        stream::once(load_journal(open_run))
+            .chain(live.then(move |_| load_journal(again.clone())))
+    })
+}
+
+async fn load_journal(dispatch_id: String) -> JournalItem {
+    match read_journal(&dispatch_id).await {
+        Ok(journal) => JournalItem {
+            journal,
+            error: String::new(),
+        },
+        Err(error) => JournalItem {
+            journal: RunJournal {
+                dispatch_id,
+                ..RunJournal::default()
+            },
+            error,
+        },
+    }
+}
+
+async fn read_journal(dispatch_id: &str) -> Result<RunJournal, String> {
+    let reply = view(
+        "runs",
+        serde_json::json!({ "run": { "dispatch_id": dispatch_id } }),
+    )
+    .await?;
+    let detail = reply["run"].clone();
+    let scope = RunJournal {
+        dispatch_id: dispatch_id.to_owned(),
+        ..RunJournal::default()
+    };
+    if detail.is_null() {
+        return Ok(scope);
+    }
+    let rows = detail["journal"].as_array().cloned().unwrap_or_default();
+    let omitted = rows.len().saturating_sub(JOURNAL_ENTRY_LIMIT);
+    let mut entries = Vec::with_capacity(JOURNAL_ENTRY_LIMIT + 1);
+    if omitted > 0 {
+        entries.push(JournalEntry {
+            kind: "history".into(),
+            summary: format!(
+                "Showing the latest {JOURNAL_ENTRY_LIMIT} events; {omitted} earlier events are \
+                 not shown."
+            ),
+            ..JournalEntry::default()
+        });
+    }
+    let kept: Vec<serde_json::Value> = rows.into_iter().skip(omitted).collect();
+    let linked_prs: Vec<serde_json::Value> = kept.iter().filter_map(pr_of_row).collect();
+    let mut chips = Chips {
+        chain: chain_digest().await,
+        names: read_accounts().await.unwrap_or_default(),
+        resolved: Vec::new(),
+    };
+    for row in &kept {
+        entries.push(chips.entry(row, &linked_prs).await);
+    }
+    let links = chips.run_links(&detail["run"]).await;
+    Ok(RunJournal {
+        entries,
+        links,
+        ..scope
+    })
+}
+
+/// The PR a journal row carries, if any: a run's sink links one.
+fn pr_of_row(row: &serde_json::Value) -> Option<serde_json::Value> {
+    let fact = &row["fact"];
+    let linked = fact["pr_linked"]["pr"].clone();
+    if linked.is_object() {
+        return Some(linked);
+    }
+    let settled = fact["settled"]["pr"].clone();
+    settled.is_object().then_some(settled)
+}
+
+/// Exact target addresses come from the canonical prepared action, never its
+/// display text.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    Chat {
+        channel: String,
+        seq: Option<u64>,
+    },
+    Message {
+        channel: String,
+        thread: Option<u64>,
+        id: String,
+    },
+    /// a `RunPlace`, verbatim from the index
+    Place(serde_json::Value),
+    ForgeRepository(String),
+    ForgeProposal {
+        repo: String,
+        source: String,
+        target: String,
+        candidates: Vec<u64>,
+    },
+    Label {
+        kind: String,
+        label: String,
+    },
+}
+
+/// One journal read's chips: the chain they are spelled for, the directory
+/// their people are named through, and every place already resolved.
+struct Chips {
+    chain: String,
+    names: Names,
+    resolved: Vec<(Target, RunLink)>,
+}
+
+impl Chips {
+    async fn cached(&mut self, target: Target) -> RunLink {
+        if let Some((_, link)) = self.resolved.iter().find(|(key, _)| key == &target) {
+            return link.clone();
+        }
+        let link = self.resolve(target.clone()).await;
+        self.resolved.push((target, link.clone()));
+        link
+    }
+
+    async fn resolve(&mut self, target: Target) -> RunLink {
+        match target {
+            Target::Chat { channel, seq } => self.chat(channel, seq, None).await,
+            Target::Message {
+                channel,
+                thread,
+                id,
+            } => self.message(channel, thread, id).await,
+            Target::Place(place) => self.place("target", place).await,
+            Target::ForgeRepository(repo) => RunLink {
+                relation: "target".into(),
+                kind: "forge".into(),
+                label: format!("Repository {repo}"),
+                url: duck_link(&format!("forge/{repo}"), &self.chain),
+            },
+            Target::ForgeProposal {
+                repo,
+                source,
+                target,
+                candidates,
+            } => self.forge_proposal(repo, source, target, candidates).await,
+            Target::Label { kind, label } => RunLink {
+                relation: "target".into(),
+                kind,
+                label,
+                url: String::new(),
+            },
+        }
+    }
+
+    /// The chip for one place. Chat, forge, page and run places carry an
+    /// address; the rest name what they are until the protocol addresses
+    /// them. A page place whose block the index no longer holds names its
+    /// id and carries no address: the journal still opens, one chip short
+    /// of a link.
+    async fn place(&mut self, relation: &str, place: serde_json::Value) -> RunLink {
+        let kind = place["kind"].as_str().unwrap_or_default().to_owned();
+        let text = |field: &str| place[field].as_str().unwrap_or_default().to_owned();
+        let link = |chip: &str, label: String, url: String| RunLink {
+            relation: relation.to_owned(),
+            kind: chip.to_owned(),
+            label,
+            url,
+        };
+        match kind.as_str() {
+            "chat_message" => {
+                let mut chip = self
+                    .chat(text("channel_id"), place["seq"].as_u64(), None)
+                    .await;
+                chip.relation = relation.to_owned();
+                chip
+            }
+            "channel" => {
+                let mut chip = self.chat(text("channel_id"), None, None).await;
+                chip.relation = relation.to_owned();
+                chip
+            }
+            "page_block" => match self.page_block(&text("block_id")).await {
+                Some((label, url)) => link("page", label, url),
+                None => link("page", "Page block unavailable".into(), String::new()),
+            },
+            "page_thread" => {
+                let anchored = self.thread_target(&text("thread_id")).await;
+                let resolved = match anchored {
+                    Some(target) => self.page_block(&target).await,
+                    None => None,
+                };
+                match resolved {
+                    Some((label, url)) => link("page", label, url),
+                    None => link("page", "Page discussion unavailable".into(), String::new()),
+                }
+            }
+            "page" => link(
+                "page",
+                chip_label(&text("title")),
+                duck_link(&format!("page/{}", text("page_id")), &self.chain),
+            ),
+            "job" => link("job", "Job discussion".into(), String::new()),
+            "task" => link("task", self.task_label(&text("task_id")).await, String::new()),
+            "file" => link("file", chip_label(&text("path")), String::new()),
+            "module" => link(
+                "module",
+                format!("module {}", text("module_id")),
+                String::new(),
+            ),
+            "conversation" => link("conversation", "Agent conversation".into(), String::new()),
+            "run" => link(
+                "run",
+                "Delegated run".into(),
+                duck_link(&format!("run/{}", text("dispatch_id")), &self.chain),
+            ),
+            "forge_item" => {
+                let number = place["number"].as_i64().unwrap_or(0);
+                link(
+                    "forge",
+                    format!("{}#{number}", text("repo")),
+                    duck_link(&format!("forge/{}/{number}", text("repo")), &self.chain),
+                )
+            }
+            "output" => link("output", "Run output".into(), String::new()),
+            _ => link("output", "Run output".into(), String::new()),
+        }
+    }
+
+    /// A page block as a chip names it: the page's opening line, then the
+    /// block's own when the block is not the page itself. The block's page
+    /// is what the link opens, the block its anchor.
+    async fn page_block(&self, block_id: &str) -> Option<(String, String)> {
+        let block = self.view_block(block_id).await?;
+        let page_id = block["page_id"].as_str().unwrap_or_default().to_owned();
+        let text = block["text"].as_str().unwrap_or_default().to_owned();
+        let is_page = page_id == block_id;
+        let label = match is_page {
+            true => chip_label(&text),
+            false => match self.view_block(&page_id).await {
+                Some(root) => chip_label(&format!(
+                    "{} · {text}",
+                    root["text"].as_str().unwrap_or_default()
+                )),
+                None => chip_label(&text),
+            },
+        };
+        let url = format!(
+            "{}#{block_id}",
+            duck_link(&format!("page/{page_id}"), &self.chain)
+        );
+        Some((label, url))
+    }
+
+    async fn view_block(&self, block_id: &str) -> Option<serde_json::Value> {
+        let reply = view(
+            "pages",
+            serde_json::json!({ "get_block": { "block_id": block_id } }),
+        )
+        .await
+        .ok()?;
+        let block = reply["block"].clone();
+        block.is_object().then_some(block)
+    }
+
+    /// The block a comment thread is anchored to, off pages' view lane.
+    async fn thread_target(&self, thread_id: &str) -> Option<String> {
+        let reply = view(
+            "pages",
+            serde_json::json!({ "get_thread": { "thread_id": thread_id } }),
+        )
+        .await
+        .ok()?;
+        reply["thread"]["target"].as_str().map(str::to_owned)
+    }
+
+    async fn task_label(&self, task_id: &str) -> String {
+        let reply = query(
+            "tasks",
+            serde_json::json!({ "task": { "get": { "task_id": task_id } } }),
+        )
+        .await;
+        match reply {
+            Ok(reply) => reply["task"]["task"]["title"]
+                .as_str()
+                .unwrap_or("Task")
+                .to_owned(),
+            Err(_) => "Task".into(),
+        }
+    }
+
+    async fn chat(
+        &self,
+        channel: String,
+        seq: Option<u64>,
+        message: Option<serde_json::Value>,
+    ) -> RunLink {
+        let room = match channel_name(&channel).await {
+            Some(name) => format!("#{name}"),
+            None => "Chat".into(),
+        };
+        let message = match (message, seq) {
+            (Some(message), _) => Some(message),
+            (None, Some(seq)) => self.message_at(&channel, seq).await,
+            (None, None) => None,
+        };
+        let label = self.message_label(room, seq, message.as_ref());
+        let url = match seq {
+            Some(seq) => format!(
+                "{}#{seq}",
+                duck_link(&format!("channel/{channel}"), &self.chain)
+            ),
+            None => duck_link(&format!("channel/{channel}"), &self.chain),
+        };
+        RunLink {
+            relation: "target".into(),
+            kind: "chat".into(),
+            label,
+            url,
+        }
+    }
+
+    async fn message_at(&self, channel: &str, seq: u64) -> Option<serde_json::Value> {
+        let reply = view(
+            "chat",
+            serde_json::json!({
+                "messages_around": { "channel_id": channel, "seq": seq, "limit": 1 }
+            }),
+        )
+        .await
+        .ok()?;
+        reply["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|row| row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq))
+    }
+
+    fn message_label(
+        &self,
+        room: String,
+        seq: Option<u64>,
+        message: Option<&serde_json::Value>,
+    ) -> String {
+        let Some(row) = message else {
+            return match seq {
+                Some(seq) => format!("{room} · message {seq} unavailable"),
+                None => room,
+            };
+        };
+        let author = self
+            .names
+            .author_label(row["author"].as_str().unwrap_or_default());
+        let author = match author.starts_with("user ") {
+            true => "Member".to_owned(),
+            false => author,
+        };
+        let body = match row["deleted"].as_bool().unwrap_or(false) {
+            true => "Deleted message".to_owned(),
+            false => chip_label(row["text"].as_str().unwrap_or_default())
+                .chars()
+                .take(120)
+                .collect(),
+        };
+        format!("{room} · {author}: {body}")
+    }
+
+    async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {
+        let found = view("chat", serde_json::json!({ "message": { "message_id": id } }))
+            .await
+            .ok()
+            .map(|reply| reply["message"].clone())
+            .filter(serde_json::Value::is_object);
+        let Some(row) = found else {
+            let mut destination = self.chat(channel, thread, None).await;
+            destination.label = format!("Destination · {}", destination.label);
+            return destination;
+        };
+        let channel_id = row["channel_id"].as_str().unwrap_or_default().to_owned();
+        let seq = row["seq"].as_u64();
+        self.chat(channel_id, seq, Some(row)).await
+    }
+
+    /// A PR number is never guessed from the newest repository item: only
+    /// this run's committed PR links can identify it, and its branches must
+    /// match the action.
+    async fn forge_proposal(
+        &self,
+        repo: String,
+        source: String,
+        target: String,
+        candidates: Vec<u64>,
+    ) -> RunLink {
+        let mut matching = Vec::new();
+        for number in candidates {
+            let reply = query(
+                "forge",
+                serde_json::json!({ "get_item": { "repo": repo, "number": number } }),
+            )
+            .await;
+            let Ok(reply) = reply else {
+                continue;
+            };
+            let item = &reply["item"];
+            let same_branches = item["source_branch"].as_str() == Some(source.as_str())
+                && item["target_branch"].as_str() == Some(target.as_str());
+            if same_branches {
+                matching.push((number, item["title"].as_str().unwrap_or_default().to_owned()));
+            }
+        }
+        match matching.as_slice() {
+            [(number, title)] => RunLink {
+                relation: "target".into(),
+                kind: "forge".into(),
+                label: format!("{repo}#{number} · {title}"),
+                url: duck_link(&format!("forge/{repo}/{number}"), &self.chain),
+            },
+            _ => RunLink {
+                relation: "target".into(),
+                kind: "forge".into(),
+                label: format!("{repo} · {source} → {target}"),
+                url: duck_link(&format!("forge/{repo}"), &self.chain),
+            },
+        }
+    }
+
+    /// Every chip of one run: its origin first, then each place its receipts
+    /// touched in journal order.
+    async fn run_links(&mut self, run: &serde_json::Value) -> Vec<RunLink> {
+        let mut links = Vec::new();
+        let origin = run["origin"].clone();
+        if origin.is_object() {
+            let mut link = self.cached(place_target(origin)).await;
+            link.relation = "from".into();
+            links.push(link);
+        }
+        let places: Vec<serde_json::Value> = run["places"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .take(MAX_TOUCHED_PLACES)
+            .collect();
+        for place in places {
+            let mut link = self.cached(place_target(place)).await;
+            link.relation = "touched".into();
+            links.push(link);
+        }
+        links
+    }
+
+    /// One journal row as an entry: its kind, a one-line summary of what the
+    /// module committed, and the chip of what it landed on.
+    async fn entry(
+        &mut self,
+        row: &serde_json::Value,
+        linked_prs: &[serde_json::Value],
+    ) -> JournalEntry {
+        let fact = &row["fact"];
+        let Some(acted) = fact.get("acted") else {
+            let mut entry = plain_entry(row);
+            if let Some(pr) = pr_of_row(row) {
+                let place = serde_json::json!({
+                    "kind": "forge_item",
+                    "repo": pr["repo"],
+                    "number": pr["number"],
+                });
+                entry.targets.push(self.cached(Target::Place(place)).await);
+            }
+            return entry;
+        };
+        let request_id = acted["request_id"].as_str().unwrap_or_default();
+        let request = self.action_request(request_id).await;
+        let operation = acted["operation"].as_str().unwrap_or_default();
+        let result = &acted["result"];
+        let (status, summary, target) = match &request {
+            Some(request) => (
+                action_status(&request["status"]),
+                action_description(
+                    request["operation"].as_str().unwrap_or_default(),
+                    &request["result"],
+                ),
+                prepared_action_target(request),
+            ),
+            None => (
+                "Status unavailable".to_owned(),
+                action_description(operation, result),
+                action_target(operation, result),
+            ),
+        };
+        let target = match &request {
+            Some(request) => completed_forge_target(request, linked_prs).or(target),
+            None => target,
+        };
+        let mut entry = plain_entry(row);
+        entry.status = status;
+        entry.summary = summary;
+        if let Some(target) = target {
+            entry.targets.push(self.cached(target).await);
+        }
+        entry
+    }
+
+    async fn action_request(&mut self, request_id: &str) -> Option<serde_json::Value> {
+        let reply = query(
+            "runs",
+            serde_json::json!({ "action_request": { "request_id": request_id } }),
+        )
+        .await
+        .ok()?;
+        let request = reply["action_request"].clone();
+        request.is_object().then_some(request)
+    }
+}
+
+/// A `RunPlace` as the target it addresses: a chat place carries its own
+/// resolver, everything else is the place itself.
+fn place_target(place: serde_json::Value) -> Target {
+    match place["kind"].as_str().unwrap_or_default() {
+        "chat_message" => Target::Chat {
+            channel: place["channel_id"].as_str().unwrap_or_default().to_owned(),
+            seq: place["seq"].as_u64(),
+        },
+        "channel" => Target::Chat {
+            channel: place["channel_id"].as_str().unwrap_or_default().to_owned(),
+            seq: None,
+        },
+        _ => Target::Place(place),
+    }
+}
+
+/// One journal fact in the tracker's words, before its action detail.
+fn plain_entry(row: &serde_json::Value) -> JournalEntry {
+    let fact = &row["fact"];
+    let (kind, summary) = journal_fact(fact);
+    JournalEntry {
+        height: height_label_short(row["height"].as_i64().unwrap_or(0)),
+        kind: kind.to_owned(),
+        summary,
+        ..JournalEntry::default()
+    }
+}
+
+fn journal_fact(fact: &serde_json::Value) -> (&'static str, String) {
+    match tagged_name(fact).as_str() {
+        "dispatched" => {
+            let dispatched = &fact["dispatched"];
+            (
+                "dispatched",
+                format!(
+                    "for {} from {}",
+                    dispatched["agent_id"].as_str().unwrap_or_default(),
+                    run_origin(dispatched)
+                ),
+            )
+        }
+        "session_opened" => (
+            "session opened",
+            format!(
+                "Attempt {}",
+                fact["session_opened"]["attempt"].as_i64().unwrap_or(0)
+            ),
+        ),
+        "acted" => (
+            "action",
+            action_description(
+                fact["acted"]["operation"].as_str().unwrap_or_default(),
+                &fact["acted"]["result"],
+            ),
+        ),
+        "settled" => {
+            let settled = &fact["settled"];
+            let mut parts = vec![
+                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
+            ];
+            if settled["degraded"].as_bool().unwrap_or(false) {
+                parts.push("degraded".into());
+            }
+            if let Some(reason) = settled["reason"].as_str() {
+                parts.push(reason.to_owned());
+            }
+            if settled["pr"].is_object() {
+                parts.push(pr_label(&settled["pr"]));
+            }
+            ("settled", parts.join(" · "))
+        }
+        "result_action_refused" => ("result action refused", "Final action was refused".into()),
+        "pr_linked" => ("pr linked", pr_label(&fact["pr_linked"]["pr"])),
+        _ => ("action", String::new()),
+    }
+}
+
+fn pr_label(pr: &serde_json::Value) -> String {
+    format!(
+        "PR {}#{}",
+        pr["repo"].as_str().unwrap_or_default(),
+        pr["number"].as_i64().unwrap_or(0)
+    )
+}
+
+/// The requested operation is independent of its execution status.
+fn action_description(operation: &str, result: &serde_json::Value) -> String {
+    let text = |key: &str| result[key].as_str().unwrap_or_default().to_owned();
+    match operation {
+        "react" => format!("React {}", text("emoji")),
+        "unreact" => format!("Remove reaction {}", text("emoji")),
+        "reply" => "Reply".into(),
+        "chat.post_message" => "Post message".into(),
+        "pages.comment" => "Comment on page".into(),
+        "pages.set_checked" => match result["checked"].as_bool() {
+            Some(true) => "Check todo".into(),
+            Some(false) => "Uncheck todo".into(),
+            None => "Change todo".into(),
+        },
+        "pages.post" => "Publish page".into(),
+        "jobs.comment" => "Comment on job".into(),
+        "tasks.create" => "Create task".into(),
+        "tasks.update_status" => {
+            format!("Move task to {}", text("status").replace('_', " "))
+        }
+        "duckfs.write_text" => "Write file".into(),
+        "modules.update" => "Request module deployment".into(),
+        "forge.open_pr" | "forge" => "Open pull request".into(),
+        "collaboration.send" => "Send agent message".into(),
+        "collaboration.acknowledge" => "Acknowledge agent message".into(),
+        "agent.call" => format!("Call {}", text("callee_agent_id")),
+        "submit" => format!("Submit to {}", text("module")),
+        _ => "Module action".into(),
+    }
+}
+
+fn action_status(status: &serde_json::Value) -> String {
+    match tagged_name(status).as_str() {
+        "awaiting_program" => "Queued".into(),
+        "claimed" => "Running".into(),
+        "rejected" => format!(
+            "Rejected: {}",
+            status["rejected"]["reason"].as_str().unwrap_or_default()
+        ),
+        "completed" => {
+            let outcome = &status["completed"]["outcome"];
+            match tagged_name(outcome).as_str() {
+                "applied" => "Completed".into(),
+                "rejected" => format!(
+                    "Rejected: {}",
+                    outcome["rejected"]["reason"].as_str().unwrap_or_default()
+                ),
+                "refused" => "Refused".into(),
+                _ => "Outcome unavailable".into(),
+            }
+        }
+        _ => "Status unavailable".into(),
+    }
+}
+
+fn prepared_action_target(request: &serde_json::Value) -> Option<Target> {
+    let payload = &request["payload"];
+    let operation = request["operation"].as_str().unwrap_or_default();
+    let result = &request["result"];
+    match request["target"].as_str().unwrap_or_default() {
+        "chat" => {
+            let reaction = payload["add_reaction"]
+                .as_object()
+                .or_else(|| payload["remove_reaction"].as_object());
+            if let Some(reaction) = reaction {
+                return Some(Target::Chat {
+                    channel: reaction
+                        .get("channel_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    seq: reaction.get("seq").and_then(serde_json::Value::as_u64),
+                });
+            }
+            let post = payload["post_message"].as_object()?;
+            Some(Target::Message {
+                channel: post
+                    .get("channel_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                thread: post.get("thread").and_then(serde_json::Value::as_u64),
+                id: post
+                    .get("message_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        }
+        "forge" => {
+            let repo = payload["open_pr"]["repo"].as_str()?;
+            Some(Target::ForgeRepository(repo.to_owned()))
+        }
+        "tasks" => match payload["task"]["create_task"]["title"].as_str() {
+            Some(title) => Some(Target::Label {
+                kind: "task".into(),
+                label: title.to_owned(),
+            }),
+            None => action_target(operation, result),
+        },
+        _ => action_target(operation, result),
+    }
+}
+
+fn action_target(operation: &str, result: &serde_json::Value) -> Option<Target> {
+    let text = |key: &str| result[key].as_str().unwrap_or_default().to_owned();
+    let number = |key: &str| result[key].as_u64();
+    let label = |kind: &str, label: &str| {
+        Some(Target::Label {
+            kind: kind.to_owned(),
+            label: label.to_owned(),
+        })
+    };
+    let page_block = |block_id: String| {
+        Some(Target::Place(
+            serde_json::json!({ "kind": "page_block", "block_id": block_id }),
+        ))
+    };
+    match operation {
+        "react" | "unreact" => Some(Target::Chat {
+            channel: text("channel_id"),
+            seq: number("seq"),
+        }),
+        "chat.post_message" => Some(Target::Message {
+            channel: text("channel_id"),
+            thread: number("thread"),
+            id: text("message_id"),
+        }),
+        "reply" => {
+            let destination = result.get("destination")?;
+            let at = |key: &str| {
+                destination[key]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            match destination["kind"].as_str().unwrap_or_default() {
+                "chat" => Some(Target::Message {
+                    channel: at("channel_id"),
+                    thread: destination["thread"].as_u64(),
+                    id: text("id"),
+                }),
+                "page" => page_block(at("target")),
+                "page_thread" => Some(Target::Place(serde_json::json!({
+                    "kind": "page_thread", "thread_id": at("thread_id")
+                }))),
+                "job" => label("job", "Job discussion"),
+                _ => None,
+            }
+        }
+        "pages.comment" => {
+            let target = text("target");
+            match target.is_empty() {
+                true => Some(Target::Place(serde_json::json!({
+                    "kind": "page_thread", "thread_id": text("thread_id")
+                }))),
+                false => page_block(target),
+            }
+        }
+        "pages.set_checked" => page_block(text("block_id")),
+        "pages.post" => Some(Target::Place(serde_json::json!({
+            "kind": "page", "page_id": text("page_id"), "title": text("title")
+        }))),
+        "jobs.comment" => label("job", "Job discussion"),
+        "tasks.create" | "tasks.update_status" => Some(Target::Place(
+            serde_json::json!({ "kind": "task", "task_id": text("task_id") }),
+        )),
+        "duckfs.write_text" => label("file", &text("path")),
+        "modules.update" => label("module", &text("module_id")),
+        "forge.open_pr" => Some(Target::ForgeRepository(text("repo"))),
+        "collaboration.send" | "collaboration.acknowledge" => {
+            label("conversation", "Agent conversation")
+        }
+        // A delegated run's address is a digest of its delegation, which
+        // this view has no hasher for; the run's own `places` still carries
+        // the delegated run as a linked chip.
+        "agent.call" => label("run", "Delegated run"),
+        "submit" => label("module", &text("module")),
+        _ => None,
+    }
+}
+
+fn completed_forge_target(
+    request: &serde_json::Value,
+    linked_prs: &[serde_json::Value],
+) -> Option<Target> {
+    let completed = request["status"]["completed"]["outcome"]["applied"].is_object();
+    let forge = request["target"].as_str() == Some("forge");
+    if !completed || !forge {
+        return None;
+    }
+    let open_pr = request["payload"]["open_pr"].as_object()?;
+    let field = |key: &str| {
+        open_pr
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let repo = field("repo");
+    let candidates: Vec<u64> = linked_prs
+        .iter()
+        .filter(|pr| pr["repo"].as_str() == Some(repo.as_str()))
+        .filter_map(|pr| pr["number"].as_u64())
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .collect();
+    Some(Target::ForgeProposal {
+        repo,
+        source: field("source_branch"),
+        target: field("target_branch"),
+        candidates,
+    })
+}
+
+// ---------- the writes ----------
+
+/// One finished write, as the kernel answered it.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct ActItem {
+    pub error: String,
+}
+
+#[derive(Default)]
+struct Acts {
+    pending: Vec<host::Response>,
+    waker: Option<Waker>,
+}
+
+thread_local! {
+    // One per thread = one per driver, like the guest's request registry:
+    // a wasm module has one thread, and every native test drives its own
+    // app on its own thread — a process-wide list would hand one app's
+    // answer to another's stream.
+    static ACTS: RefCell<Acts> = RefCell::default();
+}
+
+/// Submits one runs op: the kernel signs it with the seated key.
+fn submit(message: serde_json::Value) -> bool {
+    let op = serde_json::json!({ "target": "runs", "payload": message });
+    let response = host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"));
+    ACTS.with_borrow_mut(|acts| {
+        acts.pending.push(response);
+        if let Some(waker) = acts.waker.take() {
+            waker.wake();
+        }
+    });
+    true
+}
+
+fn configure(operation: serde_json::Value) -> bool {
+    submit(serde_json::json!({ "configure_model": { "operation": operation } }))
+}
+
+/// Pause (`paused`) or resume one agent — owner-gated at the module.
+pub fn status(agent_id: &str, paused: bool) -> bool {
+    let verb = match paused {
+        true => "pause_model",
+        false => "resume_model",
+    };
+    configure(serde_json::json!({ verb: { "agent_id": agent_id } }))
+}
+
+/// Rewrite the record under `agent_id` with the draft. Every editable field
+/// is sent, so the record afterwards IS the draft; the registry decides
+/// whether the signing account controls it.
+pub fn save(agent_id: &str, display_name: &str, capability: &str, skills: &[AgentSkill]) -> bool {
+    configure(serde_json::json!({ "update_model": {
+        "agent_id": agent_id.trim(),
+        "display_name": display_name.trim(),
+        "capability": capability.trim(),
+        "skills": skills_wire(skills),
+    }}))
+}
+
+fn skills_wire(skills: &[AgentSkill]) -> serde_json::Value {
+    let refs: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|skill| {
+            let pinned = !skill.source_snapshot.is_empty();
+            serde_json::json!({
+                "name": skill.name,
+                "source_prefix": skill.source_prefix,
+                "source_snapshot": pinned.then(|| skill.source_snapshot.clone()),
+                "load": match skill.always { true => "always", false => "on_demand" },
+            })
+        })
+        .collect();
+    serde_json::Value::Array(refs)
+}
+
+/// Every write's outcome, as the kernel answers it.
+pub fn acts() -> iced::Subscription<ActItem> {
+    iced::Subscription::run(|| ActStream)
+}
+
+struct ActStream;
+
+impl Stream for ActStream {
+    type Item = ActItem;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<ActItem>> {
+        ACTS.with_borrow_mut(|acts| {
+            let mut finished = None;
+            for (index, response) in acts.pending.iter_mut().enumerate() {
+                if let Poll::Ready(answer) = Pin::new(response).poll(cx) {
+                    finished = Some((index, answer));
+                    break;
+                }
+            }
+            let Some((index, answer)) = finished else {
+                acts.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            };
+            acts.pending.remove(index);
+            Poll::Ready(Some(ActItem {
+                error: answer.err().unwrap_or_default(),
+            }))
+        })
+    }
+}
+
+// ---------- the intents ----------
+
+/// The run the reader opened, whose panel the app is asked to follow; an
+/// empty id closes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRun {
+    pub dispatch_id: String,
+}
+
+pub fn open_run(dispatch_id: &str) -> bool {
+    notify(
+        "agents.open_run",
+        &OpenRun {
+            dispatch_id: dispatch_id.into(),
+        },
+    )
+}
+
+/// A chip pressed: the duck:// address the app's open plane warps to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenLink {
+    pub url: String,
+}
+
+pub fn open_link(url: &str) -> bool {
+    notify("agents.open_link", &OpenLink { url: url.into() })
+}
+
+/// The editor's whole record, as the app's `AgentDraft` decodes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    pub agent_id: String,
+    pub display_name: String,
+    pub capability: String,
+    pub skills: Vec<AgentSkill>,
+}
+
+/// Register a new agent from the draft. THE ONE WRITE THAT IS STILL THE
+/// APP'S: a registration first provisions the agent's program account, and
+/// the program it binds is composed by the runs module's own crate
+/// (`runs::model_program`) — a guest cannot build it without keeping a
+/// second copy of that module's workflow.
+pub fn register_agent(
+    agent_id: &str,
+    display_name: &str,
+    capability: &str,
+    skills: &[AgentSkill],
+) -> bool {
+    notify(
+        "agents.register",
+        &Draft {
+            agent_id: agent_id.trim().to_owned(),
+            display_name: display_name.trim().to_owned(),
+            capability: capability.trim().to_owned(),
+            skills: skills.to_vec(),
+        },
+    )
+}
+
+fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
+    let bytes = serde_json::to_vec(payload).expect("an intent encodes");
+    host::notify(operation, &bytes);
+    true
+}
+
+// ---------- the readings ----------
+
+/// Whether the editor's drafts were consumed by a write that landed: a save
+/// the kernel answered, or a registration whose id is now in the register.
+pub fn drafts_consumed(
+    acted: i64,
+    seeded: i64,
+    creating: bool,
+    rows: &[AgentRow],
+    draft_id: &str,
+) -> bool {
+    let write_landed = acted != seeded;
+    let registration_landed = creating && rows.iter().any(|row| row.id == draft_id);
+    write_landed || registration_landed
 }
 
 /// `4 agents · 2 working` — the title's machine subtitle. `working` is runs
@@ -175,6 +1619,18 @@ pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     let working = rows.iter().filter(|row| row.live).count();
     let noun = if rows.len() == 1 { "agent" } else { "agents" };
     format!("{} {noun} · {working} working", rows.len())
+}
+
+/// How many agents hold a run in flight — the rail's pulse, told to the
+/// kernel as this tab's count.
+pub fn working_agents(rows: &[AgentRow]) -> i64 {
+    count_i64(rows.iter().filter(|row| row.live).count())
+}
+
+/// Tells the kernel how many agents are working: the rail's pulse dot.
+pub fn badge(working: i64) -> bool {
+    host::notify("host.badge", working.to_string().as_bytes());
+    true
 }
 
 /// `12 runs · 2 in flight` — the Runs panel's machine subtitle.
@@ -208,10 +1664,6 @@ pub fn run_at(runs: &[RunRow], dispatch_id: &str) -> RunRow {
 
 pub fn empty_journal() -> RunJournal {
     RunJournal::default()
-}
-
-pub fn empty_live() -> LiveRun {
-    LiveRun::default()
 }
 
 /// The glyph a chip wears for the kind of place it names.
@@ -402,92 +1854,116 @@ pub fn valid_agent_id(id: &str) -> bool {
     sized && unhyphenated_ends && label_chars
 }
 
-// ---- the intents -----------------------------------------------------------
+// ---------- the small folds ----------
 
-/// Pause (`paused: true`) or resume an agent.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Status {
-    pub agent_id: String,
-    pub paused: bool,
+/// An externally tagged enum's variant name, or a bare string as itself.
+pub fn tagged_name(value: &serde_json::Value) -> String {
+    value.as_str().map(str::to_string).unwrap_or_else(|| {
+        value
+            .as_object()
+            .and_then(|tagged| tagged.keys().next().cloned())
+            .unwrap_or_default()
+    })
 }
 
-/// The editor's whole record, as the app's `AgentDraft` decodes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Draft {
-    pub agent_id: String,
-    pub display_name: String,
-    pub capability: String,
-    pub skills: Vec<AgentSkill>,
+fn string_list(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.as_str().map(str::to_owned))
+        .collect()
 }
 
-/// The run the reader opened, whose journal the app is asked to read; an
-/// empty id closes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenRun {
-    pub dispatch_id: String,
+/// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
+fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .map(|bytes| {
+            bytes
+                .iter()
+                .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-pub fn open_run(dispatch_id: &str) -> bool {
-    notify(
-        "agents.open_run",
-        &OpenRun {
-            dispatch_id: dispatch_id.into(),
-        },
-    )
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
-/// A chip pressed: the duck:// address the app's open plane warps to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenLink {
-    pub url: String,
+fn short_label(id: &str) -> String {
+    let mut label: String = id.chars().take(8).collect();
+    if id.chars().count() > 8 {
+        label.push('…');
+    }
+    label
 }
 
-pub fn open_link(url: &str) -> bool {
-    notify("agents.open_link", &OpenLink { url: url.into() })
-}
-
-pub fn status(agent_id: &str, paused: bool) -> bool {
-    notify(
-        "agents.status",
-        &Status {
-            agent_id: agent_id.into(),
-            paused,
-        },
-    )
-}
-
-fn draft(agent_id: &str, display_name: &str, capability: &str, skills: &[AgentSkill]) -> Draft {
-    Draft {
-        agent_id: agent_id.trim().to_owned(),
-        display_name: display_name.trim().to_owned(),
-        capability: capability.trim().to_owned(),
-        skills: skills.to_vec(),
+fn short_pubkey(pubkey: &str) -> String {
+    let head: String = pubkey.chars().take(16).collect();
+    match head.len() < pubkey.len() {
+        true => format!("{head}…"),
+        false => head,
     }
 }
 
-/// Rewrite the record under `agent_id` with the draft.
-pub fn save(agent_id: &str, display_name: &str, capability: &str, skills: &[AgentSkill]) -> bool {
-    notify(
-        "agents.save",
-        &draft(agent_id, display_name, capability, skills),
-    )
+/// A chip's label is one line: the text's words, single-spaced. How much of
+/// it a chip shows is the view's call, not a count picked here.
+fn chip_label(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Register a new agent from the draft.
-pub fn register(
-    agent_id: &str,
-    display_name: &str,
-    capability: &str,
-    skills: &[AgentSkill],
-) -> bool {
-    notify(
-        "agents.register",
-        &draft(agent_id, display_name, capability, skills),
-    )
+/// The avatar text of a display name: two letters, or one glyph.
+fn initials_of(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().take(2).collect();
+    if words.len() == 2 {
+        let letters: String = words
+            .iter()
+            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
+            .collect();
+        if letters.chars().count() == 2 {
+            return letters.to_uppercase();
+        }
+    }
+    let letters: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(2)
+        .collect();
+    match letters.is_empty() {
+        true => "?".into(),
+        false => letters.to_uppercase(),
+    }
 }
 
-fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
-    let bytes = serde_json::to_vec(payload).expect("an intent encodes");
-    host::notify(operation, &bytes);
-    true
+/// `h 84,912` — a block height, grouped; a negative one is `h —`.
+fn height_label_short(height: i64) -> String {
+    if height < 0 {
+        return "h —".into();
+    }
+    let digits = height.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        let group_boundary = index > 0 && (digits.len() - index).is_multiple_of(3);
+        if group_boundary {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    format!("h {grouped}")
+}
+
+/// `duck://<path>?net=<chain>` — an address spelled for the chain it was
+/// resolved on; a read with no chain spells no `net`.
+fn duck_link(path: &str, chain: &str) -> String {
+    if chain.is_empty() {
+        return format!("duck://{path}");
+    }
+    format!("duck://{path}?net={chain}")
 }
