@@ -426,7 +426,10 @@ fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
     let (subscription, frame) = shown(&facts());
     let frame = tick_native(type_into(&frame, "Add a comment…", "draft from Alpha"));
     let post = press(&frame, "Post");
-    let delete = press(&frame, "Delete page");
+    // The delete is a named item in the header menu now, so open the menu
+    // while the facts still stand and queue the press from inside it.
+    let opened = tick_native(press(&frame, "Page actions"));
+    let delete = press(&opened, "Delete page");
     let choose = press(&frame, "Beta");
     // The host has moved to Beta, but an incomplete update cannot replace
     // the Alpha facts that the reader still sees.
