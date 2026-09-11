@@ -329,36 +329,6 @@ fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
     );
 }
 
-#[test]
-fn a_proposal_renders_its_payload_and_its_frozen_bar() {
-    let view = serde_json::json!({
-        "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
-        "voting_rule": { "threshold": { "required_yes": 4 } }
-    });
-    assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
-    // a threshold's bar does not move with the no votes.
-    assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
-    assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
-
-    // a participating majority's quorum is TURNOUT, and passing also needs
-    // yes > no — reading `quorum` straight into a yes counter says "quorum
-    // met" at 3/3 on a vote of 3 yes / 3 no, which does not settle.
-    let majority = serde_json::json!({ "participating_majority": { "quorum": 6 } });
-    assert_eq!(yes_needed(&majority, 0), 6);
-    assert_eq!(
-        yes_needed(&majority, 2),
-        4,
-        "two no votes count toward turnout"
-    );
-    assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
-
-    assert_eq!(tagged_name(&view["action"]), "add_validator");
-    assert_eq!(
-        gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
-        "ship it"
-    );
-}
-
 /// ONE CARD, ONE SAMPLE — AND THE SAMPLE IS THE WHOLE PAIR.
 ///
 /// A checkpoint carries no meaning alone; it only ever says how far the durable

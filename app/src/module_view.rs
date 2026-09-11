@@ -17,8 +17,11 @@
 //! in its place instead of taking the window with it.
 
 mod display_budget;
+mod kernel;
 
 pub(crate) mod pages_document;
+
+pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -76,57 +79,25 @@ const LOAD_POLL: Duration = Duration::from_millis(50);
 
 // ---------- the Approvals seat ----------
 
-/// The Approvals tab: the governance register as the app has it, drawn by
-/// the `governance` view. Its intents come back as `vote` and `execute`,
-/// each with an [`Intent`] in `detail`.
+/// The Approvals tab, drawn by the `governance` view over the KERNEL
+/// CONTRACT: the app pushes session facts only, the view reads its own
+/// register through `rpc.query` / `rpc.blocks` / `rpc.live`, and a vote or
+/// a settle comes back as `op.submit`, signed here with the seated key. The
+/// one event the app hears is the kernel's `badge` (the tab's open count).
 pub fn governance_view(
     dark: bool,
     connected: bool,
     admin: bool,
-    answered: bool,
-    voting: &str,
-    rows: &[crate::backend::ProposalRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
-        "rows": rows,
-        "voting": voting,
         "admin": admin,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
     module_view(
         "governance",
         serde_json::to_vec(&props).expect("props encode"),
     )
-}
-
-/// A vote or a settle, as the governance view sends it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct Intent {
-    pub proposal_id: String,
-    pub approve: bool,
-}
-
-pub fn gov_intent(event: &ModuleViewEvent) -> crate::GovIntent {
-    match event.kind.as_str() {
-        "execute" => crate::GovIntent::Execute,
-        _ => crate::GovIntent::Vote,
-    }
-}
-
-pub fn gov_event_proposal(event: &ModuleViewEvent) -> String {
-    intent(event)
-        .map(|intent| intent.proposal_id)
-        .unwrap_or_default()
-}
-
-pub fn gov_event_approves(event: &ModuleViewEvent) -> bool {
-    intent(event).is_some_and(|intent| intent.approve)
-}
-
-fn intent(event: &ModuleViewEvent) -> Option<Intent> {
-    serde_json::from_str(&event.detail).ok()
 }
 
 // ---------- the roster seats ----------
@@ -1708,7 +1679,9 @@ fn surface_intent(module: &str) -> &'static str {
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
-        "governance" => &["vote", "execute"],
+        // the governance view speaks the kernel contract only: its writes
+        // are `op.submit`, never an intent the app decodes
+        "governance" => &[],
         "members" => &["copy", "agent_status", "propose"],
         "agents" => &[
             "status",
@@ -2613,6 +2586,11 @@ struct Guest {
     files_save_namespace: Option<String>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
+    /// The kernel's answers to this guest's node calls, on their way in.
+    replies: Arc<kernel::Replies>,
+    /// The guest's `rpc.live` subscriptions, each with the plane it named:
+    /// told on every block that moves that plane.
+    live_subscriptions: Vec<(u64, String)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3280,6 +3258,8 @@ impl Guest {
             files_save_namespace: (module == "files")
                 .then(|| crate::backend::fresh_operation_id("files-view".into())),
             intents: Vec::new(),
+            replies: Arc::default(),
+            live_subscriptions: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3371,6 +3351,7 @@ impl Guest {
             return false;
         }
         self.sync_props(props);
+        self.replies.drain_into(&mut self.pending);
         pages_document::drive(self);
         if self.staged {
             // a replacement's first tree is already here; only its
@@ -3409,6 +3390,7 @@ impl Guest {
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
+            self.live_subscriptions.retain(|(live, _)| *live != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -3430,6 +3412,10 @@ impl Guest {
             return;
         }
         let (capability, operation) = kind.split_once('.').unwrap_or((kind.as_str(), ""));
+        // the kernel contract first: what every view may ask, module-free
+        if kernel::answer(self, capability, operation, id, &payload) {
+            return;
+        }
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
@@ -3857,6 +3843,13 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         if guest.redraw(props) {
             shell.request_redraw();
         }
+        // a node call the kernel is running for the view lands between
+        // frames: poll for it, as the tab polls for a view still loading
+        if guest.replies.any_in_flight() {
+            shell.request_redraw_at(window::RedrawRequest::At(
+                iced::time::Instant::now() + LOAD_POLL,
+            ));
+        }
         let native_frame_ready = same_instance
             && self.rev == guest.frame_rev
             && guest.fault.is_none()
@@ -4072,31 +4065,12 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn an_intent_is_read_off_the_guests_json() {
-        let vote = event("vote", r#"{"proposal_id":"prop-1","approve":false}"#);
-        assert!(matches!(gov_intent(&vote), crate::GovIntent::Vote));
-        assert_eq!(gov_event_proposal(&vote), "prop-1");
-        assert!(!gov_event_approves(&vote));
-        let settle = event("execute", r#"{"proposal_id":"prop-2","approve":true}"#);
-        assert!(matches!(gov_intent(&settle), crate::GovIntent::Execute));
-        assert_eq!(gov_event_proposal(&settle), "prop-2");
-    }
-
-    /// Malformed JSON names no proposal, and the handler's empty-id guard
-    /// is what refuses it.
-    #[test]
-    fn a_malformed_intent_names_no_proposal() {
-        let broken = event("vote", "not json");
-        assert_eq!(gov_event_proposal(&broken), "");
-        assert!(!gov_event_approves(&broken));
-    }
-
     /// Only the operations a module declares reach the app; the props
     /// subscription and the log are the host's, everything else is refused.
+    /// The governance view declares none: it speaks the kernel contract.
     #[test]
     fn only_declared_intents_are_routed() {
-        assert_eq!(intents_of("governance"), ["vote", "execute"]);
+        assert!(intents_of("governance").is_empty());
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert_eq!(
             intents_of("agents"),
@@ -4136,8 +4110,7 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 10] = [
-            ("governance", "gov_intent", &[]),
+        let other_route_only: [(&str, &str, &[&str]); 9] = [
             ("members", "roster_intent", &[]),
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
@@ -4323,18 +4296,23 @@ pub(crate) mod tests {
         found
     }
 
-    /// The bundled component, end to end through the host: it boots on the
-    /// offline plate, takes the register the app pushes, and a press on its
-    /// card comes back as the intent the handler signs. Needs `make views`;
-    /// without the staged component the test says so and does nothing.
+    /// The bundled component, end to end through the host, on the kernel
+    /// contract: it boots on the offline plate, and once the session says
+    /// connected it reads its own register — an `rpc.live` subscription
+    /// the kernel keeps, and an `rpc.query` the kernel refuses here (no
+    /// node) — so the refusal is what the screen shows, and a block on the
+    /// governance plane makes it ask again. Needs `make views`; without the
+    /// staged component the test says so and does nothing.
     #[test]
-    fn the_staged_governance_view_boots_takes_the_register_and_votes() {
+    fn the_staged_governance_view_boots_and_reads_its_register_through_the_kernel() {
         let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../target/views/governance_view.wasm");
         if !staged.is_file() {
             eprintln!("skipped: no {} — run `make views`", staged.display());
             return;
         }
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
         let no_props = None;
         assert!(
@@ -4343,7 +4321,7 @@ pub(crate) mod tests {
         );
         assert!(
             guest.props_subscription.is_some(),
-            "the view subscribes to its props"
+            "the view subscribes to its session"
         );
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
@@ -4356,47 +4334,41 @@ pub(crate) mod tests {
             "the header leaves the deployment's seal to the host"
         );
 
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "rows": [{
-                    "id": "prop-1", "action": "add_validator", "detail": "node-7",
-                    "proposer": "robin", "status": "open", "deadline": 4200,
-                    "approvals": 1, "rejections": 0, "rule": "threshold",
-                    "required_yes": 2, "electorate": 4, "open": true, "settled_height": 0
-                }],
-                "voting": "", "admin": true, "connected": true, "answered": true, "dark": false
-            }))
-            .expect("props encode"),
+        // connected: the view asks the kernel for its register
+        let session = register();
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription on its plane"
         );
-        guest.redraw(&props);
+        // no node behind the kernel: the query is refused, and the view
+        // says so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in [
-            "1 pending",
-            "prop-1",
-            "1 approval · 1 more for quorum",
-            "Approve →",
-        ] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        // The same props again are not delivered again.
         assert!(
-            !guest.redraw(&props),
-            "unchanged props leave the view quiet"
+            shown.iter().any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        // the same session again is not delivered again
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
 
-        guest.deliver(Output::Activate(button_message(&guest, "Approve")));
-        guest.redraw(&props);
-        assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "vote".into(),
-                detail: r#"{"proposal_id":"prop-1","approve":true}"#.into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        // a block on the governance plane: the live item lands and the
+        // view reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The staged path for `module`, or None with a note when `make views`
@@ -4410,6 +4382,12 @@ pub(crate) mod tests {
         for _ in 0..128 {
             let busy = guest.redraw(props);
             assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            // a node call the kernel is running for the view: its answer
+            // is the next redraw's, so wait for it, never for a clock
+            if guest.replies.any_in_flight() {
+                guest.replies.wait_idle();
+                continue;
+            }
             if !busy && guest.inputs.editor_documents_status() == Ok(true) {
                 return;
             }
@@ -5536,19 +5514,27 @@ pub(crate) mod tests {
         std::sync::atomic::AtomicBool::new(false);
 
     /// One open proposal, as the host pushes the register.
+    /// The governance view's session facts: connected, as an admin.
     fn register() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "rows": [{
-                    "id": "prop-1", "action": "add_validator", "detail": "node-7",
-                    "proposer": "robin", "status": "open", "deadline": 4200,
-                    "approvals": 1, "rejections": 0, "rule": "threshold",
-                    "required_yes": 2, "electorate": 4, "open": true, "settled_height": 0
-                }],
-                "voting": "", "admin": true, "connected": true, "answered": true, "dark": false
+                "admin": true, "connected": true, "dark": false
             }))
             .expect("props encode"),
         )
+    }
+
+    /// The node's `proposals` reply the governance view reads for itself
+    /// through the kernel: one open proposal, `prop-1`.
+    fn proposals_reply() -> serde_json::Value {
+        serde_json::json!({ "proposals": [{
+            "proposal_id": "prop-1",
+            "action": { "add_validator": { "key": [7, 7, 7, 7] } },
+            "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+            "status": "open", "votes": [[[1], true]], "voter_kind": "validator_node",
+            "electorate": [[[1], 1], [[2], 1], [[3], 1], [[4], 1]],
+            "voting_rule": { "threshold": { "required_yes": 2 } }
+        }]})
     }
 
     /// Holds the node's next blob answer until released.
@@ -8492,6 +8478,8 @@ pub(crate) mod tests {
                 deployment(&component, "b.svg"),
             );
             let node = FakeDeployment::serving(module, &a);
+            // the governance view reads its register off the node itself
+            node.answer_query("governance", proposals_reply());
             let client = fake_node(node.clone()).await;
 
             let mounted = fresh(module);

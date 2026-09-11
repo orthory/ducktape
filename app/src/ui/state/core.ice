@@ -12,6 +12,9 @@ state
   status = "Connecting…"
   connected = false
   loading = false
+  // moves once per block a module view was told about (`view_live_hit`):
+  // the state change is what draws the view that took the item
+  views_live_serial:i64 = 0
   // Is ⌘ down right now? Set from the modifier stream and read by exactly one
   // subscription gate: it arms the command-chord key route, so ordinary typing
   // never pays for a key-press subscription (`lifecycle.ice`). Nothing renders

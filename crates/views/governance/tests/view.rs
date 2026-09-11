@@ -1,10 +1,11 @@
-//! The view driven natively through the wire: the register the host pushes
-//! is what the screen shows, and a press leaves as an intent the host acts
-//! on — nothing is asked of the host but the register itself.
+//! The view driven natively through the wire: the kernel pushes session
+//! facts, the view reads its own register through `rpc.query` (and the
+//! settle heights through `rpc.blocks`), re-reads it on every `rpc.live`
+//! hit, and a press leaves as `op.submit` carrying the governance message.
 
-use governance_view::host::{GovernanceProps, Intent, ProposalRow};
+use governance_view::host::Session;
 use governance_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, texts};
+use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
 use ui_lang_guest::wire::{Frame, Node, Request};
 
 fn boot() -> Frame {
@@ -35,63 +36,94 @@ fn kinds(requests: &[Request]) -> Vec<&str> {
         .collect()
 }
 
-fn proposal(id: &str, approvals: i64, required_yes: i64, open: bool) -> ProposalRow {
-    ProposalRow {
-        id: id.into(),
-        action: "add_validator".into(),
-        detail: "node-7".into(),
-        proposer: "robin".into(),
-        status: if open {
-            "open".into()
-        } else {
-            "executed".into()
-        },
-        deadline: 4_200,
-        approvals,
-        rejections: 0,
-        rule: "threshold".into(),
-        required_yes,
-        electorate: 4,
-        open,
-        settled_height: if open { 0 } else { 84_912 },
-    }
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
 }
 
-fn register(rows: Vec<ProposalRow>, voting: &str) -> Vec<u8> {
-    serde_json::to_vec(&GovernanceProps {
-        rows,
-        voting: voting.into(),
+fn session(connected: bool) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected,
         admin: true,
-        connected: true,
-        answered: true,
         dark: false,
     })
-    .expect("props encode")
+    .expect("session encodes")
 }
 
-/// The one subscription at boot, and the register it answers with is the
-/// whole screen: header count, the open card with its tally, the settled row.
+/// The node's `proposals` reply: one open proposal one vote from its bar,
+/// and one settled.
+fn proposals() -> Vec<u8> {
+    serde_json::json!({ "proposals": [
+        {
+            "proposal_id": "prop-open",
+            "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
+            "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+            "status": "open", "votes": [[[1], true]], "voter_kind": "validator_node",
+            "electorate": [[[1], 1], [[2], 1], [[3], 1], [[4], 1]],
+            "voting_rule": { "threshold": { "required_yes": 2 } }
+        },
+        {
+            "proposal_id": "prop-done",
+            "action": { "signal": { "text": "ship it" } },
+            "proposer": [1, 2, 3], "created_at": 1, "deadline": 4100,
+            "status": "passed", "votes": [[[1], true], [[2], true]], "voter_kind": "validator_node",
+            "electorate": [[[1], 1], [[2], 1]],
+            "voting_rule": { "threshold": { "required_yes": 2 } }
+        }
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+fn blocks() -> Vec<u8> {
+    serde_json::json!([{
+        "height": 84912,
+        "ops": [{
+            "target": "governance", "disposition": "applied",
+            "payload": "{\"execute\":{\"proposal_id\":\"prop-done\"}}"
+        }]
+    }])
+    .to_string()
+    .into_bytes()
+}
+
+/// Boots, connects, and answers the first register read: the frame with
+/// the register on screen, and the id of the live subscription.
+fn connected_with_register() -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let live = request(&frame, "rpc.live").id;
+    let query = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(query, &proposals())]);
+    let blocks_id = request(&frame, "rpc.blocks").id;
+    let frame = tick_native(vec![answer(blocks_id, &blocks())]);
+    (frame, live)
+}
+
+/// At boot the view asks for the session only; connected, it reads the
+/// register itself, and the fold is the whole screen: header count, the open
+/// card with its tally, the settled row with its execute height.
 #[test]
-fn the_register_the_host_pushes_is_what_the_screen_shows() {
+fn a_connected_view_reads_its_own_register() {
     let frame = boot();
     assert_eq!(
         kinds(&frame.requests),
         ["governance.props"],
-        "only the register at boot: {:?}",
+        "only the session at boot: {:?}",
         frame.requests
     );
     assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
 
-    let subscription = frame.requests[0].id;
-    let rows = vec![
-        proposal("prop-open", 1, 2, true),
-        proposal("prop-done", 2, 2, false),
-    ];
-    let frame = tick_native(vec![item(subscription, &register(rows, ""))]);
+    let (frame, _live) = connected_with_register();
     for expected in [
         "1 open · 1 settled",
         "1 pending",
         "prop-open",
+        "key 8c4fa211",
         "1 / 2",
         "1 approval · 1 more for quorum",
         "Approve →",
@@ -105,71 +137,85 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
             texts(&frame)
         );
     }
-    assert!(
-        frame.requests.is_empty(),
-        "a register asks nothing back: {:?}",
+    assert_eq!(
+        kinds(&frame.requests),
+        ["host.badge"],
+        "a folded register tells the kernel the badge and nothing else: {:?}",
         frame.requests
     );
+    assert_eq!(request(&frame, "host.badge").payload, b"1");
 }
 
-/// Approve leaves as `governance.vote` with the proposal and the answer; the
-/// host does the write and pushes the next register, on which the card is
-/// busy and a second press goes nowhere.
+/// A governance block re-reads the register through the live subscription.
 #[test]
-fn a_vote_leaves_as_an_intent_and_a_busy_register_disables_the_card() {
-    let frame = boot();
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(
-        subscription,
-        &register(vec![proposal("prop-open", 1, 2, true)], ""),
-    )]);
+fn a_live_hit_reads_the_register_again() {
+    let (_, live) = connected_with_register();
+    let frame = tick_native(vec![item(live, b"{}")]);
+    assert_eq!(kinds(&frame.requests), ["rpc.query"], "{:?}", frame.requests);
+}
 
+/// Approve leaves as `op.submit` with the governance vote; the card is busy
+/// until the kernel answers, and a refusal is shown in place.
+#[test]
+fn a_vote_leaves_as_a_signed_op_and_the_card_waits_for_the_answer() {
+    let (frame, _) = connected_with_register();
     let frame = tick_native(press(&frame, "Approve"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent after Approve, got {:?}", frame.requests);
+    let [submit] = frame.requests.as_slice() else {
+        panic!("one op after Approve, got {:?}", frame.requests);
     };
-    assert_eq!(intent.kind, "governance.vote");
+    assert_eq!(submit.kind, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<Intent>(&intent.payload).expect("an intent decodes"),
-        Intent {
-            proposal_id: "prop-open".into(),
-            approve: true,
-        }
+        op,
+        serde_json::json!({
+            "target": "governance",
+            "payload": { "vote": { "proposal_id": "prop-open", "approve": true } }
+        })
     );
-
-    let frame = tick_native(vec![item(
-        subscription,
-        &register(vec![proposal("prop-open", 1, 2, true)], "prop-open"),
-    )]);
     assert!(
         button_disabled(&frame, "Reject"),
         "a busy card's buttons are disabled: {:?}",
         texts(&frame)
     );
+
+    let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
+    assert!(
+        !button_disabled(&frame, "Reject"),
+        "the answer frees the card: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, "the local user key is locked"),
+        "{:?}",
+        texts(&frame)
+    );
 }
 
 /// Once the rule is met the card offers Settle instead of Approve, and it
-/// leaves as `governance.execute`.
+/// leaves as the execute message.
 #[test]
 fn a_met_rule_offers_settle_which_leaves_as_execute() {
     let frame = boot();
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(
-        subscription,
-        &register(vec![proposal("prop-met", 2, 2, true)], ""),
-    )]);
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let query = request(&frame, "rpc.query").id;
+    let met = serde_json::json!({ "proposals": [{
+        "proposal_id": "prop-met",
+        "action": { "signal": { "text": "ship it" } },
+        "proposer": [1], "created_at": 1, "deadline": 4200,
+        "status": "open", "votes": [[[1], true], [[2], true]], "voter_kind": "validator_node",
+        "electorate": [[[1], 1], [[2], 1]],
+        "voting_rule": { "threshold": { "required_yes": 2 } }
+    }]});
+    let frame = tick_native(vec![answer(query, met.to_string().as_bytes())]);
     assert!(has_text(&frame, "quorum met"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "Approve"), "{:?}", texts(&frame));
 
     let frame = tick_native(press(&frame, "Settle"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent after Settle, got {:?}", frame.requests);
-    };
-    assert_eq!(intent.kind, "governance.execute");
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<Intent>(&intent.payload)
-            .expect("an intent decodes")
-            .proposal_id,
-        "prop-met"
+        op["payload"],
+        serde_json::json!({ "execute": { "proposal_id": "prop-met" } })
     );
 }
