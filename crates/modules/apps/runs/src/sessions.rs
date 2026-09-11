@@ -265,7 +265,7 @@ impl RunsModule {
             // account's program mints when it claims this proposal. The settle
             // lane would emit it as `Origin::Module("runs")`, and collaboration
             // refuses that by design — no module speaks for a participant.
-            Operation::CollaborationSend { .. } | Operation::CollaborationAcknowledge { .. } => {
+            Operation::CollaborationDeliver { .. } | Operation::CollaborationAcknowledge { .. } => {
                 self.collaboration_msg(&operation)
             }
             Operation::ModulesUpdate(_) | Operation::ForgeOpenPr { .. } => Err(format!(

@@ -241,7 +241,7 @@ impl ClaudeInbox {
     /// registered before the write and never consumed would sit in the map for
     /// the life of the process.
     pub async fn offer(&self, offer: &Offer<'_>) -> (Outcome, Option<Follow>) {
-        let correlation = correlation(&offer.message_id);
+        let correlation = correlation(offer.message_id);
         // registered BEFORE the write: a verdict can come back the moment the
         // recipient reads the line, and a waiter installed afterwards would
         // race it and read silence.
@@ -400,9 +400,10 @@ impl Drop for Follow {
     }
 }
 
-/// the sender-side identity of one message, as the back-channel spells it.
-fn correlation(message_id: &crate::wire::MessageId) -> String {
-    format!("{}.{}", message_id.generation, message_id.sequence)
+/// the identity of one message, as the back-channel spells it: the chat message
+/// id itself, which is what a verdict's `orig_msg_id` carries back.
+fn correlation(message_id: &str) -> String {
+    message_id.to_string()
 }
 
 /// one verdict as an outcome. Shared by the first wait and the hold follow-up,
@@ -744,7 +745,6 @@ fn status_token(status: &Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::MessageId;
 
     fn attached(session_id: &str, socket: &Path) -> Attached {
         Attached {
@@ -758,10 +758,7 @@ mod tests {
     fn an_offer(text: &str) -> Offer<'_> {
         Offer {
             text,
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7",
             urgent: false,
         }
     }
@@ -788,7 +785,12 @@ mod tests {
     #[test]
     fn the_user_frame_names_the_bound_session_and_the_message() {
         let inbox = ClaudeInbox::new(attached("sess-abc", Path::new("/tmp/x.sock")), None);
-        let frames = inbox.frames(&an_offer("hello"), "2.1", Some("uds:/tmp/me.sock"));
+        let offer = an_offer("hello");
+        let frames = inbox.frames(
+            &offer,
+            &correlation(offer.message_id),
+            Some("uds:/tmp/me.sock"),
+        );
         assert_eq!(frames.len(), 2, "auth first, then the message");
 
         let auth: serde_json::Value = serde_json::from_str(&frames[0]).expect("auth is json");
@@ -803,7 +805,10 @@ mod tests {
             message["session_id"], "sess-abc",
             "the recipient fences on this; without it we write to a pid, not a session"
         );
-        assert_eq!(message["msg_id"], "2.1");
+        assert_eq!(
+            message["msg_id"], "m-7",
+            "the verdict's orig_msg_id is this, so it is the chat message id"
+        );
         assert_eq!(message["from"], "uds:/tmp/me.sock");
         assert_eq!(message["priority"], "next");
     }
@@ -813,7 +818,7 @@ mod tests {
         let inbox = ClaudeInbox::new(attached("sess-abc", Path::new("/tmp/x.sock")), None);
         let mut offer = an_offer("wake up");
         offer.urgent = true;
-        let frames = inbox.frames(&offer, "2.1", None);
+        let frames = inbox.frames(&offer, "m-7", None);
         let message: serde_json::Value = serde_json::from_str(&frames[1]).expect("json");
         assert_eq!(message["priority"], "now");
         assert!(

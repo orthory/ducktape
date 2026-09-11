@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::wire::{self, BindRefusal, Capabilities, MessageId, State};
+use crate::wire::{self, BindRefusal, Capabilities, State};
 
 pub mod claude;
 pub mod codex;
@@ -58,8 +58,8 @@ pub const MAX_BINDINGS: usize = 32;
 pub struct Offer<'a> {
     /// the wrapped text the session will see. Built by [`wrapper::wrap`].
     pub text: &'a str,
-    /// the sender's message id, for the provider's own correlation.
-    pub message_id: MessageId,
+    /// the chat message id, for the provider's own correlation.
+    pub message_id: &'a str,
     /// whether this may steer an active turn, where that is supported.
     pub urgent: bool,
 }
@@ -371,11 +371,7 @@ impl Deliveries {
                 generation,
             } => self.unbind(&conversation, &participant, generation),
             Messaging::Deliver(deliver) => self.deliver(deliver).await,
-            Messaging::Time { network_now } => self.advance_clock(network_now),
-            Messaging::Retain {
-                conversation,
-                floor_seq,
-            } => self.retain(&conversation, floor_seq).await,
+            Messaging::Time { network_now } => self.advance_clock(network_now).await,
             Messaging::Replay {
                 conversation,
                 participant,
@@ -383,37 +379,40 @@ impl Deliveries {
         }
     }
 
-    /// remember the agreed clock the node reports.
+    /// remember the agreed clock the node reports, and retire what it has
+    /// aged out.
     ///
     /// Monotonic by construction: a lower value than one already seen is
     /// ignored rather than applied, so a reordered or replayed frame cannot
     /// move this device's notion of network time backwards and revive an
-    /// expired message.
-    fn advance_clock(&self, network_now: u64) {
-        self.0
+    /// expired message — or un-retire a record it already dropped.
+    ///
+    /// The deadline is what prunes the dedup record, and it is a NETWORK fact:
+    /// past `expires_at` the module's own delivery record is gone, so a replay
+    /// of that message cannot be admitted upstream and forgetting it here costs
+    /// nothing. Nothing is reported to the node — pruning a record for a
+    /// message nobody may re-drive changes no delivery's state, and inventing a
+    /// receipt for it would be a status this daemon does not have.
+    async fn advance_clock(&self, network_now: u64) {
+        let previous = self
+            .0
             .network_now
             .fetch_max(network_now, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// forget what the network has stopped retaining, and compact.
-    ///
-    /// Nothing is reported to the node: pruning a record the network already
-    /// dropped changes no delivery's state, and inventing a receipt for it
-    /// would be a status this daemon does not have.
-    async fn retain(&self, conversation: &str, floor_seq: u64) {
-        match self.0.outbox.retain(conversation, floor_seq).await {
+        let advanced = network_now > previous;
+        if !advanced {
+            return;
+        }
+        match self.0.outbox.retire_expired(network_now).await {
             Ok(0) => {}
-            Ok(pruned) => tracing::info!(
+            Ok(pruned) => tracing::debug!(
                 target: "ducktape::collab",
-                conversation = %conversation,
-                floor_seq,
+                network_now,
                 pruned,
-                "compacted the outbox to the network's retention floor"
+                "retired outbox records whose deadline has passed"
             ),
             Err(error) => tracing::warn!(
                 target: "ducktape::collab",
-                conversation = %conversation,
-                floor_seq,
+                network_now,
                 reason = "outbox_compact_failed",
                 %error,
                 "the outbox could not be compacted; it keeps every record it has"
@@ -463,7 +462,7 @@ impl Deliveries {
                     seq,
                     binding_generation: entry.binding_generation,
                     sender: entry.sender.clone(),
-                    message_id: entry.message_id,
+                    message_id: entry.message_id.clone(),
                     state: entry.state,
                     reason: entry.reason.clone(),
                 })
@@ -735,7 +734,7 @@ impl Deliveries {
             participant: deliver.participant.clone(),
             binding_generation: deliver.binding_generation,
             sender: deliver.sender.clone(),
-            message_id: deliver.message_id,
+            message_id: deliver.message_id.clone(),
             expires_at: deliver.expires_at,
             digest: digest_of(&deliver),
             state: State::Queued,
@@ -774,28 +773,6 @@ impl Deliveries {
                 );
                 self.report(&deliver, generation, state, reason.as_deref())
                     .await;
-            }
-            // the network stopped retaining this sequence, so this daemon
-            // retired its record. A delivery arriving for it now is a replay
-            // of something nobody is entitled to re-drive — and admitting it
-            // would be indistinguishable from a first delivery, because the
-            // record that would have said otherwise is exactly what was
-            // pruned.
-            outbox::Admission::Retired => {
-                tracing::warn!(
-                    target: "ducktape::collab",
-                    conversation = %deliver.conversation,
-                    seq = deliver.seq,
-                    reason = "below_retention_floor",
-                    "refused: the network no longer retains this sequence"
-                );
-                self.report(
-                    &deliver,
-                    generation,
-                    State::Refused,
-                    Some("below_retention_floor"),
-                )
-                .await;
             }
             // one id, one message.
             outbox::Admission::Conflict => {
@@ -866,7 +843,7 @@ impl Deliveries {
         let text = wrapper::wrap(deliver);
         let offer = Offer {
             text: &text,
-            message_id: deliver.message_id,
+            message_id: &deliver.message_id,
             urgent: deliver.urgent,
         };
 
@@ -1066,7 +1043,7 @@ impl Deliveries {
                 seq: deliver.seq,
                 binding_generation: generation,
                 sender: deliver.sender.clone(),
-                message_id: deliver.message_id,
+                message_id: deliver.message_id.clone(),
                 state,
                 reason: reason.map(str::to_string),
             })
@@ -1089,11 +1066,6 @@ pub enum Messaging {
     /// the agreed network clock has advanced.
     Time {
         network_now: u64,
-    },
-    /// a conversation's retention floor has advanced.
-    Retain {
-        conversation: String,
-        floor_seq: u64,
     },
     /// re-report every durable delivery state for one binding.
     Replay {
@@ -1129,13 +1101,6 @@ pub fn route(command: wire::Command) -> Result<Messaging, wire::Command> {
         }),
         wire::Command::MsgDeliver(deliver) => Ok(Messaging::Deliver(deliver)),
         wire::Command::MsgTime { network_now } => Ok(Messaging::Time { network_now }),
-        wire::Command::MsgRetain {
-            conversation,
-            floor_seq,
-        } => Ok(Messaging::Retain {
-            conversation,
-            floor_seq,
-        }),
         wire::Command::MsgReplay {
             conversation,
             participant,

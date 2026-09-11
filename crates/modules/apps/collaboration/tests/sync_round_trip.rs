@@ -6,226 +6,77 @@
 //! The source drives ops through the real module, so the op log is what a
 //! validator produces, and it deliberately carries every shape a naive
 //! "export live records and re-apply" could not reproduce: record OVERWRITES
-//! (a roster edit, a binding replacement, a receipt advancing), record DELETES
-//! (a prune retiring an event, a message, a receipt and a dedup record) and
-//! the counter keys — mailbox accounting and the replay floor — that ride the
+//! (a binding replacement, a delivery advancing) and the counter keys — the
+//! event head, mailbox accounting and the per-sender quota — that ride the
 //! same root.
 
+mod common;
+
 use collaboration::{
-    encode_msg, encode_query, BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery,
-    CollaborationReply, DeliveryState, EventPage, MessageId, MessageKind, ProtectedRead, Role,
-    SendRequest, SendState,
+    Collaboration, CollaborationMsg, CollaborationReply, DeliveryState, ProtectedRead,
+    encode_msg,
 };
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
-use sdk::{Cause, Env, MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
-use sdk_testkit::TestCtx;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use common::*;
+use sdk::{MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
 use statesync::qmdb::QmdbStore;
 
-const MODULE: &str = "collaboration";
-const TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
-/// the network every op here is bound to; the synced twin must be composed
-/// with the SAME one or its ops stop applying.
-const NETWORK: &str = "test-net";
-
-fn ctx(height: u64, origin: Origin) -> TestCtx {
-    TestCtx::with_env(Env {
-        height,
-        consensus_time: height,
-        origin,
-        me: MODULE.into(),
-        cause: Cause::Direct,
-    })
-    .on_query("identity", |_| {
-        Ok(identity::encode_reply(&identity::IdentityReply::Account(
-            None,
-        )))
-    })
-    .on_query("tasks", |_| {
-        Ok(tasks::encode_job_reply(&tasks::JobsReply::Job(None)))
-    })
-}
-
 fn ext(byte: u8) -> Origin {
-    Origin::External(vec![byte; 32])
+    Origin::External(key(byte))
 }
 
-async fn apply(module: &mut Collaboration, height: u64, origin: Origin, payload: CollaborationMsg) {
-    let msg = Msg {
-        target: MODULE.into(),
-        payload: encode_msg(&collaboration::Request::new(NETWORK, payload)),
-    };
-    module
-        .execute(&mut ctx(height, origin), &msg)
-        .await
-        .expect("the op is admitted");
-    module.commit_block().await.expect("commit");
-}
-
-/// read as the owner of `participant`, whose key is `byte`.
-async fn read(
-    module: &Collaboration,
-    byte: u8,
-    participant: &str,
-    read: ProtectedRead,
-) -> CollaborationReply {
-    let request = encode_query(&CollaborationQuery::Read {
-        participant_id: participant.into(),
-        via: None,
-        read,
-    });
-    let bytes = module
-        .query_with(&ctx(99, ext(byte)), &request)
-        .await
-        .expect("a read answers");
-    collaboration::decode_reply(&bytes).expect("decode")
-}
-
-fn note(sequence: u64, expires_at: u64) -> CollaborationMsg {
-    CollaborationMsg::Send(SendRequest {
-        conversation_id: "c1".into(),
-        sender_participant_id: "alice".into(),
-        message_id: MessageId {
-            generation: 1,
-            sequence,
-        },
-        recipient_participant_id: "bob".into(),
-        kind: MessageKind::Notice,
-        reply_to: None,
-        task: None,
-        body: format!("message {sequence}"),
-        references: Vec::new(),
-        expires_at,
-    })
+async fn drive(module: &mut Collaboration, chat: &Chat, height: u64, origin: Origin, payload: CollaborationMsg) {
+    let mut ctx = at(chat, height, origin);
+    ok(module, &mut ctx, payload).await;
 }
 
 #[test]
 fn synced_store_reconstructs_source_root_and_every_read() {
     deterministic::Runner::default().start(|context| async move {
+        let scene = scene("c1");
+        let (chat, alice, bob) = (scene.chat.clone(), scene.alice.clone(), scene.bob.clone());
         let mut src = Collaboration::new(
             MODULE,
-            "identity",
-            "tasks",
+            IDENTITY,
+            TASKS,
+            CHAT,
             Box::new(QmdbStore::init(context.child("src"), "src").await),
-            TTL,
+            MAX_TTL,
             NETWORK,
         );
 
-        // registry: two participants under two keys, one conversation, both
-        // seated (roster OVERWRITES the conversation record twice).
-        apply(
+        // a binding and its REPLACEMENT: the binding record is overwritten.
+        drive(&mut src, &chat, 4, ext(2), bind("c1", &bob, key(20), 0)).await;
+        drive(&mut src, &chat, 5, ext(2), bind("c1", &bob, key(21), 1)).await;
+
+        // two deliveries: one that settles by expiry, one that advances.
+        let first = scene.alice_posts("c1", "m1");
+        let second = scene.alice_posts("c1", "m2");
+        drive(
             &mut src,
-            1,
+            &chat,
+            6,
             ext(1),
-            CollaborationMsg::RegisterParticipant {
-                participant_id: "alice".into(),
-                display_name: "alice".into(),
-                agent_account: None,
-            },
+            CollaborationMsg::Deliver(deliver("c1", "m1", &bob, 100)),
         )
         .await;
-        apply(
+        drive(
             &mut src,
-            1,
-            ext(2),
-            CollaborationMsg::RegisterParticipant {
-                participant_id: "bob".into(),
-                display_name: "bob".into(),
-                agent_account: None,
-            },
-        )
-        .await;
-        apply(
-            &mut src,
-            2,
+            &chat,
+            7,
             ext(1),
-            CollaborationMsg::CreateConversation {
-                conversation_id: "c1".into(),
-                topic: "review".into(),
-            },
+            CollaborationMsg::Deliver(deliver("c1", "m2", &bob, 1_000)),
         )
         .await;
-        for who in ["alice", "bob"] {
-            apply(
-                &mut src,
-                3,
-                ext(1),
-                CollaborationMsg::SetRoster {
-                    conversation_id: "c1".into(),
-                    participant_id: who.into(),
-                    role: Some(Role::Member),
-                },
-            )
-            .await;
-        }
-
-        // a binding and its REPLACEMENT: the binding record is overwritten and
-        // the participant's credential allocator moves with it.
-        apply(
+        drive(
             &mut src,
-            4,
-            ext(2),
-            CollaborationMsg::Bind {
-                conversation_id: "c1".into(),
-                participant_id: "bob".into(),
-                device: "laptop".into(),
-                principal: BoundPrincipal::ServiceKey(vec![20; 32]),
-                expected_credential: 0,
-            },
-        )
-        .await;
-        apply(
-            &mut src,
-            5,
-            ext(2),
-            CollaborationMsg::Bind {
-                conversation_id: "c1".into(),
-                participant_id: "bob".into(),
-                device: "desktop".into(),
-                principal: BoundPrincipal::ServiceKey(vec![21; 32]),
-                expected_credential: 2,
-            },
-        )
-        .await;
-
-        // two admissions: one that will be retired, one that survives.
-        apply(&mut src, 6, ext(1), note(1, 100)).await;
-        apply(&mut src, 7, ext(1), note(2, 1_000)).await;
-
-        // the first settles (receipt OVERWRITE + mailbox accounting release)
-        // and is then pruned (event, message, receipt and dedup DELETES, and
-        // the replay floor counter rises).
-        // derived, never counted by hand: every committed change above took a
-        // sequence, so the admission's own sequence is what the module says.
-        let CollaborationReply::SendState(SendState::Admitted { seq: first_seq, .. }) = read(
-            &src,
-            1,
-            "alice",
-            ProtectedRead::SendState {
-                generation: 1,
-                sequence: 1,
-            },
-        )
-        .await
-        else {
-            panic!("the first send was admitted");
-        };
-        apply(
-            &mut src,
+            &chat,
             101,
             ext(9),
             CollaborationMsg::ExpireMessage {
-                conversation_id: "c1".into(),
-                seq: first_seq,
-            },
-        )
-        .await;
-        apply(
-            &mut src,
-            102,
-            ext(1),
-            CollaborationMsg::Prune {
-                conversation_id: "c1".into(),
-                through_seq: first_seq + 1,
+                channel_id: "c1".into(),
+                seq: first,
+                recipient: bob.clone(),
             },
         )
         .await;
@@ -238,27 +89,28 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let src_root = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
-        let src_events = read(
-            &src,
-            2,
-            "bob",
-            ProtectedRead::Events {
-                conversation_id: "c1".into(),
-                from_seq: first_seq + 1,
-                limit: 64,
-            },
-        )
-        .await;
-        let src_mailbox = read(&src, 2, "bob", ProtectedRead::Mailbox).await;
-        let src_binding = read(
-            &src,
-            2,
-            "bob",
-            ProtectedRead::Binding {
-                conversation_id: "c1".into(),
-            },
-        )
-        .await;
+        let reads = |channel: &str| {
+            vec![
+                ProtectedRead::Events {
+                    channel_id: channel.into(),
+                    from_seq: 0,
+                    limit: 64,
+                },
+                ProtectedRead::Mailbox,
+                ProtectedRead::Binding {
+                    channel_id: channel.into(),
+                },
+                ProtectedRead::Delivery {
+                    channel_id: channel.into(),
+                    seq: second,
+                },
+            ]
+        };
+        let bob_ctx = at(&chat, 102, ext(2));
+        let mut src_answers = Vec::new();
+        for probe in reads("c1") {
+            src_answers.push(read(&src, &bob_ctx, &bob, None, probe).await);
+        }
 
         // the module consumed its store, so REOPEN the committed partitions as
         // a bare store for the handoff (drop first — one owner at a time).
@@ -276,8 +128,15 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let mut synced =
-            Collaboration::new(MODULE, "identity", "tasks", Box::new(store), TTL, NETWORK);
+        let mut synced = Collaboration::new(
+            MODULE,
+            IDENTITY,
+            TASKS,
+            CHAT,
+            Box::new(store),
+            MAX_TTL,
+            NETWORK,
+        );
 
         assert_eq!(
             synced.root(),
@@ -286,76 +145,28 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         );
 
         // every read answers exactly like the source.
-        assert_eq!(
-            read(
-                &synced,
-                2,
-                "bob",
-                ProtectedRead::Events {
-                    conversation_id: "c1".into(),
-                    from_seq: first_seq + 1,
-                    limit: 64,
-                }
-            )
-            .await,
-            src_events
-        );
-        assert_eq!(read(&synced, 2, "bob", ProtectedRead::Mailbox).await, src_mailbox);
-        assert_eq!(
-            read(
-                &synced,
-                2,
-                "bob",
-                ProtectedRead::Binding {
-                    conversation_id: "c1".into()
-                }
-            )
-            .await,
-            src_binding
-        );
-
-        // the retired sequence's dedup record is gone and the replay FLOOR
-        // counter survived the sync: a retry is still refused on the joiner.
-        let CollaborationReply::SendState(state) = read(
+        for (probe, expected) in reads("c1").into_iter().zip(src_answers) {
+            assert_eq!(read(&synced, &bob_ctx, &bob, None, probe).await, expected);
+        }
+        let CollaborationReply::Delivery(Some(delivery)) = read(
             &synced,
-            1,
-            "alice",
-            ProtectedRead::SendState {
-                generation: 1,
-                sequence: 1,
+            &bob_ctx,
+            &bob,
+            None,
+            ProtectedRead::Delivery {
+                channel_id: "c1".into(),
+                seq: first,
             },
         )
         .await
         else {
-            panic!("send state")
+            panic!("the expired record survives the sync");
         };
-        assert_eq!(
-            state,
-            SendState::ReceiptPruned,
-            "the replay floor rode the sync, so a pruned sequence stays refused"
-        );
-
-        // the surviving message is readable and still charged to the mailbox.
-        let CollaborationReply::Events(EventPage::Page { messages, .. }) = read(
-            &synced,
-            2,
-            "bob",
-            ProtectedRead::Events {
-                conversation_id: "c1".into(),
-                from_seq: first_seq + 1,
-                limit: 64,
-            },
-        )
-        .await
-        else {
-            panic!("an event page")
-        };
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_id.sequence, 2);
+        assert_eq!(delivery.state, DeliveryState::Expired);
 
         // and the joiner keeps writing: the replaced binding's credential is
         // the one that acknowledges.
-        let mut write_ctx = ctx(103, Origin::External(vec![21; 32]));
+        let mut write_ctx = at(&chat, 103, ext(21));
         synced
             .execute(
                 &mut write_ctx,
@@ -364,9 +175,10 @@ fn synced_store_reconstructs_source_root_and_every_read() {
                     payload: encode_msg(&collaboration::Request::new(
                         NETWORK,
                         CollaborationMsg::Acknowledge {
-                            conversation_id: "c1".into(),
-                            seq: messages[0].seq,
-                            binding_credential: 3,
+                            channel_id: "c1".into(),
+                            seq: second,
+                            recipient: bob.clone(),
+                            binding_credential: 2,
                             state: DeliveryState::Queued,
                             reason: None,
                         },
@@ -377,7 +189,8 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             .expect("the current binding acknowledges after a sync");
         assert!(
             write_ctx.output().is_some(),
-            "the op reports the sequence it advanced the conversation to"
+            "the op reports the sequence it advanced the channel to"
         );
+        let _ = alice;
     });
 }
