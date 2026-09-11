@@ -2,10 +2,12 @@
 //! an intent carrying what the reader typed, and a draft the app hands back
 //! lands in the field only when the seed moved.
 
-use pages_view::host::{Choose, Create, PageItem, PagesProps, Post, Search};
+use pages_view::host::{
+    Choose, Create, PageItem, PagesProps, Post, Search, sidebar_width_after_delta,
+};
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{find, has_text, item, press, submit, texts, type_into};
+use ui_lang_guest::wire::{Event, Frame, Length, Node};
 
 fn facts() -> PagesProps {
     PagesProps {
@@ -160,6 +162,71 @@ fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
     );
 }
 
+/// The events the host sends when the reader drags a resize handle sideways.
+fn drag(frame: &Frame, key: &str, dx: f64) -> Vec<Event> {
+    let Some(Node::ResizeHandle {
+        on_drag: Some(handler),
+        ..
+    }) = find(frame, key)
+    else {
+        panic!("no resize handle {key:?}");
+    };
+    vec![Event::Drag {
+        handler: *handler,
+        dx,
+        dy: 0.0,
+    }]
+}
+
+fn list_width(frame: &Frame) -> f32 {
+    let Some(Node::Container {
+        width: Some(Length::Fixed(width)),
+        ..
+    }) = find(frame, "PagesView/root/pages/page-list")
+    else {
+        panic!("no page list in {:?}", texts(frame));
+    };
+    *width
+}
+
+#[test]
+fn the_page_list_is_the_readers_to_size_and_never_crowds_the_document() {
+    assert_eq!(sidebar_width_after_delta(230.0, 60.0, 1280.0), 290.0);
+    assert_eq!(sidebar_width_after_delta(230.0, -400.0, 1280.0), 180.0);
+    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 1280.0), 420.0);
+    // A narrow console keeps half its width for the document …
+    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 600.0), 300.0);
+    // … and a window narrower than two list minimums still gets a list.
+    assert_eq!(sidebar_width_after_delta(230.0, 0.0, 200.0), 180.0);
+
+    let (_, frame) = shown(&facts());
+    assert_eq!(list_width(&frame), 230.0);
+    let handle = "PagesView/root/pages/sidebar-resize";
+    let frame = tick_native(drag(&frame, handle, 60.0));
+    assert!(frame.requests.is_empty(), "sizing the list is view-local");
+    assert_eq!(list_width(&frame), 290.0);
+    let frame = tick_native(drag(&frame, handle, 500.0));
+    assert_eq!(list_width(&frame), 420.0);
+    let frame = tick_native(drag(&frame, handle, -500.0));
+    assert_eq!(list_width(&frame), 180.0);
+}
+
+#[test]
+fn the_header_menu_names_the_delete_before_it_arms_it() {
+    let menu = "PagesView/root/pages/page-menu";
+    let (_, frame) = shown(&facts());
+    // The `⋯` arms nothing on its own: it opens a menu, view-locally …
+    assert!(find(&frame, menu).is_none());
+    let frame = tick_native(press(&frame, "Page actions"));
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+    assert!(find(&frame, menu).is_some(), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "Delete page…"), "{:?}", texts(&frame));
+    // … and the named item is what arms the confirm dialog, closing behind it.
+    let frame = tick_native(press(&frame, "Delete page…"));
+    assert_eq!(one_intent(&frame).kind, "pages.arm_delete");
+    assert!(find(&frame, menu).is_none(), "the menu left with the act");
+}
+
 #[test]
 fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
     use ui_lang_guest::{testing, wire};
@@ -284,4 +351,117 @@ fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
     };
     let tab_query = focus_request(&tick_native(vec![tab]));
     assert_eq!(reply(tab_query, false), "문서");
+}
+
+#[test]
+fn initial_loading_empty_and_recovered_pages_have_visible_states() {
+    let loading = PagesProps {
+        connected: true,
+        loading: true,
+        ..PagesProps::default()
+    };
+    let (subscription, frame) = shown(&loading);
+    assert!(has_text(&frame, "Loading pages…"));
+    assert!(!has_text(&frame, "No page selected"));
+    let empty = PagesProps {
+        loading: false,
+        ..loading
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&empty))]);
+    assert!(has_text(&frame, "No page selected"));
+    assert!(!has_text(&frame, "Loading pages…"));
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(has_text(&frame, "Alpha"));
+    assert!(!has_text(&frame, "Loading pages…"));
+    assert!(!has_text(&frame, "No page selected"));
+    let disconnected = PagesProps::default();
+    let frame = tick_native(vec![item(subscription, &encoded(&disconnected))]);
+    assert!(has_text(&frame, "Not connected"));
+    assert!(!has_text(&frame, "Loading pages…"));
+}
+
+#[test]
+fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
+    boot_native();
+    let boot = tick_native(Vec::new());
+    let subscription = boot
+        .requests
+        .iter()
+        .find(|request| request.kind == "pages.props")
+        .unwrap()
+        .id;
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(
+        !has_text(&frame, "Not connected"),
+        "a props error is not a network status"
+    );
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let _ = tick_native(type_into(&frame, "Add a comment…", "keep this draft"));
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("missing field"))
+    );
+    assert!(
+        has_text(&frame, "Alpha"),
+        "keep the last readable page visible"
+    );
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let frame = tick_native(press(&frame, "Post"));
+    assert_eq!(
+        serde_json::from_slice::<Post>(&one_intent(&frame).payload)
+            .unwrap()
+            .text,
+        "keep this draft"
+    );
+}
+
+#[test]
+fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
+    let (subscription, frame) = shown(&facts());
+    let frame = tick_native(type_into(&frame, "Add a comment…", "draft from Alpha"));
+    let post = press(&frame, "Post");
+    // The delete is a named item in the header menu now, so open the menu
+    // while the facts still stand and queue the press from inside it.
+    let opened = tick_native(press(&frame, "Page actions"));
+    let delete = press(&opened, "Delete page");
+    let choose = press(&frame, "Beta");
+    // The host has moved to Beta, but an incomplete update cannot replace
+    // the Alpha facts that the reader still sees.
+    let malformed = br#"{"connected":true,"active_page":"beta"}"#;
+    let frame = tick_native(vec![item(subscription, malformed)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(has_text(&frame, "draft from Alpha"));
+    assert!(matches!(
+        ui_lang_guest::testing::find(&frame, "PagesView/root/pages/post"),
+        Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
+    ));
+    for queued in [post, delete, choose] {
+        let frame = tick_native(queued);
+        assert!(
+            frame.requests.is_empty(),
+            "stale actions must not reach the host"
+        );
+    }
+    let beta = PagesProps {
+        active_page: "beta".into(),
+        active_page_title: "Beta".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&beta))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let frame = tick_native(press(&frame, "Post"));
+    let request = one_intent(&frame);
+    assert_eq!(request.kind, "pages.post");
+    assert_eq!(
+        serde_json::from_slice::<Post>(&request.payload)
+            .unwrap()
+            .text,
+        "draft from Alpha"
+    );
 }
