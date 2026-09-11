@@ -11,55 +11,6 @@ pub struct NavItem {
     pub live: bool,
 }
 
-/// `1 repository` / `3 repositories` — the ONE place a count and its noun are
-/// joined. English has no rule that derives the plural (repository/repositories,
-/// directory/directories), so both forms are stated by the caller. Every
-/// count label goes through here; a bare `format!("{n} agents")` renders the
-/// `1 agents` the register-machine subtitles used to show.
-pub fn plural(count: i64, one: &str, many: &str) -> String {
-    let noun = if count == 1 { one } else { many };
-    format!("{count} {noun}")
-}
-
-/// A HEADER SUBTITLE IS A MEASUREMENT, AND A DISCONNECTED APP MEASURED NOTHING.
-/// Every `*_summary` below folds rows that only a live node can deliver, so with
-/// the node down they all read `0 … · 0 …` — a claim about content, asserted off
-/// a listing nobody fetched. They take `connected` and say nothing instead, the
-/// same trade `count_label` (backend/document.rs) and `member_tier`
-/// (backend/roster.rs) already make: silence over a confident zero.
-///
-/// AND AN ALL-ZERO PAIR IS THE SAME NOISE ONE STEP LATER. Every one of these
-/// screens plates the empty case in words — "No proposals yet…", "No agents
-/// registered…", "No members here yet…", "Empty directory…" — so a subtitle
-/// reading `0 open · 0 settled` over the top of it says the same nothing twice,
-/// in digits. #996 settled the rule for the bell and the member count: gate the
-/// digit AND its word together. These four were the sites it did not reach.
-/// A zero that sits BESIDE a real reading stays — `1 agent · 0 working` is the
-/// sentence doing its job.
-///
-/// `2 humans · 1 agent` — the machine subtitle beside the Members title, and
-/// the same reading in Settings' network card.
-///
-/// IT FOLDS THE ROWS IT IS PRINTED ABOVE. This used to fold the valset queries
-/// instead — validators plus residents — while the list under it also draws the
-/// registered agents, which hold no valset standing at all. Both numbers were
-/// true and the sentence they formed was not: a demo workspace read
-/// `1 validator · 0 residents` above two rows, and "residents" is a word the
-/// screen never says anywhere else. `is_agent` is the one split the screen
-/// itself makes — the Humans / Agents chips are `filter_members` over exactly
-/// that field — so these two counts partition the list and sum to the All chip
-/// beside them. The validator count is not lost: it is its own chip, and every
-/// row carries its role marker.
-pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let agents = rows.iter().filter(|row| row.is_agent).count();
-    let left = plural(count_i64(rows.len() - agents), "human", "humans");
-    let right = plural(count_i64(agents), "agent", "agents");
-    format!("{left} · {right}")
-}
-
 /// `tally_label` for two readings that are ALREADY rendered — the consensus
 /// trio off `/v1/status` is optional per field, so each arrives as its own
 /// `optional_number` string (`—` when the node reports nothing). Joining the
