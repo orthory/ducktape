@@ -41,9 +41,6 @@ const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
-/// The voting window a membership proposal opens with, in consensus seconds —
-/// the same value the CLI's membership ceremony uses.
-const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
 /// One index view page fills the entire bounded render window. Timeline roots
 /// have their own index keyspace, so this is always one RPC regardless of how
 /// many thread replies sit between roots.

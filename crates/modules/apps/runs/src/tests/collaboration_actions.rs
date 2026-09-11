@@ -8,8 +8,8 @@
 //! `Origin::Module("runs")`, and no module speaks for a participant.
 
 use super::*;
-use crate::{OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_SEND};
-use collaboration::{CollaborationMsg, DeliveryState, MessageKind};
+use crate::{OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER};
+use collaboration::{CollaborationMsg, DeliveryState, MessageKind, Party};
 
 /// the network this test module is composed on — every emitted request is
 /// bound to it by name.
@@ -17,19 +17,14 @@ const NETWORK: &str = "test-net";
 const ASSIGNEE: [u8; 32] = [0xab; 32];
 const SESSION_KEY: [u8; 32] = [0xcd; 32];
 
-fn send(sequence: u64) -> ActionEnvelope {
+fn deliver(message_id: &str) -> ActionEnvelope {
     envelope(
-        OP_COLLABORATION_SEND,
-        Some(serde_json::json!({
-            "conversation_id": "review",
-            "participant_id": "alice",
-        })),
+        OP_COLLABORATION_DELIVER,
+        Some(serde_json::json!({"channel_id": "review"})),
         serde_json::json!({
-            "credential": 7,
-            "sequence": sequence,
-            "recipient_participant_id": "bob",
+            "message_id": message_id,
+            "recipient": "acct:42",
             "kind": "question",
-            "body": "does this hold?",
             "expires_at": 900,
         }),
     )
@@ -38,7 +33,7 @@ fn send(sequence: u64) -> ActionEnvelope {
 fn acknowledge(state: &str) -> ActionEnvelope {
     envelope(
         OP_COLLABORATION_ACKNOWLEDGE,
-        Some(serde_json::json!({"conversation_id": "review"})),
+        Some(serde_json::json!({"channel_id": "review", "participant": "acct:42"})),
         serde_json::json!({"credential": 7, "seq": 4, "state": state}),
     )
 }
@@ -86,10 +81,10 @@ fn act(run_id: &str, action: ActionEnvelope) -> Msg {
 }
 
 #[test]
-fn a_send_prepares_one_network_bound_message_naming_no_actor() {
+fn a_deliver_prepares_one_network_bound_request_naming_no_actor() {
     let (mut m, registry, run_id) = live_run();
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
-    exec(&mut m, &mut ctx, &act(&run_id, send(3))).unwrap();
+    exec(&mut m, &mut ctx, &act(&run_id, deliver("m3"))).unwrap();
 
     let msgs = ctx.collaboration_msgs();
     assert_eq!(msgs.len(), 1, "exactly one collaboration follow-up");
@@ -97,21 +92,17 @@ fn a_send_prepares_one_network_bound_message_naming_no_actor() {
         msgs[0].network, NETWORK,
         "the op is bound to this network, so it cannot be replayed onto another"
     );
-    let CollaborationMsg::Send(request) = &msgs[0].op else {
-        panic!("expected a Send, got {:?}", msgs[0].op);
+    let CollaborationMsg::Deliver(request) = &msgs[0].op else {
+        panic!("expected a Deliver, got {:?}", msgs[0].op);
     };
-    assert_eq!(request.conversation_id, "review");
-    assert_eq!(request.sender_participant_id, "alice");
-    assert_eq!(request.recipient_participant_id, "bob");
+    assert_eq!(request.channel_id, "review");
+    assert_eq!(request.message_id, "m3");
+    assert_eq!(request.recipient, Party::Account(42));
     assert_eq!(request.kind, MessageKind::Question);
-    assert_eq!(request.body, "does this hold?");
     assert_eq!(request.expires_at, 900);
-    // the credential is the message id's generation half: the binding the
-    // sender claims, which collaboration checks against the one it holds.
-    assert_eq!(request.message_id.generation, 7);
-    assert_eq!(request.message_id.sequence, 3);
-    // WHO is sending is nowhere in these bytes. It is the program origin the
-    // account's own call mints, and only collaboration ever sees it.
+    // WHO is asking is nowhere in these bytes. It is the program origin the
+    // account's own call mints, and collaboration checks the chat message
+    // was posted by exactly that origin.
     assert_eq!(request.task, None);
     assert!(request.references.is_empty());
 }
@@ -120,13 +111,13 @@ fn a_send_prepares_one_network_bound_message_naming_no_actor() {
 fn a_task_update_preserves_the_typed_attempt_reference() {
     let (mut m, registry, run_id) = live_run();
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
-    let mut action = send(3);
+    let mut action = deliver("m3");
     action.input["kind"] = serde_json::json!("task_update");
     action.input["task"] = serde_json::json!({"id": "review-task", "expected_attempt": 7});
     exec(&mut m, &mut ctx, &act(&run_id, action)).unwrap();
     let msgs = ctx.collaboration_msgs();
-    let CollaborationMsg::Send(request) = &msgs[0].op else {
-        panic!("expected Send")
+    let CollaborationMsg::Deliver(request) = &msgs[0].op else {
+        panic!("expected Deliver")
     };
     assert_eq!(request.kind, MessageKind::TaskUpdate);
     assert_eq!(
@@ -153,8 +144,9 @@ fn an_acknowledge_reports_a_state_under_the_binding_credential() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].network, NETWORK);
     let CollaborationMsg::Acknowledge {
-        conversation_id,
+        channel_id,
         seq,
+        recipient,
         binding_credential,
         state,
         reason,
@@ -162,7 +154,8 @@ fn an_acknowledge_reports_a_state_under_the_binding_credential() {
     else {
         panic!("expected an Acknowledge, got {:?}", msgs[0].op);
     };
-    assert_eq!(conversation_id, "review");
+    assert_eq!(channel_id, "review");
+    assert_eq!(*recipient, Party::Account(42));
     assert_eq!(*seq, 4);
     assert_eq!(*binding_credential, 7);
     assert_eq!(*state, DeliveryState::AdapterAccepted);
@@ -208,7 +201,7 @@ fn an_unwired_collaboration_plane_refuses_rather_than_degrades() {
     commit(&mut m);
 
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
-    let err = exec(&mut m, &mut ctx, &act(&run_id, send(3))).unwrap_err();
+    let err = exec(&mut m, &mut ctx, &act(&run_id, deliver("m3"))).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("wires none")),
         "{err:?}"
@@ -222,7 +215,7 @@ fn the_settle_lane_admits_neither_operation() {
     // which collaboration refuses by design — so the operation must never reach
     // that lane in the first place, and the run fails by name instead of
     // emitting bytes nobody will accept.
-    for action in [send(3), acknowledge("queued")] {
+    for action in [deliver("m3"), acknowledge("queued")] {
         let name = action.operation.clone();
         let registry = registry(&["bot"]);
         let mut m = configured(&registry)

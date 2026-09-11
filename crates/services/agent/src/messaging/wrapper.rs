@@ -44,10 +44,7 @@ pub fn wrap(deliver: &Deliver) -> String {
     out.push_str(&format!("<ducktape-message {fence}>\n"));
     out.push_str(&format!("from-participant: {}\n", deliver.sender));
     out.push_str(&format!("conversation: {}\n", deliver.conversation));
-    out.push_str(&format!(
-        "message: {}.{}\n",
-        deliver.message_id.generation, deliver.message_id.sequence
-    ));
+    out.push_str(&format!("message: {}\n", deliver.message_id));
     out.push_str(&format!("conversation-sequence: {}\n", deliver.seq));
     out.push_str(&format!("kind: {}\n", kind_token(deliver.kind)));
     if let Some(reply_to) = deliver.reply_to {
@@ -123,7 +120,7 @@ fn kind_token(kind: Kind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{MessageId, Reference, TaskRef};
+    use crate::wire::{Reference, TaskRef};
 
     fn deliver(body: &str) -> Deliver {
         Deliver {
@@ -131,10 +128,7 @@ mod tests {
             participant: "p-recipient".into(),
             seq: 7,
             binding_generation: 3,
-            message_id: MessageId {
-                generation: 2,
-                sequence: 1,
-            },
+            message_id: "m-7".into(),
             sender: "p-sender".into(),
             kind: Kind::Question,
             task: Some(TaskRef {
@@ -159,7 +153,7 @@ mod tests {
         for named in [
             "from-participant: p-sender",
             "conversation: conv-1",
-            "message: 2.1",
+            "message: m-7",
             "conversation-sequence: 7",
             "kind: question",
             "in-reply-to-sequence: 5",

@@ -19,10 +19,15 @@ extern crate::module_view
   // the node's height as the app last heard it: a height that moved is a
   // hit on the `block` plane every view reading the feed subscribes to
   sync view_block_hit(height:i64, serial:i64) -> i64
-  component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
+  // Members speaks the KERNEL CONTRACT too: session facts go in, the view
+  // reads the roster off the node and signs its writes through `op.submit`;
+  // the one event back is the clipboard intent
+  component members_view(dark:bool, connected:bool, admin:bool) -> ModuleViewEvent
+  // Agents speaks it as well: session facts go in — the run another tab
+  // opened for the reader among them, which the kernel has no other door
+  // for — and the view reads and writes the node itself.
+  component agents_view(dark:bool, connected:bool, account:&str, open_run:&str, opened:i64) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
-  pure roster_intent(event:&ModuleViewEvent) -> RosterIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool
   component node_view(dark:bool, connected:bool, admin:bool, tier:&str, status:&str, loading:bool, module_rows:&[ModuleRow], node_key:&str, node_data_dir:&str, node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:&str, node_quorum_label:&str, node_version:&str, node_root_hash:&str, sync_line:&str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:&str, node_peers:&[PeerRow], wall_now:i64, timeline:&NodeLogTimelineState, source:&str) -> ModuleViewEvent

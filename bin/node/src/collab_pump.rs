@@ -15,9 +15,14 @@
 //! Reads go out on [`noded::NodeCommand::QueryAs`] carrying the binding's
 //! SCOPED SERVICE KEY as the reader, never the node's own identity. The module
 //! refuses `Origin::System` for all of `ProtectedRead`, so a node cannot read a
-//! conversation it holds no binding on — including the ones its own operator
-//! owns. `via` names the conversation the key is scoped to, because the key
-//! store is hashed and the module cannot find the binding by scanning.
+//! channel's delivery records it holds no binding on — including the ones its
+//! own operator owns. `via` names the channel the key is scoped to, because
+//! the key store is hashed and the module cannot find the binding by scanning.
+//!
+//! The BODY is chat's. A delivery record names a chat message by id, and the
+//! pump reads that message over the node's public query lane: a chat message
+//! is replicated committed state that every validator holds in plaintext, so
+//! nothing about it is protected by the collaboration module.
 //!
 //! ## the deadline is the network's, and it is asked immediately before
 //!
@@ -53,11 +58,11 @@ use crate::collab_keys::Attached;
 const COLLABORATION: &str = "collaboration";
 
 /// Events read per page. The module caps a page itself; this is the pump's own
-/// ceiling on how much one conversation may hold the sweep for.
+/// ceiling on how much one channel may hold the sweep for.
 const PAGE: u64 = 64;
 
-/// Pages one conversation may consume in one sweep. A conversation catching up
-/// over thousands of events must not starve the ones behind it — the cursor
+/// Pages one channel may consume in one sweep. A channel catching up over
+/// thousands of events must not starve the ones behind it — the cursor
 /// persists across sweeps, so it resumes exactly where this stopped.
 const PAGES_PER_SWEEP: usize = 8;
 
@@ -82,7 +87,7 @@ const MAX_OWING_MESSAGES: usize = 4096;
 ///
 /// The sweep is what notices mail; the receipts come back on their own lane and
 /// are never waited for here. It is a POLL because the module's sibling-module
-/// notification (`CollaborationEvent::ConversationAdvanced`) reaches modules,
+/// notification (`CollaborationEvent::ChannelAdvanced`) reaches modules,
 /// not the node process — so there is no push to subscribe to from out here.
 // ponytail: a poll, because nothing pushes to this process yet. When the node
 // grows a committed-event subscription, feed `wake` from it and keep this as
@@ -174,7 +179,8 @@ pub(crate) struct Pump {
     owed: std::sync::Mutex<BTreeMap<Message, std::collections::VecDeque<Unsent>>>,
 }
 
-/// one message's delivery record, as the module keys it.
+/// one message's delivery record, as the module keys it: the channel, the
+/// recipient's party handle, and the channel sequence.
 type Message = (String, String, u64);
 
 /// one receipt the daemon reported and the chain has not taken.
@@ -193,8 +199,6 @@ struct Unsent {
 struct Announced {
     /// the binding credential last sent as a `MsgBind` generation. 0 = never.
     credential: collab::Credential,
-    /// the retention floor last sent as a `MsgRetain`.
-    floor: u64,
     /// the next committed event sequence to read.
     cursor: u64,
 }
@@ -236,7 +240,7 @@ struct Seen {
     /// how many receipts the term plane had dropped when this pump last looked
     /// ([`noded::TerminalSessions::dropped_receipts`]).
     dropped: u64,
-    /// keyed by (conversation, participant) — the binding's identity.
+    /// keyed by (channel, participant handle) — the binding's identity.
     bindings: BTreeMap<(String, String), Announced>,
 }
 
@@ -311,8 +315,8 @@ impl Pump {
         // "is one attached" cannot tell the two apart — a daemon that dies and
         // redials with the same bindings looks identical to one that never left,
         // and its epoch is what says otherwise. Everything cached is forgotten:
-        // the binds, the clock, the floors and the cursors all get re-sent, and
-        // the daemon's own dedup journal absorbs anything it already had.
+        // the binds, the clock and the cursors all get re-sent, and the
+        // daemon's own dedup journal absorbs anything it already had.
         let epoch = self.terminals.attach_epoch();
         if epoch != seen.epoch {
             tracing::info!(
@@ -373,8 +377,8 @@ impl Pump {
         }
     }
 
-    /// Bring one binding up to date: its generation, its retention floor, and
-    /// every message admitted for it since this pump last looked.
+    /// Bring one binding up to date: its generation, and every delivery
+    /// requested for it since this pump last looked.
     async fn pump_one(&self, attachment: &Attached, announced: &mut Announced) {
         let binding = crate::collab_keys::BindingRef {
             network: &self.network,
@@ -388,69 +392,47 @@ impl Pump {
             Ok(None) => return self.skip(attachment, "no_service_key"),
             Err(error) => return self.refuse("service_key_unreadable", &error),
         };
-        let Some(collab::CollaborationReply::Access(access)) = self
+        let Some(collab::CollaborationReply::Binding(binding)) = self
             .read(
                 attachment,
                 &key,
-                collab::ProtectedRead::Access {
-                    conversation_id: attachment.conversation.clone(),
+                collab::ProtectedRead::Binding {
+                    channel_id: attachment.conversation.clone(),
                 },
             )
             .await
         else {
             return;
         };
-        // 0 is "holds no binding here": the owner never signed the `Bind`, or an
-        // `Unbind` spent it. Forget the generation so a later re-bind is sent as
-        // a fresh one rather than looking unchanged.
-        if access.binding_credential == 0 {
+        // no live binding: the owner never signed the `Bind`, or an `Unbind`
+        // spent it. Forget the generation so a later re-bind is sent as a fresh
+        // one rather than looking unchanged.
+        let credential = binding
+            .filter(|binding| !binding.detached)
+            .map_or(0, |binding| binding.credential);
+        if credential == 0 {
             announced.credential = 0;
             return self.skip(attachment, "unbound");
         }
-        if announced.credential != access.binding_credential {
-            announced.credential = access.binding_credential;
-            // a new attachment has seen none of the conversation. Read from the
-            // floor: everything below it is gone from the module, and everything
-            // above may still be waiting for this participant.
+        if announced.credential != credential {
+            announced.credential = credential;
+            // a new attachment has seen none of the channel: read from the
+            // beginning, where everything may still be waiting for this
+            // participant.
             announced.cursor = 0;
             self.terminals
                 .send(wire::Command::MsgBind(wire::Bind {
                     conversation: attachment.conversation.clone(),
                     participant: attachment.participant.clone(),
-                    generation: access.binding_credential,
+                    generation: credential,
                     device: attachment.device.clone(),
                 }))
                 .await;
         }
-        let Some(collab::CollaborationReply::Conversation(conversation)) = self
-            .read(
-                attachment,
-                &key,
-                collab::ProtectedRead::Conversation {
-                    conversation_id: attachment.conversation.clone(),
-                },
-            )
-            .await
-        else {
-            return;
-        };
-        // the daemon prunes its dedup record ONLY where the network has stopped
-        // retaining the message, so this is what turns its bounded tracking
-        // table from a permanent refusal into a working one.
-        if conversation.floor_seq > announced.floor {
-            announced.floor = conversation.floor_seq;
-            self.terminals
-                .send(wire::Command::MsgRetain {
-                    conversation: attachment.conversation.clone(),
-                    floor_seq: conversation.floor_seq,
-                })
-                .await;
-        }
-        announced.cursor = announced.cursor.max(conversation.floor_seq);
         self.drain_events(attachment, &key, announced).await;
     }
 
-    /// Read forward from the cursor, delivering what is admitted for this
+    /// Read forward from the cursor, delivering what is requested for this
     /// participant.
     async fn drain_events(
         &self,
@@ -464,7 +446,7 @@ impl Pump {
                     attachment,
                     key,
                     collab::ProtectedRead::Events {
-                        conversation_id: attachment.conversation.clone(),
+                        channel_id: attachment.conversation.clone(),
                         from_seq: announced.cursor,
                         limit: PAGE,
                     },
@@ -473,22 +455,15 @@ impl Pump {
             else {
                 return;
             };
-            let (events, messages, next_seq) = match page {
-                collab::EventPage::Page {
-                    events,
-                    messages,
-                    next_seq,
-                } => (events, messages, next_seq),
-                // the cursor fell below the floor between two sweeps. Resync
-                // there rather than advancing past events that no longer exist.
-                collab::EventPage::HistoryGap { floor_seq } => {
-                    announced.cursor = floor_seq;
-                    continue;
-                }
-            };
-            let exhausted = next_seq <= announced.cursor;
+            let collab::EventPage {
+                events,
+                deliveries,
+                next_seq,
+            } = page;
+            // a short page reached the channel head.
+            let exhausted = (events.len() as u64) < PAGE;
             match self
-                .offer_page(attachment, key, announced.credential, &events, &messages)
+                .offer_page(attachment, key, announced.credential, &events, &deliveries)
                 .await
             {
                 // this page handed something over, or could not establish what
@@ -508,9 +483,10 @@ impl Pump {
         }
     }
 
-    /// Hand every message on one page that is admitted for this participant to
-    /// the daemon. Answers the FIRST sequence the cursor must not advance past,
-    /// or `None` when every message on the page was resolved and none delivered.
+    /// Hand every message on one page that is requested for this participant
+    /// to the daemon. Answers the FIRST sequence the cursor must not advance
+    /// past, or `None` when every message on the page was resolved and none
+    /// delivered.
     ///
     /// Two things hold the cursor, and both must:
     ///
@@ -529,16 +505,27 @@ impl Pump {
         attachment: &Attached,
         key: &commonware_cryptography::ed25519::PrivateKey,
         credential: collab::Credential,
-        events: &[collab::ConversationEvent],
-        messages: &[collab::Message],
+        events: &[collab::ChannelEvent],
+        deliveries: &[collab::Delivery],
     ) -> Option<u64> {
         let mut hold: Option<u64> = None;
         let mut keep = |seq: u64| hold = Some(hold.map_or(seq, |first: u64| first.min(seq)));
-        for seq in admitted_for(&attachment.participant, events) {
-            let Some(message) = messages.iter().find(|message| message.seq == seq) else {
-                // the event survives its message: the body was pruned out from
-                // under the page. There is nothing to deliver and never will be.
-                self.skip(attachment, "message_pruned");
+        let Ok(participant) = collab::parse_party_handle(&attachment.participant) else {
+            self.refuse(
+                "participant_unparseable",
+                "an attachment names a participant that is not a party handle",
+            );
+            return None;
+        };
+        for seq in requested_for(&participant, events) {
+            let Some(delivery) = deliveries
+                .iter()
+                .find(|delivery| delivery.seq == seq && delivery.recipient == participant)
+            else {
+                // the page joins every requested record it names; one missing
+                // is a read this build cannot make sense of, not an absence.
+                self.unresolved(attachment, seq, "record_missing");
+                keep(seq);
                 continue;
             };
             // the bound, applied where there is still a choice: a receipt is
@@ -557,10 +544,16 @@ impl Pump {
                     continue;
                 }
             }
+            // the body is chat's, read AFTER eligibility so an expired or
+            // settled record costs no chat read at all.
+            let Some(message) = self.chat_message(&delivery.message_id).await else {
+                self.unresolved(attachment, seq, "chat_read_failed");
+                continue;
+            };
             self.terminals
                 .send(wire::Command::MsgDeliver(Box::new(deliver(
-                    message,
-                    &attachment.participant,
+                    delivery,
+                    &message,
                     credential,
                 ))))
                 .await;
@@ -596,7 +589,7 @@ impl Pump {
                 attachment,
                 key,
                 collab::ProtectedRead::DeliveryEligibility {
-                    conversation_id: attachment.conversation.clone(),
+                    channel_id: attachment.conversation.clone(),
                     seq,
                 },
             )
@@ -802,9 +795,16 @@ impl Pump {
             // nothing to verify against, because verifying also needs the key.
             Err(error) => return self.owe(message, unsent, None, &error).await,
         };
+        let Ok(recipient) = collab::parse_party_handle(participant) else {
+            return self.refuse(
+                "participant_unparseable",
+                "a receipt named a participant that is not a party handle",
+            );
+        };
         let op = collab::CollaborationMsg::Acknowledge {
-            conversation_id: conversation.clone(),
+            channel_id: conversation.clone(),
             seq: *seq,
+            recipient,
             binding_credential: unsent.credential,
             state: delivery_state(unsent.state),
             reason: unsent.reason.clone(),
@@ -934,15 +934,15 @@ impl Pump {
             .read(
                 &attachment,
                 key,
-                collab::ProtectedRead::Receipt {
-                    conversation_id: conversation.clone(),
+                collab::ProtectedRead::Delivery {
+                    channel_id: conversation.clone(),
                     seq: *seq,
                 },
             )
             .await;
         // an unreadable answer, or one this build cannot interpret: nothing has
         // been verified, so nothing is given up.
-        let Some(collab::CollaborationReply::Receipt(receipt)) = answer else {
+        let Some(collab::CollaborationReply::Delivery(receipt)) = answer else {
             return Standing::Owe;
         };
         let Some(receipt) = receipt else {
@@ -1029,10 +1029,17 @@ impl Pump {
         key: &commonware_cryptography::ed25519::PrivateKey,
         read: collab::ProtectedRead,
     ) -> Option<collab::CollaborationReply> {
+        let Ok(participant) = collab::parse_party_handle(&attachment.participant) else {
+            self.refuse(
+                "participant_unparseable",
+                "an attachment names a participant that is not a party handle",
+            );
+            return None;
+        };
         let query = collab::CollaborationQuery::Read {
-            participant_id: attachment.participant.clone(),
-            // the key is scoped to ONE conversation and the store is hashed, so
-            // the module cannot find the binding that holds it by scanning. The
+            participant,
+            // the key is scoped to ONE channel and the store is hashed, so the
+            // module cannot find the binding that holds it by scanning. The
             // caller names the one it holds.
             via: Some(attachment.conversation.clone()),
             read,
@@ -1073,6 +1080,56 @@ impl Pump {
             Ok(reply) => Some(reply),
             Err(error) => {
                 self.refuse("reply_undecodable", &error);
+                None
+            }
+        }
+    }
+
+    /// One chat message by id, over the node's public query lane.
+    ///
+    /// `None` on every failure, each with its own reason token, and also for a
+    /// message chat no longer holds — a delivery record outlives nothing, but
+    /// a read this build cannot make sense of is not a body to hand over.
+    async fn chat_message(&self, message_id: &str) -> Option<chat::MessageView> {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .commands
+            .clone()
+            .send(noded::NodeCommand::Query {
+                target: chat::DEFAULT_CHAT_TARGET.to_string(),
+                req: chat::encode_query(&chat::ChatQuery::Message {
+                    message_id: message_id.to_string(),
+                }),
+                reply,
+            })
+            .await;
+        if sent.is_err() {
+            self.refuse("node_actor_gone", "the node actor is not accepting reads");
+            return None;
+        }
+        let bytes = match answer.await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                self.refuse("chat_read_refused", &error);
+                return None;
+            }
+            Err(_) => {
+                self.refuse("node_actor_gone", "the node actor dropped a read");
+                return None;
+            }
+        };
+        match chat::decode_reply(&bytes) {
+            Ok(chat::ChatReply::Message(Some(message))) => Some(message),
+            Ok(chat::ChatReply::Message(None)) => {
+                self.refuse("chat_message_gone", message_id);
+                None
+            }
+            Ok(_) => {
+                self.refuse("chat_reply_unexpected", message_id);
+                None
+            }
+            Err(error) => {
+                self.refuse("chat_reply_undecodable", &error);
                 None
             }
         }
@@ -1160,23 +1217,25 @@ fn push_once(chain: &mut std::collections::VecDeque<Unsent>, unsent: &Unsent) {
     chain.push_back(unsent.clone());
 }
 
-/// The sequences on this page that admitted a message FOR `participant`.
+/// The channel sequences on this page whose delivery was requested FOR
+/// `participant` — the sequence of the MESSAGE, which is what the record is
+/// keyed on, not of the request event.
 ///
 /// A `DeliveryAdvanced` on the page is this pump's own acknowledgement coming
-/// back, or an expiry somebody ran; neither is work. A `BindingChanged` or
-/// `RosterChanged` is read from `Access` on the next sweep, which is the
-/// authority for both.
-fn admitted_for(participant: &str, events: &[collab::ConversationEvent]) -> Vec<u64> {
+/// back, or an expiry somebody ran; neither is work. A `BindingChanged` is
+/// read from `Binding` on the next sweep, which is the authority for it.
+fn requested_for(participant: &collab::Party, events: &[collab::ChannelEvent]) -> Vec<u64> {
     events
         .iter()
         .filter_map(|event| match &event.body {
-            collab::EventBody::MessageAdmitted { recipient, .. } if recipient == participant => {
-                Some(event.seq)
-            }
-            collab::EventBody::MessageAdmitted { .. }
+            collab::EventBody::DeliveryRequested {
+                message_seq,
+                recipient,
+                ..
+            } if recipient == participant => Some(*message_seq),
+            collab::EventBody::DeliveryRequested { .. }
             | collab::EventBody::DeliveryAdvanced { .. }
-            | collab::EventBody::BindingChanged { .. }
-            | collab::EventBody::RosterChanged { .. } => None,
+            | collab::EventBody::BindingChanged { .. } => None,
         })
         .collect()
 }
@@ -1209,45 +1268,76 @@ fn admits_delivery(verdict: &collab::DeliveryEligibility) -> Result<(), &'static
     }
 }
 
-/// The committed message as the frame the daemon places into a session.
+/// The committed delivery record and its chat message as the frame the daemon
+/// places into a session.
 ///
-/// A straight projection with nothing added: every field is the module's, and
-/// `urgent` is false because no committed field says otherwise — steering an
-/// active turn is a sender's explicit request and the module carries none, so
-/// inventing one here would let the pump interrupt a model on its own authority.
+/// A straight projection with nothing added: every field is one module's or
+/// the other's, and `urgent` is false because no committed field says
+/// otherwise — steering an active turn is a sender's explicit request and
+/// neither module carries one, so inventing it here would let the pump
+/// interrupt a model on its own authority.
 ///
 /// `credential` is the RECIPIENT's current binding credential, read this sweep.
 /// It is the fence: a daemon holding a newer generation drops this delivery
 /// rather than handing a message aimed at a replaced attachment to the device
-/// that replaced it. The sender's credential is a different number and lives in
-/// `message_id`.
+/// that replaced it.
 fn deliver(
-    message: &collab::Message,
-    participant: &str,
+    delivery: &collab::Delivery,
+    message: &chat::MessageView,
     credential: collab::Credential,
 ) -> wire::Deliver {
     wire::Deliver {
-        conversation: message.conversation_id.clone(),
-        participant: participant.to_string(),
-        seq: message.seq,
+        conversation: delivery.channel_id.clone(),
+        participant: handle(&delivery.recipient),
+        seq: delivery.seq,
         binding_generation: credential,
-        message_id: wire::MessageId {
-            generation: message.message_id.generation,
-            sequence: message.message_id.sequence,
-        },
-        sender: message.sender.clone(),
-        kind: kind(message.kind),
-        task: message.task.as_ref().map(|task| wire::TaskRef {
+        message_id: delivery.message_id.clone(),
+        sender: handle(&delivery.sender),
+        kind: kind(delivery.kind),
+        task: delivery.task.as_ref().map(|task| wire::TaskRef {
             id: task.id.clone(),
             expected_attempt: task.expected_attempt,
         }),
-        reply_to: message.reply_to,
-        body: message.body.clone(),
-        references: message.references.iter().map(reference).collect(),
-        expires_at: message.expires_at,
-        network_now: message.admitted_at,
+        reply_to: message.head.thread,
+        body: plain_text(&message.head.blocks),
+        references: delivery.references.iter().map(reference).collect(),
+        expires_at: delivery.expires_at,
+        network_now: delivery.requested_at,
         urgent: false,
     }
+}
+
+/// a party as the daemon's wire spells it. Every party a delivery record names
+/// is an account or a key — the module admits nothing else — so the handle
+/// always exists; the empty string is the fail-closed spelling of one that
+/// somehow does not, and no daemon binding matches it.
+fn handle(party: &collab::Party) -> String {
+    collab::party_handle(party).unwrap_or_default()
+}
+
+/// a chat body as the plain text a provider session sees: spans joined by
+/// spaces, code kept verbatim, a divider dropped.
+fn plain_text(blocks: &[chat::Block]) -> String {
+    fn spans(out: &mut String, spans: &[chat::Span]) {
+        for span in spans {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push(' ');
+            }
+            out.push_str(&span.text);
+        }
+    }
+    let mut out = String::new();
+    for block in blocks {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        match block {
+            chat::Block::Paragraph(s) | chat::Block::Quote(s) => spans(&mut out, s),
+            chat::Block::Code { text, .. } => out.push_str(text),
+            chat::Block::Divider => {}
+        }
+    }
+    out
 }
 
 fn kind(kind: collab::MessageKind) -> wire::Kind {
@@ -1370,97 +1460,131 @@ mod tests {
         }
     }
 
-    /// A conversation's event stream carries everything that ever happened in
-    /// it. Only mail addressed to THIS participant is work — a message to
-    /// somebody else on the same roster is not this device's to deliver.
+    /// A channel's event stream carries everything that ever happened in it.
+    /// Only mail addressed to THIS participant is work — a message to somebody
+    /// else on the same channel is not this device's to deliver — and the
+    /// sequence that identifies it is the MESSAGE's, not the request event's.
     #[test]
     fn only_mail_addressed_to_this_participant_is_work() {
+        let (alice, bob, carol) = (party(1), party(2), party(3));
         let events = vec![
             event(
-                1,
-                collab::EventBody::MessageAdmitted {
-                    sender: "alice".into(),
-                    recipient: "bob".into(),
-                },
-            ),
-            event(
-                2,
-                collab::EventBody::MessageAdmitted {
-                    sender: "bob".into(),
-                    recipient: "carol".into(),
-                },
-            ),
-            event(
                 3,
+                collab::EventBody::DeliveryRequested {
+                    message_seq: 1,
+                    sender: alice.clone(),
+                    recipient: bob.clone(),
+                    kind: collab::MessageKind::Notice,
+                },
+            ),
+            event(
+                4,
+                collab::EventBody::DeliveryRequested {
+                    message_seq: 2,
+                    sender: bob.clone(),
+                    recipient: carol.clone(),
+                    kind: collab::MessageKind::Notice,
+                },
+            ),
+            event(
+                5,
                 collab::EventBody::DeliveryAdvanced {
                     message_seq: 1,
+                    recipient: bob.clone(),
                     state: State::Queued,
                     reason: None,
                 },
             ),
             event(
-                4,
+                6,
                 collab::EventBody::BindingChanged {
-                    participant_id: "bob".into(),
+                    participant: bob.clone(),
                     credential: 7,
                     detached: false,
                 },
             ),
             event(
-                5,
-                collab::EventBody::MessageAdmitted {
-                    sender: "carol".into(),
-                    recipient: "bob".into(),
+                7,
+                collab::EventBody::DeliveryRequested {
+                    message_seq: 5,
+                    sender: carol,
+                    recipient: bob.clone(),
+                    kind: collab::MessageKind::Notice,
                 },
             ),
         ];
         assert_eq!(
-            admitted_for("bob", &events),
+            requested_for(&bob, &events),
             vec![1, 5],
             "carol's mail, our own receipts and a binding change are not deliveries"
         );
     }
 
-    fn event(seq: u64, body: collab::EventBody) -> collab::ConversationEvent {
-        collab::ConversationEvent { seq, at: seq, body }
+    fn event(seq: u64, body: collab::EventBody) -> collab::ChannelEvent {
+        collab::ChannelEvent { seq, at: seq, body }
     }
 
-    /// The generation on a delivery is the RECIPIENT's binding, not the
-    /// sender's credential. Confusing the two hands a message aimed at a
-    /// replaced attachment to the device that replaced it — the exact thing the
-    /// daemon's fence is there to stop.
+    fn party(byte: u8) -> collab::Party {
+        collab::Party::Key(vec![byte; 32])
+    }
+
+    /// The generation on a delivery is the RECIPIENT's binding, not anything
+    /// the sender said. Confusing the two hands a message aimed at a replaced
+    /// attachment to the device that replaced it — the exact thing the daemon's
+    /// fence is there to stop. And the body is chat's, flattened.
     #[test]
-    fn a_delivery_is_fenced_by_the_recipients_binding_and_not_the_senders() {
-        let message = collab::Message {
+    fn a_delivery_is_fenced_by_the_recipients_binding_and_carries_chats_body() {
+        let delivery = collab::Delivery {
+            channel_id: CONVERSATION.into(),
             seq: 4,
-            message_id: collab::MessageId {
-                generation: 11,
-                sequence: 3,
-            },
-            conversation_id: CONVERSATION.into(),
-            sender: "alice".into(),
-            recipient: "bob".into(),
+            message_id: "m-3".into(),
+            sender: party(1),
+            recipient: party(2),
             kind: collab::MessageKind::Question,
-            reply_to: Some(2),
             task: None,
-            body: "ready?".into(),
             references: vec![collab::Reference::Blob { hash: "ab".into() }],
             expires_at: 900,
-            admitted_at: 50,
-            digest: "d".into(),
+            requested_at: 50,
+            state: State::Stored,
+            advanced_by: 0,
+            reason: None,
+            updated_at: 50,
         };
-        let frame = deliver(&message, "bob", 42);
-        assert_eq!(frame.binding_generation, 42, "the recipient's binding");
-        assert_eq!(
-            frame.message_id,
-            wire::MessageId {
-                generation: 11,
-                sequence: 3
+        let message = chat::MessageView {
+            channel_id: CONVERSATION.into(),
+            seq: 4,
+            head: chat::MessageHead {
+                message_id: "m-3".into(),
+                author: party(1),
+                origin: sdk::Origin::External(vec![1; 32]),
+                content_origin: sdk::Origin::External(vec![1; 32]),
+                blocks: vec![
+                    chat::Block::paragraph("ready?"),
+                    chat::Block::Code {
+                        lang: None,
+                        text: "cargo test".into(),
+                    },
+                ],
+                created_at: 40,
+                rev: 0,
+                revision: 1,
+                edited_at: None,
+                base_rev: None,
+                deleted: false,
+                thread: Some(2),
+                reply_count: 0,
+                last_reply_seq: None,
             },
-            "the sender's credential stays where it belongs"
-        );
+        };
+        let frame = deliver(&delivery, &message, 42);
+        assert_eq!(frame.binding_generation, 42, "the recipient's binding");
+        assert_eq!(frame.message_id, "m-3", "chat's id, verbatim");
+        assert_eq!(frame.sender, handle(&party(1)));
+        assert_eq!(frame.participant, handle(&party(2)));
+        assert_eq!(frame.body, "ready?\ncargo test");
+        assert_eq!(frame.reply_to, Some(2), "the thread root is the reply target");
         assert_eq!(frame.expires_at, 900, "the network's deadline, unconverted");
-        assert_eq!(frame.network_now, 50, "the agreed clock at admission");
+        assert_eq!(frame.network_now, 50, "the agreed clock at the request");
         assert!(
             !frame.urgent,
             "no committed field asks for a turn to be steered"
@@ -1475,9 +1599,33 @@ mod tests {
 
     const NETWORK: &str = "pump-test#a1b2c3d4";
     const CONVERSATION: &str = "standup";
-    const SENDER: &str = "alice";
-    const RECIPIENT: &str = "bob";
     const DEVICE: &str = "laptop";
+    /// the owner keys: alice sends, bob receives. Fixed seeds, because the
+    /// participant handles below derive from the public halves.
+    const ALICE_SEED: u64 = 1;
+    const BOB_SEED: u64 = 2;
+
+    fn signer(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+        commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
+    }
+
+    /// the party an owner key IS on a network whose identity module holds no
+    /// account for it.
+    fn party_of(seed: u64) -> collab::Party {
+        collab::Party::Key(
+            commonware_cryptography::Signer::public_key(&signer(seed))
+                .as_ref()
+                .to_vec(),
+        )
+    }
+
+    fn sender() -> String {
+        handle(&party_of(ALICE_SEED))
+    }
+
+    fn recipient() -> String {
+        handle(&party_of(BOB_SEED))
+    }
     const LINK_TOKEN: &str = "pump-test-link-token";
     /// well past the testkit's clock, which is one tick per committed block.
     const DEADLINE: u64 = 1_000_000;
@@ -1492,7 +1640,10 @@ mod tests {
         link: tokio::sync::mpsc::Receiver<wire::Command>,
         /// dropping it detaches the daemon, which is how a reconnect is staged.
         attached: Option<noded::AttachGuard>,
+        /// alice: the sender, and the channel's creator.
         owner: commonware_cryptography::ed25519::PrivateKey,
+        /// bob: the recipient, whose own key signs his binding.
+        bob: commonware_cryptography::ed25519::PrivateKey,
         service: commonware_cryptography::ed25519::PrivateKey,
         /// every `Acknowledge` a [`Fixture::flaky_times`] lane carried, in
         /// order, INCLUDING the ones it then refused. What landed is readable
@@ -1529,10 +1680,15 @@ mod tests {
                             "attribution",
                             Box::new(sdk_testkit::MemStore::new()),
                         )),
+                        Box::new(chat::Chat::new(
+                            chat::DEFAULT_CHAT_TARGET,
+                            Box::new(sdk_testkit::MemStore::new()),
+                        )),
                         Box::new(collab::Collaboration::new(
                             COLLABORATION,
                             "identity",
                             "tasks",
+                            chat::DEFAULT_CHAT_TARGET,
                             Box::new(sdk_testkit::MemStore::new()),
                             DEADLINE * 2,
                             NETWORK,
@@ -1540,7 +1696,7 @@ mod tests {
                     ])
                     .expect("genesis")
                 },
-                vec![COLLABORATION.into()],
+                vec![COLLABORATION.into(), chat::DEFAULT_CHAT_TARGET.into()],
             );
             let hub = noded::StreamHub::with_log_ring(64, noded::LogRing::default());
             let terminals = noded::TerminalSessions::new(
@@ -1550,15 +1706,16 @@ mod tests {
             );
             let (attached, link) = terminals.attach(LINK_TOKEN).expect("the link is free");
 
-            let owner =
-                commonware_cryptography::ed25519::PrivateKey::from_seed(rand::random::<u64>());
+            let owner = signer(ALICE_SEED);
+            let bob = signer(BOB_SEED);
             // the binding's own key, minted the way `collab attach` mints it —
             // and RECORDED the same way, because the key file is named by a
             // digest and the pump could not read the ids back out of it.
+            let recipient = recipient();
             let binding = crate::collab_keys::BindingRef {
                 network: NETWORK,
                 conversation: CONVERSATION,
-                participant: RECIPIENT,
+                participant: &recipient,
             };
             let service = crate::collab_keys::ensure(dir.path(), binding).expect("mint");
             crate::collab_keys::remember(dir.path(), binding, DEVICE).expect("remember");
@@ -1569,6 +1726,7 @@ mod tests {
                 link,
                 attached: Some(attached),
                 owner,
+                bob,
                 service,
                 attempts: Attempts::default(),
                 dir,
@@ -1577,86 +1735,67 @@ mod tests {
             fixture
         }
 
-        /// the committed setup: two participants, a conversation both sit on,
-        /// and this device's binding — every one a REAL signed op.
+        /// the committed setup: a chat channel alice opens to anyone, and
+        /// bob's binding on it — every one a REAL signed op.
         async fn compose(&self) {
             let service_key = commonware_cryptography::Signer::public_key(&self.service)
                 .as_ref()
                 .to_vec();
-            for op in [
-                collab::CollaborationMsg::RegisterParticipant {
-                    participant_id: SENDER.into(),
-                    display_name: "Alice".into(),
-                    agent_account: None,
+            self.submit_chat(
+                &self.owner,
+                chat::ChatMsg::CreateChannel {
+                    channel_id: CONVERSATION.into(),
+                    name: "standup".into(),
+                    post_policy: chat::PostPolicy::Open,
                 },
-                collab::CollaborationMsg::RegisterParticipant {
-                    participant_id: RECIPIENT.into(),
-                    display_name: "Bob".into(),
-                    agent_account: None,
-                },
-                collab::CollaborationMsg::CreateConversation {
-                    conversation_id: CONVERSATION.into(),
-                    topic: "standup".into(),
-                },
-                collab::CollaborationMsg::SetRoster {
-                    conversation_id: CONVERSATION.into(),
-                    participant_id: SENDER.into(),
-                    role: Some(collab::Role::Member),
-                },
-                collab::CollaborationMsg::SetRoster {
-                    conversation_id: CONVERSATION.into(),
-                    participant_id: RECIPIENT.into(),
-                    role: Some(collab::Role::Member),
-                },
+            )
+            .await
+            .expect("alice opens the channel");
+            self.submit(
+                &self.bob,
                 collab::CollaborationMsg::Bind {
-                    conversation_id: CONVERSATION.into(),
-                    participant_id: RECIPIENT.into(),
+                    channel_id: CONVERSATION.into(),
+                    participant: party_of(BOB_SEED),
                     device: DEVICE.into(),
                     principal: collab::BoundPrincipal::ServiceKey(service_key),
                     expected_credential: 0,
                 },
-            ] {
-                self.submit(&self.owner, op).await.expect("the owner's op");
-            }
+            )
+            .await
+            .expect("bob binds his device");
         }
 
-        /// admit one message from alice to bob, as the owner of alice.
-        async fn send(&self, sequence: u64, body: &str) {
-            self.send_expiring(sequence, body, DEADLINE).await;
+        /// alice posts one chat message and asks that it be delivered to bob.
+        async fn send(&self, message_id: &str, body: &str) {
+            self.send_expiring(message_id, body, DEADLINE).await;
         }
 
-        async fn send_expiring(&self, sequence: u64, body: &str, expires_at: u64) {
-            let collab::CollaborationReply::Participant(alice) = self
-                .read(
-                    &self.owner,
-                    SENDER,
-                    None,
-                    collab::ProtectedRead::Participant,
-                )
-                .await
-            else {
-                panic!("the owner reads its own participant");
-            };
+        async fn send_expiring(&self, message_id: &str, body: &str, expires_at: u64) {
+            self.submit_chat(
+                &self.owner,
+                chat::ChatMsg::PostMessage {
+                    channel_id: CONVERSATION.into(),
+                    message_id: message_id.into(),
+                    blocks: vec![chat::Block::paragraph(body)],
+                    thread: None,
+                },
+            )
+            .await
+            .expect("alice's message posts");
             self.submit(
                 &self.owner,
-                collab::CollaborationMsg::Send(collab::SendRequest {
-                    conversation_id: CONVERSATION.into(),
-                    sender_participant_id: SENDER.into(),
-                    message_id: collab::MessageId {
-                        generation: alice.owner_credential,
-                        sequence,
-                    },
-                    recipient_participant_id: RECIPIENT.into(),
+                collab::CollaborationMsg::Deliver(collab::DeliverRequest {
+                    channel_id: CONVERSATION.into(),
+                    message_id: message_id.into(),
+                    recipient: party_of(BOB_SEED),
                     kind: collab::MessageKind::Question,
-                    reply_to: None,
                     task: None,
-                    body: body.into(),
                     references: Vec::new(),
                     expires_at,
                 }),
             )
             .await
-            .expect("alice's message is admitted");
+            .expect("alice's delivery is requested");
         }
 
         async fn submit(
@@ -1665,8 +1804,26 @@ mod tests {
             op: collab::CollaborationMsg,
         ) -> Result<u64, String> {
             let request = collab::Request::new(NETWORK, op);
-            let frame =
-                crate::userkey_cli::user_frame(signer, COLLABORATION, collab::encode_msg(&request));
+            self.submit_frame(signer, COLLABORATION, collab::encode_msg(&request))
+                .await
+        }
+
+        async fn submit_chat(
+            &self,
+            signer: &commonware_cryptography::ed25519::PrivateKey,
+            op: chat::ChatMsg,
+        ) -> Result<u64, String> {
+            self.submit_frame(signer, chat::DEFAULT_CHAT_TARGET, chat::encode_msg(&op))
+                .await
+        }
+
+        async fn submit_frame(
+            &self,
+            signer: &commonware_cryptography::ed25519::PrivateKey,
+            target: &str,
+            payload: Vec<u8>,
+        ) -> Result<u64, String> {
+            let frame = crate::userkey_cli::user_frame(signer, target, payload);
             let (reply, answer) = oneshot::channel();
             self.daemon
                 .commands()
@@ -1682,12 +1839,12 @@ mod tests {
         async fn read(
             &self,
             signer: &commonware_cryptography::ed25519::PrivateKey,
-            participant: &str,
+            participant: collab::Party,
             via: Option<&str>,
             read: collab::ProtectedRead,
         ) -> collab::CollaborationReply {
             let query = collab::CollaborationQuery::Read {
-                participant_id: participant.to_string(),
+                participant,
                 via: via.map(str::to_string),
                 read,
             };
@@ -1709,14 +1866,14 @@ mod tests {
         }
 
         /// bob's committed delivery record for one message.
-        async fn receipt(&self, seq: u64) -> collab::Receipt {
-            let collab::CollaborationReply::Receipt(receipt) = self
+        async fn receipt(&self, seq: u64) -> collab::Delivery {
+            let collab::CollaborationReply::Delivery(receipt) = self
                 .read(
                     &self.service,
-                    RECIPIENT,
+                    party_of(BOB_SEED),
                     Some(CONVERSATION),
-                    collab::ProtectedRead::Receipt {
-                        conversation_id: CONVERSATION.into(),
+                    collab::ProtectedRead::Delivery {
+                        channel_id: CONVERSATION.into(),
                         seq,
                     },
                 )
@@ -1724,7 +1881,7 @@ mod tests {
             else {
                 panic!("the binding reads its own receipt");
             };
-            receipt.expect("an admitted message has a receipt")
+            receipt.expect("a requested delivery has a record")
         }
 
         /// the agreed network time, as this node last settled it.
@@ -1736,59 +1893,43 @@ mod tests {
         async fn tick(&self) {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.submit(
+            self.submit_chat(
                 &self.owner,
-                collab::CollaborationMsg::CreateConversation {
-                    conversation_id: format!("filler-{n}"),
-                    topic: "advancing the agreed clock".into(),
+                chat::ChatMsg::CreateChannel {
+                    channel_id: format!("filler-{n}"),
+                    name: "advancing the agreed clock".into(),
+                    post_policy: chat::PostPolicy::Open,
                 },
             )
             .await
             .expect("a block commits");
         }
 
-        /// the oldest sequence the conversation still retains.
-        async fn floor(&self) -> u64 {
-            let collab::CollaborationReply::Conversation(conversation) = self
-                .read(
-                    &self.service,
-                    RECIPIENT,
-                    Some(CONVERSATION),
-                    collab::ProtectedRead::Conversation {
-                        conversation_id: CONVERSATION.into(),
-                    },
-                )
-                .await
-            else {
-                panic!("the binding reads the conversation it is on");
-            };
-            conversation.floor_seq
-        }
-
-        /// the conversation sequence of the one message admitted for bob.
-        async fn only_admitted_seq(&self) -> u64 {
+        /// the channel sequence of the one message requested for bob.
+        async fn only_requested_seq(&self) -> u64 {
             let reply = self
                 .read(
                     &self.service,
-                    RECIPIENT,
+                    party_of(BOB_SEED),
                     Some(CONVERSATION),
                     collab::ProtectedRead::Events {
-                        conversation_id: CONVERSATION.into(),
-                        // the floor, not zero: sequences start at 1 and reading
-                        // below the floor answers `HistoryGap`, which is what
-                        // the pump's own cursor is clamped up to.
-                        from_seq: self.floor().await,
+                        channel_id: CONVERSATION.into(),
+                        from_seq: 0,
                         limit: PAGE,
                     },
                 )
                 .await;
-            let collab::CollaborationReply::Events(collab::EventPage::Page { events, .. }) = reply
+            let collab::CollaborationReply::Events(collab::EventPage { events, .. }) = reply
             else {
-                panic!("the binding reads its own conversation, got {reply:?}");
+                panic!("the binding reads its own channel, got {reply:?}");
             };
-            let mut admitted = admitted_for(RECIPIENT, &events);
-            assert_eq!(admitted.len(), 1, "this fixture admits exactly one message");
-            admitted.remove(0)
+            let mut requested = requested_for(&party_of(BOB_SEED), &events);
+            assert_eq!(
+                requested.len(),
+                1,
+                "this fixture requests exactly one delivery"
+            );
+            requested.remove(0)
         }
 
         fn pump(&self) -> Pump {
@@ -1937,7 +2078,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_admitted_message_reaches_the_daemon_and_its_receipt_reaches_the_chain() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "what is the status?").await;
+        fixture.send("m1", "what is the status?").await;
         let pump = fixture.pump();
         let mut seen = Seen::default();
 
@@ -1951,10 +2092,11 @@ mod tests {
             "the agreed clock, as the node last settled it"
         );
         let (bound, deliver) = bind_and_delivery(&sent);
-        assert_eq!(bound.participant, RECIPIENT);
+        assert_eq!(bound.participant, recipient());
         assert_eq!(bound.device, DEVICE, "the label the operator attached");
         assert_eq!(deliver.body, "what is the status?");
-        assert_eq!(deliver.sender, SENDER);
+        assert_eq!(deliver.sender, sender());
+        assert_eq!(deliver.message_id, "m1", "chat's id rides the frame");
         assert_eq!(
             deliver.binding_generation, bound.generation,
             "the delivery is fenced by the binding just announced"
@@ -1972,7 +2114,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ))
             .await;
@@ -2003,12 +2145,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_message_past_its_deadline_is_never_offered() {
         let mut fixture = Fixture::start().await;
-        // admitted with a live deadline — the module refuses one already past —
-        // and then the network's own clock walks over it. The testkit's agreed
-        // time is one tick per committed block, so a few ordinary ops do it.
-        let deadline = fixture.now() + 2;
-        fixture.send_expiring(1, "too late", deadline).await;
-        let seq = fixture.only_admitted_seq().await;
+        // requested with a live deadline — the module refuses one already past,
+        // and the post and the request are two blocks — and then the network's
+        // own clock walks over it. The testkit's agreed time is one tick per
+        // committed block, so a few ordinary ops do it.
+        let deadline = fixture.now() + 3;
+        fixture.send_expiring("m1", "too late", deadline).await;
+        let seq = fixture.only_requested_seq().await;
         while fixture.now() < deadline {
             fixture.tick().await;
         }
@@ -2038,7 +2181,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_held_message_is_not_re_offered_and_its_release_is_recorded() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "may i deploy?").await;
+        fixture.send("m1", "may i deploy?").await;
         let pump = fixture.pump();
         let mut seen = Seen::default();
 
@@ -2048,7 +2191,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ))
             .await;
@@ -2069,7 +2212,7 @@ mod tests {
         pump.receipt(reported(
             deliver.seq,
             bound.generation,
-            deliver.message_id,
+            deliver.message_id.clone(),
             wire::State::AdapterAccepted,
         ))
         .await;
@@ -2100,7 +2243,7 @@ mod tests {
 
         terminals.on_event(wire::Event::MsgBindRefused {
             conversation: CONVERSATION.into(),
-            participant: RECIPIENT.into(),
+            participant: recipient(),
             generation: 3,
             reason: wire::BindRefusal::UnknownDevice,
         });
@@ -2148,7 +2291,7 @@ mod tests {
             match command {
                 wire::Command::MsgBind(bind) => bound = Some(bind.clone()),
                 wire::Command::MsgDeliver(deliver) => delivered = Some(deliver.clone()),
-                wire::Command::MsgTime { .. } | wire::Command::MsgRetain { .. } => {}
+                wire::Command::MsgTime { .. } => {}
                 other => panic!("the pump drives no pty: {other:?}"),
             }
         }
@@ -2165,7 +2308,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_message_whose_eligibility_cannot_be_read_is_held_and_delivered_next_sweep() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "did the read land?").await;
+        fixture.send("m1", "did the read land?").await;
         let pump = fixture.pump_behind(fixture.flaky(Fault::Eligibility));
         let mut seen = Seen::default();
 
@@ -2208,7 +2351,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_acknowledgement_the_chain_did_not_take_is_retried_on_the_next_sweep() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "please accept me").await;
+        fixture.send("m1", "please accept me").await;
         let pump = fixture.pump_behind(fixture.flaky(Fault::AcceptedReceipt));
         let mut seen = Seen::default();
 
@@ -2218,7 +2361,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ))
             .await;
@@ -2249,7 +2392,7 @@ mod tests {
     async fn a_receipt_survives_far_more_transient_failures_than_a_retry_budget_would() {
         const FAILURES: u32 = 9;
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "keep trying").await;
+        fixture.send("m1", "keep trying").await;
         let pump = fixture.pump_behind(fixture.flaky_times(Fault::AcceptedReceipt, FAILURES));
         let mut seen = Seen::default();
 
@@ -2259,7 +2402,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ))
             .await;
@@ -2293,7 +2436,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_acceptance_waits_behind_the_queued_receipt_it_follows() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "order matters").await;
+        fixture.send("m1", "order matters").await;
         let pump = fixture.pump_behind(fixture.flaky(Fault::QueuedReceipt));
         let mut seen = Seen::default();
 
@@ -2304,7 +2447,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ))
             .await;
@@ -2353,12 +2496,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pump_this_far_behind_offers_the_daemon_nothing_new() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "not while you are this far behind").await;
+        fixture.send("m1", "not while you are this far behind").await;
         let pump = fixture.pump();
         let attachment = Attached {
             network: NETWORK.into(),
             conversation: CONVERSATION.into(),
-            participant: RECIPIENT.into(),
+            participant: recipient(),
             device: DEVICE.into(),
         };
         let mut announced = Announced::default();
@@ -2368,7 +2511,7 @@ mod tests {
             let mut owed = pump.owed.lock().expect("collab owed lock poisoned");
             for seq in 0..MAX_OWING_MESSAGES as u64 {
                 owed.insert(
-                    (CONVERSATION.into(), RECIPIENT.into(), 1_000_000 + seq),
+                    (CONVERSATION.into(), recipient(),1_000_000 + seq),
                     [Unsent {
                         credential: 1,
                         state: wire::State::Queued,
@@ -2402,7 +2545,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_transition_reported_again_is_owed_once() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "say that again").await;
+        fixture.send("m1", "say that again").await;
         let pump = fixture.pump_behind(fixture.flaky(Fault::QueuedReceipt));
         let mut seen = Seen::default();
 
@@ -2412,7 +2555,7 @@ mod tests {
             pump.receipt(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 wire::State::Queued,
             ))
             .await;
@@ -2450,7 +2593,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_receipt_a_full_lane_dropped_is_recovered_by_a_journal_replay() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "the lane is full").await;
+        fixture.send("m1", "the lane is full").await;
         let pump = fixture.pump_behind(fixture.watched());
         let mut seen = Seen::default();
 
@@ -2468,7 +2611,7 @@ mod tests {
             fixture.terminals.on_event(reported(
                 deliver.seq,
                 bound.generation,
-                deliver.message_id,
+                deliver.message_id.clone(),
                 state,
             ));
         }
@@ -2493,7 +2636,7 @@ mod tests {
         pump.receipt(reported(
             deliver.seq,
             bound.generation,
-            deliver.message_id,
+            deliver.message_id.clone(),
             wire::State::AdapterAccepted,
         ))
         .await;
@@ -2529,7 +2672,7 @@ mod tests {
         pump.owed
             .lock()
             .expect("collab owed lock poisoned")
-            .get(&(CONVERSATION.into(), RECIPIENT.into(), seq))
+            .get(&(CONVERSATION.into(), recipient(),seq))
             .into_iter()
             .flatten()
             .map(|unsent| unsent.state)
@@ -2542,7 +2685,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reconnecting_daemon_is_told_everything_again() {
         let mut fixture = Fixture::start().await;
-        fixture.send(1, "hello").await;
+        fixture.send("m1", "hello").await;
         let pump = fixture.pump();
         let mut seen = Seen::default();
 
@@ -2590,15 +2733,15 @@ mod tests {
     fn reported(
         seq: u64,
         generation: u64,
-        message_id: wire::MessageId,
+        message_id: String,
         state: wire::State,
     ) -> wire::Event {
         wire::Event::MsgDelivery {
             conversation: CONVERSATION.into(),
-            participant: RECIPIENT.into(),
+            participant: recipient(),
             seq,
             binding_generation: generation,
-            sender: SENDER.into(),
+            sender: sender(),
             message_id,
             state,
             reason: None,

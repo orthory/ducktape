@@ -119,7 +119,7 @@ view
           bell_sev=bell_worst_severity(bell_items)
           approvals=gov_open
           account=account_name
-          agent_live=any_agent_active(agents_rows)
+          agent_live=agents_live
           tier=member_tier(members_rows)
           answered=members_answered
           root_hash=node_root_hash
@@ -207,13 +207,21 @@ view
         // computed here, once.
         files:
           extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes, connected_rpc, network_chain_id, connect_generation, fs_preview_base, fs_save_reply) #files -> files_view_event _
+        // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads the roster off the node itself and
+        // writes through `op.submit` (signed with the seated key). The
+        // app's own `members_rows` stays — it is the SESSION fact of who
+        // this node is on this network, which the rail, the forge gate and
+        // the approvals gate all read.
         members:
-          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
+          extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
-          // the register whole, with the editor's pick lists and the signing
-          // account; every write comes back as an intent the roster handler
-          // signs
-          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
+          // Agents is a VIEW ON THE KERNEL CONTRACT: session facts go in —
+          // the signing account and the run another tab opened for the
+          // reader — and the view reads its own register and signs its own
+          // writes through `op.submit`. What comes back is its working
+          // count, a registration, and two navigations.
+          extern agents_view(dark, connected, account_number, agents_open_run, agents_opened) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
         // go in — the network's name and chain id, the endpoint, and the
         // `duck://forge/...` the open plane routed here — and the view reads

@@ -31,7 +31,6 @@ pulldown-cmark = "0.12.2"
 agent.workspace = true
 # the network's node -> announced-provider registry, behind the Shell's host
 # picker: which peers can actually run an agent.
-capability.workspace = true
 chat.workspace = true
 # the huddle media planes: the call-socket framing and voice/video wire.
 media-service.workspace = true
@@ -48,7 +47,6 @@ gateway.workspace = true
 # forge's exact pin (vendored, no TLS transports — the bridge speaks plain
 # http on loopback/LAN; probed against a live node before adoption).
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
-governance.workspace = true
 # THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home.workspace = true

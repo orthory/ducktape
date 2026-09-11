@@ -59,6 +59,7 @@ ducktape_module_sdk::store_guest! {
         MODULE_ID,
         "identity",
         "tasks",
+        "chat",
         Box::new(WitStore),
         max_delivery_ttl(store_genesis_time_unit(MODULE_ID)?),
         store_genesis_chain_id(MODULE_ID)?,

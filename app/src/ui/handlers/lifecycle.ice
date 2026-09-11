@@ -251,14 +251,12 @@ on workspace_connected(next)
   error = ""
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  agents_generation = agents_generation + 1
-  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. The scope
-  // fences stop a stale ANSWER from being installed; they cannot un-draw one
-  // already on screen, and a run journal from the previous network under the
-  // new one's name is exactly the confusion they exist to prevent. It goes,
-  // along with the run that was open in it.
+  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. A run
+  // opened on the previous network, still named under the new one, is
+  // exactly the confusion the scope fences exist to prevent — so the open
+  // run goes, and with it the badge the last network's view reported.
   agents_open_run = ""
-  agents_journal = empty_run_journal()
+  agents_live = false
   account_generation = account_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
@@ -274,7 +272,6 @@ on workspace_connected(next)
       from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
       try request -> done request
       done -> peers_load_selected _
-    run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
@@ -375,7 +372,6 @@ on live_updated(next)
       members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
       account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
       dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
-      agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
       fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
       parallel
         flow
@@ -397,10 +393,6 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
           try request -> done request
           done -> names_moved_selected _
-        flow
-          from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
-          try request -> done request
-          done -> agents_load_selected _
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
           try request -> done request
@@ -778,15 +770,6 @@ on select_shell_tab(next)
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
-  // `run replace lane=agents_load` aborts work still running on the lane, but
-  // it cannot retract a completion the runtime has ALREADY queued — and an
-  // unconditional bump here is what makes `agents_loaded` reject exactly that
-  // completion, throwing away a live-plane read that had already answered. The
-  // Forge seat's dot is drawn off those rows on EVERY tab, so opening the
-  // destination pane does not pay the loss back: it waits for the next `agent`
-  // or `runs` op, which for a run that just started is the moment it ends.
-  agents_generation = keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation + 1, agents_generation)
   account_generation = account_generation + 1
   // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
   // other loader here draws only its own tab, so a bump that discards a
@@ -825,10 +808,6 @@ on select_shell_tab(next)
       try request -> done request
       done -> peers_load_selected _
     flow
-      from done load_request(tab_reads_plane(shell_tab, "agents"), connected_rpc, "", agents_generation)
-      try request -> done request
-      done -> agents_load_selected _
-    flow
       from done load_request(tab_reads_plane(shell_tab, "account"), connected_rpc, "", account_generation)
       try request -> done request
       done -> account_load_selected _
@@ -865,11 +844,6 @@ on peers_load_selected(request)
   let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview
   return if obsolete_request || unmounted
   run replace lane=peers_load load_peers(request.rpc, request.generation) -> peers_loaded _ | peers_failed _
-
-on agents_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != agents_generation
-  return if obsolete_request
-  run replace lane=agents_load load_agents(request.rpc, request.generation) -> agents_loaded _ | agents_failed _
 
 on account_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != account_generation
