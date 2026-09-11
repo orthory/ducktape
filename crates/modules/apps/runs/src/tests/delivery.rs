@@ -4,11 +4,7 @@ use super::*;
 
 #[test]
 fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
-    let (mut m, registry, run_id) = awaiting_run(&[
-        ACTION_CHAT_POST,
-        ACTION_TASKS_CREATE,
-        ACTION_TASKS_UPDATE_STATUS,
-    ]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -66,7 +62,7 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
 
 #[test]
 fn a_threaded_anchor_threads_the_reply() {
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry);
     // seq 3 is a reply to root 1; the pin records thread_root = 1.
     let mut thread_transcript = transcript(2);
@@ -109,56 +105,36 @@ fn a_threaded_anchor_threads_the_reply() {
 #[test]
 fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
     // normalization already absorbed shape problems (prose, fences,
-    // oversize); what remains failable is POLICY: task validity and
-    // grants. every case emits NO follow-up except the ⚠ failure reply
-    // (the agent here holds chat.post), leaves a breadcrumb, and prunes
-    // the entry — never the block.
+    // oversize); what remains failable is POLICY: task validity. every
+    // case emits NO follow-up except the ⚠ failure reply, leaves a
+    // breadcrumb, and prunes the entry — never the block.
     let cases: Vec<(&str, Vec<u8>)> = vec![
         (
             "task already exists: t0",
-            response(
-                &["ok"],
-                vec![create_task("t0", "dup of a committed task")],
-            ),
+            response(&["ok"], vec![create_task("t0", "dup of a committed task")]),
         ),
         (
             "task already exists: fresh",
             response(
                 &["ok"],
-                vec![
-                    create_task("fresh", "one"),
-                    create_task("fresh", "two"),
-                ],
+                vec![create_task("fresh", "one"), create_task("fresh", "two")],
             ),
         ),
         (
             "unknown task: ghost",
-            response(
-                &["ok"],
-                vec![update_task_status("ghost", "done")],
-            ),
+            response(&["ok"], vec![update_task_status("ghost", "done")]),
         ),
         (
             "unknown task status",
-            response(
-                &["ok"],
-                vec![update_task_status("t0", "shipped")],
-            ),
+            response(&["ok"], vec![update_task_status("t0", "shipped")]),
         ),
         (
             "task_id must be non-empty",
-            response(
-                &["ok"],
-                vec![create_task(String::new(), "x")],
-            ),
+            response(&["ok"], vec![create_task(String::new(), "x")]),
         ),
     ];
     for (fragment, bytes) in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[
-            ACTION_CHAT_POST,
-            ACTION_TASKS_CREATE,
-            ACTION_TASKS_UPDATE_STATUS,
-        ]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -233,7 +209,7 @@ fn a_task_id_tasks_would_reject_fails_the_run_not_the_op() {
         ),
     ];
     for (task_id, fragment) in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -283,7 +259,7 @@ fn a_task_id_at_the_cap_still_emits() {
     // the boundary belongs to the ACCEPTING side: tasks admits exactly
     // MAX_TASK_ID bytes, so this validator must not be one byte stricter.
     let task_id = "t".repeat(tasks::MAX_TASK_ID);
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -325,7 +301,7 @@ fn raw_model_text_normalizes_into_a_postable_reply() {
         ),
     ];
     for bytes in cases {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let (mut m, registry, run_id) = awaiting_run();
         let mut ctx = CaptureCtx::new()
             .at(8)
             .with_dispatch_origin()
@@ -345,16 +321,13 @@ fn oversized_actions_fail_the_run_deterministically() {
     // (a pasted-file title) must be a deterministic run failure — never an
     // oversized finalize payload the jobs board would byte-truncate into
     // invalid JSON.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
-    let huge = response(
-        &[],
-        vec![create_task("t1", "x".repeat(MAX_ACTIONS_BYTES))],
-    );
+    let huge = response(&[], vec![create_task("t1", "x".repeat(MAX_ACTIONS_BYTES))]);
     exec(&mut m, &mut ctx, &result_event(&run_id, Ok(huge))).unwrap();
     commit(&mut m);
     assert_eq!(
@@ -383,7 +356,7 @@ fn an_over_cap_action_set_is_refused_not_truncated() {
     // of silently losing its tail and delivering a partial action set the agent
     // never sees dropped.
     let over_cap = MAX_ACTIONS_PER_RUN + 1;
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -430,7 +403,7 @@ fn an_over_cap_action_set_is_refused_not_truncated() {
 
 #[test]
 fn code_blocks_survive_normalization_into_chat_blocks() {
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let raw = r#"{"reply_blocks":[{"id":"b1","kind":"paragraph","text":"hello"},{"kind":"code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"paragraph","text":"  "}],"actions":[]}"#;
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -466,7 +439,7 @@ fn a_fenced_json_reply_is_parsed_into_prose_not_dumped_as_a_code_block() {
     // ```json fence despite the contract, the bare parse fails, and the
     // whole fenced string lands in chat as a raw code block. the tolerant
     // parser must recover the real prose.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"QUACKTEST! Hello there.\"}],\"actions\":[]}\n```";
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -547,7 +520,7 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
     // the agent SPEAKING (its own channel, its own message) rather than
     // ANSWERING where it was engaged — one more action in the strict lane, and
     // one more proposed chat post for the program account.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -587,55 +560,10 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
 }
 
 #[test]
-fn post_message_without_its_own_grant_fails_the_run() {
-    // THE ESCALATION GUARD, on the settle path: `chat.post` authorizes the
-    // reply and nothing more. an agent registered before this action existed
-    // must not have been silently handed the wider power.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-    let mut ctx = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(response(
-                &["done"],
-                vec![post_message("general", "sneaking in", None)],
-            )),
-        ),
-    )
-    .unwrap();
-
-    // the strict lane: an ungranted action fails the RUN (never the block).
-    assert!(
-        ctx.notes()
-            .iter()
-            .any(|n| n.contains("not allowed to chat.post_message")),
-        "{:?}",
-        ctx.notes()
-    );
-    let posts = ctx.chat_msgs();
-    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
-    assert!(
-        matches!(
-            &posts[0],
-            ChatMsg::PostMessage { message_id, .. } if *message_id == reply_message_id(&run_id)
-        ),
-        "the agent's own post never existed — only the run's failure reply"
-    );
-    commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
-}
-
-#[test]
 fn a_post_message_action_decodes_and_threads() {
     // a `chat.post_message` action in the response prose threads under the
     // named root — the prose-parsed action lane (the production path).
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()

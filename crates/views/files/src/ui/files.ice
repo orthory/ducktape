@@ -83,13 +83,11 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         button "+ Folder" -> emit(fs_mkdir_submit)
           with
             disabled=(loading || empty(trim(new_name)) || !empty(write_refusal))
-            h=26.0
             p=5.0
             @secondary_action
         button "+ File" -> emit(fs_new_file_submit)
           with
             disabled=(loading || empty(trim(new_name)) || !empty(write_refusal))
-            h=26.0
             p=5.0
             @secondary_action
         space w=fill
@@ -105,7 +103,6 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
           button "Delete object" -> emit(fs_arm_delete, preview_path)
             with
               disabled=(loading || !empty(delete_target))
-              h=26.0
               p=5.0
               @secondary_action
             active bg=transparent text=muted border=card_line border-w=1.0 r=7.0
@@ -135,7 +132,6 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         button "History" -> fs_toggle_history
           with
             expanded=history_open
-            h=26.0
             p=5.0
             @secondary_action
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
@@ -296,9 +292,8 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                     space w=fill
                     button "Back" -> emit(fs_close_diff)
                       with
-                        h=22.0
                         p=4.0
-                        @secondary_action
+                        @secondary_action text-11px leading-snug font-medium
                       active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle
@@ -369,9 +364,8 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                               @text-meta
                           button "Diff" -> emit(fs_show_diff, snapshot.id)
                             with
-                              h=20.0
                               p=3.0
-                              @ghost_action
+                              @ghost_action text-11px leading-snug font-medium
                             active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                             hovered bg=elevated text=fg
                             pressed bg=subtle
@@ -446,18 +440,16 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                         button "Edit" -> emit(fs_begin_edit, edit_context)
                           with
                             disabled=(loading || edit_blocked)
-                            h=22.0
                             p=4.0
-                            @secondary_action
+                            @secondary_action text-11px leading-snug font-medium
                           active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                           hovered bg=elevated text=fg
                           pressed bg=subtle
                       if editing
                         button "Cancel" -> emit(fs_cancel_edit, edit_context)
                           with
-                            h=22.0
                             p=4.0
-                            @secondary_action
+                            @secondary_action text-11px leading-snug font-medium
                           active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                           hovered bg=elevated text=fg
                           pressed bg=subtle
@@ -465,9 +457,8 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                         button "Save" -> emit(fs_save_edit, edit_context)
                           with
                             disabled=loading
-                            h=22.0
                             p=4.0
-                            @primary_action
+                            @primary_action text-11px leading-snug font-medium rounded-5px
                     stack w=fill h=fill
                       if editing
                         editor #fs-editor <-> draft

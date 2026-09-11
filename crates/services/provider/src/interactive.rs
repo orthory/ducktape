@@ -43,8 +43,8 @@ use crate::broker::RunBroker;
 use crate::microvm;
 use crate::sandbox::SandboxBackend;
 use crate::{
-    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome,
-    broker_provider_overrides, canonical_mount_path, configure_process_group,
+    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome, broker_provider_overrides,
+    canonical_mount_path, configure_process_group,
 };
 
 /// how a live interactive session carries the terminal.
@@ -586,12 +586,9 @@ mod tests {
     /// line-discipline echo, so the payload is guaranteed to come back.)
     #[tokio::test]
     async fn pty_round_trips_bytes_through_a_child() {
-        let session = InteractiveSession::spawn_on_pty(
-            tokio::process::Command::new("cat"),
-            None,
-            None,
-        )
-        .expect("spawn cat on a pty");
+        let session =
+            InteractiveSession::spawn_on_pty(tokio::process::Command::new("cat"), None, None)
+                .expect("spawn cat on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
 
         let mut seen = Vec::new();
@@ -627,14 +624,16 @@ mod tests {
     async fn wait_child_exit_returns_while_a_grandchild_holds_the_pty() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo ready"]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None)
-            .expect("spawn sh on a pty");
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None).expect("spawn sh on a pty");
 
         // The child leader (sh) exits right after `echo ready`; the backgrounded
         // sleep keeps the slave open, so this must still complete promptly.
-        tokio::time::timeout(std::time::Duration::from_secs(10), session.wait_child_exit())
-            .await
-            .expect("wait_child_exit hung while a grandchild held the pty");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.wait_child_exit(),
+        )
+        .await
+        .expect("wait_child_exit hung while a grandchild held the pty");
 
         // Drain any buffered output; the pty must reach a BLOCK (no more data),
         // never EOF — the sleep still holds a slave, so a read-until-EOF wrap
@@ -662,12 +661,9 @@ mod tests {
     /// TIOCGWINSZ. Pure ioctl round-trip — no VM.
     #[tokio::test]
     async fn resize_sets_the_window_size() {
-        let session = InteractiveSession::spawn_on_pty(
-            tokio::process::Command::new("cat"),
-            None,
-            None,
-        )
-        .expect("spawn cat on a pty");
+        let session =
+            InteractiveSession::spawn_on_pty(tokio::process::Command::new("cat"), None, None)
+                .expect("spawn cat on a pty");
         session.resize(120, 40).expect("resize");
         assert_eq!(session.window_size(), (120, 40));
         session.close().await;

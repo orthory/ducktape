@@ -147,14 +147,8 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
     commit(&mut m);
     let run_id = job_run_id_for("job-1", "duck", 3);
 
-    let bytes = response(
-        &[],
-        vec![create_task("job-task", "complete job")],
-    );
-    let inner = response_json(
-        &[],
-        vec![create_task("job-task", "complete job")],
-    );
+    let bytes = response(&[], vec![create_task("job-task", "complete job")]);
+    let inner = response_json(&[], vec![create_task("job-task", "complete job")]);
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -314,10 +308,7 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(response(
-                &[],
-                vec![create_task("stale", "late")],
-            )),
+            Ok(response(&[], vec![create_task("stale", "late")])),
         ),
     )
     .unwrap();

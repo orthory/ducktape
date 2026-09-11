@@ -20,9 +20,9 @@
 //! the replacement for its cross-node fetch lane too: consensus replicates the
 //! document, so nothing has to fetch it.
 //!
-//! it also proves the LIBRARY paragraph is cap-gated end to end: the agent is
-//! granted `duckfs_read` over the shared library prefix, and the assembled
-//! document it receives tells it the library is there.
+//! it also proves the LIBRARY paragraph reaches every agent end to end: the
+//! assembled document tells the agent the shared library is there and names
+//! the operation that opens it.
 
 mod common;
 
@@ -39,7 +39,7 @@ use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
 };
-use runs::{ACTION_CHAT_POST, ModelMsg, SkillRef};
+use runs::{ModelMsg, SkillRef};
 use runs::{RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -464,17 +464,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
                 agent_id: AGENT_ID.into(),
                 display_name: AGENT_ID.into(),
                 capability: provider.tag.clone(),
-                allowed_actions: vec![ACTION_CHAT_POST.into()],
                 recipe_hash: None,
-                // the library grant the app pre-fills on every new agent: an
-                // ordinary duckfs_read cap over the shared skill library. it is what
-                // earns the assembled document its library paragraph (and what the
-                // MCP tool plane would gate a real grep/read on) — ungranted, the
-                // document must never mention a door the tool plane would slam.
-                caps: Some(runs::ResourceCaps {
-                    duckfs_read: vec![runs::SKILL_LIBRARY_PREFIX.into()],
-                    ..Default::default()
-                }),
                 // a TRACKING skill (no pin): the composer resolves it to the
                 // committed head, the provisioner mounts it read-only (W6). curated
                 // `Always`, so it is this agent's PERSONA: the assembler inlines its
@@ -534,12 +524,11 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         prompt.contains("A Ducktape MCP tool server"),
         "the ambient tool-plane instruction ships with every run: {prompt}"
     );
-    // GAP 2, end to end: the agent HAS the library read cap, so the document
-    // tells it the library exists and names the tools that open it. an agent
-    // without the cap is never told (proved in compute_service::soul).
+    // the shared library is every agent's to read, so the document tells the
+    // agent it exists and names the tools that open it.
     assert!(
         prompt.contains("## The shared skill library"),
-        "a library-granted agent is told the library is there: {prompt}"
+        "the agent is told the library is there: {prompt}"
     );
     assert!(
         prompt.contains("files.grep") && prompt.contains(runs::SKILL_LIBRARY_PREFIX),

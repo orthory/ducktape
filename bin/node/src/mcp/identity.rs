@@ -1,31 +1,30 @@
-//! who this run is, and what it may do.
+//! who this run is.
 //!
 //! the environment carries which node and agent, plus a narrow host endpoint
 //! for actions made by this run. The session private key never enters the child.
-//! it carries NOTHING about the grant: owner, `allowed_actions` and
-//! `ResourceCaps` are read back from the committed Runs model configuration,
-//! so this module reports what consensus actually holds.
+//! it carries NOTHING about the model's record: that is read back from the
+//! committed Runs model configuration, so this module reports what consensus
+//! actually holds.
 //!
-//! ## writes are gated in CONSENSUS, not here
+//! ## writes are validated in CONSENSUS, not here
 //!
-//! this binary does not decide whether a write is allowed. it asks the scoped
-//! host endpoint to sign an allowed runs message; the runs module then checks —
-//! on every validator — that the origin IS
-//! the session key bound to that run, that the run is still in flight, and that
-//! the action sits inside the agent's committed `allowed_actions` and caps. a
-//! refusal comes back as the module's own words.
+//! this binary does not decide whether a write is well-formed. it asks the
+//! scoped host endpoint to sign a runs message; the runs module then checks —
+//! on every validator — that the origin IS the session key bound to that run
+//! and that the run is still in flight, and the target module decides whether
+//! the message it carries is one it accepts. a refusal comes back as the
+//! module's own words.
 //!
 //! a frame's origin is its verified public key. The endpoint accepts only
 //! `RunsMsg::AgentAction` for its exact run id, so its bearer token is not a
 //! general-purpose signer even if the child reads its environment.
 //!
-//! READS are still gated here, against the committed caps (`forge_read`,
-//! `duckfs_read`) — they cross no consensus op to be checked by, and `/v1/query`
-//! is ambient to any local process anyway.
+//! READS are not gated: `/v1/query` is ambient to any local process anyway,
+//! and a run reads what any member reads.
 
 use std::time::Duration;
 
-use runs::{CapRequest, ModelRecord};
+use runs::ModelRecord;
 use serde_json::json;
 
 use crate::mcp::node::{Node, NodeError, Result};
@@ -66,7 +65,7 @@ pub struct Run {
     pub skills: Option<String>,
     /// the CONSENSUS run id this server is bound to, from `DUCKTAPE_RUN_ID`.
     /// exported for every provisioned run, session or not: it is identity, not
-    /// a credential, and the read plane needs it to fetch the run's ceiling.
+    /// a credential.
     run_id: Option<String>,
     /// Absent when this MCP server starts without a scoped action endpoint.
     /// Writes then refuse: only a provisioned run has the credential to act
@@ -102,11 +101,10 @@ impl Run {
     /// signer, under the caller's idempotency key, and return its committed
     /// receipt.
     ///
-    /// there is NO permission check here, and no decoding of the envelope. the
-    /// runs module makes both, on every validator, against the catalog it owns
-    /// and the agent's committed grant — and its refusal is what comes back. a
-    /// second gate in this process could only ever drift from the one that
-    /// actually decides.
+    /// there is NO decoding of the envelope here. the runs module decodes it,
+    /// on every validator, against the catalog it owns — and its refusal, or
+    /// the target module's, is what comes back. a second decoder in this
+    /// process could only ever drift from the one that actually decides.
     pub fn act(
         &self,
         request_id: String,
@@ -140,20 +138,11 @@ impl Run {
         control.request(request_id, requested_secs)
     }
 
-    /// the agent's COMMITTED record, NARROWED to this run's admission ceiling.
+    /// the agent's COMMITTED record.
     ///
-    /// fetched per call rather than cached at startup: an owner can pause an
-    /// agent or narrow its caps mid-run, and a cached grant would keep
-    /// honouring a permission that consensus has already taken away.
-    ///
-    /// the standing record is only half of it. a DELEGATED run carries the
-    /// caller's frozen grant as a ceiling, which consensus applies to every
-    /// write (`runs`' `agent_for_run`); gating reads on the standing record
-    /// alone would let a peer's agent read whatever ITS owner granted it, on
-    /// behalf of a caller who granted far less. so the ceiling is fetched with
-    /// the record and applied the same way — and FAIL CLOSED: a query this
-    /// server cannot complete, or a run the module no longer holds, refuses the
-    /// read. falling back to the standing record is exactly the escalation.
+    /// fetched per call rather than cached at startup: an owner can pause or
+    /// reconfigure an agent mid-run, and a cached record would keep reporting
+    /// what consensus has already changed.
     pub fn record(&self) -> Result<ModelRecord> {
         let agent_id = self.agent_id.as_deref().ok_or_else(|| {
             NodeError::Rejected(format!(
@@ -181,55 +170,8 @@ impl Run {
                 "Runs holds no model {agent_id:?}"
             )));
         }
-        let standing: ModelRecord = serde_json::from_value(record.clone()).map_err(|e| {
-            NodeError::Transport(format!("the Runs model record did not decode: {e}"))
-        })?;
-        let Some(run_id) = self.run_id.as_deref() else {
-            return Ok(standing);
-        };
-        let reply = self
-            .node
-            .query(TARGET_RUNS, json!({"run_authority": {"run_id": run_id}}))?;
-        // RunsReply::RunAuthority(Option<RunAuthorityView>) — externally
-        // tagged, so the view sits under "run_authority" and is null for a run
-        // the module is not holding.
-        let view = reply.get("run_authority").ok_or_else(|| {
-            NodeError::Transport(format!(
-                "the runs module answered a shape this server does not understand: {reply}"
-            ))
-        })?;
-        if view.is_null() {
-            return Err(NodeError::Rejected(format!(
-                "run {run_id:?} is not in flight, so its authority cannot be established"
-            )));
-        }
-        let view: runs::RunAuthorityView = serde_json::from_value(view.clone()).map_err(|e| {
-            NodeError::Transport(format!("the run's authority did not decode: {e}"))
-        })?;
-        Ok(match &view.authority {
-            Some(ceiling) => ceiling.apply(&standing),
-            None => standing,
-        })
-    }
-
-    /// a read-side cap probe. reads cross no consensus op that could check
-    /// them, so this is the gate they get — and it is not the only one: a
-    /// sandboxed run reaches the node through its own cap-checked read lane
-    /// (`provider-host`'s `read_lane`), which gates the raw `/v1/files/*`
-    /// routes on this same predicate and this same record. So the two agree by
-    /// construction, and the duckfs cap is a real boundary rather than a
-    /// suggestion a `curl` walks around.
-    ///
-    /// WRITES do not come through here. they are gated in consensus — see
-    /// [`Run::act`] and this module's doc.
-    pub fn permits(&self, record: &ModelRecord, cap: &CapRequest) -> Result<()> {
-        record.permits(cap).then_some(()).ok_or_else(|| {
-            NodeError::Rejected(format!(
-                "agent {:?}'s resource caps do not cover {}",
-                record.agent_id,
-                describe(cap)
-            ))
-        })
+        serde_json::from_value(record.clone())
+            .map_err(|e| NodeError::Transport(format!("the Runs model record did not decode: {e}")))
     }
 }
 
@@ -400,28 +342,12 @@ mod provider_control_tests {
     }
 }
 
-/// a cap request in the words the agent's own grant uses, so a refusal names
-/// the field its owner would have to widen.
-fn describe(cap: &CapRequest) -> String {
-    match cap {
-        CapRequest::ForgeRead(r) => format!("reading forge repo {r:?} (caps.forge_read)"),
-        CapRequest::ForgePush(r) => format!("pushing to forge repo {r:?} (caps.forge_push)"),
-        CapRequest::DuckfsRead(p) => format!("reading duckfs path {p:?} (caps.duckfs_read)"),
-        CapRequest::DuckfsWrite(p) => format!("writing duckfs path {p:?} (caps.duckfs_write)"),
-        CapRequest::Tool(t) => format!("invoking tool {t:?} (caps.tools)"),
-        CapRequest::Secret(s) => format!("resolving secret {s:?} (caps.secrets)"),
-        CapRequest::PagesWrite(p) => format!("writing page {p:?} (caps.pages_write)"),
-        CapRequest::SpawnSubagent => "calling a peer agent (caps.subagent_budget)".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// a node that answers `/v1/query` from a canned table: the Runs model query
-    /// arm, then the runs `run_authority` arm. one thread, `n` requests, no
-    /// framework — the whole point is to watch `record()` make BOTH queries.
+    /// a node that answers `/v1/query` from a canned table. one thread, `n`
+    /// requests, no framework.
     fn fake_node(replies: Vec<serde_json::Value>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().unwrap().port();
@@ -445,23 +371,19 @@ mod tests {
     }
 
     fn standing_record() -> ModelRecord {
-        let mut record = runs::ModelRecord {
+        runs::ModelRecord {
             account: 2,
             agent_id: "worker".into(),
             owner: runs::RunOrigin::External(vec![9; 32]),
             display_name: "Worker".into(),
             capability: "model-1".into(),
-            allowed_actions: vec![runs::ACTION_CHAT_POST.into()],
             status: runs::ModelStatus::Active,
             role: runs::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
-            caps: runs::ResourceCaps::default(),
             skills: Vec::new(),
-        };
-        record.caps.duckfs_read = vec!["/shared".into()];
-        record
+        }
     }
 
     fn bound_run(node: String, replies: Vec<serde_json::Value>) -> Run {
@@ -477,74 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn a_delegated_runs_ceiling_narrows_the_record_the_read_plane_gates_on() {
-        let standing = standing_record();
-        // the caller granted LESS than the callee's owner did: no duckfs read.
-        let ceiling = json!({
-            "allowed_actions": [runs::ACTION_CHAT_POST],
-            "caps": runs::ResourceCaps::default(),
-        });
+    fn the_record_is_the_committed_standing_record_and_a_missing_one_refuses() {
         let run = bound_run(
             "run-1".into(),
-            vec![
-                json!({"model": {"agent": standing}}),
-                json!({"run_authority": {
-                    "run_id": "run-1", "agent_id": "worker", "authority": ceiling
-                }}),
-            ],
+            vec![json!({"model": {"agent": standing_record()}})],
         );
-        let record = run.record().expect("both queries answer");
-        assert!(
-            record.caps.duckfs_read.is_empty(),
-            "the ceiling, not the standing grant: {:?}",
-            record.caps.duckfs_read
+        assert_eq!(
+            run.record().expect("the registry answers"),
+            standing_record()
         );
-        assert!(
-            !record.permits(&CapRequest::DuckfsRead("/shared/notes")),
-            "a read the standing record allows is refused under the ceiling"
-        );
-        // and the standing record really did allow it.
-        assert!(standing.permits(&CapRequest::DuckfsRead("/shared/notes")));
-    }
 
-    #[test]
-    fn an_ordinary_run_keeps_its_standing_record() {
-        let run = bound_run(
-            "run-1".into(),
-            vec![
-                json!({"model": {"agent": standing_record()}}),
-                json!({"run_authority": {
-                    "run_id": "run-1", "agent_id": "worker", "authority": null
-                }}),
-            ],
-        );
-        let record = run.record().expect("both queries answer");
-        assert!(record.permits(&CapRequest::DuckfsRead("/shared/notes")));
-    }
-
-    #[test]
-    fn a_ceiling_the_server_cannot_establish_refuses_the_read() {
-        // the authority query answers a shape this server does not understand
-        // (a node mid-restart, a wire drift) — FAIL CLOSED: never fall back to
-        // the standing record, which is exactly the escalation.
-        let run = bound_run(
-            "run-1".into(),
-            vec![
-                json!({"model": {"agent": standing_record()}}),
-                json!({"nope": 1}),
-            ],
-        );
-        assert!(run.record().is_err());
-
-        // a run the module is not holding proves no ceiling either.
-        let gone = bound_run(
-            "run-1".into(),
-            vec![
-                json!({"model": {"agent": standing_record()}}),
-                json!({"run_authority": null}),
-            ],
-        );
-        assert!(gone.record().is_err());
+        let gone = bound_run("run-1".into(), vec![json!({"model": {"agent": null}})]);
+        assert!(matches!(gone.record(), Err(NodeError::Rejected(_))));
     }
 
     #[test]

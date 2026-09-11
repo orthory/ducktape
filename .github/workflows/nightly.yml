@@ -1,0 +1,95 @@
+# The proofs: every suite that builds a wasm artifact or boots a node. They
+# take an hour-plus of runner time between them, so they run once a night
+# against `dev` and on demand (`gh workflow run nightly.yml --ref <branch>`),
+# never per push — `ci.yml` is the per-push lane.
+#
+# Two jobs, each a single sequential chain over ONE `target/`, so nothing is
+# built twice: `make views` runs once and every suite that mounts it follows
+# in the same job, and the crates they share compile into one cache.
+# Wall-clock is not the point of a nightly; runner time and cache reuse are.
+#
+# A `schedule` fires only from the repository's default branch and runs on
+# that ref, so the cron checks out `dev` — the branch under test — by name; a
+# dispatch checks out the ref it was dispatched on.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # rustc segfaults under load at the default job count on a shared runner.
+  CARGO_BUILD_JOBS: 3
+
+jobs:
+  # The view bundle and everything that mounts it. `make views` once, then:
+  #   - `views-repro-check`: the bundle rebuilds byte-identical from an
+  #     isolated archive, with no builder-local path inside it
+  #   - `simnode`: every scenario, booting the 15-module `topology::SIM_BASE`
+  #     genesis. `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH` pins the
+  #     sim's genesis composition and this is the only place it runs.
+  #     DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's compilation cache
+  #     (`simnode::boot` calls `wasm_host::enable_compilation_cache`) so the
+  #     test binaries compile the shared genesis once instead of once each;
+  #     a node never sets it, so production boot is unchanged. It lives
+  #     under `target/` so rust-cache persists it.
+  #   - `ducktape-app`: its unit tests mount the staged views in
+  #     `module_view`; and the rpc client's blob round-trip
+  #   - `host_state`: the network genesis root-hash pin
+  views-and-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DUCKTAPE_WASM_CACHE_DIR: ${{ github.workspace }}/target/sim-wasm-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref }}
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/sim-wasm-cache
+      - run: rustup show
+      - run: make views
+      - run: make views-repro-check
+      - run: cargo test --locked -p simnode
+      - run: cargo test --locked -p ducktape-rpc --test blob
+      - run: cargo test --locked -p ducktape-app
+      - run: cargo test --locked -p node-bin host_state
+
+  # The guest artifacts against their source, and the host against the
+  # guests:
+  #   - `wasm-rebuild-check`: every component and index guest rebuilt from
+  #     HEAD and compared to the committed bytes. Comparing committed copies
+  #     alone (ci.yml's `wasm-modules-check`) cannot see a stale artifact; a
+  #     mismatch here means the guest source moved and its `component.wasm`
+  #     was not rebuilt with it.
+  #   - host parity (crates/kernel/host/tests/wasm_*_parity.rs): each op
+  #     sequence commits the identical root, replies and rejection reasons on
+  #     a native module and its wasm guest, block by block.
+  #   - the attested path (crates/services/broker/src/attested.rs,
+  #     bin/node/src/cred_seal.rs) only compiles under airlock's opt-in
+  #     `verify` feature, which the default workspace build never enables, so
+  #     it needs its own lint pass or it rots unnoticed.
+  wasm-and-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref }}
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p guest-builder
+      - run: make wasm-rebuild-check
+      - run: cargo test --locked -p host --tests
+      - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings
