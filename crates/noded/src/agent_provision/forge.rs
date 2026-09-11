@@ -728,6 +728,19 @@ fn commit_message(run_dir: &Path, oid: &str) -> Result<String, String> {
         .map_err(|_| format!("agent commit {oid} message is not valid UTF-8"))
 }
 
+/// what the agent's own commits are worth once read.
+enum AgentHistory {
+    /// every commit is the run's author and the node's committer with a clean
+    /// message: pushed as the agent wrote it.
+    Kept,
+    /// this commit names another identity or carries an unsafe message; the
+    /// reason is a stable snake_case token.
+    Refused {
+        commit: String,
+        reason: &'static str,
+    },
+}
+
 fn validate_agent_commits(
     run_dir: &Path,
     pinned_commit: &str,
@@ -735,7 +748,7 @@ fn validate_agent_commits(
     author_email: &str,
     committer_name: &str,
     committer_email: &str,
-) -> Result<(), String> {
+) -> Result<AgentHistory, String> {
     if run_git(
         run_dir,
         &["merge-base", "--is-ancestor", pinned_commit, "HEAD"],
@@ -758,18 +771,58 @@ fn validate_agent_commits(
             &[],
         )?;
         if identity != expected_identity {
-            return Err(format!(
-                "agent-created commit {oid} does not use the run's agent author and node committer"
-            ));
+            return Ok(AgentHistory::Refused {
+                commit: oid.to_string(),
+                reason: "foreign_identity",
+            });
         }
         let message = commit_message(run_dir, oid)?;
         if commit_message_candidate(&message).is_none() {
-            return Err(format!(
-                "agent-created commit {oid} has an invalid or unsafe message"
-            ));
+            return Ok(AgentHistory::Refused {
+                commit: oid.to_string(),
+                reason: "unsafe_message",
+            });
         }
     }
-    Ok(())
+    Ok(AgentHistory::Kept)
+}
+
+/// the commit the run's output is built on. the agent's own commits are kept
+/// when every one is theirs and clean. one that names another identity or
+/// carries an unsafe message costs the history, never the work: the branch
+/// drops back to the pinned commit with the agent's tree still staged, and the
+/// node captures that tree in its own commit. history that does not descend
+/// from the pin is refused outright.
+fn agent_history_base(
+    run_dir: &Path,
+    pinned_commit: &str,
+    head: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<String, String> {
+    if head == pinned_commit {
+        return Ok(head.to_string());
+    }
+    let history = validate_agent_commits(
+        run_dir,
+        pinned_commit,
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+    )?;
+    let AgentHistory::Refused { commit, reason } = history else {
+        return Ok(head.to_string());
+    };
+    tracing::warn!(
+        target: "ducktape::agent", event = "agent_history_dropped",
+        commit = commit.as_str(), reason,
+        "agent commits dropped; their tree is captured in the node's commit"
+    );
+    run_git(run_dir, &["reset", "--soft", pinned_commit], &[])?;
+    Ok(pinned_commit.to_string())
 }
 
 fn create_run_commit(
@@ -845,21 +898,20 @@ fn commit_blocking(
         attribution_email_local_part(&identity.agent_id)
     );
     let committer_email = format!("{}@nodes.duck", identity.committer_name);
-    if head != pinned_commit {
-        validate_agent_commits(
-            run_dir,
-            pinned_commit,
-            &safe_display_name,
-            &author_email,
-            &identity.committer_name,
-            &committer_email,
-        )?;
-    }
+    let base = agent_history_base(
+        run_dir,
+        pinned_commit,
+        &head,
+        &safe_display_name,
+        &author_email,
+        &identity.committer_name,
+        &committer_email,
+    )?;
 
     run_git(run_dir, &["add", "-A"], &[])?;
     let final_tree = run_git(run_dir, &["write-tree"], &[])?;
     let head_tree = run_git(run_dir, &["rev-parse", "HEAD^{tree}"], &[])?;
-    if head == pinned_commit && final_tree == head_tree {
+    if base == pinned_commit && final_tree == head_tree {
         return Ok(CommitOutcome::NoChanges);
     }
     // the run produced something to push — an agent-authored commit, a
@@ -869,7 +921,7 @@ fn commit_blocking(
         let oid = create_run_commit(
             run_dir,
             &final_tree,
-            &head,
+            &base,
             &message,
             &safe_display_name,
             &author_email,
