@@ -697,16 +697,22 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                     // still open on it. A card opened from a margin badge IS
                     // that block's, so it offers no way out to the page — the
                     // page was never what the badge pointed at.
+                    // THE ROW FILLS THE PLATE. `h=shrink` laid the title out at
+                    // its own height at the plate's TOP and left the rest of the
+                    // 50px as a hole under it — the title jammed against the
+                    // card's edge with an empty band beneath. The row is
+                    // `h=fill` and centred in a 44px plate now, which is what
+                    // "centred in the header" always meant.
                     box
                       with
                         w=fill
-                        h=50.0
+                        h=44.0
                         pl=16.0
                         pr=16.0
                       row
                         with
                           w=fill
-                          h=shrink
+                          h=fill
                           gap=8.0
                           align=center
                         box w=fill clip=true
@@ -758,7 +764,7 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         w=fill
                         h=shrink
                         p=12.0
-                        gap=6.0
+                        gap=10.0
                       if threads_loading
                         text "Loading comments…" size=12.5 @text-muted
                       // EVERY THREAD EXPANDED, oldest first — the card IS the
@@ -771,7 +777,11 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                             dir=vertical
                             w=fill
                             h=shrink
-                          col w=fill gap=8.0
+                          // RHYTHM IS THE ONLY SEPARATOR. No thread wears a box
+                          // of its own inside this one, so the spacing carries
+                          // the structure: 16 between threads that share an
+                          // anchor, 18 between one anchor's group and the next.
+                          col w=fill gap=18.0
                             if empty(comment_groups) && empty(resolved_comment_rows) && !threads_loading
                               text empty_scope_label(scope_target)
                                 with
@@ -780,10 +790,18 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                                   align-x=center
                                   @text-muted
                             for comment_group in comment_groups
-                              col w=fill gap=6.0
+                              col w=fill gap=8.0
                                 // The quote is the way IN to a block's own
                                 // scope; in block scope there is one group
                                 // and the header above already names it.
+                                //
+                                // THE PAGE'S OWN GROUP GETS NO CAPTION. Its
+                                // anchor is the words "This page", which the
+                                // header says one line above — printed again
+                                // over the threads it was a third heading in a
+                                // card that has room for one. A block's group
+                                // keeps its quote: that quote is the only thing
+                                // naming the line those threads hang off.
                                 if empty(scope_target) && comment_group.target != active_page
                                   button -> emit(narrow_comment_scope, comment_group.target)
                                     with
@@ -803,21 +821,14 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                                     active bg=transparent text=hint border=transparent border-w=1.0 r=6.0
                                     hovered bg=fg/6 text=fg
                                     pressed bg=fg/10 text=fg
-                                if empty(scope_target) && comment_group.target == active_page
-                                  text comment_group.anchor
-                                    with
-                                      w=fill
-                                      size=10.5
-                                      wrap=none
-                                      font=code_medium
-                                      @text-hint
-                                for group_thread in comment_group.threads
-                                  PageCommentThreadCard thread=group_thread replying=(reply_thread == group_thread.id) expanded=expanded(expanded_threads, group_thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
-                                    forward
-                                      resolve_thread_submit
-                                      select_reply_thread
-                                      toggle_thread_replies
-                                      post_thread_reply
+                                col w=fill gap=16.0
+                                  for group_thread in comment_group.threads
+                                    PageCommentThreadCard thread=group_thread replying=(reply_thread == group_thread.id) expanded=expanded(expanded_threads, group_thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
+                                      forward
+                                        resolve_thread_submit
+                                        select_reply_thread
+                                        toggle_thread_replies
+                                        post_thread_reply
                             if !empty(resolved_comment_rows)
                               button -> emit(toggle_resolved_comments)
                                 with
@@ -838,13 +849,32 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                                 hovered bg=fg/6 text=fg
                                 pressed bg=fg/10 text=fg
                             if resolved_open
-                              for resolved_row in resolved_comment_rows
-                                PageCommentThreadCard thread=resolved_row.thread replying=false expanded=expanded(expanded_threads, resolved_row.thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
-                                  forward
-                                    resolve_thread_submit
-                                    select_reply_thread
-                                    toggle_thread_replies
-                                    post_thread_reply
+                              col w=fill gap=16.0
+                                for resolved_row in resolved_comment_rows
+                                  PageCommentThreadCard thread=resolved_row.thread replying=false expanded=expanded(expanded_threads, resolved_row.thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
+                                    forward
+                                      resolve_thread_submit
+                                      select_reply_thread
+                                      toggle_thread_replies
+                                      post_thread_reply
+                    // THE COMPOSER IS THE CARD'S FOOTER, behind its own rule.
+                    // It used to trail the thread list as a third floating
+                    // section — a monospace caption adrift between the last
+                    // thread and a field — which read as a settings row rather
+                    // than the place you write. Behind a rule it is furniture:
+                    // the caption is the FIELD'S LABEL and sits on it.
+                    box
+                      with
+                        w=fill
+                        h=1.0
+                        bg=separator
+                      space w=1.0 h=1.0
+                    col
+                      with
+                        w=fill
+                        h=shrink
+                        p=12.0
+                        gap=6.0
                       // THE ONE COMPOSER THAT ALWAYS OPENS A NEW THREAD on the
                       // card's scope. A reply has its own box inside its
                       // thread, so this is how a second thread on the same
@@ -858,10 +888,10 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         text compose_hint
                           with
                             w=fill
-                            size=10.5
+                            size=11.0
                             wrap=word
-                            font=code_medium
-                            @text-hint
+                            font=medium
+                            @text-muted
                       row
                         with
                           w=fill

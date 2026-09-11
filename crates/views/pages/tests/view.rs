@@ -272,6 +272,12 @@ fn margin_press(frame: &Frame, line: u32) -> Vec<Event> {
 /// block each anchors to — there is nothing to drill into. Replies are held to
 /// three; the settled thread waits behind its own toggle; and the header chip
 /// counts what is OUTSTANDING, not what was ever said.
+///
+/// ONLY A BLOCK'S GROUP IS CAPTIONED. The page's own group is not: its anchor
+/// is the words "This page", which the header already carries as the scope,
+/// and printing it again over the threads was a second heading for the same
+/// thing. The quote over a block's group stays — it is the only thing naming
+/// the line those threads hang off.
 #[test]
 fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
     let (frame, _) = connected_with_register();
@@ -284,7 +290,6 @@ fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
     let frame = tick_native(press(&frame, "Comments"));
     for expected in [
         "This page · 2 threads",
-        "This page",
         "“the first paragraph”",
         "the page reads well",
         "the opening claim",
