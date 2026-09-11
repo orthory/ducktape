@@ -47,7 +47,6 @@ gateway.workspace = true
 # forge's exact pin (vendored, no TLS transports — the bridge speaks plain
 # http on loopback/LAN; probed against a live node before adoption).
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
-governance.workspace = true
 # THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home.workspace = true

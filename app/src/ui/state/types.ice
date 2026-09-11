@@ -250,13 +250,6 @@ enum ForgeIntent
   copy
   composer
 
-// what the Members view asks of the app: a clipboard write, an agent's
-// paused state, or a membership ballot
-enum RosterIntent
-  copy
-  agent_status
-  propose
-
 // what the Agents view asks of the app: how many of its agents are working
 // (the rail's pulse), a new agent registered from the editor's draft, or a
 // place to open — the reads and the other writes are the view's own

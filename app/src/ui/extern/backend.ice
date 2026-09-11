@@ -368,7 +368,6 @@ extern crate::backend
   // — the one agent write the Agents view cannot sign for itself, because
   // the program it binds is the runs module's own composition
   register_agent(rpc:str, password:str, controller:str, draft:str) -> bool ! AppError
-  governance_propose(rpc:str, password:str, action:str, target_key:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
