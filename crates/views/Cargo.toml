@@ -23,6 +23,7 @@ ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev 
 # No renderer: a view builds a node tree, never a picture, so it needs only
 # iced's types. The desktop app draws the tree with its own renderer.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -410,8 +410,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // A selector is a queued message. If an older one lands after a newer
     // intent, it must not start and replace the newer lane.
     for (selected, generation) in [
-        ("files_list_selected", "fs_generation"),
-        ("files_history_selected", "fs_generation"),
         ("members_load_selected", "members_generation"),
         ("settings_load_selected", "settings_generation"),
         ("peers_load_selected", "node_peers_generation"),
@@ -429,8 +427,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     }
 
     for (selected, unmounted) in [
-        ("files_list_selected", "shell_tab != ShellTab.files"),
-        ("files_history_selected", "shell_tab != ShellTab.files"),
         ("settings_load_selected", "shell_tab != ShellTab.settings"),
         (
             "peers_load_selected",
@@ -1259,192 +1255,6 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
     );
 }
 
-/// A DIRECTORY YOU HAVE NOT LISTED HAS NO CONTENTS TO REPORT. Measured live:
-/// clicking `reports` inside `/shared` moved the crumb to
-/// `duckfs /shared/reports` while the rows below it, and the `0 files · 1 dir`
-/// beside the crumb, still described `/shared`. Both were `/shared`'s reading,
-/// printed under `/shared/reports`'s name — and `/shared/reports` is in fact
-/// empty, so every word of it was wrong.
-///
-/// `fs_path` is the path asked for (the crumb moves on the click, deliberately
-/// — a click that repaints nothing reads as a dead app). `fs_listed_path` is
-/// the path the rows describe. Same split as `active_page`/`buffer_page`.
-#[test]
-fn the_files_pane_reports_only_a_directory_it_has_listed() {
-    let entry = |path: &str, kind: &str| backend::FsEntry {
-        key: 0,
-        path: path.into(),
-        name: path.rsplit('/').next().unwrap_or(path).into(),
-        kind: kind.into(),
-        size: 0,
-        object: String::new(),
-    };
-    let listing = |generation: i64, path: &str, entries: Vec<backend::FsEntry>| {
-        __DucktapeMessage::FsListed(backend::FsListing {
-            generation,
-            path: path.into(),
-            entries,
-        })
-    };
-
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    let _ = app.__update(listing(
-        app.fs_generation,
-        "/shared",
-        vec![entry("/shared/reports", "dir")],
-    ));
-    assert_eq!(
-        app.fs_listed_path, app.fs_path,
-        "the listing answered for it"
-    );
-
-    // Navigate. The crumb moves at once; the rows have not.
-    let _ = app.__update(__DucktapeMessage::FsOpenDir("/shared/reports".into()));
-    assert_eq!(
-        app.fs_path, "/shared/reports",
-        "the crumb moves on the click"
-    );
-    assert_eq!(
-        app.fs_listed_path, "/shared",
-        "the rows still describe where you came from"
-    );
-    assert_ne!(
-        app.fs_listed_path, app.fs_path,
-        "`listed` is false for the whole of the navigation, and every reading \
-         of `entries` on the screen is gated on it"
-    );
-
-    // The answer lands and the two agree again. The directory is empty, so the
-    // tally stays silent — the pane's own plate says "Empty directory" in
-    // words, and a subtitle of nothing but zeros repeats it in digits.
-    let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
-    assert_eq!(app.fs_listed_path, app.fs_path);
-
-    // A same-path refresh — what a write kicks off — must NOT blank the pane:
-    // the rows on hand still describe the path in the crumb.
-    let _ = app.__update(listing(
-        app.fs_generation,
-        "/shared/reports",
-        vec![entry("/shared/reports/q3.md", "file")],
-    ));
-    assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
-
-    // And the screen — the `files` module view's — actually gates on it, at
-    // every reading of the rows, the crumb's tally included.
-    let storage = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
-    let files = storage
-        .split_once("component FilesScreen(")
-        .expect("the screen")
-        .1;
-    let files = files
-        .split_once("\ncomponent ")
-        .map_or(files, |(body, _)| body);
-    assert!(
-        files.contains("listed:bool"),
-        "the screen is handed the fact"
-    );
-    for gate in [
-        "meta=fs_counts_summary(connected, listed, entries)",
-        "if connected && listed && empty(directories)",
-        "if connected && listed",
-        "if listed && empty(entries)",
-        "if listed && !empty(entries)",
-    ] {
-        assert!(files.contains(gate), "ungated reading of the rows: {gate}");
-    }
-    let view = inlined(include_str!("../ui/view.ice"));
-    assert!(
-        view.contains("extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, "),
-        "the mount has to compute it"
-    );
-}
-
-/// THE FILES PREVIEW IS THE FORGE READER, NOT A PLAIN TEXT NODE.
-///
-/// Text files read as numbered, syntect-coloured rows through the same
-/// `forge_code` extern the forge blob pane mounts (behind the same `lazy`
-/// memo boundary), and a Markdown path reads as a document through
-/// `agent_markdown`. Pinned so the pane cannot quietly fall back to the one-ink
-/// `text preview_text` it shipped with — and so a pick clears the previous
-/// body before the read lands, instead of showing A's text under B's path.
-#[test]
-fn the_files_preview_reads_text_through_the_forge_reader() {
-    let storage = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
-    let files = storage
-        .split_once("component FilesScreen(")
-        .expect("the screen")
-        .1;
-    let files = files
-        .split_once("\ncomponent ")
-        .map_or(files, |(body, _)| body);
-    assert!(
-        files.contains("lazy preview_text by preview_text, preview_path, dark as cached_source"),
-        "the reader's memo boundary is the mount's lazy"
-    );
-    assert!(
-        files.contains("extern forge_code(cached_source, preview_path, dark) #fs-code"),
-        "text mounts the highlighted reader"
-    );
-    assert!(
-        files.contains("if !preview_binary && !preview_picture && markdown_path(preview_path)")
-            && files
-                .contains("lazy preview_text by preview_text, preview_path, dark as cached_doc")
-            && files.contains("extern agent_markdown(cached_doc, dark) #fs-markdown"),
-        "a markdown path reads as a document"
-    );
-    assert!(
-        files.contains("if preview_picture\n")
-            && files.contains("extern picture(\"files\", preview_path) #fs-picture"),
-        "a picture draws through the viewer"
-    );
-    assert!(
-        files.contains("if !preview_binary && !preview_picture && !editing && !preview_truncated"),
-        "a picture has no Edit"
-    );
-    assert!(
-        !files.contains("text preview_text\n"),
-        "no arm falls back to the one-ink text node"
-    );
-
-    let view = inlined(include_str!("../ui/view.ice"));
-    assert!(
-        view.contains("extern files_view(dark, connected, "),
-        "the mount hands the view the appearance"
-    );
-    let handlers = include_str!("../ui/handlers/files.ice");
-    let open_link = handlers
-        .split_once("\n    FilesIntent.open_link\n")
-        .expect("the link intent")
-        .1;
-    assert!(
-        open_link.contains("done -> open_message_link _"),
-        "markdown links route through the shell's link seam"
-    );
-
-    let handlers = include_str!("../ui/handlers/files.ice");
-    let open_file = handlers
-        .split_once("on fs_open_file(path)")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("the handler ends")
-        .0;
-    let cleared = open_file
-        .find("fs_preview_text = \"\"")
-        .expect("the old body is cleared");
-    let unpictured = open_file
-        .find("fs_preview_picture = false")
-        .expect("the old picture flag is cleared");
-    let read = open_file
-        .find("run replace lane=files_preview")
-        .expect("the read");
-    assert!(
-        cleared < read && unpictured < read,
-        "the body is cleared before the read is issued"
-    );
-}
-
 /// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
 ///
 /// Channel details unmounts the rail — `if active_thread_seq > 0 &&
@@ -1480,35 +1290,6 @@ fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
     assert_eq!(app.thread_message_action, MessageAction::Toolbar);
     assert_eq!(app.thread_edit_draft, "");
-}
-
-/// THE FILES DELETE CONFIRM IS AN OVERLAY, SO IT ANSWERS ESCAPE.
-///
-/// `fs_delete_target` arms a scrim + `ConfirmDelete` over duckfs
-/// (`screens/storage.ice`). Its dismiss route is the backdrop click and the
-/// Cancel button — a destructive confirm with no keyboard exit, which is the
-/// state the drawer was in before #1132 gave it a rung.
-#[test]
-fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Files;
-    app.fs_delete_target = "/shared/report.md".into();
-
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert_eq!(
-        app.fs_delete_target, "",
-        "Escape is the keyboard way out of a destructive confirm"
-    );
-
-    // And the rung is scoped like every other per-tab rung: from another tab
-    // the confirm is not on screen, so the press names no layer at all.
-    app.shell_tab = ShellTab::Node;
-    app.fs_delete_target = "/shared/report.md".into();
-    app.bell_open = true;
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert!(!app.bell_open, "the bell rides every tab and answers first");
-    assert_eq!(app.fs_delete_target, "/shared/report.md");
 }
 
 /// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
@@ -1721,7 +1502,6 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     app.thread_message_action = MessageAction::Editing;
     app.thread_edit_draft = "half typed too".into();
     app.page_delete_armed = true;
-    app.fs_delete_target = "/shared/report.md".into();
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
 
@@ -1737,15 +1517,14 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
         !app.page_delete_armed,
         "an armed delete never rides a tab move"
     );
-    assert_eq!(app.fs_delete_target, "");
 
     // The disconnected path returns before the generation bumps, and retires
     // the same set — the clear sits above both early returns, like `error`.
     let (mut app, _) = Ducktape::__boot();
-    app.shell_tab = ShellTab::Files;
-    app.fs_delete_target = "/shared/report.md".into();
+    app.shell_tab = ShellTab::Pages;
+    app.page_delete_armed = true;
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(app.fs_delete_target, "");
+    assert!(!app.page_delete_armed);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 
     // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
