@@ -390,15 +390,6 @@ extern crate::backend
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   pure members_is_admin(rows:&[MemberRow]) -> bool
   pure member_tier(rows:&[MemberRow]) -> str
-  ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
-  ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
-  ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
-  pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
-  load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
-  ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
-  KindCount(kind:str, label:str, count:i64)
-  ExplorerResults(hits:[ExplorerHit], kinds:[KindCount], partial:str)
-  search_workspace(rpc:str, text:str) -> ExplorerResults
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
   load_desktop_notifications() -> bool
