@@ -297,12 +297,6 @@ component NodeAccessCard(tier:str, admin:bool)
                   GatedChip label="Forge contribute & merge"
                   GatedChip label="Sign quorum"
                   GatedChip label="Invite"
-                text "Contributing needs a resident invite · quorum grants resident and validator standing."
-                  with
-                    w=fill
-                    size=12.0
-                    line-h=1.5
-                    @text-caption
       _
         box
           with
@@ -439,12 +433,6 @@ component GatedChip(label:str)
 // resident column would be printing a claim the chain refuses.
 component PermissionMatrix(tier:str)
   col #root w=fill gap=13.0
-    box w=fill max-w=640.0
-      text "Standing is one axis, not two: the row the validator set holds for this node is the whole of its authority, and quorum — not this device — writes it. The table is what each standing may do; this node's standing is highlighted."
-        with
-          size=12.5
-          line-h=1.55
-          @text-muted
     box
       with
         w=fill
@@ -617,12 +605,6 @@ component MatrixTick(on:bool)
 // instead. Same fact, one less moving part.
 component ModulesPanel(rows:[ModuleRow])
   col #root w=fill gap=13.0
-    box w=fill max-w=640.0
-      text "Every module the registry says is running here, with the code hash consensus is executing for it. A module is installed, swapped and removed by governance at a block boundary — never from this device — so this list is a reading, not a control."
-        with
-          size=12.5
-          line-h=1.55
-          @text-muted
     row
       with
         w=fill
