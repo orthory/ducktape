@@ -3619,6 +3619,66 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
+    /// A chat block reaches the app as a CHAT update, never as a plane
+    /// update, and the app's own fold of it is not the only reader: the
+    /// chat room and a forge item's discussion are views that re-read on
+    /// an `rpc.live` hit for the chat plane. Nothing else tells them — a
+    /// message committed and indexed stayed off the open room until the
+    /// reader left it and came back.
+    #[test]
+    fn a_chat_block_tells_every_view_holding_the_chat_plane() {
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
+        const CHAT_LIVE: u64 = 4242;
+        guest.live_subscriptions.push((CHAT_LIVE, "chat".to_owned()));
+        let seat = Arc::new(Mutex::new(Mounted {
+            slot: Slot::Ready(Box::new(guest)),
+            props: None,
+            generation: 1,
+            hash: None,
+            in_flight: false,
+            wanted: None,
+            waiting_since: None,
+            replacement: Replacement::Preserve,
+            retry: None,
+        }));
+        registry()
+            .lock()
+            .expect("module views")
+            .insert("governance", seat.clone());
+
+        let (mut app, _) = crate::Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        let serial = app.views_live_serial;
+        let _ = app.__update(crate::__DucktapeMessage::LiveUpdated(
+            crate::backend::LiveUpdate {
+                kind: crate::LiveKind::Chat,
+                status: "Live".into(),
+                height: 12,
+                module: "chat".into(),
+                ..crate::backend::LiveUpdate::default()
+            },
+        ));
+
+        let locked = seat.lock().expect("module view lock");
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("the seat is still ready")
+        };
+        let told = guest.pending.iter().any(|event| {
+            matches!(event, wire::Event::Response { id, done: false, .. } if *id == CHAT_LIVE)
+        });
+        assert!(told, "the chat-plane subscriber was not told: {:?}", guest.pending);
+        assert_eq!(
+            app.views_live_serial,
+            serial + 1,
+            "the serial moves so the redraw that delivers the item follows"
+        );
+    }
+
     /// The staged path for `module`, or None with a note when `make views`
     /// has not run.
     /// Redraw until the view is quiet and every editor document it draws
