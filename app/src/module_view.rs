@@ -5502,7 +5502,20 @@ pub(crate) mod tests {
         let path = staged("pages").expect("actual Pages Wasm is required");
         let mut guest = Guest::load_from("pages", &path).unwrap();
         let mut renderer = crate::frame_probe::headless_renderer();
+        // INLINE, where the card is actually OVER the text: this window leaves
+        // the pane 860, too narrow for a margin to float in, so the card drops
+        // onto the document's own text column. That is the one placement where
+        // the card and the editor share pixels, and so the only one where
+        // pointer routing between them can be proved at all — the document's
+        // width under each of the three is
+        // `pages_comments_answer_the_pane_they_open_in`.
         let size = Size::new(1100.0, 700.0);
+        let width = size.width as usize;
+        // Where the inline float carries the card, from the pane corner it was
+        // laid out in: onto the document surface's own 22 of left padding, and
+        // down past its 26 of top padding and the 33.3 title line this
+        // page-scoped rail anchors under, plus half the 16px gutter.
+        let translation = Vector::new(22.0, 26.0 + 33.3 + 8.0);
         let mut closed_bounds = None;
         for open in [false, true] {
             facts["block_comments_open"] = open.into();
@@ -5521,6 +5534,27 @@ pub(crate) mod tests {
                 card: None,
                 card_text: None,
             };
+            // THE PLACEMENT IS MEASURED, so settle the sensors before reading
+            // anything: their answers reach the guest as ordinary outputs, and
+            // the tree they decide takes a few passes to come to rest —
+            // exactly as it does on a real window resize.
+            for _ in 0..6 {
+                let mut outputs = Vec::new();
+                ui.update(
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+                for output in outputs {
+                    guest.deliver(output);
+                }
+                settle_documents(&mut guest, &props);
+                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            }
             ui.operate(&renderer, &mut bounds);
             let editor = bounds.editor.expect("document editor");
             if !open {
@@ -5533,7 +5567,6 @@ pub(crate) mod tests {
                 "comments must not resize or move the document"
             );
             let card = bounds.card.expect("comment card bounds");
-            let translation = Vector::new(size.width - card.x - card.width - 16.0, 0.0);
             let post = bounds.post.expect("floating Post button").center() + translation;
             let card_point = bounds.card_text.expect("comment card content").center() + translation;
             assert!(
@@ -5675,7 +5708,7 @@ pub(crate) mod tests {
                     },
                     mouse::Cursor::Unavailable,
                 );
-                renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
+                renderer.screenshot(Size::new(width as u32, 700), 1.0, iced::Color::WHITE)
             };
             ui.update(
                 &[],
@@ -5696,28 +5729,35 @@ pub(crate) mod tests {
                 &mut outputs,
             );
             let after = capture(&mut ui, &mut renderer);
-            let region = |pixels: &[u8], x: usize, y: usize, width: usize, height: usize| -> Vec<u8> {
+            let region = |pixels: &[u8], x: usize, y: usize, span: usize, height: usize| -> Vec<u8> {
                 (y..y + height)
                     .flat_map(|y| {
-                        pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
+                        pixels[(y * width + x) * 4..(y * width + x + span) * 4]
                             .iter()
                             .copied()
                     })
                     .collect()
             };
+            // The float paints the card away from where it was laid out, so
+            // both regions read here are the drawn ones — the text BELOW the
+            // inline card, and the card itself.
+            let drawn = card.position() + translation;
+            let below = (drawn.y + card.height) as usize + 10;
             assert!(
-                region(&before, editor.x as usize + 10, 150, 220, 350)
-                    != region(&after, editor.x as usize + 10, 150, 220, 350),
+                region(&before, editor.x as usize + 10, below, 220, 690 - below)
+                    != region(&after, editor.x as usize + 10, below, 220, 690 - below),
                 "wheel outside the card must scroll the document"
             );
+            let (inside_x, inside_y) = (drawn.x as usize + 5, drawn.y as usize + 5);
             assert!(
-                region(&before, 800, card.y as usize + 5, 250, card.height as usize - 10) == region(&after, 800, card.y as usize + 5, 250, card.height as usize - 10),
+                region(&before, inside_x, inside_y, 250, card.height as usize - 10)
+                    == region(&after, inside_x, inside_y, 250, card.height as usize - 10),
                 "scrolling the document must not scroll the card"
             );
             let directory =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
             std::fs::create_dir_all(&directory).unwrap();
-            image::RgbaImage::from_raw(1100, 700, after)
+            image::RgbaImage::from_raw(width as u32, 700, after)
                 .unwrap()
                 .save(directory.join("floating-comments.png"))
                 .unwrap();
@@ -5744,11 +5784,183 @@ pub(crate) mod tests {
                 "widening the scope must not resize or move the document"
             );
             let frame = capture(&mut ui, &mut renderer);
-            image::RgbaImage::from_raw(1100, 700, frame)
+            image::RgbaImage::from_raw(width as u32, 700, frame)
                 .unwrap()
                 .save(directory.join("page-scope-comments.png"))
                 .unwrap();
         }
+    }
+
+    /// The card answers the DOCUMENT PANE, not the window: it floats in the
+    /// margin while there is one, squeezes the document left to make one while
+    /// the document can still spare it, and below that drops full-width onto
+    /// the document's own text column, in a gap the editor holds open for it.
+    #[test]
+    fn pages_comments_answer_the_pane_they_open_in() {
+        use iced::advanced::renderer::Headless as _;
+        use iced_test::runtime::{UserInterface, user_interface};
+
+        #[derive(Default)]
+        struct Bounds {
+            editor: Option<Rectangle>,
+            card: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+                if id
+                    == Some(&iced::widget::Id::from(
+                        "PagesView/root/pages/comments-card",
+                    ))
+                {
+                    self.card = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.editor = Some(bounds);
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let original = (0..80)
+            .map(|n| format!("Paragraph {n}: editable document text.\n"))
+            .collect::<String>();
+        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        facts["block_comments_open"] = true.into();
+        // A REAL CARD in the evidence, block-scoped: a fixed 340 rail and the
+        // full text column have to hold the same conversation, and the hint
+        // under it quotes a whole paragraph — the one line in the card that a
+        // narrow rail can run out of room for.
+        facts["scope_target"] = "block-7".into();
+        facts["scope_pinned"] = true.into();
+        facts["scope_label"] = "“Paragraph 7: editable document text.”".into();
+        facts["compose_hint"] = "New thread on “Paragraph 7: editable document text.”".into();
+        facts["thread_total"] = 1.into();
+        facts["comment_rows"] = serde_json::json!([{
+            "thread": {
+                "id": "thread-a", "target": "block-7", "author": "Ada Lovelace",
+                "meta": "2 comments", "resolved": false, "comment_count": 2,
+                "comments": [
+                    {"id": "c1", "ordinal": 1, "author": "Ada Lovelace",
+                     "meta": "#1", "text": "This paragraph reads backwards."},
+                    {"id": "c2", "ordinal": 2, "author": "Bo Chen",
+                     "meta": "#2", "text": "Agreed — the clause order is inverted."}
+                ]
+            },
+            "anchor": "“Paragraph 7”"
+        }]);
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let directory =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
+        std::fs::create_dir_all(&directory).unwrap();
+        // The page list and its grip come off the window before the pane the
+        // card answers to: 1500 - 240 = 1260 beside, 1300 - 240 = 1060
+        // squeezing, 1100 - 240 = 860 inline.
+        let measured = |window: f32| {
+            let mut guest = Guest::load_from("pages", &path).unwrap();
+            let mut renderer = crate::frame_probe::headless_renderer();
+            let size = Size::new(window, 700.0);
+            let mut bounds = Bounds::default();
+            let mut ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            // The pane and the card are measured by sensors, and their answers
+            // reach the guest as ordinary outputs — so the tree settles over a
+            // few passes, exactly as it does on a real window resize.
+            for _ in 0..6 {
+                settle_documents(&mut guest, &props);
+                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                let mut outputs = Vec::new();
+                ui.update(
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+                for output in outputs {
+                    guest.deliver(output);
+                }
+            }
+            ui.operate(&renderer, &mut bounds);
+            ui.draw(
+                &mut renderer,
+                &iced::Theme::Light,
+                &renderer::Style {
+                    text_color: iced::Color::BLACK,
+                },
+                mouse::Cursor::Unavailable,
+            );
+            let frame = renderer.screenshot(Size::new(window as u32, 700), 1.0, iced::Color::WHITE);
+            (
+                bounds.editor.expect("document editor"),
+                bounds.card.expect("comment card"),
+                frame,
+            )
+        };
+
+        // A float TRANSLATES a laid-out child, so `operate` reports where the
+        // card was laid out, not where it paints. What is asserted here is
+        // therefore the layout the placement decides — the widths the document
+        // and the card are actually given — and the screenshots beside each
+        // assertion are where the translated card itself is read.
+
+        // BESIDE: the document keeps its 766 surface, less its 62 of padding,
+        // and the card keeps the fixed rail it has always had.
+        let (beside_editor, beside_card, frame) = measured(1500.0);
+        assert_eq!(beside_editor.width, 704.0);
+        assert_eq!(beside_card.width, 340.0);
+        image::RgbaImage::from_raw(1500, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-beside.png"))
+            .unwrap();
+
+        // SQUEEZE: the surface gives up exactly the card and its two gutters,
+        // and what is left still holds both with a gutter to spare.
+        let (squeeze_editor, squeeze_card, frame) = measured(1300.0);
+        assert_eq!(squeeze_editor.width, 1060.0 - 340.0 - 32.0 - 62.0);
+        assert_eq!(squeeze_card.width, 340.0);
+        assert!(
+            squeeze_editor.width + 62.0 + 32.0 + squeeze_card.width <= 1060.0,
+            "a squeezed document and its card must fit the pane side by side: \
+             {squeeze_editor:?} {squeeze_card:?}"
+        );
+        assert!(
+            squeeze_editor.width < beside_editor.width,
+            "squeezing is what makes the margin the card floats in"
+        );
+        image::RgbaImage::from_raw(1300, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-squeeze.png"))
+            .unwrap();
+
+        // INLINE: the document takes its full width back — nothing is beside
+        // it — and the card is laid out at exactly the text column's width.
+        let (inline_editor, inline_card, frame) = measured(1100.0);
+        assert_eq!(inline_editor.width, 704.0);
+        assert_eq!(inline_card.width, inline_editor.width);
+        image::RgbaImage::from_raw(1100, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-inline.png"))
+            .unwrap();
     }
 
     #[test]

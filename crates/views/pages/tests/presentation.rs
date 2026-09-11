@@ -1,6 +1,6 @@
 //! Compare the flattened wire paint with the existing native Markdown policy.
 use iced::advanced::text::Highlighter;
-use pages_view::{editor_binding, editor_menu, markdown};
+use pages_view::{editor_binding, editor_menu, editor_view, editor_view::EditorReserve, markdown};
 use ui_lang_guest::{Editor, wire};
 #[path = "../src/editor_presentation.rs"]
 pub mod presentation;
@@ -25,8 +25,15 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
             ..editor.state_view()
         };
         let actual =
-            presentation::build(state, editor_binding::initial_menu(), dark, vec![1], true)
-                .unwrap();
+            presentation::build(
+                state,
+                editor_binding::initial_menu(),
+                dark,
+                vec![1],
+                true,
+                EditorReserve::default(),
+            )
+            .unwrap();
         let mut native = markdown::DocumentHighlighter::new(&caret);
         for (line, source) in wire::editor_lines(text).enumerate() {
             let expected: Vec<_> = native.highlight_line(source).collect();
@@ -73,6 +80,7 @@ fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret(
             false,
             vec![],
             focused,
+            EditorReserve::default(),
         )
         .unwrap();
         let visible: String = paint
@@ -151,4 +159,73 @@ fn named_links_use_markdown_destinations_and_leave_incomplete_syntax_editable() 
                 .any(|(_, mark)| *mark == Inline::Marker)
         );
     }
+}
+
+/// The gap an inline comment card sits in is the anchored line's own bottom
+/// padding, plus the card. Nothing else on the page moves, and the line keeps
+/// whatever indent it was already owed.
+#[test]
+fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
+    let text = "Title\nordinary paragraph\n  - nested item\nanother paragraph";
+    let editor = Editor::new(text);
+    let state = editor.state_view();
+    let bottom_of = |paint: &wire::editor_presentation::EditorPresentation, line: u32| {
+        paint
+            .spans
+            .iter()
+            .filter(|span| span.line == line)
+            .map(|span| paint.formats[span.format as usize].line_padding)
+            .rfind(|padding| *padding != wire::Edges::default())
+            .unwrap_or_default()
+    };
+    let plain = presentation::build(
+        state,
+        editor_binding::initial_menu(),
+        false,
+        vec![],
+        true,
+        EditorReserve::default(),
+    )
+    .unwrap();
+    // The nested line: an indent it must not lose to the reserve.
+    assert!(bottom_of(&plain, 2).left > 0.0);
+    let reserved = presentation::build(
+        state,
+        editor_binding::initial_menu(),
+        false,
+        vec![],
+        true,
+        EditorReserve {
+            line: 2,
+            height: 200,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        bottom_of(&reserved, 2),
+        wire::Edges {
+            bottom: bottom_of(&plain, 2).bottom + 200.0,
+            ..bottom_of(&plain, 2)
+        }
+    );
+    for untouched in [0, 1, 3] {
+        assert_eq!(
+            bottom_of(&reserved, untouched),
+            bottom_of(&plain, untouched),
+            "line {untouched} is not the anchor"
+        );
+    }
+    // A reserve of nothing is no reserve at all.
+    let none = presentation::build(
+        state,
+        editor_binding::initial_menu(),
+        false,
+        vec![],
+        true,
+        EditorReserve { line: 2, height: 0 },
+    )
+    .unwrap();
+    assert_eq!(none.formats, plain.formats);
+    assert_eq!(none.spans, plain.spans);
+    assert_eq!(editor_view::no_reserve(), EditorReserve::default());
 }

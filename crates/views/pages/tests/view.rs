@@ -7,7 +7,7 @@ use pages_view::host::{
     PagesProps, Post, Resolve, Search, sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{find, has_text, item, press, submit, texts, type_into};
+use ui_lang_guest::testing::{find, has_text, item, measure, press, submit, texts, type_into};
 use ui_lang_guest::wire::{Event, Frame, Length, Node};
 
 fn facts() -> PagesProps {
@@ -762,4 +762,143 @@ fn a_chip_opened_card_narrowed_to_a_block_can_widen_back() {
     assert!(has_text(&frame, "← This page"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "All comments on this page"));
     assert_eq!(one_intent(&frame).kind, "pages.widen");
+}
+
+/// The screen after the pane sensor reports `width`: the card is placed against
+/// the document pane, so this is the one measurement all three placements read.
+fn at_pane(props: &PagesProps, width: f32) -> Frame {
+    let (_, frame) = shown(props);
+    let mut root = frame.root.clone().expect("a first root");
+    let next = tick_native(measure(
+        &frame,
+        "PagesView/root/pages/pane-measure",
+        width,
+        700.0,
+    ));
+    match &next.root {
+        Some(replacement) => root = replacement.clone(),
+        None => {
+            ui_lang_guest::wire::apply(&mut root, next.patches.clone()).expect("patches");
+        }
+    }
+    Frame {
+        root: Some(root),
+        ..Default::default()
+    }
+}
+
+fn card_width(frame: &Frame) -> f32 {
+    let Some(Node::Container {
+        width: Some(Length::Fixed(width)),
+        ..
+    }) = find(frame, "PagesView/root/pages/comments-card")
+    else {
+        panic!("no comment card in {:?}", texts(frame));
+    };
+    *width
+}
+
+/// Every `max-w` in the tree. With no search answer standing the document
+/// surface is the only box that carries one.
+fn max_widths(node: &Node) -> Vec<f32> {
+    let own = match node {
+        Node::Container {
+            max_width: Some(width),
+            ..
+        } => vec![*width],
+        _ => Vec::new(),
+    };
+    node.children()
+        .iter()
+        .flat_map(max_widths)
+        .chain(own)
+        .collect()
+}
+
+fn float_in(node: &Node) -> Option<&Node> {
+    if matches!(node, Node::Float { .. }) {
+        return Some(node);
+    }
+    node.children().iter().find_map(float_in)
+}
+
+/// Where the card's float puts it in a pane `pane` wide, given the card's own
+/// laid-out width: the same arithmetic the host runs on the float's program,
+/// from the card's natural place at the pane's top-left corner.
+fn card_placed(frame: &Frame, pane: f32, card: f32) -> (f32, f32) {
+    let Some(Node::Float { x, y, .. }) = float_in(frame.root.as_ref().expect("a root")) else {
+        panic!("no floating comment card in {:?}", texts(frame));
+    };
+    let geometry = [
+        0.0,
+        0.0,
+        f64::from(card),
+        300.0,
+        0.0,
+        0.0,
+        f64::from(pane),
+        700.0,
+    ];
+    (x.evaluate(geometry), y.evaluate(geometry))
+}
+
+#[test]
+fn the_comment_card_answers_the_pane_it_is_opened_in() {
+    let props = facts();
+    // WIDE: the document keeps its own width and the card floats in the margin
+    // it leaves, a gutter inside the pane's right edge and a gutter below the
+    // header — this rail is page-scoped, so it has no line to sit on.
+    let beside = at_pane(&props, 1200.0);
+    assert_eq!(max_widths(beside.root.as_ref().unwrap()), vec![766.0]);
+    assert_eq!(card_width(&beside), 340.0);
+    assert_eq!(card_placed(&beside, 1200.0, 340.0), (1200.0 - 356.0, 16.0));
+
+    // TIGHTER: no margin to float in, so the document gives up exactly the card
+    // and its two gutters and the text reflows left of it.
+    let squeeze = at_pane(&props, 1000.0);
+    let document = 1000.0 - 340.0 - 32.0;
+    assert_eq!(max_widths(squeeze.root.as_ref().unwrap()), vec![document]);
+    assert_eq!(card_width(&squeeze), 340.0);
+    let (left, top) = card_placed(&squeeze, 1000.0, 340.0);
+    assert_eq!((left, top), (1000.0 - 356.0, 16.0));
+    assert!(
+        left >= document,
+        "the card must not overlap the document it just squeezed"
+    );
+
+    // NARROW: nothing is beside anything. The document takes its full width
+    // back and the card drops onto its text column at full width, into the gap
+    // the reserve opens under the title.
+    let inline = at_pane(&props, 900.0);
+    assert_eq!(max_widths(inline.root.as_ref().unwrap()), vec![766.0]);
+    assert_eq!(card_width(&inline), 766.0 - 62.0);
+    assert_eq!(card_placed(&inline, 900.0, 704.0), (22.0, 67.3));
+}
+
+#[test]
+fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
+    let (_, frame) = shown(&facts());
+    let frame = tick_native(measure(
+        &frame,
+        "PagesView/root/pages/pane-measure",
+        1200.0,
+        700.0,
+    ));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "half a thought"));
+    // The same rail, the same draft, narrower pane — and no intent leaves for it.
+    let frame = tick_native(measure(
+        &frame,
+        "PagesView/root/pages/pane-measure",
+        900.0,
+        700.0,
+    ));
+    assert!(frame.requests.is_empty(), "a placement is view-local");
+    let frame = tick_native(press(&frame, "Post"));
+    assert_eq!(
+        serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
+        Post {
+            text: "half a thought".into(),
+            thread_id: String::new()
+        }
+    );
 }

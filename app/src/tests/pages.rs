@@ -517,27 +517,37 @@ fn block_comments_float_a_card_over_the_document() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
     // the pages screen is the `pages` view's now (crates/views/pages).
     let pages = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
-    // the card is a full-size positioning layer pinning a fixed-width card to
-    // the right edge through a native float, without a modal backdrop.
+    // THE LAYER IS THE CARD. A stack lays every layer out at its own top-left,
+    // so the card's natural place is the pane's corner and one native float
+    // carries it from there — to the right edge, or onto the text column. The
+    // sensor around it measures the card the inline gap is sized from, and
+    // there is still no modal backdrop.
     let card = pages
         .split_once("if connected && !empty(active_page) && block_comments_open\n")
         .unwrap()
         .1;
     let mut opening = card.lines().map(str::trim);
-    assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0"));
     assert_eq!(
         opening.next(),
         Some(
-            "float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset"
+            "sensor show=emit(measure_comments_card, _, _) resize=emit(measure_comments_card, _, _)"
         )
     );
     assert_eq!(
         opening.next(),
+        Some("float x=((viewport_x + viewport_width - original_x - original_width) * comments_right_anchor + comments_left_inset) y=comments_offset")
+    );
+    assert_eq!(
+        opening.next(),
         Some(
-            "box #comments-card w=340.0 h=shrink max-h=comments_height bg=elevated r=12.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0 border=separator border-w=1.0 clip=true"
+            "box #comments-card w=comments_card_width(pane_width) h=shrink max-h=comments_height bg=elevated r=12.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0 border=separator border-w=1.0 clip=true"
         )
     );
     assert!(!pages.contains("w=306.0"));
+    // The pane the placement is read off is measured, not assumed: the page
+    // list is the reader's to size and the card answers what it leaves.
+    assert!(pages.contains("sensor #pane-measure show=emit(resize_pane, _, _) resize=emit(resize_pane, _, _)"));
+    assert!(pages.contains("max-w=document_width(pane_width, block_comments_open)"));
     // A STACK LAYER DECLARED AFTER THE DOCUMENT ARM, or it would paint under
     // the text it covers and the editor would own the pointer through it. The
     // delete confirm still outranks it: that one IS an overlay with a scrim.
