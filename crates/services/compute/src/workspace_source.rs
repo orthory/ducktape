@@ -41,9 +41,6 @@ pub enum WorkspaceSource {
         /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
         /// surface and an audit/M2 signal.
         branch_born: bool,
-        /// whether consensus granted `forge_push` for this repo when the run
-        /// was composed.
-        forge_push: bool,
     },
 }
 
@@ -75,8 +72,8 @@ impl WorkspaceSource {
 }
 
 /// the wire decode of a portable envelope's `workspace` block (contract §1). every
-/// field — source coordinates, the `forge_push` verdict, and the `item_title`
-/// — is required at the serde step (a malformed envelope fails to parse —
+/// field — source coordinates and the `item_title` — is required at the serde
+/// step (a malformed envelope fails to parse —
 /// acceptance IS validation). [`WireWorkspace::validate`] adds the per-field
 /// non-empty checks and surfaces the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
@@ -93,7 +90,6 @@ pub(crate) enum WireWorkspace {
         commit: String,
         branch: String,
         branch_born: bool,
-        forge_push: bool,
     },
 }
 
@@ -120,7 +116,6 @@ impl WireWorkspace {
                 commit,
                 branch,
                 branch_born,
-                forge_push,
             } => {
                 for (field, value) in [("repo", &repo), ("commit", &commit), ("branch", &branch)] {
                     if value.is_empty() {
@@ -135,7 +130,6 @@ impl WireWorkspace {
                     commit,
                     branch,
                     branch_born,
-                    forge_push,
                 })
             }
         }
@@ -170,7 +164,7 @@ mod tests {
         // fails the serde step, never a run with a silently-missing title.
         assert!(
             serde_json::from_str::<WireWorkspace>(
-                r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false,"forge_push":false}"#,
+                r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false}"#,
             )
             .is_err()
         );
@@ -189,12 +183,11 @@ mod tests {
     #[test]
     fn a_forge_workspace_missing_a_field_fails_to_decode() {
         for broken in [
-            r#"{"kind":"forge","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no repo
-            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no item_title
-            r#"{"kind":"forge","repo":"app","item_title":"t","branch":"b","branch_born":true,"forge_push":true}"#, // no commit
-            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch_born":true,"forge_push":true}"#, // no branch
-            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"b","forge_push":true}"#,       // no branch_born
-            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"b","branch_born":true}"#, // no forge_push
+            r#"{"kind":"forge","item_title":"t","commit":"c","branch":"b","branch_born":true}"#, // no repo
+            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","branch_born":true}"#, // no item_title
+            r#"{"kind":"forge","repo":"app","item_title":"t","branch":"b","branch_born":true}"#, // no commit
+            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch_born":true}"#, // no branch
+            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"b"}"#, // no branch_born
         ] {
             assert!(
                 serde_json::from_str::<WireWorkspace>(broken).is_err(),
@@ -207,15 +200,15 @@ mod tests {
     fn validation_rejects_empty_forge_coordinates_per_field() {
         let cases = [
             (
-                r#"{"kind":"forge","repo":"","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#,
+                r#"{"kind":"forge","repo":"","item_title":"t","commit":"c","branch":"b","branch_born":true}"#,
                 "repo",
             ),
             (
-                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"","branch":"b","branch_born":true,"forge_push":true}"#,
+                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"","branch":"b","branch_born":true}"#,
                 "commit",
             ),
             (
-                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"","branch_born":true,"forge_push":true}"#,
+                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"","branch_born":true}"#,
                 "branch",
             ),
         ];
@@ -267,7 +260,6 @@ mod tests {
             commit: "d0".repeat(20),
             branch: "agent/item-7".into(),
             branch_born: true,
-            forge_push: true,
         };
         assert_eq!(
             forge.receipt_coords(),

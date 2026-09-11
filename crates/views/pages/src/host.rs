@@ -16,14 +16,6 @@ pub struct PageItem {
     pub child_count: i64,
 }
 
-/// One open document tab, titled from the page list, the active one flagged.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
-pub struct DocTab {
-    pub id: String,
-    pub title: String,
-    pub active: bool,
-}
-
 /// A subpage block of the open page: navigation, listed under the body.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Subpage {
@@ -95,7 +87,6 @@ pub struct PagesProps {
     pub page_delete_armed: bool,
     pub autosave: String,
     pub page_refusal: String,
-    pub doc_tabs: Vec<DocTab>,
     pub subpages: Vec<Subpage>,
     pub orphaned_comment_drafts: Vec<String>,
     pub block_comments_open: bool,
@@ -164,12 +155,6 @@ pub struct Choose {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Search {
     pub query: String,
-}
-
-/// `pages.close_tab` — close one document tab.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloseTab {
-    pub id: String,
 }
 
 /// `pages.open_hit` — open the page a search hit was found in.
@@ -282,10 +267,6 @@ pub fn delete(comment_draft: &str) -> bool {
             comment_draft: comment_draft.into(),
         },
     )
-}
-
-pub fn close_tab(id: &str) -> bool {
-    notify("pages.close_tab", &CloseTab { id: id.into() })
 }
 
 pub fn open_hit(page_id: &str, block_id: &str, comment_draft: &str) -> bool {

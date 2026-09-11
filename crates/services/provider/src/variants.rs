@@ -450,7 +450,10 @@ args = ["run", "--model", "m1"]
                 "{}: codex authenticates through the host broker",
                 spec.tag
             );
-            assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+            assert_eq!(
+                spec.isolation.config_home_env.as_deref(),
+                Some("CODEX_HOME")
+            );
         }
         for spec in specs.iter().filter(|s| s.tag.starts_with("claude")) {
             assert_eq!(

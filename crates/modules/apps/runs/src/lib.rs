@@ -1,6 +1,7 @@
-//! Callable model work for programmable users. Model grants and context are
-//! consensus state; workers return data or propose session actions. A user's
-//! program chooses each source write and receives its actual dispatch outcome.
+//! Callable model work for programmable users. Model configuration and context
+//! are consensus state; workers return data or propose session actions. A
+//! user's program chooses each source write and receives its actual dispatch
+//! outcome, under each target module's own rules.
 // the wire surface: this module's shared types, flattened at the crate root.
 mod model;
 pub use model::*;
@@ -24,7 +25,10 @@ mod index_guest;
 // operations it decodes to, and the views discovery answers.
 mod catalog;
 pub use catalog::{
-    ActionEnvelope, ContentPart, Grant, LaneKind, OP_AGENT_CALL, OP_REACT, OP_REPLY, OP_UNREACT,
+    ActionEnvelope, ContentPart, LaneKind, OP_AGENT_CALL, OP_CHAT_POST_MESSAGE,
+    OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER, OP_DUCKFS_WRITE_TEXT, OP_FORGE_OPEN_PR,
+    OP_JOBS_COMMENT, OP_MODULES_UPDATE, OP_PAGES_COMMENT, OP_PAGES_POST, OP_PAGES_SET_CHECKED,
+    OP_REACT, OP_REPLY, OP_SUBMIT, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS, OP_UNREACT,
     OperationView, catalog, content_blocks, operation_view, validate_request_id,
 };
 
@@ -36,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use attribution::{Actor, AttributionMsg, ObjectRef, Reason, Relation};
 use chat::{
-    Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
@@ -80,9 +84,10 @@ pub const RUN_LEASE_VIEWS: u64 = 1024;
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// every peer-call callee requests this fixed sandbox profile. One root call
-/// tree runs at most `min(root_budget, 8)` callees concurrently, so the same cap
-/// bounds live delegated compute at `2*min(root_budget, 8)` cores and
-/// `4*min(root_budget, 8)` GiB. completed calls release their slot.
+/// tree runs at most `MAX_DELEGATIONS_PER_RUN` callees concurrently, so the
+/// same bound holds live delegated compute at `2 * MAX_DELEGATIONS_PER_RUN`
+/// cores and `4 * MAX_DELEGATIONS_PER_RUN` GiB. completed calls release
+/// their slot.
 pub const DELEGATED_CHILD_CORES: u64 = 2;
 pub const DELEGATED_CHILD_MEM_GB: u64 = 4;
 
@@ -333,12 +338,12 @@ mod inject;
 mod jobs_intake;
 mod module_impl;
 // the pages effects lane (M2): pages.comment / pages.set_checked applied at
-// the run boundary — probe-guarded, cap-gated, per-action degrade.
+// the run boundary — probe-guarded, per-action degrade.
 mod pages_effects;
 mod response;
 // the agent session lane: the mid-run write path — an ephemeral key bound to a
-// live run, and the actions it signs, validated against the SAME grant the
-// settle path validates.
+// live run, and the actions it signs, decoded against the SAME catalog the
+// settle path decodes.
 mod sessions;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.
@@ -368,10 +373,6 @@ struct PendingState {
     /// already share their item branch, but keeping this explicit makes both
     /// paths agree under nested calls.
     workspace_agent_id: String,
-    /// `None` for an ordinary run. A callee stores the authority intersection
-    /// fixed when the call was admitted; later registry changes may narrow it
-    /// again, never widen it.
-    authority: Option<RunAuthority>,
     /// The run-scoped call edge that created this entry.
     delegation_id: Option<String>,
     /// empty for job-backed runs.
@@ -682,9 +683,8 @@ impl RunsModule {
 
     /// wire the forge module as the PR/merge sink target (O2), after
     /// construction — mirrors the injected `Option<ModuleId>` collaborators so
-    /// `new` and every existing call site stay untouched. the PR sink only fires
-    /// under a D3 forge-push cap; without this wired the sink degrades to a
-    /// breadcrumb.
+    /// `new` and every existing call site stay untouched. without this wired
+    /// the PR sink degrades to a breadcrumb.
     pub fn with_sink_forge(mut self, forge: impl Into<ModuleId>) -> Self {
         let forge = forge.into();
         assert!(

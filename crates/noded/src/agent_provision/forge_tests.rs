@@ -215,20 +215,9 @@ impl Bed {
                 commit: commit.into(),
                 branch: BRANCH.into(),
                 branch_born,
-                forge_push: true,
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
-    }
-
-    fn read_only_spec(&self, run_id: &str, commit: &str) -> WorkspaceSpec {
-        let mut spec = self.spec(run_id, commit, false);
-        let WorkspaceSource::Forge { forge_push, .. } = &mut spec.source else {
-            unreachable!()
-        };
-        *forge_push = false;
-        spec
     }
 }
 
@@ -361,7 +350,14 @@ fn validate_coords_refuses_any_push_target_outside_agent_namespace() {
     // before a single git command runs.
     let ok_commit = "a".repeat(40);
     validate_coords("app", &ok_commit, "agent/item-7").expect("an agent-scoped branch is fine");
-    for outside in ["dev", "main", "feature/x", "agent", "agent-item-7", "/agent/x"] {
+    for outside in [
+        "dev",
+        "main",
+        "feature/x",
+        "agent",
+        "agent-item-7",
+        "/agent/x",
+    ] {
         let err = validate_coords("app", &ok_commit, outside).unwrap_err();
         assert!(
             err.contains("agent/") || err.contains("not a safe branch name"),
@@ -416,7 +412,7 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
     assert_eq!(
         git_stdout(&dir, &["remote"]),
         "",
-        "a push-granted clone has no configured path back to the canonical repo"
+        "a run's clone has no configured path back to the canonical repo"
     );
     assert_eq!(
         ws.env().get("DUCKTAPE_RUN_WORKSPACE"),
@@ -619,7 +615,6 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
         commit: bed.head.clone(),
         branch: BRANCH.into(),
         branch_born: false,
-        forge_push: true,
     };
     let err = provision_err(bed.provisioner().await.provision(&spec).await);
     assert!(
@@ -914,7 +909,7 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
 }
 
 #[tokio::test]
-async fn a_push_granted_dirty_tree_pushes_with_agent_and_node_identity() {
+async fn a_dirty_tree_pushes_with_agent_and_node_identity() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
@@ -941,20 +936,20 @@ async fn a_push_granted_dirty_tree_pushes_with_agent_and_node_identity() {
 }
 
 #[tokio::test]
-async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
+async fn a_clean_tree_yields_no_changes_and_no_push() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
         .provisioner()
         .await
-        .provision(&bed.read_only_spec("s1:0", &bed.head))
+        .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
     let runtime = ws.workdir().join(provider_host::RUN_RUNTIME_DIR);
     assert_eq!(
         git_stdout(&ws.workdir(), &["remote"]),
         "",
-        "a read-only clone has no configured path back to the canonical repo"
+        "a run's clone has no configured path back to the canonical repo"
     );
     std::fs::create_dir_all(runtime.join("provider-config")).unwrap();
     std::fs::write(runtime.join("provider-config/auth.json"), "must-not-push").unwrap();
@@ -973,28 +968,6 @@ async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
         ref_oid(&bare, BRANCH),
         None,
         "NO push happened — the remote never saw the branch"
-    );
-    ws.cleanup().await;
-}
-
-#[tokio::test]
-async fn a_read_only_dirty_tree_is_rejected_without_moving_the_remote_ref() {
-    let bed = bed();
-    let bare = bed.snapshot_bare();
-    let ws = bed
-        .provisioner()
-        .await
-        .provision(&bed.read_only_spec("s1:0", &bed.head))
-        .await
-        .expect("provision");
-    std::fs::write(ws.workdir().join("answer.md"), "must stay local\n").unwrap();
-
-    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
-    assert!(err.contains("no forge_push grant"), "{err}");
-    assert_eq!(
-        ref_oid(&bare, BRANCH),
-        None,
-        "a read-only run must never create or move the remote work branch"
     );
     ws.cleanup().await;
 }

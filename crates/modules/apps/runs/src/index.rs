@@ -39,11 +39,11 @@ use index_guest::{Fail, MAX_SCAN_LIMIT, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_DELIVER,
-    ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT,
-    ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
-    OP_AGENT_CALL, OP_REPLY, PageSource, PrRef, RunEvent, RunFact, RunOutcome, decode_assigned,
-    delegated_run_id_for, dispatch_id_for, page_source,
+    OP_AGENT_CALL, OP_CHAT_POST_MESSAGE, OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_DELIVER,
+    OP_DUCKFS_WRITE_TEXT, OP_JOBS_COMMENT, OP_MODULES_UPDATE, OP_PAGES_COMMENT, OP_PAGES_POST,
+    OP_PAGES_SET_CHECKED, OP_REPLY, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS, PageSource, PrRef,
+    RunEvent, RunFact, RunOutcome, decode_assigned, delegated_run_id_for, dispatch_id_for,
+    page_source,
 };
 use sdk::Origin as RunOrigin;
 
@@ -122,8 +122,7 @@ pub enum RunPlace {
         channel_id: String,
         seq: u64,
     },
-    /// a channel the run posted into at top level, asked a delivery in, or
-    /// acknowledged one in.
+    /// a channel the run posted into at top level.
     Channel {
         channel_id: String,
     },
@@ -325,11 +324,11 @@ fn acted_place(operation: &str, result: &serde_json::Value) -> Option<RunPlace> 
                 ReplyDestinationReceipt::Job { job_id } => RunPlace::Job { job_id },
             })
         }
-        ACTION_CHAT_POST_MESSAGE => {
+        OP_CHAT_POST_MESSAGE => {
             let ChatPostReceipt { channel_id, thread } = receipt(result)?;
             Some(chat_place(channel_id, thread))
         }
-        ACTION_PAGES_COMMENT => {
+        OP_PAGES_COMMENT => {
             let PageCommentReceipt { target, thread_id } = receipt(result)?;
             let has_block_target = !target.is_empty();
             Some(match has_block_target {
@@ -337,31 +336,31 @@ fn acted_place(operation: &str, result: &serde_json::Value) -> Option<RunPlace> 
                 false => RunPlace::PageThread { thread_id },
             })
         }
-        ACTION_PAGES_SET_CHECKED => {
+        OP_PAGES_SET_CHECKED => {
             let BlockReceipt { block_id } = receipt(result)?;
             Some(RunPlace::PageBlock { block_id })
         }
-        ACTION_PAGES_POST => {
+        OP_PAGES_POST => {
             let PageReceipt { page_id, title } = receipt(result)?;
             Some(RunPlace::Page { page_id, title })
         }
-        ACTION_JOBS_COMMENT => {
+        OP_JOBS_COMMENT => {
             let JobReceipt { job_id } = receipt(result)?;
             Some(RunPlace::Job { job_id })
         }
-        ACTION_TASKS_CREATE | ACTION_TASKS_UPDATE_STATUS => {
+        OP_TASKS_CREATE | OP_TASKS_UPDATE_STATUS => {
             let TaskReceipt { task_id } = receipt(result)?;
             Some(RunPlace::Task { task_id })
         }
-        ACTION_DUCKFS_WRITE_TEXT => {
+        OP_DUCKFS_WRITE_TEXT => {
             let FileReceipt { path } = receipt(result)?;
             Some(RunPlace::File { path })
         }
-        ACTION_MODULES_UPDATE => {
+        OP_MODULES_UPDATE => {
             let ModuleReceipt { module_id } = receipt(result)?;
             Some(RunPlace::Module { module_id })
         }
-        ACTION_COLLABORATION_DELIVER | ACTION_COLLABORATION_ACKNOWLEDGE => {
+        OP_COLLABORATION_DELIVER | OP_COLLABORATION_ACKNOWLEDGE => {
             let ChannelReceipt { channel_id } = receipt(result)?;
             Some(RunPlace::Channel { channel_id })
         }
@@ -1046,7 +1045,7 @@ mod tests {
                         RUN,
                         acted(
                             "r1",
-                            ACTION_CHAT_POST_MESSAGE,
+                            OP_CHAT_POST_MESSAGE,
                             serde_json::json!({"channel_id": "general", "thread": 2, "message_id": "agent/x/post/s1"}),
                         ),
                     ),
@@ -1054,7 +1053,7 @@ mod tests {
                         RUN,
                         acted(
                             "r2",
-                            ACTION_PAGES_POST,
+                            OP_PAGES_POST,
                             serde_json::json!({"page_id": "p9", "title": "Duck poem"}),
                         ),
                     ),
@@ -1062,23 +1061,19 @@ mod tests {
                         RUN,
                         acted(
                             "r3",
-                            ACTION_PAGES_COMMENT,
+                            OP_PAGES_COMMENT,
                             serde_json::json!({"target": "b4", "thread_id": "t4", "comment_id": "c1"}),
                         ),
                     ),
                     event(
                         RUN,
-                        acted(
-                            "r4",
-                            ACTION_TASKS_CREATE,
-                            serde_json::json!({"task_id": "t-1"}),
-                        ),
+                        acted("r4", OP_TASKS_CREATE, serde_json::json!({"task_id": "t-1"})),
                     ),
                     event(
                         RUN,
                         acted(
                             "r5",
-                            ACTION_DUCKFS_WRITE_TEXT,
+                            OP_DUCKFS_WRITE_TEXT,
                             serde_json::json!({"path": "/shared/poem.md", "base_snapshot": null}),
                         ),
                     ),

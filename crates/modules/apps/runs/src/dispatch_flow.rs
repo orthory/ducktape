@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::{
-    CONTEXT_WINDOW, ChannelAccess, ChatQuery, ChatReply, Ctx, DispatchMsg, DispatchQuery,
-    DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES, MessageView, ModelRecord,
-    ModelStatus, ModuleId, Msg, PendingState, PreparedDispatch, RunOrigin, RunsModule,
-    SiblingReadBudget, SkillRef, chat_decode_reply, chat_encode_query, dispatch_decode_reply,
-    dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply,
-    files_encode_query, inject, recipe_id_for,
+    CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply,
+    FilesQuery, FilesReply, MAX_PAYLOAD_BYTES, MessageView, ModelRecord, ModelStatus, ModuleId,
+    Msg, PendingState, PreparedDispatch, RunOrigin, RunsModule, SiblingReadBudget, SkillRef,
+    chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
+    dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
+    inject, recipe_id_for,
 };
 use crate::RunFact;
 use crate::facets::WireSink;
@@ -26,24 +26,13 @@ impl RunsModule {
         Ok(self.model(agent_id).cloned())
     }
 
-    /// The live registry record narrowed by this run's admission ceiling.
-    /// Ordinary runs have no ceiling. Delegated runs re-intersect on every
-    /// read so a later owner revocation narrows authority immediately while a
-    /// later widening cannot escape what the caller originally granted.
+    /// The live registry record of the agent a run executes as.
     pub(super) async fn agent_for_run(
         &self,
         ctx: &dyn Ctx,
         entry: &PendingState,
     ) -> Result<Option<ModelRecord>, String> {
-        Ok(self
-            .agent_record(ctx, &entry.agent_id)
-            .await?
-            .map(|record| {
-                entry
-                    .authority
-                    .as_ref()
-                    .map_or(record.clone(), |authority| authority.apply(&record))
-            }))
+        self.agent_record(ctx, &entry.agent_id).await
     }
 
     /// the record, but only while the agent may engage new runs.
@@ -92,56 +81,6 @@ impl RunsModule {
     }
 
     // ---- explicit-request admission ---------------------------------------
-
-    /// chat's answer to "may `user` post to `channel_id`" — the standing an
-    /// explicit `RequestRun` submitter must hold before this module pins that
-    /// channel's transcript for a model run whose program may reply there.
-    /// post standing covers read (chat's [`ChatReply::may_post`] implies
-    /// `may_read`), so this one query is the whole gate. an unexpected or
-    /// failed reply answers `false` — the submission fails closed rather than
-    /// leaking a channel it could not confirm.
-    pub(super) async fn may_post(
-        &self,
-        ctx: &dyn Ctx,
-        user: &[u8],
-        channel_id: &str,
-    ) -> Result<bool, String> {
-        Ok(self.channel_access(ctx, user, channel_id).await?.may_post)
-    }
-
-    /// chat's answer to "may `user` SEE `channel_id`" — the standing an
-    /// account must hold before this module pins that channel's transcript
-    /// into a dispatch payload its owner's provider will read.
-    pub(super) async fn may_read(
-        &self,
-        ctx: &dyn Ctx,
-        user: &[u8],
-        channel_id: &str,
-    ) -> Result<bool, String> {
-        Ok(self.channel_access(ctx, user, channel_id).await?.may_read)
-    }
-
-    async fn channel_access(
-        &self,
-        ctx: &dyn Ctx,
-        user: &[u8],
-        channel_id: &str,
-    ) -> Result<ChannelAccess, String> {
-        let reply = ctx
-            .query(
-                &self.chat,
-                &chat_encode_query(&ChatQuery::Access {
-                    channel_id: channel_id.to_string(),
-                    party: chat::Party::Key(user.to_vec()),
-                }),
-            )
-            .await
-            .map_err(|e| format!("chat access query failed: {e}"))?;
-        match chat_decode_reply(&reply) {
-            Ok(ChatReply::Access(access)) => Ok(access),
-            _ => Err("unexpected chat reply for an access query".into()),
-        }
-    }
 
     // ---- context pinning (P4) --------------------------------------------------
 
@@ -557,7 +496,6 @@ impl RunsModule {
             prepared,
             demands,
             None,
-            None,
         );
     }
 
@@ -573,7 +511,6 @@ impl RunsModule {
         requester: RunOrigin,
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
-        authority: Option<super::RunAuthority>,
         delegation_id: Option<String>,
     ) {
         let now = ctx.env().consensus_time;
@@ -608,7 +545,6 @@ impl RunsModule {
                 run_id: run_id.to_string(),
                 workspace_agent_id,
                 agent_id,
-                authority,
                 delegation_id,
                 channel_id,
                 anchor_seq,

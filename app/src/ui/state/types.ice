@@ -33,6 +33,8 @@ enum SubmitVerdict
 enum ComposerKind
   message
   reply
+  edit
+  thread_edit
 
 enum MessageAction
   toolbar
@@ -323,7 +325,6 @@ enum SettingsIntent
   wallet
   login
   copy
-  clear_tabs
   light
   dark
   notifications
@@ -341,7 +342,6 @@ enum PagesIntent
   arm_delete
   disarm_delete
   delete
-  close_tab
   open_hit
   use_draft
   discard_draft
@@ -385,7 +385,6 @@ enum ChatIntent
   clear_range
   copy_range
   reaction_submit
-  edit
   delete
   rename
   archive
@@ -398,7 +397,6 @@ enum ChatIntent
   thread_begin_edit
   thread_arm_delete
   thread_clear_selection
-  thread_edit
   thread_delete
   load_thread
   cancel_run

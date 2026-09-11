@@ -271,7 +271,13 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
         .lines()
         .map(str::trim)
         .filter_map(|line| line.strip_prefix("extern chat_composer("))
-        .map(|arguments| terms(split_top(arguments)[4]))
+        .filter_map(|arguments| {
+            let arguments = split_top(arguments);
+            match arguments[1] {
+                "\"message\"" | "\"reply\"" => Some(terms(arguments[4])),
+                _ => None,
+            }
+        })
         .collect();
     // The re-read is a VERDICT now, computed once from the same four inputs
     // the mount's gate wears — so the lint reads its arguments rather than a
@@ -303,7 +309,7 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
     assert_eq!(
         shown.len(),
         2,
-        "two composers are mounted, each with its own gate"
+        "the message and reply composers each have a delivery gate"
     );
     assert_eq!(
         refused.len(),
@@ -743,7 +749,10 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
         .find("  return if empty(escape_key)")
         .expect("the inert-press guard");
     assert!(guard > 0);
-    assert!(!body.contains("page_history_key("), "Pages owns undo in its guest binding");
+    assert!(
+        !body.contains("page_history_key("),
+        "Pages owns undo in its guest binding"
+    );
 
     fn plain(code: iced::keyboard::key::Code, key: iced::keyboard::Key) -> __IceKeyPress {
         __IceKeyPress {

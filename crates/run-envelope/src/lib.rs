@@ -46,7 +46,6 @@ pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) ->
             "source_snapshot": null,
         },
         "skills": [],
-        "library_readable": false,
         "result_contract": { "ducktape_runner_result": RUNNER_RESULT_MARKER },
     });
     if let Some(credential) = credential {

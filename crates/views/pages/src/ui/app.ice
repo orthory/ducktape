@@ -13,13 +13,12 @@ use "kit.ice"
 
 extern crate::host
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  DocTab(id:str, title:str, active:bool)
   Subpage(id:str, title:str)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
+  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
   pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
@@ -32,7 +31,6 @@ extern crate::host
   pure arm_delete() -> bool
   pure disarm_delete() -> bool
   pure delete(comment_draft:&str) -> bool
-  pure close_tab(id:&str) -> bool
   pure open_hit(page_id:&str, block_id:&str, comment_draft:&str) -> bool
   pure use_draft(draft:&str, comment_draft:&str) -> bool
   pure discard_draft(draft:&str) -> bool
@@ -108,7 +106,6 @@ state
   page_delete_armed = false
   autosave = "idle"
   page_refusal = ""
-  doc_tabs:[DocTab] = []
   subpages:[Subpage] = []
   orphaned_comment_drafts:[str] = []
   block_comments_open = false
@@ -191,7 +188,6 @@ on props_arrived(item)
   page_delete_armed = next.page_delete_armed
   autosave = next.autosave
   page_refusal = next.page_refusal
-  doc_tabs = next.doc_tabs
   subpages = next.subpages
   orphaned_comment_drafts = next.orphaned_comment_drafts
   block_comments_open = next.block_comments_open
@@ -223,12 +219,16 @@ on props_arrived(item)
   return if !next.dark
   active_palette = AppTheme.app_dark
 
+// Failed facts may leave a different target on the host. Keep drafts and
+// readable content, but reject even queued actions until valid facts recover.
 on toggle_page_create
+  return if !empty(host_error)
   sent = toggle_create()
 
 // The title leaves with the act; the field clears here, as the app's
 // handler used to clear it — a refused create hands it back as a seed.
 on create_page_submit
+  return if !empty(host_error)
   return if loading || busy || !connected || empty(trim(page_draft))
   sent = create(trim(page_draft), block_comment_draft)
   page_draft = ""
@@ -236,74 +236,89 @@ on create_page_submit
 // A PICK ABANDONS THE RAIL'S DRAFT: it leaves with the act, for the app to
 // keep as a recovered draft on the page it belonged to.
 on choose_page(id)
+  return if !empty(host_error)
   return if loading || busy
   sent = choose(id, block_comment_draft)
   block_comment_draft = ""
 
 on search_pages_submit
+  return if !empty(host_error)
   return if page_searching || empty(trim(page_search_draft))
   sent = search(trim(page_search_draft))
 
 on clear_page_search
+  return if !empty(host_error)
   sent = clear_search()
   page_search_draft = ""
 
 on arm_page_delete
+  return if !empty(host_error)
   sent = arm_delete()
 
 on disarm_page_delete
+  return if !empty(host_error)
   sent = disarm_delete()
 
 on delete_page_submit
+  return if !empty(host_error)
   sent = delete(block_comment_draft)
 
-on close_doc_tab(id)
-  sent = close_tab(id)
-
 on open_page_search_hit(page_id, block_id)
+  return if !empty(host_error)
   return if loading || busy
   sent = open_hit(page_id, block_id, block_comment_draft)
   block_comment_draft = ""
 
 on use_orphaned_comment_draft(draft)
+  return if !empty(host_error)
   return if loading || busy || !empty(trim(block_comment_draft))
   sent = use_draft(draft, block_comment_draft)
 
 on discard_orphaned_comment_draft(draft)
+  return if !empty(host_error)
   sent = discard_draft(draft)
 
 on toggle_block_comments
+  return if !empty(host_error)
   return if loading || busy || empty(active_page)
   sent = toggle_comments(block_comment_draft)
   block_comment_draft = ""
 
 on close_block_comments
+  return if !empty(host_error)
   sent = close_comments(block_comment_draft)
   block_comment_draft = ""
 
 on open_block_comment_thread(id, target)
+  return if !empty(host_error)
   sent = open_thread(id, target)
 
 on resolve_thread_submit(resolved)
+  return if !empty(host_error)
   sent = resolve(resolved)
 
 on load_more_block_threads
+  return if !empty(host_error)
   sent = more_threads()
 
 on close_block_comment_thread
+  return if !empty(host_error)
   sent = close_thread()
 
 on load_more_block_comments
+  return if !empty(host_error)
   sent = more_comments()
 
 // The comment leaves with the act and the field clears, as the app's
 // handler used to clear it; a post the node refused hands it back as a seed.
 on post_block_comment_submit
+  return if !empty(host_error)
   return if busy || threads_loading || comments_loading || empty(trim(block_comment_draft))
   sent = post(trim(block_comment_draft))
   block_comment_draft = ""
 
 on copy_to_clipboard(text, label)
+  return if !empty(host_error)
   sent = copy(text, label)
 
 on document_arrived(item)
@@ -322,6 +337,7 @@ on document_arrived(item)
   task widget focused #root/pages/document -> document_focus_checked query source _
 
 on document_committed(next)
+  return if !empty(host_error)
   document_history = next.history
   document_menu = next.menu
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
@@ -335,11 +351,12 @@ view
       bg=bg
     PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft block_comment_draft<->block_comment_draft #pages
       with
+        host_error
         page_link
         pages
         page_create_open
         loading
-        busy
+        busy=(busy || !empty(host_error))
         connected
         active_page
         active_page_title
@@ -350,7 +367,6 @@ view
         page_delete_armed
         autosave
         page_refusal
-        doc_tabs
         subpages
         orphaned_comment_drafts
         block_comments_open
@@ -374,7 +390,6 @@ view
         arm_page_delete -> arm_page_delete
         disarm_page_delete -> disarm_page_delete
         delete_page_submit -> delete_page_submit
-        close_doc_tab -> close_doc_tab _
         open_page_search_hit -> open_page_search_hit _ _
         use_orphaned_comment_draft -> use_orphaned_comment_draft _
         discard_orphaned_comment_draft -> discard_orphaned_comment_draft _
@@ -404,6 +419,6 @@ view
               wrap=word
               font=ui
               hint="Write something… `#` for a heading, `-` for a list"
-              disabled=(loading || !connected || empty(document_source_ref.reference) || document_installed != document_source_ref.reference)
+              disabled=(!empty(host_error) || loading || !connected || empty(document_source_ref.reference) || document_installed != document_source_ref.reference)
             active bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0
             disabled bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0

@@ -1,11 +1,10 @@
 use super::{
     AgentSession, BTreeMap, DelegationState, DelegationStatus, Digest, Error,
-    MAX_ACTIONS_PER_SESSION, MAX_DELEGATIONS_PER_RUN, MAX_REQUEST_ID_BYTES,
-    PendingState, RUN_KEY_SEPARATOR, RunAuthority, RunOrigin, SESSION_KEY_LEN, Sha256, StateRoot,
-    WireSink, delegation_id_for, dispatch_id_for,
+    MAX_ACTIONS_PER_SESSION, MAX_DELEGATIONS_PER_RUN, MAX_REQUEST_ID_BYTES, PendingState,
+    RUN_KEY_SEPARATOR, RunOrigin, SESSION_KEY_LEN, Sha256, StateRoot, WireSink, delegation_id_for,
+    dispatch_id_for,
 };
 use sdk::codec;
-use serde::de::DeserializeOwned;
 
 // ---- canonical encoding -------------------------------------------------------
 // u64-le counts, sorted keys, every field in declaration order: u64-le length
@@ -33,19 +32,6 @@ fn put_sink(out: &mut Vec<u8>, sink: &WireSink) {
 fn take_sink(cur: &mut codec::Cursor) -> Result<WireSink, String> {
     serde_json::from_slice(&take_lp_bytes(cur)?)
         .map_err(|error| format!("snapshot sink failed to decode: {error}"))
-}
-
-fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
-    match opt {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            codec::push_bytes(
-                out,
-                &serde_json::to_vec(value).expect("committed state serializes"),
-            );
-        }
-    }
 }
 
 fn put_origin(out: &mut Vec<u8>, origin: &RunOrigin) {
@@ -88,7 +74,6 @@ pub(super) fn encode_committed(
         codec::push_bytes(&mut out, p.run_id.as_bytes());
         codec::push_bytes(&mut out, p.agent_id.as_bytes());
         codec::push_bytes(&mut out, p.workspace_agent_id.as_bytes());
-        put_opt_json(&mut out, &p.authority);
         put_opt_string(&mut out, &p.delegation_id);
         codec::push_bytes(&mut out, p.channel_id.as_bytes());
         out.extend_from_slice(&p.anchor_seq.to_le_bytes());
@@ -193,16 +178,6 @@ fn take_opt_string(cur: &mut codec::Cursor) -> Result<Option<String>, String> {
     }
 }
 
-fn take_opt_json<T: DeserializeOwned>(cur: &mut codec::Cursor) -> Result<Option<T>, String> {
-    match take_byte(cur, "snapshot opt tag")? {
-        0 => Ok(None),
-        1 => serde_json::from_slice(&take_lp_bytes(cur)?)
-            .map(Some)
-            .map_err(|error| format!("snapshot json value failed to decode: {error}")),
-        tag => Err(format!("snapshot has unknown option tag {tag}")),
-    }
-}
-
 fn take_origin(cur: &mut codec::Cursor) -> Result<RunOrigin, String> {
     match take_byte(cur, "snapshot origin discriminant")? {
         0 => Ok(RunOrigin::External(take_lp_bytes(cur)?)),
@@ -259,9 +234,6 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     }
     if contains_run_separator(&p.workspace_agent_id) {
         return Err("snapshot workspace agent id contains reserved unit separator".into());
-    }
-    if p.delegation_id.is_some() && p.authority.is_none() {
-        return Err("snapshot delegated run has an edge without scoped authority".into());
     }
     match &p.job_id {
         Some(job_id) => {
@@ -404,7 +376,6 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let run_id = take_lp_string(&mut cur)?;
         let agent_id = take_lp_string(&mut cur)?;
         let workspace_agent_id = take_lp_string(&mut cur)?;
-        let authority = take_opt_json::<RunAuthority>(&mut cur)?;
         let delegation_id = take_opt_string(&mut cur)?;
         let channel_id = take_lp_string(&mut cur)?;
         let anchor_seq = take_u64(&mut cur)?;
@@ -421,7 +392,6 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             run_id,
             agent_id,
             workspace_agent_id,
-            authority,
             delegation_id,
             channel_id,
             anchor_seq,

@@ -20,9 +20,8 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], live_agents:[LiveRunHint], rail_shown:bool, active_thread_seq:i64, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component MessageTimeline(messages:[ChatMessage], live_agents:[LiveRunHint], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
-    cancel_run(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -111,25 +110,16 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveRunHint], rai
                 open_message_link
                 open_run
                 press_message
-      // THE RUN THIS MESSAGE ANCHORED, live under it while it runs; the
-      // committed reply takes the row's place.
-      //
-      // A PLAIN `for`, NOT `keyed`. The card holds no state to follow, and
-      // this loop sits INSIDE the row loop — a `keyed live ... by=anchor_seq`
-      // here mints the same key once per message on screen, so a single run
-      // turned into one duplicate-keyed scope per visible row.
-      //
-      // AND NOT WHEN THE RAIL HAS IT. With the run's own thread open, the
-      // anchor match here and the rail's match below were both true: two cards
-      // and two Stops for one run. `rail_owns_run` is the one rule both
-      // surfaces read, so the card moves to the rail and comes back when it
-      // closes.
+      // Pending runs already have a thread, even before the first reply lands.
+      // Only the thread draws execution details and run controls.
       for live in live_agents
-        if live.anchor_seq == message.seq && !rail_owns_run(live, rail_shown, active_thread_seq)
-          LiveRunCard live=live
-            forward
-              cancel_run
-              open_run
+        if run_in_thread(live, message.seq)
+          button -> emit(open_thread_for, message.seq)
+            with
+              label=live_thread_label(live.agent)
+              p=4.0
+              @secondary_action text-11px leading-snug font-medium rounded-5px
+            text live_thread_label(live.agent) size=11.0
 
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
@@ -216,12 +206,10 @@ component CopyRangeBar(count:i64)
       space w=fill
       button "Clear" -> emit(clear_copy_range)
         with
-          h=26.0
           p=5.0
           @secondary_action
       button "Copy" #copy-range -> emit(copy_selected_messages)
         with
-          h=26.0
           p=5.0
           @primary_action
 
@@ -257,7 +245,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     arm_message_delete(i64, str, i64)
     clear_message_selection()
     add_reaction_submit(str)
-    edit_message_submit()
     delete_message_submit()
     rename_channel_submit()
     archive_channel_submit()
@@ -271,7 +258,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     begin_thread_message_edit(i64, str, i64)
     arm_thread_message_delete(i64, str, i64)
     clear_thread_message_selection()
-    edit_thread_message_submit()
     delete_thread_message_submit()
     load_more_thread()
   state
@@ -795,7 +781,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               button "Loading older messages…" -> emit(load_more_history)
                                 with
                                   disabled=true
-                                  h=30.0
                                   p=6.0
                                   @secondary_action
                                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
@@ -811,7 +796,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               button "Load older messages" -> emit(load_more_history)
                                 with
                                   disabled=(busy)
-                                  h=30.0
                                   p=6.0
                                   @secondary_action
                                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
@@ -870,20 +854,11 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           // the quiet rows always did: the reaction handlers
                           // keep refusing while loading; the openers never
                           // did.
-                          // `active_thread_seq` AND `channel_settings_open` are
-                          // memo keys because the stream's own card now depends
-                          // on both: opening the rail on a run's thread moves
-                          // that card out of here, and the settings drawer
-                          // hiding the rail moves it back. Leave either out and
-                          // the cached frame keeps the card the other surface is
-                          // also drawing.
-                          lazy timeline by active_channel, active_thread_seq, channel_settings_open, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_timeline
+                          lazy timeline by active_channel, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_timeline
                             MessageTimeline
                               with
                                 messages=cached_timeline.messages
                                 live_agents=cached_timeline.live_agents
-                                rail_shown=(active_thread_seq > 0 && !channel_settings_open)
-                                active_thread_seq
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
@@ -891,7 +866,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                 copy_head_seq
                                 copy_surface
                               forward
-                                cancel_run
                                 add_reaction_at
                                 remove_reaction_at
                                 open_thread_for
@@ -1207,34 +1181,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                   w=fill
                                   gap=4.0
                                   align=center
-                                input "" #message-edit <-> message_edit_draft
-                                  with
-                                    label="Edit message"
-                                    hint="Edit message"
-                                    disabled=(busy)
-                                    submit=emit(edit_message_submit)
-                                    w=fill
-                                    p=6.2
-                                    text-size=13.0
-                                    line-h=1.2
-                                    @control
-                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                                  hovered bg=fg/4 border=fg/8
-                                  // THE EDITOR IS BORDERLESS AT REST ON PURPOSE, and the
-                                  // recipe's ring alone on a transparent field is a thin
-                                  // outline around nothing. `begin_message_edit` drops the
-                                  // caret in here by hand, so focus also lifts the plate —
-                                  // without the `bg=` the field's HOVER read stronger than
-                                  // its focus.
-                                  focused bg=fg/4 border=ring
-                                  disabled value=muted
-                                button "Save" -> emit(edit_message_submit)
-                                  with
-                                    label="Save message changes"
-                                    disabled=(busy || empty(trim(message_edit_draft)))
-                                    h=28.0
-                                    p=6.0
-                                    @primary_action
+                                extern chat_composer(edit_scope(endpoint, active_channel, selected_message_seq), "edit", true, "Edit message", busy, false, "Could not save changes") #message-edit
                                 button -> emit(clear_message_selection)
                                   with
                                     label="Cancel message edit"
@@ -1279,13 +1226,11 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                   button "Delete" -> emit(delete_message_submit)
                                     with
                                       disabled=(busy)
-                                      h=26.0
                                       p=5.0
                                       @danger_action
                                   button "Cancel" -> emit(clear_message_selection)
                                     with
                                       disabled=(busy)
-                                      h=26.0
                                       p=5.0
                                       @secondary_action
                                     active bg=transparent text=muted r=6.0
@@ -1316,9 +1261,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                   align-y=end
                 button "↓  Jump to latest" -> emit(choose_channel, active_channel)
                   with
-                    h=28.0
-                    p=10.0
-                    @ghost_action
+                    @ghost_action px-10px py-5px
                   active bg=surface text=muted border=border border-w=1.0 r=14.0
                   hovered bg=fg/6 text=fg border=fg/14
                   pressed bg=accent text=fg
@@ -1556,7 +1499,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                       button "Rename" -> emit(rename_channel_submit)
                         with
                           disabled=(busy || empty(trim(channel_name_draft)))
-                          h=29.0
                           p=6.0
                           @secondary_action
                   // A channel id is a uuid: this is the only place a member
@@ -1565,7 +1507,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                     with
                       label="Copy channel link"
                       w=fill
-                      h=29.0
                       p=6.0
                       @secondary_action
                   col w=fill gap=6.0
@@ -1608,7 +1549,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                       button "Add" -> emit(add_channel_member_submit)
                         with
                           disabled=(busy || empty(trim(member_key_draft)))
-                          h=29.0
                           p=6.0
                           @secondary_action
                     if empty(channel_members)
@@ -1649,7 +1589,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                       with
                         disabled=(busy)
                         w=fill
-                        h=30.0
                         p=6.0
                         @secondary_action
                       active bg=danger_zone_bg text=danger border=danger_zone_line border-w=1.0 r=9.0
@@ -1660,7 +1599,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                       with
                         disabled=(busy)
                         w=fill
-                        h=30.0
                         p=6.0
                         @secondary_action
         if active_thread_seq > 0 && !channel_settings_open
@@ -1837,7 +1775,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           with
                             disabled=true
                             w=fill
-                            h=28.0
                             p=5.0
                             @secondary_action
                           active bg=transparent text=muted r=7.0
@@ -1848,7 +1785,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           with
                             disabled=(busy)
                             w=fill
-                            h=28.0
                             p=5.0
                             @secondary_action
                           active bg=transparent text=muted r=7.0
@@ -2140,30 +2076,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               w=fill
                               gap=4.0
                               align=center
-                            input "" #thread-edit <-> thread_edit_draft
-                              with
-                                label="Edit message"
-                                hint="Edit message"
-                                disabled=(busy)
-                                submit=emit(edit_thread_message_submit)
-                                w=fill
-                                p=6.2
-                                text-size=13.0
-                                line-h=1.2
-                                @control
-                              active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                              hovered bg=fg/4 border=fg/8
-                              // Same borderless-at-rest editor as the main stream's, so
-                              // the same focused plate — see `#message-edit` above.
-                              focused bg=fg/4 border=ring
-                              disabled value=muted
-                            button "Save" -> emit(edit_thread_message_submit)
-                              with
-                                label="Save message changes"
-                                disabled=(busy || empty(trim(thread_edit_draft)))
-                                h=28.0
-                                p=6.0
-                                @primary_action
+                            extern chat_composer(edit_scope(endpoint, active_channel, thread_selected_seq), "thread_edit", true, "Edit message", busy, false, "Could not save changes") #thread-edit
                             button -> emit(clear_thread_message_selection)
                               with
                                 label="Cancel message edit"
@@ -2208,13 +2121,11 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               button "Delete" -> emit(delete_thread_message_submit)
                                 with
                                   disabled=(busy)
-                                  h=26.0
                                   p=5.0
                                   @danger_action
                               button "Cancel" -> emit(clear_thread_message_selection)
                                 with
                                   disabled=(busy)
-                                  h=26.0
                                   p=5.0
                                   @secondary_action
                                 active bg=transparent text=muted r=6.0

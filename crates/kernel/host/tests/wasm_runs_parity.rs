@@ -19,10 +19,7 @@ use dispatch::{
 use files::Files;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use pages::Pages;
-use runs::{
-    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ActionEnvelope,
-    AgentResponse, ReplyBlock, ResourceCaps, SkillRef, encode_response,
-};
+use runs::{ActionEnvelope, AgentResponse, OP_TASKS_CREATE, ReplyBlock, SkillRef, encode_response};
 use runs::{
     RunsModule, RunsMsg, RunsQuery, RunsReply, decode_reply as runs_decode_reply, dispatch_id_for,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query, reply_message_id,
@@ -253,22 +250,14 @@ fn quackbot_ref() -> Party {
     Party::Account(2)
 }
 
-fn register_agent(
-    account: u64,
-    agent_id: &str,
-    actions: Vec<String>,
-    caps: Option<ResourceCaps>,
-    skills: Option<Vec<SkillRef>>,
-) -> Msg {
+fn register_agent(account: u64, agent_id: &str, skills: Option<Vec<SkillRef>>) -> Msg {
     runs_op(&RunsMsg::ConfigureModel {
         operation: runs::ModelMsg::RegisterModel {
             account,
             agent_id: agent_id.into(),
             display_name: agent_id.into(),
             capability: "mock-llm-1".into(),
-            allowed_actions: actions,
             recipe_hash: None,
-            caps,
             skills,
         },
     })
@@ -372,23 +361,15 @@ fn reply(text: &str) -> ActionEnvelope {
 
 fn create_task(task_id: &str, title: &str) -> ActionEnvelope {
     ActionEnvelope::new(
-        ACTION_TASKS_CREATE,
+        OP_TASKS_CREATE,
         None,
         serde_json::json!({"task_id": task_id, "title": title}),
     )
 }
 
-fn update_task_status(task_id: &str, status: &str) -> ActionEnvelope {
-    ActionEnvelope::new(
-        runs::ACTION_TASKS_UPDATE_STATUS,
-        Some(serde_json::json!({"task_id": task_id})),
-        serde_json::json!({"status": status}),
-    )
-}
-
 fn set_page_checked(block_id: &str, checked: bool) -> ActionEnvelope {
     ActionEnvelope::new(
-        runs::ACTION_PAGES_SET_CHECKED,
+        runs::OP_PAGES_SET_CHECKED,
         Some(serde_json::json!({"block_id": block_id})),
         serde_json::json!({"checked": checked}),
     )
@@ -599,30 +580,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(
-            2,
-            "quackbot",
-            &[runs::ACTION_PAGES_COMMENT, runs::ACTION_PAGES_SET_CHECKED],
-        )
-        .await;
-        pair.submit(
-            alice(),
-            runs_op(&RunsMsg::ConfigureModel {
-                operation: runs::ModelMsg::UpdateModel {
-                    agent_id: "quackbot".into(),
-                    display_name: None,
-                    capability: None,
-                    allowed_actions: None,
-                    recipe_hash: None,
-                    skills: None,
-                    caps: Some(ResourceCaps {
-                        pages_write: vec!["inline".into()],
-                        ..Default::default()
-                    }),
-                },
-            }),
-        )
-        .await;
+        pair.provision(2, "quackbot").await;
         pair.submit(
             alice(),
             op!(
@@ -695,7 +653,9 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
             .await;
             pair.drain().await;
             assert!(matches!(
-                pair.action(&runs::action_request_id(run, "tick")).await.status,
+                pair.action(&runs::action_request_id(run, "tick"))
+                    .await
+                    .status,
                 runs::ActionStatus::Completed {
                     outcome: dispatch::CallOutcomeSummary::Applied { .. },
                     ..
@@ -868,7 +828,7 @@ impl Pair {
         }
         assert!(!self.wasm.has_pending_work().await.unwrap());
     }
-    async fn provision(&mut self, account: u64, id: &str, actions: &[&str]) {
+    async fn provision(&mut self, account: u64, id: &str) {
         self.submit(
             alice(),
             op!(
@@ -880,17 +840,8 @@ impl Pair {
             ),
         )
         .await;
-        self.submit(
-            alice(),
-            register_agent(
-                account,
-                id,
-                actions.iter().map(|action| (*action).into()).collect(),
-                None,
-                None,
-            ),
-        )
-        .await;
+        self.submit(alice(), register_agent(account, id, None))
+            .await;
     }
     async fn mention_run(&mut self) -> String {
         self.submit(alice(), mention_post("general", "mention"))
@@ -1003,8 +954,7 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(2, "quackbot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
-            .await;
+        pair.provision(2, "quackbot").await;
         let run = pair.mention_run().await;
         assert_eq!(pair.requests.len(), 1, "one real work request");
         pair.accept(&run).await;
@@ -1106,8 +1056,7 @@ fn multiple_programs_compose_bounded_references_inside_the_real_wasm_budget() {
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
         for index in 0..20 {
-            pair.provision(index + 2, &format!("bot-{index:02}"), &[ACTION_CHAT_POST])
-                .await;
+            pair.provision(index + 2, &format!("bot-{index:02}")).await;
         }
         pair.submit(alice(), reference_post("general", "bounded", 2..22))
             .await;
@@ -1128,7 +1077,7 @@ fn rejections_match_and_leave_no_trace() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(2, "quackbot", &[ACTION_TASKS_CREATE]).await;
+        pair.provision(2, "quackbot").await;
         let rejects = [
             (
                 alice(),
@@ -1208,12 +1157,6 @@ fn rejections_match_and_leave_no_trace() {
         for (origin, message, reason) in rejects {
             pair.rejected(origin, message, reason).await;
         }
-        pair.rejected(
-            Origin::External(vec![3; 32]),
-            register_agent(2, "intruder", Vec::new(), None, None),
-            "requires an account",
-        )
-        .await;
     });
 }
 
@@ -1222,8 +1165,7 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(2, "quackbot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
-            .await;
+        pair.provision(2, "quackbot").await;
         // Program calls are authenticated by the host seam. Two identical
         // calls in a block must observe the first call's staged turn claim.
         pair.submit(alice(), plain_post("general", "anchor")).await;
@@ -1277,9 +1219,7 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
         assert_eq!(task_ids(&pair.wasm).await, vec!["first", "second"]);
         for id in ["first", "second"] {
             assert!(matches!(
-                pair.action(&runs::action_request_id(&run, id))
-                    .await
-                    .status,
+                pair.action(&runs::action_request_id(&run, id)).await.status,
                 runs::ActionStatus::Completed {
                     outcome: dispatch::CallOutcomeSummary::Applied { .. },
                     ..
@@ -1331,20 +1271,11 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
 }
 
 #[test]
-fn the_session_lane_matches_lease_acl_budget_and_close_out() {
+fn the_session_lane_matches_lease_budget_and_close_out() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(
-            2,
-            "quackbot",
-            &[
-                ACTION_CHAT_POST,
-                ACTION_CHAT_POST_MESSAGE,
-                ACTION_TASKS_CREATE,
-            ],
-        )
-        .await;
+        pair.provision(2, "quackbot").await;
         pair.submit(alice(), plain_post("general", "manual-anchor"))
             .await;
         pair.submit(alice(), request("quackbot", "general", 1))
@@ -1389,21 +1320,13 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             "only the bound session key",
         )
         .await;
-        pair.rejected(
-            Origin::External(SESSION_KEY.to_vec()),
-            runs_op(&RunsMsg::AgentAction {
-                run_id: run.clone(),
-                request_id: "status".into(),
-                action: update_task_status("task-1", "done"),
-            }),
-            "not allowed to tasks.update_status",
-        )
-        .await;
         pair.submit(Origin::External(SESSION_KEY.to_vec()), post)
             .await;
         assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 1);
         assert!(matches!(
-            pair.action(&runs::action_request_id(&run, "working")).await.status,
+            pair.action(&runs::action_request_id(&run, "working"))
+                .await
+                .status,
             runs::ActionStatus::AwaitingProgram
         ));
         pair.drain().await;
@@ -1484,7 +1407,9 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             .await;
         pair.drain().await;
         assert!(matches!(
-            pair.action(&runs::action_request_id(&run, "next")).await.status,
+            pair.action(&runs::action_request_id(&run, "next"))
+                .await
+                .status,
             runs::ActionStatus::Rejected { .. }
         ));
         assert!(
@@ -1528,12 +1453,7 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(
-            2,
-            "quackbot",
-            &[ACTION_TASKS_CREATE, runs::ACTION_JOBS_COMMENT],
-        )
-        .await;
+        pair.provision(2, "quackbot").await;
         pair.submit(
             alice(),
             runs_op(&RunsMsg::EnableJobWorker { enabled: true }),
@@ -1621,16 +1541,80 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
 }
 
 #[test]
+fn a_submit_carries_a_module_message_to_its_module_on_both_runtimes() {
+    let directory = tempfile::tempdir().unwrap();
+    deterministic::Runner::default().start(|context| async move {
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(2, "quackbot").await;
+        pair.submit(alice(), plain_post("general", "anchor")).await;
+        pair.submit(alice(), request("quackbot", "general", 1))
+            .await;
+        pair.drain().await;
+        let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        pair.accept(&run).await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            runs_op(&RunsMsg::OpenAgentSession {
+                attempt: 0,
+                run_id: run.clone(),
+                session_key: SESSION_KEY.to_vec(),
+            }),
+        )
+        .await;
+        // the floor under the catalog: a chat post spelled as chat's own
+        // message, carried verbatim and executed by the program account.
+        let message = serde_json::to_value(ChatMsg::PostMessage {
+            channel_id: "general".into(),
+            message_id: "via-submit".into(),
+            blocks: vec![Block::paragraph("any message a member may send")],
+            thread: None,
+        })
+        .unwrap();
+        pair.submit(
+            Origin::External(SESSION_KEY.to_vec()),
+            runs_op(&RunsMsg::AgentAction {
+                run_id: run.clone(),
+                request_id: "any-message".into(),
+                action: ActionEnvelope::new(
+                    runs::OP_SUBMIT,
+                    Some(serde_json::json!({"module": "chat"})),
+                    message.clone(),
+                ),
+            }),
+        )
+        .await;
+        let receipt = pair
+            .action(&runs::action_request_id(&run, "any-message"))
+            .await;
+        assert_eq!(receipt.target, "chat");
+        assert_eq!(receipt.payload, message, "carried verbatim");
+        assert!(matches!(
+            receipt.status,
+            runs::ActionStatus::AwaitingProgram
+        ));
+        pair.drain().await;
+        let receipt = pair
+            .action(&runs::action_request_id(&run, "any-message"))
+            .await;
+        assert!(matches!(
+            receipt.status,
+            runs::ActionStatus::Completed {
+                outcome: dispatch::CallOutcomeSummary::Applied { .. },
+                ..
+            }
+        ));
+        let posted = chat_message(&pair.wasm, "via-submit").await.unwrap();
+        assert_eq!(posted.head.author, Party::Account(2));
+        assert_eq!(posted.head.origin, Origin::Program(2));
+    });
+}
+
+#[test]
 fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(
-            2,
-            "quackbot",
-            &[ACTION_CHAT_POST, runs::ACTION_COLLABORATION_DELIVER],
-        )
-        .await;
+        pair.provision(2, "quackbot").await;
         pair.submit(alice(), plain_post("general", "anchor")).await;
         pair.submit(alice(), request("quackbot", "general", 1))
             .await;
@@ -1652,7 +1636,7 @@ fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
                 run_id: run.clone(),
                 request_id: "task-update".into(),
                 action: ActionEnvelope::new(
-                    runs::ACTION_COLLABORATION_DELIVER,
+                    runs::OP_COLLABORATION_DELIVER,
                     Some(serde_json::json!({"channel_id":"review"})),
                     serde_json::json!({"message_id":"m3","recipient":"acct:7",
                     "kind":"task_update","expires_at":900,

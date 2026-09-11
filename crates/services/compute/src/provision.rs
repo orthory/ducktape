@@ -38,11 +38,6 @@ pub struct PortablePlan {
     pub skills: Vec<RoMount>,
     /// committed registry name, carried to the Forge commit boundary.
     pub agent_display_name: String,
-    /// whether the agent's `duckfs_read` caps cover the global skill library —
-    /// see [`WorkspaceSpec::library_readable`]. `false` on an envelope composed
-    /// before the field existed: the conservative default, since the paragraph it
-    /// gates is only useful to an agent that can act on it.
-    pub library_readable: bool,
 }
 
 /// Committed model identity and the exact host execution attempt.
@@ -73,15 +68,6 @@ pub struct WorkspaceSpec {
     /// W6 skill/instruction ro subtrees — the plan's C4 skill mounts,
     /// verbatim.
     pub ro_mounts: Vec<RoMount>,
-    /// whether the agent may READ the global skill library
-    /// (`runs::SKILL_LIBRARY_PREFIX`): a plain-data echo of the committed
-    /// `duckfs_read` grant, decided in consensus by the composer and carried
-    /// across the reachability wall like every other plan field.
-    ///
-    /// the provisioner hands it to [`crate::assemble_context_doc`], which emits
-    /// the library paragraph only when it is `true` — an agent without the grant
-    /// is never pointed at a prefix the MCP tool plane would refuse it.
-    pub library_readable: bool,
 }
 
 /// a read-only mount the provisioner materializes beside the rw source (W6) —
@@ -240,9 +226,9 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn context_doc(&self) -> Option<String> {
         None
     }
-    /// the node's operator credential the run's node lane lends to a forge
-    /// push the committed grant admits → `ctx.operator_credential`. `None`
-    /// (the default, for an embedder with no node) refuses every push.
+    /// the node's operator credential the run's node lane lends to every
+    /// forge push → `ctx.operator_credential`. `None` (the default, for an
+    /// embedder with no node) refuses every push.
     fn operator_credential(&self) -> Option<OperatorCredential> {
         None
     }
@@ -558,7 +544,6 @@ mod tests {
                 source_snapshot: Some("aa".repeat(32)),
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
     }
 
@@ -577,10 +562,8 @@ mod tests {
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: true,
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         }
     }
 

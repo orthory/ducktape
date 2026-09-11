@@ -282,7 +282,6 @@ component WalletsScreen(wallets:[WalletInfo], selected:str, network:str, busy:bo
         button "Restore from recovery phrase" -> emit(go_restore)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -291,7 +290,6 @@ component WalletsScreen(wallets:[WalletInfo], selected:str, network:str, busy:bo
         button "Continue read-only" -> emit(login_skip)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -571,7 +569,6 @@ component PasswordScreen(network:str, busy:bool, error:str)
         button "Restore from recovery phrase" -> emit(go_restore)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -584,7 +581,6 @@ component PasswordScreen(network:str, busy:bool, error:str)
         button "Continue read-only" #password-skip -> emit(login_skip)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -818,7 +814,6 @@ component ConfirmPhraseScreen(prompt:str, busy:bool, error:str)
         button "Show the phrase again" #confirm-back -> emit(show_phrase_again)
           with
             disabled=busy
-            h=26.0
             p=5.0
             @ghost_action
           active bg=transparent text=muted r=7.0
@@ -879,7 +874,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
           button "Use this computer's passkey instead" #welcome-desktop -> emit(welcome_desktop)
             with
               disabled=busy
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -887,7 +881,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
             pressed bg=fg/14
           button "Cancel" #welcome-cancel -> emit(welcome_cancel)
             with
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -909,7 +902,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
               @text-caption
           button "Cancel" #welcome-cancel-working -> emit(welcome_cancel)
             with
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -981,7 +973,6 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
           button "Continue without an account" #welcome-skip -> emit(welcome_skip)
             with
               disabled=busy
-              h=26.0
               p=5.0
               @ghost_action
             active bg=transparent text=muted r=7.0
@@ -1262,7 +1253,6 @@ component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:s
             button "Join another network with an invite" -> emit(go_join)
               with
                 disabled=busy
-                h=26.0
                 p=5.0
                 @ghost_action
               active bg=transparent text=muted r=7.0
@@ -1381,9 +1371,8 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
             button "Forget" -> emit(forget_network_submit, row.id)
               with
                 disabled=busy
-                h=22.0
                 p=4.0
-                @ghost_action
+                @ghost_action text-11px leading-snug font-medium
               active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
               hovered bg=danger_bg text=fg
               pressed bg=danger_bg text=fg
@@ -2094,12 +2083,10 @@ component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, pas
                 @text-meta
             button "Create or sign in" #open -> emit(open_account_welcome)
               with
-                h=26.0
                 p=5.0
                 @secondary_action
             button "Dismiss" #dismiss -> emit(dismiss_account_banner)
               with
-                h=26.0
                 p=5.0
                 @ghost_action
               active bg=transparent text=muted r=7.0

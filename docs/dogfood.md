@@ -96,7 +96,7 @@ git push ducktape-dev dev
 The persona is an **always skill**: a SKILL.md under
 /shared/skills/<name>/ whose body the host includes in the run context.
 The model user is a keyless identity account running a program; runs stores
-its provider, action grants, resource caps and skill references.
+its provider and skill references.
 
 The commands below use curl, jq, Python 3 and the current ducktape binary.
 They act through the node's operator credential, so that node's identity
@@ -143,9 +143,6 @@ submit runs "$(jq -nc --argjson account "$MODEL_ACCOUNT" '{
   configure_model:{operation:{register_model:{
     account:$account, agent_id:"dogfood", display_name:"Dogfood Duck",
     capability:"<your provider tag>",
-    allowed_actions:["*"],
-    caps:{forge_read:["ducktape"],forge_push:["ducktape"],pages_write:["*"],
-          duckfs_read:["/shared/skills"]},
     skills:[{name:"dogfood",source_prefix:"/shared/skills/dogfood",load:"always"}]
   }}}
 }')"
@@ -159,15 +156,13 @@ already owns more than 256 accounts. Names are display labels, so the
 selection above fails if the controller has several Dogfood Duck accounts.
 
 ConfigureModel wraps runs::ModelMsg from
-crates/modules/apps/runs/src/model.rs. The current program account or its
-live identity controller can update the record. allowed_actions names exact
-catalog actions (runs::KNOWN_ACTIONS), with "*" granting every action the
-catalog knows now or later. Forge caps name exact repos and pages_write exact
-page ids, each with "*" permitting all of them at the runs validation layer.
-Source modules still enforce their own ownership.
+crates/modules/apps/runs/src/model.rs. Any member can update the record. The
+model acts as its program account and submits whatever a member may: the
+typed catalog operations, and any module's own message through the runs
+`submit` operation.
 A skill without source_snapshot follows the committed library head; supply
 a snapshot id to pin it. The app's Agents view lists the resulting model,
-its grants and its controller.
+its skills and its controller.
 
 ## 3. Write the spec in Pages
 
@@ -229,8 +224,8 @@ program, is recorded on it. Preflight skips emit debug breadcrumbs under
 `ducktape::modules`; enable that log target to inspect them. Once an action
 is admitted, its program call has an independent target outcome in
 `ActionRequest`; a refusal cannot undo earlier successful effects. If a comment
-didn't land, inspect that receipt, the model's `pages_write` capability and the
-target block/page id. Replies and other proposed effects also depend on their
+didn't land, inspect that receipt and the target block/page id. Replies and
+other proposed effects also depend on their
 own call outcomes.
 
 ## 6. Review in-app
@@ -258,9 +253,8 @@ only an existing verified PR or a successfully committed allocation.
 ## Known limits
 
 - **No page read-authorization:** `[spec](duck://page/<id>)` injection renders any
-  referenced page's subtree into the run context with no read-cap gate
-  (pages are workspace-visible to members). A member can surface any page
-  they can already see.
+  referenced page's subtree into the run context (pages are workspace-visible
+  to members). A member can surface any page they can already see.
 - **Page depth is bounded:** one document allows 64 parent edges
   (`MAX_PAGE_DEPTH`). A nested Page block is a leaf in its containing
   document and starts a separate 64-edge document.
@@ -277,9 +271,9 @@ only an existing verified PR or a successfully committed allocation.
 ## Deploy a component from a chat run
 
 The node process runs the module deployment executor alongside its API. There
-is no separate executor binary. A model with `modules.update` in
-`allowed_actions` can ask its program to deploy an existing module from the
-run's committed forge output. The runs Wasm projects each validator's next
+is no separate executor binary. A model can ask its program, with the
+`modules.update` action, to deploy an existing module from the run's
+committed forge output. The runs Wasm projects each validator's next
 directive from committed state.
 The native bridge stages a hash-pinned forge file or submits the directive's
 opaque message with its own node key. Module loadability is checked by the
@@ -376,7 +370,7 @@ offline builds: the run's VM can reach only its host service tunnels.
 Writable run filesystems provide 8 GiB of sparse capacity. Only written blocks
 consume host disk. The read-only input image retains its measured size plus
 metadata margin. Headless Claude invocations allow shell, file and Ducktape MCP
-tools without interactive approval; the VM and committed grants define access.
+tools without interactive approval; the VM defines access.
 
 The live repair test uses the standard Claude capability, an installed CLI and
 the host broker credential. The e2e lanes stage a node's workspace themselves:

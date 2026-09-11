@@ -3,8 +3,8 @@
 //! only things that leave are the writes the reader asked for.
 
 use agents_view::host::{
-    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, LiveActivity, LiveRun,
-    OpenLink, OpenRun, RunJournal, RunLink, RunRow, Status,
+    AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, LiveActivity, LiveRun, OpenLink,
+    OpenRun, RunJournal, RunLink, RunRow, Status,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, texts, toggle, type_into};
@@ -24,12 +24,6 @@ fn agent(name: &str, status: &str, live: bool) -> AgentRow {
         owner_handle: "eddy".into(),
         controller: "7".into(),
         live,
-        allowed_actions: vec!["chat.post".into()],
-        caps: AgentCaps {
-            forge_read: vec!["ducktape".into()],
-            pages_write: vec!["*".into()],
-            ..AgentCaps::default()
-        },
         skills: vec![
             AgentSkill {
                 name: "review".into(),
@@ -125,7 +119,6 @@ fn register_with_live(
         journal,
         live,
         capabilities: vec!["claude".into(), "codex".into()],
-        actions: vec!["chat.post".into(), "tasks.create".into()],
         account: account.into(),
         committed,
         connected: true,
@@ -314,9 +307,8 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
         "ACTIVE",
         "PAUSED",
         "eddy",
-        // counts derive from the record: three skills, two grants
+        // the count derives from the record: three skills
         "3",
-        "2",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -334,26 +326,26 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
 fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
     let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
-    for expected in [
-        "Identity", "Executor", "Actions", "Grants", "Skills", "ducktape", "*",
-    ] {
+    for expected in ["Identity", "Executor", "Skills", "review", "style"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
     }
+    for gone in ["Actions", "Grants"] {
+        assert!(
+            !has_text(&frame, gone),
+            "the record has no {gone} to edit: {:?}",
+            texts(&frame)
+        );
+    }
     assert!(!has_text(&frame, "Only this agent's controller"));
 
-    // tick an action, pick the executor, drop a grant, flip a skill to the
-    // persona, and add a grant — every edit is a draft until the save
-    let frame = tick_native(toggle(&frame, "tasks.create", true));
+    // pick the executor and flip a skill to the persona — every edit is a
+    // draft until the save
     let frame = tick_native(pick(&frame, CAPABILITY_PICK, "claude"));
-    let frame = tick_native(press(&frame, "Remove grant"));
     let frame = tick_native(press(&frame, "Load always"));
-    let frame = tick_native(type_into(&frame, "repo, prefix, page id…", "playground"));
-    let frame = tick_native(press(&frame, "Add grant"));
-    let frame = tick_native(type_into(&frame, "0", "4"));
     assert!(
         frame.requests.is_empty(),
         "drafts leave nothing: {:?}",
@@ -367,12 +359,6 @@ fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
     assert_eq!(draft.agent_id, "reviewer-bot");
     assert_eq!(draft.display_name, "Reviewer Bot");
     assert_eq!(draft.capability, "claude");
-    assert_eq!(draft.allowed_actions, ["chat.post", "tasks.create"]);
-    // the first "Remove grant" was the forge read; the added one is a
-    // forge read again (the kind picker's default)
-    assert_eq!(draft.caps.forge_read, ["playground"]);
-    assert_eq!(draft.caps.pages_write, ["*"]);
-    assert_eq!(draft.caps.subagent_budget, 4);
     assert!(draft.skills.iter().filter(|skill| skill.always).count() == 2);
 }
 
@@ -388,8 +374,8 @@ fn a_reader_who_is_not_the_controller_gets_the_record_read_only() {
         "{:?}",
         texts(&frame)
     );
-    // the grants and skills still read, the controls do not
-    assert!(has_text(&frame, "ducktape"));
+    // the skills still read, the controls do not
+    assert!(has_text(&frame, "review"));
     assert!(has_text(&frame, "on demand"));
     assert!(!has_text(&frame, "Save"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "Pause"), "{:?}", texts(&frame));
@@ -431,7 +417,6 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let frame = tick_native(type_into(&frame, AGENT_ID_HINT, "chiefduck"));
     let frame = tick_native(type_into(&frame, "display name…", "ChiefDuck"));
     let frame = tick_native(pick(&frame, CAPABILITY_PICK, "claude"));
-    let frame = tick_native(toggle(&frame, "chat.post", true));
     let frame = tick_native(type_into(
         &frame,
         "skill name (its mount directory)…",
@@ -446,7 +431,6 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     assert_eq!(draft.agent_id, "chiefduck");
     assert_eq!(draft.display_name, "ChiefDuck");
     assert_eq!(draft.capability, "claude");
-    assert_eq!(draft.allowed_actions, ["chat.post"]);
     // a skill named without a prefix lands in the shared library
     assert_eq!(
         draft.skills,
@@ -463,7 +447,7 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
 fn a_committed_write_reseeds_the_open_record_from_its_fresh_row() {
     let (subscription, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
-    let _ = tick_native(toggle(&frame, "tasks.create", true));
+    let _ = tick_native(press(&frame, "Load always"));
 
     // the app committed a write and re-read the register: the row now names
     // the agent differently, and the drafts follow the row, not the reader
@@ -474,9 +458,9 @@ fn a_committed_write_reseeds_the_open_record_from_its_fresh_row() {
     let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
     assert_eq!(draft.display_name, "Renamed Bot");
     assert_eq!(
-        draft.allowed_actions,
-        ["chat.post"],
-        "the unsaved tick was consumed"
+        draft.skills.iter().filter(|skill| skill.always).count(),
+        1,
+        "the unsaved persona flip was consumed"
     );
 }
 
@@ -773,14 +757,4 @@ fn the_open_run_draws_its_progress_and_its_places_as_chips() {
         "an unaddressed place was offered as a link: {:?}",
         texts(&frame)
     );
-}
-
-#[test]
-fn the_every_action_grant_implies_each_action_and_saves_as_the_star() {
-    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
-    let frame = tick_native(press(&frame, "Reviewer Bot"));
-    let frame = tick_native(toggle(&frame, "every action (*)", true));
-    let frame = tick_native(press(&frame, "Save agent"));
-    let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
-    assert_eq!(draft.allowed_actions, ["*", "chat.post"]);
 }

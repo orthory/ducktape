@@ -18,10 +18,9 @@ const PANES: [&str; 4] = ["general", "network", "account", "security"];
 /// Every authored group, and the pane that owns it. The pairing is the whole
 /// of the redesign: a group in two panes is a group that drifted, and a group
 /// in none is a group nobody can reach.
-const GROUPS: [(&str, &str); 7] = [
+const GROUPS: [(&str, &str); 6] = [
     ("APPEARANCE", "general"),
     ("NOTIFICATIONS", "general"),
-    ("THIS DEVICE", "general"),
     ("NETWORK", "network"),
     ("YOUR IDENTITY", "account"),
     ("ACCOUNT KEYS", "account"),

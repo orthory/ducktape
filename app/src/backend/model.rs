@@ -474,6 +474,7 @@ pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
     match kind {
         crate::ComposerKind::Message => "message".to_owned(),
         crate::ComposerKind::Reply => "reply".to_owned(),
+        crate::ComposerKind::Edit | crate::ComposerKind::ThreadEdit => "edit".to_owned(),
     }
 }
 
@@ -481,6 +482,10 @@ pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
 /// rooms is two different threads.
 pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
     format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
+}
+
+pub fn edit_scope(endpoint: &str, channel_id: &str, seq: i64) -> String {
+    format!("{endpoint}\u{1f}{channel_id}#{seq}/edit")
 }
 
 /// The room a composer scope belongs to: a thread scope shorn of the
@@ -491,6 +496,7 @@ pub fn room_scope(scope: &str) -> String {
     let Some((room, seq)) = scope.rsplit_once('#') else {
         return scope.to_owned();
     };
+    let seq = seq.strip_suffix("/edit").unwrap_or(seq);
     let seq_is_thread = !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit());
     if seq_is_thread {
         return room.to_owned();
