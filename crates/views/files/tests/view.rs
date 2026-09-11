@@ -1,71 +1,369 @@
-//! The facts the host pushes are what the browser shows; every navigation
-//! and every write leaves as an intent carrying what the reader chose or
-//! typed, and a committed write the host reports consumes the name draft.
+//! The view driven natively through the wire: the kernel pushes session
+//! facts, the view lists the directory, reads the preview and the snapshot
+//! history for itself through `files.get`, re-reads on every `rpc.live` hit
+//! for the files plane, and a write leaves as `op.submit` carrying the
+//! duckfs commit.
 
-use files_view::host::{FilesProps, FsEntry, Name, Path, Save, SaveHistory, SaveReply};
+use files_view::host::Session;
 use files_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{edit, find, has_text, item, keys, press, texts, type_into};
-use ui_lang_guest::wire::{Frame, Node};
+use ui_lang_guest::testing::{
+    answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
+};
+use ui_lang_guest::wire::{Frame, Node, Request};
 
-fn entry(key: i64, path: &str, kind: &str, size: i64) -> FsEntry {
-    FsEntry {
-        key,
-        path: path.into(),
-        name: path.rsplit('/').next().unwrap_or(path).into(),
-        kind: kind.into(),
-        size,
-        object: format!("object-{key}"),
-    }
-}
-
-fn facts() -> FilesProps {
-    let docs = entry(1, "/shared/docs", "dir", 2);
-    let readme = entry(2, "/shared/README.md", "file", 421_888);
-    FilesProps {
-        save_namespace: "guest-a".into(),
-        network_scope: "network-a".into(),
-        context: "connection-a".into(),
-        preview_base: "snapshot-a".into(),
-        save_reply: SaveHistory::default(),
-        path: "/shared".into(),
-        listed: true,
-        entries: vec![docs.clone(), readme.clone()],
-        directories: vec![docs],
-        connected: true,
-        loading: false,
-        preview_path: "/shared/README.md".into(),
-        preview_entry: readme,
-        delete_target: String::new(),
-        diff_from: String::new(),
-        diff: Vec::new(),
-        history: Vec::new(),
-        preview_truncated: false,
-        preview_binary: false,
-        preview_picture: false,
-        preview_width: 0,
-        preview_height: 0,
-        preview_text: "# Hello\n".into(),
-        preview_display_text: "# Hello\n".into(),
-        preview_display_clipped: false,
-        dark: false,
-        write_refusal: String::new(),
-        writes: 0,
-        ..FilesProps::default()
-    }
-}
-
-fn encoded(props: &FilesProps) -> Vec<u8> {
-    serde_json::to_vec(props).expect("props encode")
-}
-
-/// Boot and push the facts; returns the subscription id and the frame.
-fn shown(props: &FilesProps) -> (u64, Frame) {
+fn boot() -> Frame {
     boot_native();
-    let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests[0].kind, "files.props");
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &encoded(props))]);
-    (subscription, frame)
+    tick_native(Vec::new())
+}
+
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
+}
+
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
+}
+
+/// The `files.get` request on `lane`, and the params it carries.
+fn files_get<'a>(frame: &'a Frame, lane: &str) -> (&'a Request, serde_json::Value) {
+    let found = frame.requests.iter().find(|request| {
+        let ask: serde_json::Value = serde_json::from_slice(&request.payload).unwrap_or_default();
+        request.kind == "files.get" && ask["lane"] == lane
+    });
+    let request = found.unwrap_or_else(|| panic!("no `{lane}` read in {:?}", frame.requests));
+    let ask: serde_json::Value = serde_json::from_slice(&request.payload).expect("a read decodes");
+    (request, ask["params"].clone())
+}
+
+fn session(connected: bool) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected,
+        dark: false,
+        chain: "chain-a".into(),
+    })
+    .expect("session encodes")
+}
+
+fn listing() -> Vec<u8> {
+    serde_json::json!({ "entries": [
+        { "path": "/shared/docs", "kind": "dir", "size": 2, "object": "aa" },
+        { "path": "/shared/README.md", "kind": "file", "size": 421_888, "object": "bb" },
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+fn history() -> Vec<u8> {
+    serde_json::json!({ "snapshots": [
+        { "id": "s1", "author": "ext:aa", "height": 84_912, "message": "first commit" },
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+fn refs() -> Vec<u8> {
+    serde_json::json!({ "head": "cc".repeat(32) })
+        .to_string()
+        .into_bytes()
+}
+
+fn read(text: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    serde_json::json!({ "b64": b64, "eof": true })
+        .to_string()
+        .into_bytes()
+}
+
+/// The subscriptions a connected view holds: the session push it was given
+/// at boot, and the `rpc.live` it keeps on the files plane.
+struct Held {
+    session: u64,
+    live: u64,
+}
+
+/// Boots, connects and answers the first listing read: the frame with the
+/// directory on screen, and the subscriptions behind it.
+fn connected_with_listing() -> (Frame, Held) {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let live = request(&frame, "rpc.live").id;
+    let ls = files_get(&frame, "ls").0.id;
+    let frame = tick_native(vec![answer(ls, &listing())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    (
+        frame,
+        Held {
+            session: session_id,
+            live,
+        },
+    )
+}
+
+/// Opens `/shared/README.md` and answers its two reads (the head snapshot,
+/// then the page at it).
+fn with_preview(frame: &Frame, body: &str) -> Frame {
+    let frame = tick_native(press(frame, "Show object"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let page = files_get(&frame, "read").0.id;
+    tick_native(vec![answer(page, &read(body))])
+}
+
+/// At boot the view asks for the session only; connected, it lists the
+/// directory itself and folds the rows, the counts and the snapshot rail.
+#[test]
+fn a_connected_view_lists_its_own_directory() {
+    let frame = boot();
+    assert_eq!(
+        kinds(&frame.requests),
+        ["files.props"],
+        "only the session at boot: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+
+    let (frame, _held) = connected_with_listing();
+    for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "412 KB"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "History"));
+    assert!(has_text(&frame, "h 84,912"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "first commit"), "{:?}", texts(&frame));
+}
+
+/// Opening a directory reads THAT directory, and the rows on hand go silent
+/// until its own listing lands — a tally of the directory you left, printed
+/// under the one you opened, is wrong in every word.
+#[test]
+fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Open directory"));
+    let (_, params) = files_get(&frame, "ls");
+    assert_eq!(params["path"], "/shared/docs");
+    assert!(
+        !has_text(&frame, "1 file · 1 dir"),
+        "the old tally survived the navigation: {:?}",
+        texts(&frame)
+    );
+    assert_eq!(
+        request(&frame, "files.at").payload,
+        br#"{"path":"/shared/docs"}"#,
+        "the window's drop door is told where the view stands"
+    );
+
+    let ls = files_get(&frame, "ls").0.id;
+    let frame = tick_native(vec![answer(
+        ls,
+        serde_json::json!({ "entries": [] }).to_string().as_bytes(),
+    )]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(
+        has_text(
+            &frame,
+            "Empty directory — nothing is committed under this path."
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// A files block re-reads the directory through the live subscription.
+#[test]
+fn a_live_hit_lists_the_directory_again() {
+    let (_, held) = connected_with_listing();
+    let frame = tick_native(vec![item(held.live, b"{}")]);
+    assert_eq!(files_get(&frame, "ls").1["path"], "/shared");
+}
+
+/// A preview reads the HEAD SNAPSHOT first and then the page at it: the
+/// snapshot the text was read at is the save's CAS base.
+#[test]
+fn a_preview_reads_the_snapshot_it_will_save_against() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Show object"));
+    let (_, params) = files_get(&frame, "refs");
+    assert_eq!(params, serde_json::json!({}));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let (_, params) = files_get(&frame, "read");
+    assert_eq!(params["path"], "/shared/README.md");
+    assert_eq!(params["snapshot"], "cc".repeat(32));
+    assert_eq!(params["len"], 65_536);
+}
+
+/// A typed name leaves as a duckfs commit the kernel signs, the bar waits for
+/// the answer, and the committed write consumes the name it read.
+#[test]
+fn a_new_folder_leaves_as_a_signed_commit_and_consumes_its_name() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(type_into(&frame, "new name…", "  reports  "));
+    assert!(frame.requests.is_empty(), "typing runs no handler");
+    let frame = tick_native(press(&frame, "+ Folder"));
+    // the head the commit lands on, read first
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "files",
+            "payload": { "commit": {
+                "base_snapshot": "cc".repeat(32),
+                "message": "mkdir /shared/reports",
+                "changes": [{ "mkdir": { "path": "/shared/reports" } }],
+            }},
+        })
+    );
+    assert_eq!(
+        name_field(&frame),
+        "  reports  ",
+        "the draft stays until the write lands"
+    );
+
+    let frame = tick_native(vec![answer(submit.id, b"42")]);
+    assert_eq!(name_field(&frame), "");
+    assert_eq!(
+        files_get(&frame, "ls").1["path"],
+        "/shared",
+        "a committed write re-reads the directory"
+    );
+}
+
+/// A refused write says so in place and keeps the name draft.
+#[test]
+fn a_refused_write_is_shown_in_place_and_keeps_the_draft() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(type_into(&frame, "new name…", "reports"));
+    let frame = tick_native(press(&frame, "+ Folder"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit").id;
+    let frame = tick_native(vec![refuse(submit, "the local user key is locked")]);
+    assert!(
+        has_text(&frame, "the local user key is locked"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert_eq!(name_field(&frame), "reports");
+}
+
+/// The root is nobody's to write in, and the view says so from the module's
+/// own rule before any round trip.
+#[test]
+fn a_root_directory_refuses_the_write_bar_before_the_round_trip() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Go to the duckfs root"));
+    let ls = files_get(&frame, "ls").0.id;
+    let frame = tick_native(vec![answer(
+        ls,
+        serde_json::json!({ "entries": [] }).to_string().as_bytes(),
+    )]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(
+        has_text(&frame, "path is outside /home and /shared"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(button_disabled(&frame, "+ Folder"));
+}
+
+/// A Markdown preview reads as a document through the host's surface; a save
+/// carries the SNAPSHOT THE TEXT WAS READ AT, never the head it raced.
+#[test]
+fn an_edited_body_saves_against_the_snapshot_it_was_read_at() {
+    let (frame, _held) = connected_with_listing();
+    let frame = with_preview(&frame, "# Hello\n");
+    assert_eq!(
+        surface_names(&frame),
+        ["agent_markdown"],
+        "a markdown path reads as a document"
+    );
+
+    let frame = tick_native(press(&frame, "Edit"));
+    assert!(frame.requests.is_empty(), "editing is the view's own");
+    let frame = tick_native(press(&frame, "Save"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(op["payload"]["commit"]["base_snapshot"], "cc".repeat(32));
+    assert_eq!(
+        op["payload"]["commit"]["changes"][0]["put"]["path"],
+        "/shared/README.md"
+    );
+    assert!(
+        has_text(&frame, "Save"),
+        "unacknowledged edits stay in the editor"
+    );
+
+    let frame = tick_native(vec![answer(submit.id, b"43")]);
+    assert!(!has_text(&frame, "Save"), "the answer closes the editor");
+}
+
+/// A draft belongs to its file AND its network: a queued Save landing after
+/// the reader moved on must never retarget the new file, and a draft whose
+/// network changed parks with its bytes intact.
+#[test]
+fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
+    let (frame, held) = connected_with_listing();
+    let frame = with_preview(&frame, "A source");
+    let editing = tick_native(press(&frame, "Edit"));
+    let editor_key = keys(&editing)
+        .into_iter()
+        .find(|key| key.ends_with("/fs-editor"))
+        .expect("the editor");
+    let (editing, before) = read_draft(&editing);
+    let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
+    let queued_save = press(&editing, "Save");
+
+    // the network moves under the draft
+    let frame = tick_native(vec![item(
+        held.session,
+        &serde_json::to_vec(&Session {
+            connected: true,
+            dark: false,
+            chain: "chain-b".into(),
+        })
+        .unwrap(),
+    )]);
+    assert!(has_text(&frame, "Unsaved changes to:"), "{:?}", texts(&frame));
+    let frame = tick_native(queued_save);
+    assert!(
+        !frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "op.submit"),
+        "a parked draft never submits: {:?}",
+        frame.requests
+    );
+
+    // back on the network it belongs to, the draft returns with its bytes
+    let frame = tick_native(vec![item(held.session, &session(true))]);
+    let (frame, text) = read_draft(&frame);
+    assert_eq!(text, "unsaved A — 한글");
+    let frame = tick_native(press(&frame, "Save"));
+    let op: serde_json::Value =
+        serde_json::from_slice(&request(&frame, "op.submit").payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["commit"]["base_snapshot"],
+        "cc".repeat(32),
+        "the draft still saves against the snapshot it was read at"
+    );
 }
 
 /// What the write bar's name field reads now.
@@ -80,142 +378,38 @@ fn name_field(frame: &Frame) -> String {
     }
 }
 
-fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    intent
+/// Whether the button labelled `name` is in the tree with no press to send.
+fn button_disabled(frame: &Frame, name: &str) -> bool {
+    let mut root = frame.root.clone().expect("a tree");
+    let mut disabled = None;
+    root.for_each_mut(&mut |node| {
+        if let Node::Button {
+            label,
+            content,
+            on_press,
+            ..
+        } = node
+        {
+            let named = label.as_deref() == Some(name)
+                || matches!(content, ui_lang_guest::wire::ButtonContent::Label(label) if label == name);
+            if named {
+                disabled = Some(on_press.is_none());
+            }
+        }
+    });
+    disabled.expect("the button is in the tree")
 }
 
-#[test]
-fn the_facts_the_host_pushes_are_what_the_browser_shows_and_a_row_opens_as_a_path() {
-    let (_, frame) = shown(&facts());
-    for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "412 KB"] {
-        assert!(
-            has_text(&frame, expected),
-            "missing {expected:?} in {:?}",
-            texts(&frame)
-        );
-    }
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(press(&frame, "Open directory"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "files.open_dir");
-    assert_eq!(
-        serde_json::from_slice::<Path>(&intent.payload).expect("decodes"),
-        Path {
-            path: "/shared/docs".into()
+/// Every host surface the tree leaves a slot for.
+fn surface_names(frame: &Frame) -> Vec<String> {
+    let mut root = frame.root.clone().expect("a tree");
+    let mut names = Vec::new();
+    root.for_each_mut(&mut |node| {
+        if let Node::Surface { name, .. } = node {
+            names.push(name.clone());
         }
-    );
-    let frame = tick_native(press(&frame, "Parent directory"));
-    assert_eq!(one_intent(&frame).kind, "files.open_parent");
-}
-
-#[test]
-fn a_committed_write_consumes_the_name_it_read() {
-    let (subscription, frame) = shown(&facts());
-    let frame = tick_native(type_into(&frame, "new name…", "  reports  "));
-    assert!(frame.requests.is_empty(), "typing runs no handler");
-    let frame = tick_native(press(&frame, "+ Folder"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "files.mkdir");
-    assert_eq!(
-        serde_json::from_slice::<Name>(&intent.payload).expect("decodes"),
-        Name {
-            name: "reports".into()
-        }
-    );
-    assert_eq!(
-        name_field(&frame),
-        "  reports  ",
-        "the draft stays until a write lands"
-    );
-    // the write landed: the name goes …
-    let written = FilesProps {
-        writes: 1,
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&written))]);
-    assert_eq!(name_field(&frame), "");
-    // … and the same report pushed again consumes nothing more
-    let typed = tick_native(type_into(&frame, "new name…", "notes"));
-    assert_eq!(name_field(&typed), "notes");
-    let frame = tick_native(vec![item(subscription, &encoded(&written))]);
-    assert_eq!(name_field(&frame), "notes");
-    // a refused directory says so under the bar and keeps the draft
-    let refused = FilesProps {
-        write_refusal: "roots are not writable".into(),
-        ..written
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&refused))]);
-    assert!(has_text(&frame, "roots are not writable"));
-    assert_eq!(name_field(&frame), "notes");
-}
-
-#[test]
-fn the_edited_body_stays_until_its_exact_save_is_committed() {
-    let (subscription, frame) = shown(&facts());
-    let frame = tick_native(press(&frame, "Edit"));
-    assert!(frame.requests.is_empty(), "editing is the view's own");
-    assert!(has_text(&frame, "Save"), "{:?}", texts(&frame));
-    let frame = tick_native(press(&frame, "Save"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "files.save");
-    assert_eq!(
-        serde_json::from_slice::<Save>(&intent.payload).expect("decodes"),
-        Save {
-            namespace: "guest-a".into(),
-            context: "connection-a".into(),
-            base: "snapshot-a".into(),
-            request: 1,
-            path: "/shared/README.md".into(),
-            text: "# Hello\n".into()
-        }
-    );
-    assert!(
-        has_text(&frame, "Save"),
-        "unacknowledged edits stay in the editor"
-    );
-    let committed = FilesProps {
-        // Restore keeps the pending request even when the new host instance supplies a new namespace.
-        save_namespace: "guest-replacement".into(),
-        save_reply: SaveReply {
-            namespace: "guest-a".into(),
-            context: "connection-a".into(),
-            request: 1,
-            success: true,
-            message: String::new(),
-        }
-        .into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&committed))]);
-    assert!(!has_text(&frame, "Save"));
-}
-
-#[test]
-fn a_save_queued_before_navigation_never_targets_the_new_file() {
-    let original = facts();
-    let (subscription, frame) = shown(&original);
-    let editing = tick_native(press(&frame, "Edit"));
-    let queued_save = press(&editing, "Save");
-    let next = FilesProps {
-        preview_path: "/shared/other.md".into(),
-        preview_entry: entry(3, "/shared/other.md", "file", 4),
-        preview_text: "other file".into(),
-        ..facts()
-    };
-    tick_native(vec![item(subscription, &encoded(&next))]);
-    let after = tick_native(queued_save);
-    for request in &after.requests {
-        if request.kind == "files.save" {
-            let save: Save = serde_json::from_slice(&request.payload).unwrap();
-            assert_eq!(
-                save.path, original.preview_path,
-                "a queued Save must never retarget the old draft to a new file"
-            );
-        }
-    }
+    });
+    names
 }
 
 fn read_draft(frame: &Frame) -> (Frame, String) {
@@ -266,219 +460,4 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
         }
     }
     panic!("the small Files document must finish its bounded transfer");
-}
-
-#[test]
-fn parked_draft_returns_with_its_original_bytes_and_snapshot_after_reconnect() {
-    let original = facts();
-    let (subscription, frame) = shown(&original);
-    let editing = tick_native(press(&frame, "Edit"));
-    let editor_key = keys(&editing)
-        .into_iter()
-        .find(|key| key.ends_with("/fs-editor"))
-        .unwrap();
-    let (editing, before) = read_draft(&editing);
-    let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
-    let stale_save = press(&editing, "Save");
-    let other = FilesProps {
-        network_scope: "network-b".into(),
-        context: "connection-b".into(),
-        preview_text: "B source".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&other))]);
-    assert!(has_text(&frame, "Unsaved changes to:"));
-    assert!(!has_text(&frame, "Save"));
-    let frame = tick_native(stale_save);
-    assert!(frame.requests.is_empty());
-    let returned = FilesProps {
-        context: "connection-a-reconnected".into(),
-        preview_base: "snapshot-new".into(),
-        preview_text: "external edit".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&returned))]);
-    let (frame, text) = read_draft(&frame);
-    assert_eq!(text, "unsaved A — 한글");
-    let frame = tick_native(press(&frame, "Save"));
-    let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
-    assert_eq!(saved.context, returned.context);
-    assert_eq!(saved.base, original.preview_base);
-    assert_eq!(saved.text, "unsaved A — 한글");
-    let refused = FilesProps {
-        save_reply: SaveReply {
-            namespace: "guest-a".into(),
-            context: returned.context.clone(),
-            request: saved.request,
-            success: false,
-            message: "The file changed elsewhere. Your edits are kept.".into(),
-        }
-        .into(),
-        ..returned
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&refused))]);
-    let (frame, text) = read_draft(&frame);
-    assert_eq!(text, "unsaved A — 한글");
-    assert!(has_text(
-        &frame,
-        "The file changed elsewhere. Your edits are kept."
-    ));
-}
-
-#[test]
-fn an_old_save_acknowledgement_cannot_consume_a_new_draft() {
-    let (subscription, frame) = shown(&facts());
-    let frame = tick_native(press(&frame, "Edit"));
-    let frame = tick_native(press(&frame, "Save"));
-    let a: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
-    let other = FilesProps {
-        network_scope: "network-b".into(),
-        context: "connection-b".into(),
-        preview_text: "B source".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&other))]);
-    let frame = tick_native(press(&frame, "Discard unsaved changes"));
-    let frame = tick_native(press(&frame, "Edit"));
-    let frame = tick_native(press(&frame, "Save"));
-    let b: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
-    assert_ne!(a.request, b.request);
-    let late = FilesProps {
-        save_reply: SaveReply {
-            namespace: "guest-a".into(),
-            context: a.context,
-            request: a.request,
-            success: true,
-            message: String::new(),
-        }
-        .into(),
-        ..other
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&late))]);
-    assert!(
-        has_text(&frame, "Save"),
-        "an old acknowledgement cannot close B's editor"
-    );
-    let mut pending = false;
-    frame.root.clone().unwrap().for_each_mut(&mut |node| {
-        if let Node::Button {
-            content: ui_lang_guest::wire::ButtonContent::Label(label),
-            on_press,
-            ..
-        } = node
-            && label == "Save"
-        {
-            pending = on_press.is_none();
-        }
-    });
-    assert!(pending, "B remains pending");
-    let (_, text) = read_draft(&frame);
-    assert_eq!(text, "B source");
-}
-
-#[test]
-fn a_fresh_guest_never_consumes_the_previous_instances_save_reply() {
-    let old_success = SaveReply {
-        namespace: "guest-old".into(),
-        context: "connection-a".into(),
-        request: 1,
-        success: true,
-        message: String::new(),
-    };
-    // A retained reply and a reply still in flight when the old guest died.
-    for initial_reply in [old_success.clone(), SaveReply::default()] {
-        let initial = FilesProps {
-            save_namespace: "guest-new".into(),
-            save_reply: initial_reply.into(),
-            ..facts()
-        };
-        let (subscription, frame) = shown(&initial);
-        let frame = tick_native(press(&frame, "Edit"));
-        let key = keys(&frame)
-            .into_iter()
-            .find(|key| key.ends_with("/fs-editor"))
-            .unwrap();
-        let (frame, before) = read_draft(&frame);
-        let frame = tick_native(edit(&frame, &key, &before, "new unsaved text"));
-        let frame = tick_native(press(&frame, "Save"));
-        let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
-        assert_eq!(saved.namespace, "guest-new");
-        assert_eq!(saved.request, 1, "fresh guest restarts its local counter");
-        let late = FilesProps {
-            save_reply: old_success.clone().into(),
-            ..initial
-        };
-        let frame = tick_native(vec![item(subscription, &encoded(&late))]);
-        assert!(
-            has_text(&frame, "Save"),
-            "a previous instance's success cannot consume the fresh draft"
-        );
-        let (_, text) = read_draft(&frame);
-        assert_eq!(text, "new unsaved text");
-        let confirmed = FilesProps {
-            save_reply: SaveReply {
-                namespace: saved.namespace,
-                ..old_success.clone()
-            }
-            .into(),
-            ..late
-        };
-        let frame = tick_native(vec![item(subscription, &encoded(&confirmed))]);
-        assert!(
-            !has_text(&frame, "Save"),
-            "the new save's own reply consumes it"
-        );
-    }
-}
-
-#[test]
-fn lost_confirmation_never_discards_the_draft_or_waits_forever() {
-    let (subscription, frame) = shown(&facts());
-    let frame = tick_native(press(&frame, "Edit"));
-    let key = keys(&frame)
-        .into_iter()
-        .find(|key| key.ends_with("/fs-editor"))
-        .unwrap();
-    let (frame, before) = read_draft(&frame);
-    let frame = tick_native(edit(
-        &frame,
-        &key,
-        &before,
-        "unsaved bytes after history overflow",
-    ));
-    let frame = tick_native(press(&frame, "Save"));
-    assert_eq!(one_intent(&frame).kind, "files.save");
-    let overflowed = FilesProps {
-        save_reply: SaveHistory {
-            replies: Vec::new(),
-            overflow: "new-overflow".into(),
-        },
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&overflowed))]);
-    let (frame, text) = read_draft(&frame);
-    assert_eq!(text, "unsaved bytes after history overflow");
-    assert!(has_text(
-        &frame,
-        "Save confirmation is no longer available. Your edits are still here; check the file before saving again."
-    ));
-    assert!(
-        !press(&frame, "Save").is_empty(),
-        "the editor is not stranded waiting for an evicted reply"
-    );
-}
-
-#[test]
-fn omitted_rows_are_a_number_not_literal_template_text() {
-    let (_, frame) = shown(&FilesProps {
-        display_omitted: 12_345,
-        ..facts()
-    });
-    let key = keys(&frame)
-        .into_iter()
-        .find(|key| key.ends_with("/display-omitted"))
-        .expect("the omission count has its own identity");
-    assert!(matches!(find(&frame, &key), Some(Node::Text { content, .. }) if content == "12345"));
-    assert!(has_text(&frame, "rows are not shown."));
-    assert!(has_text(&frame, "Edit"));
 }
