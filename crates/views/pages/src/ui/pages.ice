@@ -669,7 +669,6 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                     label="Delete page"
                     disabled=(busy)
                     w=fill
-                    h=28.0
                     p=6.0
                     @danger_action
                   active bg=transparent text=danger border=transparent border-w=1.0 r=7.0
