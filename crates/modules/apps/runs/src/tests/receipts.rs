@@ -48,7 +48,7 @@ impl sdk::MerkleStore for Backing {
 }
 
 fn hosted() -> (RunsModule, Backing, PendingState) {
-    let (module, _, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
+    let (module, _, run_id) = awaiting_run();
     let entry = module
         .pending_entry(&dispatch_id_for(&run_id))
         .unwrap()
@@ -76,7 +76,7 @@ fn stage(module: &mut RunsModule, entry: &PendingState, slot: u32) -> String {
                     owner: None,
                 }),
             },
-            ACTION_TASKS_CREATE,
+            OP_TASKS_CREATE,
             serde_json::json!({"task_id": format!("task-{slot}")}),
         ),
     ))
@@ -243,7 +243,7 @@ fn reordered_json_has_the_same_durable_proposal_bytes() {
                     target: "tasks".into(),
                     payload: payload.to_vec(),
                 },
-                ACTION_TASKS_CREATE,
+                OP_TASKS_CREATE,
                 serde_json::json!({"task_id": "same"}),
             ),
         ))

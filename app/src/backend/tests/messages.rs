@@ -309,6 +309,7 @@ fn concurrent_optimistic_messages_settle_independently() {
         seq,
         author: "You".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: paragraph_blocks(body),
         pending: false,
@@ -377,6 +378,7 @@ fn message_groups_collapse_consecutive_authors() {
         seq,
         author: author.into(),
         meta: format!("#{seq}"),
+        edit_body: "body".into(),
         body: "body".into(),
         blocks: paragraph_blocks("body"),
         pending: false,
@@ -415,6 +417,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         seq,
         author: "alice".into(),
         meta: format!("#{seq}"),
+        edit_body: "body".into(),
         body: "body".into(),
         blocks: paragraph_blocks("body"),
         pending: false,
@@ -443,7 +446,7 @@ fn history_pagination_prepends_older_and_flags_more() {
 }
 
 /// The composer's grammar loop, closed over a real node: the SAME parser
-/// the rich composer previews (`parse_message_with_mentions`) builds the
+/// the rich composer previews (`parse_message`) builds the
 /// committed blocks, and the spans read back off the node still carry the
 /// marks. If the preview grammar and the renderer grammar ever drift, one
 /// of the two ends of this test moves.
@@ -484,10 +487,7 @@ async fn composer_markdown_round_trips_rich_spans() {
         chat::encode_msg(&ChatMsg::PostMessage {
             channel_id: "general".into(),
             message_id: "styled-1".into(),
-            blocks: parse_message_with_mentions(
-                "say **hi** to _all_",
-                &MentionCandidates::default(),
-            ),
+            blocks: ::chat::client::parse_message("say **hi** to _all_"),
             thread: None,
         }),
     )
@@ -665,6 +665,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         seq: if pending { -1 } else { seq },
         author: "u".into(),
         meta: String::new(),
+        edit_body: String::new(),
         body: String::new(),
         blocks: Vec::new(),
         pending,
@@ -987,6 +988,7 @@ fn message(seq: i64, author: &str, body: &str) -> ChatMessage {
         seq,
         author: author.into(),
         meta: String::new(),
+        edit_body: body.into(),
         body: body.into(),
         blocks: Vec::new(),
         pending: false,

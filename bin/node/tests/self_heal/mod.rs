@@ -309,17 +309,8 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
                 agent_id: LIVE_MODEL.into(),
                 display_name: LIVE_MODEL.into(),
                 capability: LIVE_CAPABILITY.into(),
-                allowed_actions: vec![
-                    runs::ACTION_CHAT_POST.into(),
-                    runs::ACTION_MODULES_UPDATE.into(),
-                ],
                 recipe_hash: None,
                 skills: None,
-                caps: Some(runs::ResourceCaps {
-                    forge_read: vec![LIVE_REPO.into()],
-                    forge_push: vec![LIVE_REPO.into()],
-                    ..Default::default()
-                }),
             },
         }),
     );

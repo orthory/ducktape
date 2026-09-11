@@ -8,7 +8,7 @@ extern crate::backend
   ChannelSwitchFacts(unread_boundary:i64, name:str, archived:bool, members_only:bool)
   ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, edit_body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
   CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
@@ -64,51 +64,13 @@ extern crate::backend
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
   ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, forge_discussion:[ChatMessage], refresh_chat:bool)
   AppError(message:str, committed:bool)
-  AgentTerminalSession()
-  AgentTerminalNotice(running:bool, title:str)
-  AgentTerminalStarted(session:AgentTerminalSession, title:str)
-  AgentCredential(name:str, provider:str)
-  AgentCredentialsData(generation:i64, rows:[AgentCredential])
-  AgentHostNode(key:str, label:str, providers:[str])
-  AgentHostNodesData(generation:i64, rows:[AgentHostNode])
-  AgentIdentity(label:str, provider:str, credential:str)
-  AgentActivity(id:i64, title:str, detail:str, status:str)
-  AgentChatEntry(id:i64, role:str, body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity], steps_label:str)
-  AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
   LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
   pure live_run_for(rows:&[LiveAgentRow], dispatch_id:&str) -> LiveRun
   LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
-  pure idle_agent_terminal() -> AgentTerminalSession
-  start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
-  task focus_agent_terminal(session:AgentTerminalSession) -> unit
   task note_window_focus(focused:bool) -> unit
   component forge_markdown(source:str, doc:str, dark:bool) -> str
-  subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
-  load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
-  load_agent_host_nodes(rpc:str, generation:i64) -> AgentHostNodesData ! HydrationError
-  pure agent_identities(rows:[AgentCredential]) -> [AgentIdentity]
-  pure agent_identity_options(rows:[AgentIdentity]) -> [str]
-  pure agent_identity_choice(rows:[AgentIdentity], current:str) -> str
-  pure agent_identity_provider(rows:[AgentIdentity], label:str) -> str
-  pure agent_identity_credential(rows:[AgentIdentity], label:str) -> str
-  pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
-  pure agent_host_node_choice(options:[str], current:str) -> str
-  pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
-  pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
-  pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
-  pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
-  pure agent_chat_drop_detached(entries:[AgentChatEntry]) -> [AgentChatEntry]
-  pure agent_activity_apply(rows:[AgentActivity], event:AgentChatEvent) -> [AgentActivity]
-  pure agent_event_status(current:str, event:AgentChatEvent) -> str
-  pure agent_event_detail(current:str, event:AgentChatEvent) -> str
-  pure agent_event_saga(current:str, event:AgentChatEvent) -> str
-  pure agent_event_live(current:str, event:AgentChatEvent) -> str
-  pure agent_event_busy(event:AgentChatEvent) -> bool
-  pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
-  stream agent_chat_turn(rpc:str, provider:str, credential:str, host_node:str, entries:[AgentChatEntry]) -> AgentChatEvent
-  stream agent_chat_watch(rpc:str, provider:str, saga_id:str) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, thread_seq:i64, body:str)
   HydrationError(generation:i64, message:str)
   box-style raised_style()
@@ -303,7 +265,6 @@ extern crate::backend
   pure height_label(height:i64) -> str
   pure height_label_short(height:i64) -> str
   pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str
-  pure doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
   pure initial_of(name:&str) -> str
   pure initials_of(name:&str) -> str
   NodeLogLine(cursor:str, line:str)
@@ -360,9 +321,8 @@ extern crate::backend
   pure ceremony_step(phase:str, qr:str, detail:str) -> CeremonyStep
   pure ceremony_phase(step:&CeremonyStep) -> CeremonyPhase
   pure welcome_door(name_draft:&str) -> WelcomeDoor
-  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
-  clear_doc_tabs(rpc:str) -> bool
   ForgeRepo(name:str, head:str)
   ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
@@ -406,15 +366,14 @@ extern crate::backend
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
-  AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
   JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
-  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
+  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
   pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
@@ -440,17 +399,10 @@ extern crate::backend
   KindCount(kind:str, label:str, count:i64)
   ExplorerResults(hits:[ExplorerHit], kinds:[KindCount], partial:str)
   search_workspace(rpc:str, text:str) -> ExplorerResults
-  pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
-  pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
-  DocTab(id:str, title:str, active:bool)
-  pure doc_tab_rows(tabs:&[str], pages:&[PageItem], active:&str) -> [DocTab]
-  pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
-  load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
   load_desktop_notifications() -> bool
   save_desktop_notifications(enabled:bool) -> bool
-  save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase
   pure mutation_phase_after_recovery(current:MutationPhase) -> MutationPhase
@@ -483,6 +435,7 @@ extern crate::backend
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
+  pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -490,7 +443,6 @@ extern crate::backend
   pure chain_moved(held:str, live:str) -> bool
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
-  pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
@@ -557,12 +509,12 @@ extern crate::backend
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   pure reaction_refusal(archived:bool, banner:str) -> str
-  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
+  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, after_reply_seq:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64) -> LiveThreadData ! AppError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
-  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str, members:[ChatMember]) -> bool ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError

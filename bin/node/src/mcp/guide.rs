@@ -7,28 +7,20 @@
 //! can never describe a tool the binary does not have, and it costs the run
 //! nothing until the tool server is actually attached.
 
-use std::sync::LazyLock;
-
 /// the server instructions. deliberately short: the tool DESCRIPTIONS carry the
 /// per-tool detail, and the catalog `ducktape_actions` returns carries the
 /// per-operation detail, so repeating either here would be one more thing to
 /// keep in sync. what belongs here is only what no single tool's description
 /// can say — the shape of the system, and the rules an agent gets wrong if
 /// nobody tells it.
-///
-/// the one list it does carry — the grant vocabulary — is INTERPOLATED from
-/// [`runs::KNOWN_ACTIONS`] rather than typed out, so it cannot drift from the
-/// names consensus actually enforces. a hand-copied list here silently taught
-/// the model a short vocabulary, and the whole point of the paragraph is that
-/// it can name the grant behind a refusal.
-pub static GUIDE: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "\
+pub const GUIDE: &str = "\
 You are running inside Ducktape: a peer-to-peer workspace where chat, tasks, \
 pages, a git forge, and a replicated filesystem (duckfs) are all modules of one \
 consensus-backed network. These tools are how you read and write that network. \
-Call ducktape_whoami first if you are unsure what you are permitted to do, and \
-ducktape_actions to see the operation catalog.
+You act as your program account, a member of the network like any other: \
+whatever a member may submit to a module, you may submit. Call ducktape_whoami \
+first if you are unsure who you are acting as, and ducktape_actions to see the \
+operation catalog.
 
 Two things are easy to get wrong:
 
@@ -40,15 +32,19 @@ end is captured with the commit message from your final response. The files.* \
 operations read the SHARED filesystem, which is a different thing and mostly \
 outside your checkout.
 
-2. WRITES ARE GATED BY THE NETWORK ITSELF, AND A REFUSAL IS INFORMATION. Every \
-write goes through one tool, ducktape_action(operation, target, input, \
-request_id). The catalog names each operation's schemas and the grant it needs; \
-the grant vocabulary is {actions}, and some operations also need resource caps. \
-The check does not happen in this tool server — your write passes through this \
-run's narrow host signer and is refused or accepted by Ducktape itself, so a \
-refusal is final and tells you exactly which grant or cap you lack. Say so in \
-your answer rather than working around it. Do not retry a refusal; it will not \
-become allowed. Pick a fresh request_id for each new write and reuse one only to \
+2. EVERY WRITE IS A MODULE MESSAGE, AND A REFUSAL IS THE MODULE'S OWN WORDS. \
+Every write goes through one tool, ducktape_action(operation, target, input, \
+request_id). The catalog names each typed operation's schemas, and the submit \
+operation carries ANY module's own message verbatim: target {\"module\": id}, \
+input the message as that module's wire spells it (an object with exactly one \
+key, or a bare string). Nothing a member can do is out of your reach because \
+the catalog lacks a name for it; submit an unknown message name and the \
+module's refusal lists the names it does accept. The check does not happen in \
+this tool server — your write passes through this run's narrow host signer and \
+is accepted or refused by the target module itself, so a refusal describes \
+what that module could not accept (a stale expected oid, an unknown id, a \
+malformed message), never a permission you lack. Fix the message rather than \
+retrying it. Pick a fresh request_id for each new write and reuse one only to \
 retry the identical write; ducktape_action returns the committed receipt, and \
 ducktape_receipt reads it again later.
 
@@ -56,7 +52,9 @@ Reads go through ducktape_query(operation, target, input) with the read \
 operations the catalog lists: chat.channels and chat.messages, tasks.list and \
 jobs.get, pages.list and pages.get, forge.repos, forge.items, forge.item and \
 forge.pr_diff, files.ls, files.read and files.grep, agents.list, runs.list and \
-agent.calls.
+agent.calls — and query, which runs ANY module's own query verbatim (target \
+{\"module\": id}, input the query as that module's wire spells it). Reads are \
+not gated.
 
 Use the reply operation to post progress or ask a question where this run was \
 called: its chat thread, Pages block/comment thread, or job discussion. Name an \
@@ -65,9 +63,13 @@ Ducktape posts as your program account; a temporary run key authenticates the \
 request. Use the other operations for tasks, files or page edits, and tick off a \
 todo as you finish it — rather than saving everything for your final answer. \
 Your final response's actions carry the same envelopes; modules.update and \
-forge.open_pr are final-response only, and agent.call is live only. A branch \
-you pushed to a forge repository becomes a pull request through forge.open_pr \
-in your final response, under the same forge_push cap that admitted the push.
+forge.open_pr are final-response only, agent.call is live only, and submit \
+runs in both. A branch you pushed to a forge repository becomes a pull request \
+through forge.open_pr in your final response. To merge a pull request, build \
+the merge commit yourself in a checkout, upload the pack that carries it to \
+$DUCKTAPE_NODE/v1/files/blob, and submit forge's merge_pr message naming the \
+repo, the PR number, the source and target oids it expects, the merge oid and \
+the pack digest the upload returned.
 
 modules.update: build the module using its repository's toolchain and \
 dependencies. The standard Linux guest includes Rust, the wasm32-unknown-unknown \
@@ -80,30 +82,17 @@ host-pushed commit before your program requests deployment.
 
 Agents are peers, not a permanent parent/child hierarchy. If another registered \
 agent is useful, call it with the agent.call operation while this run is live, \
-then read agent.calls to collect its result. Each call receives only the \
-intersection of both agents' grants, and the root run's peer-call budget bounds \
-concurrent live calls across the whole recursive tree. Completed calls release \
-their slot. Your final answer still follows whatever output contract your prompt \
-gave you; these tools do not replace it.",
-        actions = runs::KNOWN_ACTIONS.join(", ")
-    )
-});
+then read agent.calls to collect its result. The root run's tree admits a \
+bounded number of live calls at once; completed calls release their slot. Your \
+final answer still follows whatever output contract your prompt gave you; these \
+tools do not replace it.";
 
 #[cfg(test)]
 mod tests {
     use super::GUIDE;
 
     #[test]
-    fn the_guide_names_every_known_action_and_every_tool() {
-        // the guide's promise is that a refused agent can name what it lacks.
-        // that only holds if the vocabulary it prints is the vocabulary
-        // consensus enforces — so no hand-written subset may creep back in.
-        for action in runs::KNOWN_ACTIONS {
-            assert!(
-                GUIDE.contains(action),
-                "the initialize guide does not name the {action} action"
-            );
-        }
+    fn the_guide_names_every_tool_and_the_two_generic_operations() {
         for tool in crate::mcp::tools::all() {
             let control_tool = tool.name == "ducktape_extend_provider_idle";
             if control_tool {
@@ -115,5 +104,9 @@ mod tests {
                 tool.name
             );
         }
+        // the two doors that make every module reachable: an agent that only
+        // ever reads the guide must still learn they exist.
+        assert!(GUIDE.contains("the submit operation carries ANY module's own message"));
+        assert!(GUIDE.contains("query, which runs ANY module's own query"));
     }
 }

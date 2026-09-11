@@ -29,7 +29,7 @@ fn public_message_ids_are_bounded_and_disjoint_for_internal_run_keys() {
 
 #[test]
 fn model_run_session_and_request_state_round_trip() {
-    let (mut module, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
+    let (mut module, registry, run_id) = awaiting_run();
     let mut open = CaptureCtx::new()
         .with_origin(user(8))
         .with_registry(&registry)

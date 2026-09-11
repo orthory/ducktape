@@ -5,7 +5,6 @@ state
   settings_key_state = ""
   // Full local user key used by the channel membership post gate.
   settings_user_key = ""
-  settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
 
   account_exists = false

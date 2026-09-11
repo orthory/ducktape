@@ -2,19 +2,17 @@
 //! read / write because the two halves have genuinely different rules.
 //!
 //! - READ tools ([`read`]) serve `whoami`, the operation catalog, one generic
-//!   `query` over a host-side table of read operations, and receipt lookup.
-//!   reads are ungated except where the caps vocabulary already names the
-//!   resource (`forge_read` repos, `duckfs_read` prefixes).
+//!   `query` over a host-side table of read operations (whose floor is the
+//!   `query` operation: any module's own query, verbatim), and receipt lookup.
+//!   reads are not gated.
 //! - the ONE WRITE tool ([`write`]) carries a catalog envelope the runs module
-//!   decodes and gates in consensus. The tool plane grants an agent nothing its
-//!   registered `allowed_actions` did not already grant it, and there is
-//!   exactly one vocabulary of "what an agent may do" — the one consensus
-//!   validates a response's actions against — and exactly one catalog of
-//!   operations, owned by the module that executes them.
+//!   decodes in consensus, whose floor is the `submit` operation: any module's
+//!   own message, verbatim, under the run's program account. there is exactly
+//!   one catalog of operations, owned by the module that executes them.
 //!
 //! a tool's `description` is not decoration: it is the entire interface the
 //! model has. it says what the tool reads or writes and where the catalog is,
-//! so a denied agent can tell its owner precisely which grant to widen.
+//! so a refused agent can read what the module could not accept.
 
 use serde_json::{Value, json};
 
@@ -134,9 +132,9 @@ mod tests {
 
     #[test]
     fn the_one_write_tool_points_at_the_catalog() {
-        // the description is the model's only view of the gate. the write tool
-        // must send the model to the catalog that names each operation's grant,
-        // and every live catalog operation must be reachable through it.
+        // the description is the model's only view of the door. the write tool
+        // must send the model to the catalog that names each operation's
+        // schemas, and every live catalog operation must be reachable through it.
         let [write] = write::tools().try_into().ok().expect("one write tool");
         assert_eq!(write.name, "ducktape_action");
         assert!(write.description.contains("ducktape_actions"));

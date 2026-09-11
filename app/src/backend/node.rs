@@ -9,7 +9,6 @@ pub struct SettingsFacts {
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
-    pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
     /// `ChatMember.key` is `member_id(..)` at full width, and the account card
     /// carries an account NUMBER, not a key, so neither the account card nor
@@ -20,8 +19,8 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-/// Load the settings facts: the local user key's location and state, the
-/// workspace directory, and the persisted tab count.
+/// Load the settings facts: the local user key's location and state, and the
+/// workspace directory.
 pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
@@ -33,7 +32,6 @@ pub async fn load_settings_facts(
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
             Ok(path) => (path.display().to_string(), key_state_of(&path)),
         };
-        let tabs = load_doc_tabs(rpc.clone()).await;
         let data_dir = workspace_at(&rpc)
             .map(|(_, dir)| dir.display().to_string())
             .or_else(|| ducktape_home().map(|home| home.display().to_string()))
@@ -43,7 +41,6 @@ pub async fn load_settings_facts(
             key_path,
             key_state,
             data_dir,
-            open_tabs: count_i64(tabs.len()),
             user_key: local_user_key()
                 .await
                 .map(|key| hex_encode(&key))
@@ -55,11 +52,6 @@ pub async fn load_settings_facts(
         generation,
         message: user_error(message),
     })
-}
-
-/// Forget this endpoint's persisted doc tabs.
-pub async fn clear_doc_tabs(rpc: String) -> bool {
-    save_doc_tabs(rpc, Vec::new()).await
 }
 
 /// One log line for the operator pane.
@@ -1085,52 +1077,6 @@ impl From<AgentSkill> for runs::SkillRef {
     }
 }
 
-/// The resource grant, list by list: the record's caps as the register shows
-/// them and the editor hands them back.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentCaps {
-    pub forge_read: Vec<String>,
-    pub forge_push: Vec<String>,
-    pub duckfs_read: Vec<String>,
-    pub duckfs_write: Vec<String>,
-    pub tools: Vec<String>,
-    pub secrets: Vec<String>,
-    pub pages_write: Vec<String>,
-    pub subagent_budget: i64,
-}
-
-impl From<runs::ResourceCaps> for AgentCaps {
-    fn from(caps: runs::ResourceCaps) -> Self {
-        Self {
-            forge_read: caps.forge_read,
-            forge_push: caps.forge_push,
-            duckfs_read: caps.duckfs_read,
-            duckfs_write: caps.duckfs_write,
-            tools: caps.tools,
-            secrets: caps.secrets,
-            pages_write: caps.pages_write,
-            subagent_budget: i64::from(caps.subagent_budget),
-        }
-    }
-}
-
-impl AgentCaps {
-    fn into_resource_caps(self) -> Result<runs::ResourceCaps, String> {
-        let subagent_budget = u32::try_from(self.subagent_budget)
-            .map_err(|_| "the subagent budget must be a whole number of calls".to_string())?;
-        Ok(runs::ResourceCaps {
-            forge_read: self.forge_read,
-            forge_push: self.forge_push,
-            duckfs_read: self.duckfs_read,
-            duckfs_write: self.duckfs_write,
-            tools: self.tools,
-            secrets: self.secrets,
-            pages_write: self.pages_write,
-            subagent_budget,
-        })
-    }
-}
-
 /// One configured model: its record, whole, with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
@@ -1148,8 +1094,6 @@ pub struct AgentRow {
     /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -1162,8 +1106,6 @@ pub struct AgentsData {
     /// Every capability tag a node on this network announces — what a
     /// record's `capability` can be dispatched on today.
     pub capabilities: Vec<String>,
-    /// The action vocabulary a grant draws from.
-    pub actions: Vec<String>,
 }
 
 /// Load model configurations with current account controllers and run activity.
@@ -1218,8 +1160,6 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                     status,
                     owner_handle,
                     controller: controller.to_string(),
-                    allowed_actions: record.allowed_actions,
-                    caps: record.caps.into(),
                     skills: record.skills.into_iter().map(AgentSkill::from).collect(),
                 })
             })
@@ -1237,10 +1177,6 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
             agents,
             runs,
             capabilities,
-            actions: runs::KNOWN_ACTIONS
-                .iter()
-                .map(|action| (*action).to_string())
-                .collect(),
         })
     }
     .await
@@ -1763,31 +1699,30 @@ fn pr_label(pr: &runs::PrRef) -> String {
 fn action_description(operation: &str, result: &serde_json::Value) -> String {
     use runs::*;
     match operation {
-        "react" => format!("React {}", receipt_text(result, "emoji")),
-        "unreact" => format!("Remove reaction {}", receipt_text(result, "emoji")),
-        "reply" => "Reply".into(),
-        ACTION_CHAT_POST_MESSAGE => "Post message".into(),
-        ACTION_PAGES_COMMENT => "Comment on page".into(),
-        ACTION_PAGES_SET_CHECKED => {
-            match result.get("checked").and_then(serde_json::Value::as_bool) {
-                Some(true) => "Check todo".into(),
-                Some(false) => "Uncheck todo".into(),
-                None => "Change todo".into(),
-            }
-        }
-        ACTION_PAGES_POST => "Publish page".into(),
-        ACTION_JOBS_COMMENT => "Comment on job".into(),
-        ACTION_TASKS_CREATE => "Create task".into(),
-        ACTION_TASKS_UPDATE_STATUS => format!(
+        OP_REACT => format!("React {}", receipt_text(result, "emoji")),
+        OP_UNREACT => format!("Remove reaction {}", receipt_text(result, "emoji")),
+        OP_REPLY => "Reply".into(),
+        OP_CHAT_POST_MESSAGE => "Post message".into(),
+        OP_PAGES_COMMENT => "Comment on page".into(),
+        OP_PAGES_SET_CHECKED => match result.get("checked").and_then(serde_json::Value::as_bool) {
+            Some(true) => "Check todo".into(),
+            Some(false) => "Uncheck todo".into(),
+            None => "Change todo".into(),
+        },
+        OP_PAGES_POST => "Publish page".into(),
+        OP_JOBS_COMMENT => "Comment on job".into(),
+        OP_TASKS_CREATE => "Create task".into(),
+        OP_TASKS_UPDATE_STATUS => format!(
             "Move task to {}",
             receipt_text(result, "status").replace('_', " ")
         ),
-        ACTION_DUCKFS_WRITE_TEXT => "Write file".into(),
-        ACTION_MODULES_UPDATE => "Request module deployment".into(),
-        ACTION_FORGE_OPEN_PR | "forge" => "Open pull request".into(),
-        ACTION_COLLABORATION_SEND => "Send agent message".into(),
-        ACTION_COLLABORATION_ACKNOWLEDGE => "Acknowledge agent message".into(),
-        "agent.call" => format!("Call {}", receipt_text(result, "callee_agent_id")),
+        OP_DUCKFS_WRITE_TEXT => "Write file".into(),
+        OP_MODULES_UPDATE => "Request module deployment".into(),
+        OP_FORGE_OPEN_PR | "forge" => "Open pull request".into(),
+        OP_COLLABORATION_SEND => "Send agent message".into(),
+        OP_COLLABORATION_ACKNOWLEDGE => "Acknowledge agent message".into(),
+        OP_AGENT_CALL => format!("Call {}", receipt_text(result, "callee_agent_id")),
+        OP_SUBMIT => format!("Submit to {}", receipt_text(result, "module")),
         _ => "Module action".into(),
     }
 }
@@ -1924,16 +1859,16 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<JournalT
         })
     };
     match operation {
-        "react" | "unreact" => Some(JournalTarget::Chat {
+        OP_REACT | OP_UNREACT => Some(JournalTarget::Chat {
             channel: text("channel_id"),
             seq: number("seq"),
         }),
-        ACTION_CHAT_POST_MESSAGE => Some(JournalTarget::Message {
+        OP_CHAT_POST_MESSAGE => Some(JournalTarget::Message {
             channel: text("channel_id"),
             thread: number("thread"),
             id: text("message_id"),
         }),
-        "reply" => {
+        OP_REPLY => {
             let destination = result.get("destination")?;
             match receipt_text(destination, "kind") {
                 "chat" => Some(JournalTarget::Message {
@@ -1953,7 +1888,7 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<JournalT
                 _ => None,
             }
         }
-        ACTION_PAGES_COMMENT => {
+        OP_PAGES_COMMENT => {
             let target = text("target");
             let place = match target.is_empty() {
                 true => RunPlace::PageThread {
@@ -1963,31 +1898,30 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<JournalT
             };
             Some(JournalTarget::Place(place))
         }
-        ACTION_PAGES_SET_CHECKED => Some(JournalTarget::Place(RunPlace::PageBlock {
+        OP_PAGES_SET_CHECKED => Some(JournalTarget::Place(RunPlace::PageBlock {
             block_id: text("block_id"),
         })),
-        ACTION_PAGES_POST => Some(JournalTarget::Place(RunPlace::Page {
+        OP_PAGES_POST => Some(JournalTarget::Place(RunPlace::Page {
             page_id: text("page_id"),
             title: text("title"),
         })),
-        ACTION_JOBS_COMMENT => label("job", "Job discussion"),
-        ACTION_TASKS_CREATE | ACTION_TASKS_UPDATE_STATUS => {
-            Some(JournalTarget::Place(RunPlace::Task {
-                task_id: text("task_id"),
-            }))
-        }
-        ACTION_DUCKFS_WRITE_TEXT => label("file", receipt_text(result, "path")),
-        ACTION_MODULES_UPDATE => label("module", receipt_text(result, "module_id")),
-        ACTION_FORGE_OPEN_PR => Some(JournalTarget::ForgeRepository(text("repo"))),
-        ACTION_COLLABORATION_SEND | ACTION_COLLABORATION_ACKNOWLEDGE => {
+        OP_JOBS_COMMENT => label("job", "Job discussion"),
+        OP_TASKS_CREATE | OP_TASKS_UPDATE_STATUS => Some(JournalTarget::Place(RunPlace::Task {
+            task_id: text("task_id"),
+        })),
+        OP_DUCKFS_WRITE_TEXT => label("file", receipt_text(result, "path")),
+        OP_MODULES_UPDATE => label("module", receipt_text(result, "module_id")),
+        OP_FORGE_OPEN_PR => Some(JournalTarget::ForgeRepository(text("repo"))),
+        OP_COLLABORATION_SEND | OP_COLLABORATION_ACKNOWLEDGE => {
             label("conversation", "Agent conversation")
         }
-        "agent.call" => Some(JournalTarget::Place(RunPlace::Run {
+        OP_AGENT_CALL => Some(JournalTarget::Place(RunPlace::Run {
             dispatch_id: dispatch_id_for(&delegated_run_id_for(
                 receipt_text(result, "delegation_id"),
                 receipt_text(result, "callee_agent_id"),
             )),
         })),
+        OP_SUBMIT => label("module", receipt_text(result, "module")),
         _ => None,
     }
 }
@@ -2443,8 +2377,6 @@ pub struct AgentDraft {
     pub agent_id: String,
     pub display_name: String,
     pub capability: String,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -2467,9 +2399,7 @@ pub async fn save_agent(rpc: String, password: String, draft: String) -> Result<
             agent_id,
             display_name: Some(draft.display_name),
             capability: Some(draft.capability),
-            allowed_actions: Some(draft.allowed_actions),
             recipe_hash: None,
-            caps: Some(draft.caps.into_resource_caps()?),
             skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
         };
         let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
@@ -2519,9 +2449,7 @@ pub async fn register_agent(
             agent_id: draft.agent_id,
             display_name,
             capability: draft.capability,
-            allowed_actions: draft.allowed_actions,
             recipe_hash: None,
-            caps: Some(draft.caps.into_resource_caps()?),
             skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
         };
         let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
@@ -3999,7 +3927,7 @@ mod journal_summary_tests {
             account: 7,
             generation: 1,
             run_id: "run".into(),
-            operation: runs::ACTION_FORGE_OPEN_PR.into(),
+            operation: runs::OP_FORGE_OPEN_PR.into(),
             target: "forge".into(),
             result: serde_json::Value::Null,
             payload: serde_json::to_value(::forge::ForgeMsg::OpenPr {

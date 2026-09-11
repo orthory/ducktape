@@ -29,7 +29,7 @@ pub use ::chat::client::{
     author_display, bounded_chat_window, bounded_thread_window, chat_message,
     contains_pending_message, handle_char, mark_message_groups, merge_landing_messages,
     merge_message_send_result, merge_pending_messages, merge_thread_refresh,
-    parse_message_with_mentions, rollback_pending_message, short_label,
+    rollback_pending_message, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.

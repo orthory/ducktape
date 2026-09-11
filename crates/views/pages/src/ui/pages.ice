@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
+component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -11,7 +11,6 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
     arm_page_delete()
     disarm_page_delete()
     delete_page_submit()
-    close_doc_tab(str)
     open_page_search_hit(str, str)
     use_orphaned_comment_draft(str)
     discard_orphaned_comment_draft(str)
@@ -359,68 +358,6 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 h=1.0
                 bg=separator
               space w=1.0 h=1.0
-        if connected && !empty(doc_tabs)
-          box
-            with
-              w=fill
-              h=34.0
-              pl=8.0
-              pr=8.0
-              bg=sidebar
-              border=separator
-              border-w=1.0
-            scroll
-              with
-                dir=horizontal
-                w=fill
-                h=fill
-                bar=hidden
-              row
-                with
-                  h=fill
-                  gap=2.0
-                  align=center
-                for tab in doc_tabs
-                  row gap=0.0 align=center
-                    button -> emit(choose_page, tab.id)
-                      with
-                        label="Open page tab"
-                        checked=tab.active
-                        h=26.0
-                        p=5.0
-                        @ghost_action
-                      row
-                        with
-                          h=fill
-                          gap=5.0
-                          align=center
-                        if tab.active
-                          text tab.title
-                            with
-                              size=13.0
-                              wrap=none
-                              font=medium
-                              @text-fg
-                        if !tab.active
-                          text tab.title
-                            with
-                              size=13.0
-                              wrap=none
-                              @text-muted
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
-                      hovered bg=fg/5 text=fg
-                      pressed bg=fg/8
-                    button -> emit(close_doc_tab, tab.id)
-                      with
-                        label="Close page tab"
-                        w=24.0
-                        h=24.0
-                        p=0.0
-                        @icon_action
-                      text "×" size=12.5 font=ui
-                      active bg=transparent text=muted r=6.0
-                      hovered bg=fg/8 text=fg
-                      pressed bg=fg/12
         stack
           with
             w=fill
@@ -519,7 +456,6 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                             with
                               label="Use as comment"
                               disabled=(loading || busy)
-                              h=26.0
                               p=5.0
                               @ghost_action
                             active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
@@ -528,7 +464,6 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                           button "Discard" -> emit(discard_orphaned_comment_draft, recovered_comment)
                             with
                               disabled=(loading || busy)
-                              h=26.0
                               p=5.0
                               @danger_action
                 // THE PAGE. One editor, the whole document — see the file
@@ -801,9 +736,8 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                       button "More" -> emit(load_more_block_threads)
                         with
                           disabled=(threads_loading || busy)
-                          h=24.0
                           p=4.0
-                          @secondary_action
+                          @secondary_action text-11px leading-snug font-medium
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
@@ -816,9 +750,8 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                   button "← Threads" -> emit(close_block_comment_thread)
                     with
                       disabled=(comments_loading || busy)
-                      h=24.0
                       p=4.0
-                      @secondary_action
+                      @secondary_action text-11px leading-snug font-medium
                     active bg=transparent text=muted r=6.0
                     hovered bg=fg/9 text=fg
                     pressed bg=fg/14
@@ -833,9 +766,8 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                     button "Resolve" -> emit(resolve_thread_submit, true)
                       with
                         disabled=(busy)
-                        h=24.0
                         p=4.0
-                        @secondary_action
+                        @secondary_action text-11px leading-snug font-medium
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
@@ -843,9 +775,8 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                     button "Reopen" -> emit(resolve_thread_submit, false)
                       with
                         disabled=(busy)
-                        h=24.0
                         p=4.0
-                        @secondary_action
+                        @secondary_action text-11px leading-snug font-medium
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
@@ -861,9 +792,8 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                       button "More" -> emit(load_more_block_comments)
                         with
                           disabled=(comments_loading || busy)
-                          h=24.0
                           p=4.0
-                          @secondary_action
+                          @secondary_action text-11px leading-snug font-medium
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
@@ -898,6 +828,5 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 button "Post" #post -> emit(post_block_comment_submit)
                   with
                     disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
-                    h=28.0
                     p=5.0
                     @primary_action

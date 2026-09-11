@@ -70,8 +70,6 @@ test palette_escape_contract
         space w=1.0 h=1.0
       chat:
         space w=1.0 h=1.0
-      shell:
-        space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
       files:
@@ -201,8 +199,6 @@ test minimum_window_layout_contract
       notice:
         space w=1.0 h=1.0
       chat:
-        space w=1.0 h=1.0
-      shell:
         space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0

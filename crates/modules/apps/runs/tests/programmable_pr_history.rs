@@ -96,33 +96,6 @@ async fn awaiting_pr_with_actions(
     ));
     network.provision_program(program).await;
     network
-        .submit(
-            member(),
-            msg(
-                "runs",
-                &runs::RunsMsg::ConfigureModel {
-                    operation: runs::ModelMsg::UpdateModel {
-                        agent_id: "builder".into(),
-                        display_name: None,
-                        capability: None,
-                        allowed_actions: Some(vec![
-                            runs::ACTION_TASKS_CREATE.into(),
-                            runs::ACTION_CHAT_POST.into(),
-                            runs::ACTION_MODULES_UPDATE.into(),
-                        ]),
-                        recipe_hash: None,
-                        skills: None,
-                        caps: Some(runs::ResourceCaps {
-                            forge_read: vec!["demo".into()],
-                            forge_push: vec!["demo".into()],
-                            ..Default::default()
-                        }),
-                    },
-                },
-            ),
-        )
-        .await;
-    network
         .submit(member(), msg("forge", &push("dev", None, Some(1))))
         .await;
     network

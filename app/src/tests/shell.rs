@@ -444,10 +444,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
         ("forge_load_selected", "forge_generation"),
-        (
-            "shell_credentials_load_selected",
-            "shell_credentials_generation",
-        ),
     ] {
         let guarded = format!(
             "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}"
@@ -468,10 +464,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
         ),
         ("forge_load_selected", "shell_tab != ShellTab.forge"),
-        (
-            "shell_credentials_load_selected",
-            "shell_tab != ShellTab.shell",
-        ),
     ] {
         let handler = lifecycle
             .split_once(&format!("on {selected}(request)"))
@@ -510,7 +502,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
-            open_tabs: 0,
             user_key: "abcd".into(),
         },
     ));
@@ -564,13 +555,10 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
             owner_handle: String::new(),
             controller: String::new(),
             live: true,
-            allowed_actions: Vec::new(),
-            caps: backend::AgentCaps::default(),
             skills: Vec::new(),
         }],
         runs: Vec::new(),
         capabilities: Vec::new(),
-        actions: Vec::new(),
     }));
     assert!(
         backend::any_agent_active(&app.agents_rows),
@@ -1147,9 +1135,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "root state reclaimed `reply_draft`"
     );
     let page_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
-    assert!(!root_state.contains("closing_doc_tab"));
-    assert!(page_handlers.contains("on close_doc_tab(id)"));
-    assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
     assert!(!root_state.contains("page_link"));
     assert!(page_handlers.contains("let page_link = document.link"));
 
@@ -1927,101 +1912,6 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.message_action, MessageAction::Editing);
     assert_eq!(app.selected_message_seq, 4);
     assert_eq!(app.selected_message_rev, 2);
-}
-
-/// A RUN IN FLIGHT IS NOT A CAGE.
-///
-/// The Shell screen used to refuse, while a task or a session was live: the
-/// surface switch, both pickers, and the reset — `return if shell_terminal_busy
-/// || shell_terminal_running || shell_chat_busy` at the top of every one. That
-/// left exactly one state with no exit: a run whose event stream stalls holds
-/// `shell_chat_busy` forever, and every control that could have moved the
-/// operator off it is disabled by the same flag. The tab is wedged until the
-/// app restarts.
-///
-/// Two properties close it, and both are pinned here: the switch always lands,
-/// and `shell_chat_detach` — the operator's way out — is reachable from INSIDE
-/// the busy state it exits.
-#[test]
-fn a_running_turn_never_locks_the_screen_that_started_it() {
-    let saga = format!("origin/sched\u{1f}{}", "a".repeat(64));
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Shell;
-    app.shell_provider = "codex".into();
-    app.shell_chat_entries =
-        backend::agent_chat_push_user(Vec::new(), "do it".into(), "codex".into());
-    app.shell_chat_busy = true;
-    app.shell_chat_saga = saga.clone();
-
-    let _ = app.__update(__DucktapeMessage::ShellSurfaceChanged(
-        ShellSurface::Terminal,
-    ));
-    assert_eq!(
-        app.shell_surface,
-        ShellSurface::Terminal,
-        "a live task must not pin the operator to the surface that started it"
-    );
-
-    let _ = app.__update(__DucktapeMessage::ShellChatDetach);
-    assert!(!app.shell_chat_busy, "detaching leaves the busy state");
-    assert_eq!(
-        app.shell_detached_saga, saga,
-        "STOP WATCHING, NOT STOP RUNNING: the turn keeps the id that reaches \
-         the still-executing saga"
-    );
-    let closed = app.shell_chat_entries.last().expect("the turn is closed");
-    assert_eq!(closed.status, "detached");
-    assert_eq!(closed.saga_id, saga);
-
-    // and discarding it hands the composer back.
-    let _ = app.__update(__DucktapeMessage::ShellChatDiscard);
-    assert!(app.shell_detached_saga.is_empty());
-    assert_eq!(app.shell_chat_entries.len(), 1);
-}
-
-/// ONE PICK, BOTH ANSWERS. `--cred` decides the provider, so choosing an
-/// identity settles the credential AND the provider, and re-narrows the host
-/// list to the peers that announced it — a peer that cannot serve the pick must
-/// not survive the change that made it unreachable.
-#[test]
-fn choosing_an_identity_settles_the_provider_and_re_narrows_the_hosts() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Shell;
-    app.shell_host_nodes = vec![backend::AgentHostNode {
-        key: "b".repeat(64),
-        label: "bo".into(),
-        providers: vec!["codex".into()],
-    }];
-    app.shell_identities = backend::agent_identities(vec![
-        backend::AgentCredential {
-            name: "x1".into(),
-            provider: "codex".into(),
-        },
-        backend::AgentCredential {
-            name: "c1".into(),
-            provider: "claude".into(),
-        },
-    ]);
-
-    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged("x1 · Codex".into()));
-    assert_eq!(app.shell_provider, "codex");
-    assert_eq!(app.shell_credential, "x1");
-    assert_eq!(app.shell_host_node_options, ["This node", "bo"]);
-
-    let _ = app.__update(__DucktapeMessage::ShellHostNodeChanged("bo".into()));
-    assert_eq!(app.shell_host_node_key, "b".repeat(64));
-
-    // bo announces no claude provider, so the run it would bounce is not on
-    // offer — and the pick that pointed at it falls back to the local row.
-    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged(
-        "c1 · Claude Code".into(),
-    ));
-    assert_eq!(app.shell_provider, "claude");
-    assert_eq!(app.shell_host_node_options, ["This node"]);
-    assert_eq!(app.shell_host_node, "This node");
-    assert_eq!(app.shell_host_node_key, "");
 }
 
 /// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only

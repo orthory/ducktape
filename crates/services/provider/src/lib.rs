@@ -205,9 +205,6 @@ pub(crate) use sandbox_host::sandbox;
 pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
-// the duckfs read cap applied to a reply: shared by this crate's read lane and
-// `bin/node`'s MCP read tools, so the two gate identically.
-pub mod duckfs_cap;
 mod egress_proxy;
 mod read_lane;
 mod spec;
@@ -289,9 +286,9 @@ impl Eq for RunCancellation {}
 
 /// This node's operator credential as a run's node lane lends it. Read fresh
 /// on every use, because the node re-mints it each boot; never handed to the
-/// guest — the lane attaches it only to a forge push the run's committed
-/// grant admits, so a push proves itself with the node's authority rather
-/// than with a signing key the guest never holds.
+/// guest — the lane attaches it to the guest's forge pushes itself, so a push
+/// proves itself with the node's authority rather than with a signing key the
+/// guest never holds.
 #[derive(Clone)]
 pub struct OperatorCredential {
     header: &'static str,
@@ -800,7 +797,7 @@ impl CliProvider {
         };
 
         let mut envs = self.sandbox_env(ctx, auth)?;
-        // the run's node entry is its OWN cap-checked read lane, not the node's
+        // the run's node entry is its OWN read lane, not the node's
         // listener: this binds it and repoints `DUCKTAPE_NODE` at it, so what
         // gets tunnelled below is the lane's port. It lives exactly as long as
         // the returned value, which the run holds beside its VM.
@@ -1784,12 +1781,10 @@ impl Drop for ContextGuard {
 /// **The node entry is this run's read lane, not the node's listener.** The VM
 /// has no NIC, so these tunnels ARE the guest's attack surface — and the node
 /// end of them terminates in [`read_lane::ReadLane`], a loopback proxy bound to
-/// THIS run, which refuses `/v1/ws` outright and admits a `/v1/files/*` read
-/// only under the run's committed `duckfs_read` cap (see that module). What is
+/// THIS run, which refuses `/v1/ws` outright (see that module). What is
 /// reachable from any process in the guest, with no credential:
 /// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
-///   `/v1/blocks`, `/v1/index/*`, `/metrics`; the `/v1/files/*` duckfs reads
-///   only inside the run's cap;
+///   `/v1/blocks`, `/v1/index/*`, `/metrics`, the `/v1/files/*` duckfs reads;
 /// * `/v1/submit/frame` — self-authenticating: the frame's own signature IS
 ///   its origin, so a guest with no key can put nothing through it;
 /// * `/v1/services/hello`, volatile presence that ages out on its own TTL;
@@ -1808,8 +1803,7 @@ impl Drop for ContextGuard {
 /// `git-receive-pack` takes the same two proofs in git's own shapes — a
 /// `git push --signed` certificate or that operator credential in a header —
 /// and a guest can present neither ITSELF: the lane presents the operator
-/// credential on the guest's behalf, and only for a push the run's committed
-/// `forge_push` cap admits (a fetch needs `forge_read`).
+/// credential on the guest's behalf for every push (a fetch needs no proof).
 ///
 /// Off the host altogether, the guest has one more tunnel: its egress proxy
 /// ([`egress_proxy`]), named through `HTTP_PROXY`/`HTTPS_PROXY`, which dials
@@ -2513,7 +2507,7 @@ struct MicroVmHandle {
 }
 
 /// the host ends of a guest's tunnels that this crate itself terminates: the
-/// cap-checked node lane behind `DUCKTAPE_NODE`, and the egress proxy behind
+/// node lane behind `DUCKTAPE_NODE`, and the egress proxy behind
 /// `HTTPS_PROXY`. Each lives exactly as long as the run holding it.
 pub(crate) struct GuestLanes {
     _read_lane: Option<read_lane::ReadLane>,

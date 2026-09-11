@@ -111,7 +111,6 @@ on agents_loaded(next)
   agents_rows = next.agents
   agents_runs = next.runs
   agents_capabilities = next.capabilities
-  agents_actions = next.actions
   // the open journal follows the register: the op that moved the register
   // may have moved the open run too
   return if empty(agents_open_run)

@@ -13,7 +13,7 @@ enum SettingsPane
   account
   security
 
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
   emits
     show_tab(str)
     reconnect()
@@ -31,7 +31,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     account_wallet_submit()
     account_login_submit()
     copy_to_clipboard(str, str)
-    settings_clear_tabs()
     set_appearance_light()
     set_appearance_dark()
     set_desktop_notifications(bool)
@@ -173,28 +172,24 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     button "Light" -> emit(set_appearance_light)
                       with
                         checked=true
-                        h=28.0
                         p=6.0
                         @primary_action
                   if appearance != "light"
                     button "Light" -> emit(set_appearance_light)
                       with
                         checked=false
-                        h=28.0
                         p=6.0
                         @secondary_action
                   if appearance == "dark"
                     button "Dark" -> emit(set_appearance_dark)
                       with
                         checked=true
-                        h=28.0
                         p=6.0
                         @primary_action
                   if appearance != "dark"
                     button "Dark" -> emit(set_appearance_dark)
                       with
                         checked=false
-                        h=28.0
                         p=6.0
                         @secondary_action
             col w=fill gap=9.0
@@ -230,28 +225,24 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     button "On" -> emit(set_desktop_notifications, true)
                       with
                         checked=true
-                        h=28.0
                         p=6.0
                         @primary_action
                   if !desktop_notifications
                     button "On" -> emit(set_desktop_notifications, true)
                       with
                         checked=false
-                        h=28.0
                         p=6.0
                         @secondary_action
                   if !desktop_notifications
                     button "Off" -> emit(set_desktop_notifications, false)
                       with
                         checked=true
-                        h=28.0
                         p=6.0
                         @primary_action
                   if desktop_notifications
                     button "Off" -> emit(set_desktop_notifications, false)
                       with
                         checked=false
-                        h=28.0
                         p=6.0
                         @secondary_action
             // NO PREFERENCES GROUP. `Change receipts` was a placebo: every
@@ -261,44 +252,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
             // and flipped itself OFF a beat later, because the loader
             // answers `false` for an absent key. The group comes back the
             // day the marks are actually gated on it.
-            col w=fill gap=9.0
-              GroupLabel label="THIS DEVICE"
-              box
-                with
-                  w=fill
-                  bg=surface
-                  border=card_line
-                  border-w=1.0
-                  r=11.0
-                  clip=true
-                col w=fill
-                  box
-                    with
-                      w=fill
-                      px=15.0
-                      py=13.0
-                    row
-                      with
-                        w=fill
-                        gap=10.0
-                        align=center
-                      col w=fill gap=1.0
-                        text "Open page tabs" size=12.5 @text-accent_fg
-                        text "Preferences persist per endpoint in app-prefs.json beside the user key."
-                          with
-                            size=12.5
-                            @text-meta
-                      text settings_open_tabs
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code_medium
-                          @text-secondary_fg
-                      button "Forget tabs" -> emit(settings_clear_tabs)
-                        with
-                          h=28.0
-                          p=5.0
-                          @secondary_action
         SettingsPane.network
           col w=fill gap=18.0
             col w=fill gap=9.0
@@ -341,9 +294,8 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           @text-secondary_fg
                       button "manage" -> emit(show_tab, "members")
                         with
-                          h=22.0
                           p=0.0
-                          @ghost_action
+                          @ghost_action text-11px leading-snug font-medium
                         active bg=transparent text=brand border=transparent border-w=1.0 r=6.0
                         hovered bg=elevated text=brand
                         pressed bg=subtle text=brand
@@ -371,9 +323,8 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           @text-secondary_fg
                       button "view" -> emit(show_tab, "node")
                         with
-                          h=22.0
                           p=0.0
-                          @ghost_action
+                          @ghost_action text-11px leading-snug font-medium
                         active bg=transparent text=brand border=transparent border-w=1.0 r=6.0
                         hovered bg=elevated text=brand
                         pressed bg=subtle text=brand
@@ -398,13 +349,11 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       button "Reconnect" -> emit(reconnect)
                         with
                           disabled=(loading || (busy && !recovering))
-                          h=28.0
                           p=6.0
                           @secondary_action
                       button "Switch network" -> emit(switch_network)
                         with
                           disabled=busy
-                          h=28.0
                           p=6.0
                           @secondary_action
         // WHO YOU ARE, AND EVERY KEY THAT SPEAKS FOR YOU — one pane, because
@@ -540,7 +489,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       button "Rename" -> emit(account_rename_submit)
                         with
                           disabled=(account_renaming || empty(trim(account_name_draft)))
-                          h=28.0
                           p=5.0
                           @secondary_action
                     // NO ACCOUNT YET: this key founds one, or joins one another
@@ -569,7 +517,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         button "Create account" -> emit(account_create_submit)
                           with
                             disabled=(account_busy || !unlocked || empty(trim(account_create_draft)))
-                            h=28.0
                             p=5.0
                             @secondary_action
                       row
@@ -594,7 +541,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         button "Join" -> emit(account_key_join_submit)
                           with
                             disabled=(account_busy || !unlocked || empty(trim(account_join_draft)))
-                            h=28.0
                             p=5.0
                             @secondary_action
                       // …or a passkey registered on a member device consents in
@@ -613,7 +559,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         button "Log in with a passkey" -> emit(account_login_submit)
                           with
                             disabled=(account_busy || !unlocked)
-                            h=28.0
                             p=5.0
                             @secondary_action
                       CeremonyPlate #account-login-ceremony
@@ -650,7 +595,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           with
                             label="Copy number"
                             disabled=empty(account_number)
-                            h=28.0
                             p=7.0
                             @secondary_action
             // THE ACCOUNT'S KEYS — every device, wallet or passkey on it. A row
@@ -700,7 +644,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           button "Remove" -> emit(account_key_remove, row.pubkey)
                             with
                               disabled=(account_busy || !unlocked || account_keys <= 1)
-                              h=26.0
                               p=5.0
                               @secondary_action
                     // ADD A DEVICE: paste the other device's key, mint the ticket
@@ -750,7 +693,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           button "Mint ticket" -> emit(account_key_add_submit)
                             with
                               disabled=(account_busy || !unlocked || empty(trim(account_key_draft)))
-                              h=28.0
                               p=5.0
                               @secondary_action
                         // …or a passkey: from the phone (the card shows a QR),
@@ -770,19 +712,16 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           button "On your phone" #account-passkey-qr -> emit(account_passkey_submit)
                             with
                               disabled=(account_busy || !unlocked)
-                              h=28.0
                               p=5.0
                               @secondary_action
                           button "In this browser" -> emit(account_passkey_desktop)
                             with
                               disabled=(account_busy || !unlocked)
-                              h=28.0
                               p=5.0
                               @secondary_action
                           button "Link a wallet" -> emit(account_wallet_submit)
                             with
                               disabled=(account_busy || !unlocked)
-                              h=28.0
                               p=5.0
                               @secondary_action
                         CeremonyPlate #account-ceremony
@@ -806,7 +745,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                                 @text-meta
                             button "Copy ticket" -> emit(copy_to_clipboard, account_ticket, "Ticket copied")
                               with
-                                h=26.0
                                 p=5.0
                                 @secondary_action
         SettingsPane.security
@@ -858,7 +796,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           button "Unlock" -> emit(settings_unlock_submit, key_pw)
                             with
                               disabled=(busy || empty(key_pw))
-                              h=28.0
                               p=6.0
                               @secondary_action
                       if unlocked
@@ -874,6 +811,5 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                               @text-meta
                           button "Lock" -> emit(lock_session)
                             with
-                              h=28.0
                               p=6.0
                               @secondary_action

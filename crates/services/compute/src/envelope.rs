@@ -62,13 +62,6 @@ struct WireEnvelope {
     context: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
-    /// the committed `duckfs_read` verdict on the global skill library: the
-    /// composer asks the agent's record (`runs::ModelRecord::library_readable`)
-    /// and states the answer here, because the host has no consensus registry to
-    /// ask. required (the composer always states it) — an envelope that never
-    /// stated the grant cannot have earned it, and the paragraph it gates would
-    /// only send the agent at a door the tool plane refuses.
-    library_readable: bool,
     result_contract: Option<WireResultContract>,
     /// the on-chain gateway credential name this run draws its provider
     /// subscription from (`ducktape agent sched --cred`). ABSENT for every
@@ -164,7 +157,6 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         envelope.skills,
         envelope.result_contract,
         agent_display_name,
-        envelope.library_readable,
     )?;
     // reading order: system instructions → item context (forge runs only: what
     // this run is working ON) → output contract → conversation. every section is
@@ -214,7 +206,6 @@ fn accept_portable_envelope(
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
     agent_display_name: String,
-    library_readable: bool,
 ) -> Result<PortablePlan, String> {
     let workspace = workspace.ok_or_else(|| "run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
@@ -244,9 +235,6 @@ fn accept_portable_envelope(
     // decides whether to act on.
     Ok(PortablePlan {
         source,
-        // consensus decided this (the agent's duckfs_read caps); the host only
-        // obeys — exactly like a skill's load mode.
-        library_readable,
         // the id CONSENSUS knows this run by — carried through to the
         // provisioner, which is the only thing that can name the run back to
         // `runs`.
@@ -301,7 +289,6 @@ mod tests {
             "skills": [
                 {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32), "always": false}
             ],
-            "library_readable": false,
             "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
@@ -325,11 +312,9 @@ mod tests {
                 "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
-                "branch_born": false,
-                "forge_push": true
+                "branch_born": false
             },
             "skills": [],
-            "library_readable": false,
             "result_contract": {
                 "ducktape_runner_result": 1,
                 "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}
@@ -518,28 +503,6 @@ mod tests {
         );
     }
 
-    /// the library grant crosses the wall as plain data: consensus decided it
-    /// (the agent's `duckfs_read` caps), and the plan carries it to the
-    /// assembler, which is what decides whether the run is ever TOLD the shared
-    /// library exists. a `false` grant means the run is never pointed at the
-    /// library — advertising a door the tool plane would refuse is the one
-    /// outcome this field exists to prevent.
-    #[test]
-    fn the_library_read_grant_rides_the_envelope_into_the_plan() {
-        let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        v["library_readable"] = serde_json::json!(true);
-        let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
-        assert!(workspace.library_readable);
-
-        // the composer stating `false` (an agent with no grant) rides through
-        // as false.
-        let Prepared { workspace, .. } = prepare(&envelope_json()).unwrap();
-        assert!(
-            !workspace.library_readable,
-            "a false grant is no grant: the run is never pointed at the library"
-        );
-    }
-
     #[test]
     fn the_plan_carries_the_consensus_run_id_and_an_absent_one_fails_the_decode() {
         // the id `runs` resolves the run by. it MUST survive the decode: the
@@ -589,7 +552,6 @@ mod tests {
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: true,
             }
         );
         assert_eq!(

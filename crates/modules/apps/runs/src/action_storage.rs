@@ -181,9 +181,8 @@ impl RunsModule {
             RequestScope::Session { .. } => LaneKind::Live,
             RequestScope::Result => LaneKind::Final,
         };
-        let payload = canonical_action_payload(
-            sdk::wire::decode(&message.payload).map_err(Error::Module)?,
-        );
+        let payload =
+            canonical_action_payload(sdk::wire::decode(&message.payload).map_err(Error::Module)?);
         let view = ActionRequestView {
             request_id: id.clone(),
             account: entry.account,
@@ -206,8 +205,7 @@ impl RunsModule {
         let next = item
             .checked_add(1)
             .ok_or_else(|| Error::Module("action delivery counter exhausted".into()))?;
-        let model = self
-            .model(&entry.agent_id)
+        self.model(&entry.agent_id)
             .ok_or_else(|| Error::Module("run model no longer exists".into()))?;
         let record = ActionRequest {
             view,
@@ -216,7 +214,6 @@ impl RunsModule {
             publication: Publication::Queued,
             scope,
             model_id: entry.agent_id.clone(),
-            grant: RunAuthority::from_record(model),
             invocation: receipt.invocation,
         };
         // Agent invocation names consist of account/sequence, both u64. Claim
