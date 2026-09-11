@@ -4422,6 +4422,86 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    #[test]
+    fn a_chat_notification_scrolls_the_native_thread_to_its_target_once() {
+        use iced::advanced::widget::Operation;
+        use iced::{Rectangle, Size, Vector};
+        use iced_test::runtime::{UserInterface, user_interface};
+        struct Position(iced::widget::Id, Option<(f32, f32)>);
+        impl Operation for Position {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&self.0) {
+                    self.1 = Some((translation.y, content.height - bounds.height));
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        let rows: Vec<_> = (1..=60)
+            .map(|seq| {
+                let body = format!("Reply {seq}: {}", "conversation context ".repeat(8));
+                crate::backend::ChatMessage {
+                    blocks: chat::client::paragraph_blocks(&body),
+                    body,
+                    thread_seq: if seq == 1 { 0 } else { 1 },
+                    ..first_light_at(seq)
+                }
+            })
+            .collect();
+        let bytes = chat_facts_with(&rows[..1], &rows).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        facts["active_thread_seq"] = 1.into();
+        facts["thread_target_seq"] = 31.into();
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let path = staged("chat").expect("actual Chat Wasm is required");
+        let mut guest = Guest::load_from("chat", &path).unwrap();
+        guest.redraw(&None);
+        guest.redraw(&props);
+        assert_eq!(guest.widget_commands.len(), 1, "{:?}", guest.fault);
+        assert!(matches!(
+            &guest.widget_commands[0].2,
+            wire::WidgetCommand::ScrollToKey { key: 31, .. }
+        ));
+        let target = match &guest.widget_commands[0].2 {
+            wire::WidgetCommand::ScrollToKey { target, .. } => target.clone(),
+            _ => unreachable!(),
+        };
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(1280.0, 800.0);
+        let mut ui = UserInterface::build(
+            guest.render(),
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        guest.execute_widget_commands(|operation| ui.operate(&renderer, operation));
+        let cache = ui.into_cache();
+        let mut ui = UserInterface::build(guest.render(), size, cache, &mut renderer);
+        let mut position = Position(iced::widget::Id::from(target), None);
+        ui.operate(&renderer, &mut position);
+        let (offset, maximum) = position.1.expect("thread scroll exists");
+        assert!(
+            offset > 0.0 && offset < maximum,
+            "target is inside the conversation: {offset}/{maximum}"
+        );
+        drop(ui);
+        guest.redraw(&props);
+        assert!(
+            guest.widget_commands.is_empty(),
+            "an unchanged target must not reset reading position"
+        );
+        assert!(guest.fault.is_none());
+    }
+
     /// The bundled Explorer view end to end through the host, on the kernel
     /// contract: it boots on the offline plate, and once the session says
     /// connected it reads the block window itself — an `rpc.live`
