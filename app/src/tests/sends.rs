@@ -52,8 +52,8 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
             "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
             "keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, \
              palette_open, bell_open, channel_create_open, thread_message_action, \
-             message_action, channel_settings_open, page_delete_armed, \
-             fs_delete_target)) -> global_key_pressed _",
+             message_action, channel_settings_open, page_delete_armed)) -> \
+             global_key_pressed _",
             "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
             "keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == \
              ShellTab.chat) -> copy_chord_pressed _",
