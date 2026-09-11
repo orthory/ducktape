@@ -12,9 +12,10 @@
 //! care how busy the machine is, and the large fixtures make per-row list
 //! clones and lost virtualization visible in the medians.
 //!
-//! THE CHAT PROBES LEFT WITH THE CHAT SCREEN. Its timeline, rail, composer
-//! keystroke and room switch are the `chat` view's frames now, measured
-//! against the view's own tree rather than this app's.
+//! THE CHAT AND PAGES PROBES LEFT WITH THEIR SCREENS. Chat's timeline, rail,
+//! composer keystroke and room switch, and the pages comments card, are their
+//! views' own frames now, measured against each view's tree rather than this
+//! app's. What is left here is the huddle window, which is the app's.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
@@ -26,14 +27,12 @@ use iced::{Event, Size};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape, ShellTab};
+use super::{__DucktapeMessage, Ducktape};
 
 /// The head seq a probe channel wears — a workspace with real scrollback
 /// behind each room, so the sidebar's per-row work is visible.
 const ROWS: i64 = 256;
-const WINDOW: Size = Size::new(1440.0, 900.0);
 const HUDDLE_WINDOW: Size = Size::new(320.0, 460.0);
-const PAGE_ROWS: usize = 128;
 const HUDDLE_ROWS: usize = 32;
 /// Enough passes to fill the lazy parking lot and settle the text caches.
 const WARMUP_FRAMES: usize = 4;
@@ -48,19 +47,7 @@ struct ScreenProbe {
 
 const SCREEN_PROBES: &[ScreenProbe] = &[
     // Each ceiling sits between the optimized baseline and the smallest
-    // one-change negative control measured with this deterministic fixture:
-    // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
-    // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
-    // externs borrowing their list and string arguments
-    // (`subpage_blocks`, `comment_scope_label`, `comment_compose_hint`, and
-    // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
-    // externs cloning them per frame.
-    ScreenProbe {
-        label: "pages comments build+layout",
-        size: WINDOW,
-        fixture: console_in_page_comments,
-        allocation_ceiling: 30_000,
-    },
+    // one-change negative control measured with this deterministic fixture.
     // 4,947 vs 7,059 for restoring per-row peer lookup.
     ScreenProbe {
         label: "huddle build+layout",
@@ -177,83 +164,6 @@ fn probe_channel(index: i64) -> backend::ChatChannel {
     probe_channel_with_head(index, ROWS)
 }
 
-fn console_on(tab: ShellTab) -> (Ducktape, iced::window::Id) {
-    let (mut app, _) = Ducktape::__boot();
-    let console = iced::window::Id::unique();
-    app.console_win = Some(console);
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab));
-    assert_eq!(app.shell_tab, tab, "the probe mounts the requested screen");
-    (app, console)
-}
-
-fn probe_page_block(index: usize) -> backend::PageBlock {
-    backend::PageBlock {
-        key: index as i64,
-        id: format!("block-{index}"),
-        parent: "page".into(),
-        kind: "Text".into(),
-        text: format!(
-            "Page paragraph {index} gives the comment rail a stable, non-empty anchor label."
-        ),
-        pending: false,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-    }
-}
-
-fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Pages);
-    let blocks: Vec<_> = (0..PAGE_ROWS).map(probe_page_block).collect();
-    let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
-        pages: vec![backend::PageItem {
-            id: "page".into(),
-            title: "Performance notes".into(),
-            parent: String::new(),
-            prefix: String::new(),
-            child_count: 0,
-        }],
-        blocks,
-        active_page: "page".into(),
-        active_page_title: "Performance notes".into(),
-        active_page_parent: String::new(),
-        comment_thread_total: PAGE_ROWS as i64,
-        commented_block_hits: Vec::new(),
-    }));
-    let _ = app.__update(__DucktapeMessage::ToggleBlockComments);
-    let generation = app.block_comments_generation;
-    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
-        backend::BlockThreadListData {
-            generation,
-            target: "page".into(),
-            threads: (0..PAGE_ROWS)
-                .map(|index| backend::PageCommentThread {
-                    id: format!("thread-{index}"),
-                    target: format!("block-{index}"),
-                    author: format!("reviewer-{}", index % 7),
-                    meta: "1 comment".into(),
-                    resolved: false,
-                    comment_count: 1,
-                    comments: vec![backend::PageComment {
-                        id: format!("comment-{index}"),
-                        ordinal: 1,
-                        author: format!("reviewer-{}", index % 7),
-                        meta: "#1".into(),
-                        text: format!("A note on block {index}."),
-                    }],
-                })
-                .collect(),
-            total: PAGE_ROWS as i64,
-        },
-    ));
-    assert_eq!(app.blocks.len(), PAGE_ROWS);
-    assert_eq!(app.block_comment_threads.len(), PAGE_ROWS);
-    assert!(app.block_comments_open);
-    (app, console)
-}
-
 fn probe_huddle_participant(index: usize) -> backend::HuddleParticipant {
     backend::HuddleParticipant {
         key: format!("user-{index}"),
@@ -350,7 +260,7 @@ fn live_chat_batches_take_one_shipping_app_message() {
         live_updated.contains("match next.kind"),
         "live_updated must dispatch once on its closed LiveKind"
     );
-    for variant in ["retry", "tip", "ready", "chat", "bell", "pages", "plane", "resync"] {
+    for variant in ["retry", "tip", "ready", "chat", "bell", "plane", "resync"] {
         assert_eq!(
             live_updated.matches(&format!("LiveKind.{variant}")).count(),
             1,
@@ -398,7 +308,7 @@ fn large_screens_stay_under_their_allocation_ceilings() {
 }
 
 fn probe_large_screens() {
-    eprintln!("large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows");
+    eprintln!("large screen frame probes: {HUDDLE_ROWS} huddle rows");
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();
         let allocations = probe_unchanged_build(probe.label, app, window, probe.size);

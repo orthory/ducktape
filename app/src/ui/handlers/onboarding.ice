@@ -392,13 +392,9 @@ on network_entered
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-  invalidate lane=page_search
   invalidate lane=palette_search
   invalidate lane=chat_load
-  invalidate lane=page_load
-  invalidate lane=block_threads
   invalidate lane=live_resync
-  invalidate lane=page_autosave
   wall_now = current_wall_seconds()
   connected = false
   loading = true
@@ -443,38 +439,10 @@ on network_entered
   // right here, or a sentence typed on one node was handed back on ANOTHER.
   channel_draft = ""
   pending_channel = ""
-  pages = []
-  blocks = []
-  active_page = ""
-  active_page_title = ""
-  active_page_parent = ""
-  page_draft = ""
-  pending_page = ""
-  block_comments_generation = block_comments_generation + 1
-  block_comments_open = false
-  block_comments_target = ""
-  inline_comment_target = ""
-  block_comments_pinned = false
-  block_comment_threads = []
-  block_comment_rows = []
-  block_comment_thread_total = 0
-  block_comment_threads_loading = false
-  block_comment_draft = ""
-  pending_block_comment = ""
-  commented_block_hits = []
-  page_text = installed_page_text(page_text, true, "")
-  page_cursor_line = 0
-  page_saved_text = ""
-  buffer_page = ""
-  page_inflight_text = ""
-  page_refusal = ""
-  block_autosave_status = AutosaveStatus.idle
-  orphaned_comment_drafts = []
-  page_delete_armed = false
-  page_search_draft = ""
-  page_search_hits = []
-  page_searching = false
-  page_search_query = ""
+  // THE PAGES VIEW RESETS ITSELF — its list, document, comments and drafts are
+  // guest state. What the app clears is the address a `duck://page/…` link
+  // asked for, which names the network being left.
+  page_route = ""
   // The palette's readings name the network being left too: hits from the
   // previous network are live, clickable rows that would render — and route —
   // on the new one if the palette is up. Scrubbed like its chat and pages
@@ -651,7 +619,6 @@ on switch_network
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-  invalidate lane=page_autosave
   task window open onboarding -> onboarding_reopened _
 
 on onboarding_reopened(id)
@@ -686,7 +653,6 @@ on open_account_welcome
   account_ceremony_qr = ""
   account_ceremony_detail = ""
   account_ceremony_left = ""
-  invalidate lane=page_autosave
   rpc = connected_rpc
   hub_chain_id = network_chain_id
   task window open onboarding -> welcome_reopened _

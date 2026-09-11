@@ -367,82 +367,58 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     use iced::keyboard::{Key, key::Named};
 
     let escape = Key::Named(Named::Escape);
-    let target = |tab: ShellTab, palette: bool, bell: bool, create: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            palette,
-            bell,
-            create,
-            false,
-        )
-    };
+    let target =
+        |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
 
     // Not Escape -> nothing, whatever is open.
     assert_eq!(
-        escape_target(
-            Key::Character("x".into()),
-            ShellTab::Chat,
-            false,
-            true,
-            true,
-            true,
-        ),
+        escape_target(Key::Character("x".into()), false, true, true),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(ShellTab::Chat, true, true, true), "");
+    assert_eq!(target(true, true, true), "");
     // The ladder order is the z-order: bell over the create modal.
-    assert_eq!(target(ShellTab::Chat, false, true, true), "bell");
-    assert_eq!(target(ShellTab::Chat, false, false, true), "channel_create");
-    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
-    // the Pages screen — so it is a rung, and it answers only from Pages.
-    let armed = |tab: ShellTab, page_delete: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            false,
-            false,
-            page_delete,
-        )
-    };
-    assert_eq!(armed(ShellTab::Pages, true), "page_delete");
-    assert_eq!(armed(ShellTab::Chat, true), "");
+    assert_eq!(target(false, true, true), "bell");
+    assert_eq!(target(false, false, true), "channel_create");
 
-    // Nothing transient open -> Escape is a no-op. THE CHAT RUNGS ARE GONE
-    // WITH THE CHAT SCREEN: its menus and its details drawer are the view's
-    // own layers now, dismissed inside the view.
-    assert_eq!(target(ShellTab::Chat, false, false, false), "");
+    // Nothing transient open -> Escape is a no-op. THE PER-TAB RUNGS ARE GONE
+    // WITH THEIR SCREENS: the chat menus and details drawer, the pages armed
+    // delete and comments card, are their views' own layers now, dismissed
+    // inside the guest that painted the scrim.
+    assert_eq!(target(false, false, false), "");
 }
 
-// A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
-// clears overlay state, so a layer armed on one tab is still SET while
-// another is on screen — unscoped, that stale flag ate the first Escape
-// everywhere else. The palette, bell and create modal are mounted OUTSIDE the
-// tab match in `components/shell.ice` and keep answering from every tab.
+// EVERY RUNG LEFT RIDES EVERY TAB, WHICH IS WHY NEITHER READER TAKES ONE. The
+// per-tab rungs went to the views that mount their surfaces; the palette, the
+// bell and the create modal are mounted OUTSIDE the `match tab` in
+// `components/shell.ice`, so they stay on screen across a switch and must keep
+// answering from wherever the reader lands. The two readers enumerate the SAME
+// layers in the same order, and differ on exactly one verdict.
 #[test]
-fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
+fn the_two_ladder_readers_enumerate_the_same_layers() {
     use iced::keyboard::{Key, key::Named};
 
     let escape = Key::Named(Named::Escape);
-    let none = String::new();
+    let target =
+        |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
 
-    let overlay = |tab: ShellTab, page_delete: bool| {
-        topmost_overlay(tab, false, false, false, page_delete)
-    };
-    let target = |tab: ShellTab, bell: bool, create: bool| {
-        escape_target(escape.clone(), tab, false, bell, create, false)
-    };
+    for (palette, bell, create, layer) in [
+        (false, true, true, "bell"),
+        (false, false, true, "channel_create"),
+    ] {
+        assert_eq!(topmost_overlay(palette, bell, create), layer);
+        assert_eq!(target(palette, bell, create), layer);
+    }
 
-    // A stale armed delete names no layer from another tab — for BOTH readers.
-    assert_eq!(overlay(ShellTab::Pages, true), "page_delete");
-    assert_eq!(overlay(ShellTab::Chat, true), none);
+    // THE ONE VERDICT THEY DIFFER ON. The scroll reader has to know a palette
+    // is over the pane it would otherwise move; Escape must not close what
+    // `palette_key_action` already owns.
+    assert_eq!(topmost_overlay(true, true, true), "palette");
+    assert_eq!(target(true, true, true), String::new());
 
-    // Window-level layers ride every tab: mounted outside the tab match, they
-    // stay on screen across a switch and must keep answering.
-    assert_eq!(target(ShellTab::Governance, true, false), "bell");
-    assert_eq!(target(ShellTab::Node, false, true), "channel_create");
+    // Nothing transient open, nothing named — for both.
+    assert_eq!(topmost_overlay(false, false, false), String::new());
+    assert_eq!(target(false, false, false), String::new());
 }
 
 #[test]

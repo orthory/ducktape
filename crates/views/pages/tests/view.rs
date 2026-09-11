@@ -1,164 +1,299 @@
-//! The facts the host pushes are what the screen shows; every act leaves as
-//! an intent carrying what the reader typed, and a draft the app hands back
-//! lands in the field only when the seed moved.
+//! The view driven natively through the wire: the kernel pushes session
+//! facts, the view reads the workspace, the open document and its comment
+//! threads for itself through `rpc.view`, re-reads them on every `rpc.live`
+//! hit, and every act leaves as `op.submit` carrying the pages message.
 
 use pages_view::host::{
-    Choose, Create, Narrow, PageComment, PageCommentThread, PageCommentThreadRow, PageItem,
-    PagesProps, Post, Resolve, Search, sidebar_width_after_delta,
+    PageCommentThread, PageCommentThreadRow, Session, comment_post_target, sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{find, has_text, item, measure, press, submit, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Length, Node};
+use ui_lang_guest::testing::{answer, find, has_text, item, measure, press, texts, type_into};
+use ui_lang_guest::wire::{self, Event, Frame, Length, Node, Request};
 
-fn facts() -> PagesProps {
-    PagesProps {
-        connected: true,
-        page_link: "duck://pages/alpha".into(),
-        pages: vec![
-            PageItem {
-                id: "alpha".into(),
-                title: "Alpha".into(),
-                ..PageItem::default()
-            },
-            PageItem {
-                id: "beta".into(),
-                title: "Beta".into(),
-                ..PageItem::default()
-            },
-        ],
-        page_create_open: true,
-        active_page: "alpha".into(),
-        active_page_title: "Alpha".into(),
-        autosave: "saved".into(),
-        block_comments_open: true,
-        scope_label: "This page · 0 threads".into(),
-        compose_hint: "Comment on this page".into(),
-        ..PagesProps::default()
+/// The first editor in the tree, depth first.
+fn find_editor(node: &Node) -> Option<&Node> {
+    if matches!(node, Node::Editor { .. }) {
+        return Some(node);
     }
+    node.children().iter().find_map(find_editor)
 }
 
-fn comment(ordinal: i64, author: &str, text: &str) -> PageComment {
-    PageComment {
-        id: format!("comment-{ordinal}-{author}"),
-        ordinal,
-        author: author.into(),
-        meta: format!("#{ordinal}"),
-        text: text.into(),
-    }
-}
-
-fn thread(id: &str, target: &str, resolved: bool, comments: Vec<PageComment>) -> PageCommentThread {
-    PageCommentThread {
-        id: id.into(),
-        target: target.into(),
-        author: comments
-            .first()
-            .map(|first| first.author.clone())
-            .unwrap_or_default(),
-        meta: format!("{} comments", comments.len()),
-        resolved,
-        comment_count: comments.len() as i64,
-        comments,
-    }
-}
-
-fn row(thread: PageCommentThread, anchor: &str) -> PageCommentThreadRow {
-    PageCommentThreadRow {
-        thread,
-        anchor: anchor.into(),
-    }
-}
-
-/// Two open threads on one block — one of them a conversation with five
-/// replies — a thread on another block, one on the page, and a settled one.
-fn conversation() -> Vec<PageCommentThreadRow> {
-    vec![
-        row(
-            thread(
-                "page-thread",
-                "alpha",
-                false,
-                vec![comment(1, "Ines", "Is the whole page ready?")],
-            ),
-            "this page",
-        ),
-        row(
-            thread(
-                "seven-a",
-                "block-7",
-                false,
-                vec![
-                    comment(1, "Ada", "This paragraph reads backwards."),
-                    comment(2, "Bo", "reply one"),
-                    comment(3, "Ada", "reply two"),
-                    comment(4, "Bo", "reply three"),
-                    comment(5, "Ada", "reply four"),
-                    comment(6, "Bo", "reply five"),
-                ],
-            ),
-            "“Paragraph 7”",
-        ),
-        row(
-            thread(
-                "seven-b",
-                "block-7",
-                false,
-                vec![comment(1, "Cy", "And the number is wrong.")],
-            ),
-            "“Paragraph 7”",
-        ),
-        row(
-            thread(
-                "seven-done",
-                "block-7",
-                true,
-                vec![comment(1, "Dee", "Settled long ago.")],
-            ),
-            "“Paragraph 7”",
-        ),
-        row(
-            thread(
-                "nine",
-                "block-9",
-                false,
-                vec![comment(1, "Eve", "Elsewhere entirely.")],
-            ),
-            "“Paragraph 9”",
-        ),
-    ]
-}
-
-fn encoded(props: &PagesProps) -> Vec<u8> {
-    serde_json::to_vec(props).expect("props encode")
-}
-
-/// Boot and push the facts; returns the subscription id and the frame.
-fn shown(props: &PagesProps) -> (u64, Frame) {
+fn boot() -> Frame {
     boot_native();
-    let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests[0].kind, "pages.props");
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &encoded(props))]);
-    (subscription, frame)
+    tick_native(Vec::new())
 }
 
-fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    intent
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
 }
 
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
+}
+
+fn session(connected: bool) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected,
+        dark: false,
+        chain: "mynet#d0cdf950".into(),
+        route_page: String::new(),
+        route_serial: 0,
+    })
+    .expect("session encodes")
+}
+
+/// The workspace index: two top-level pages, one cursor page.
+fn page_list() -> Vec<u8> {
+    serde_json::json!({ "pages": {
+        "pages": [
+            { "id": "alpha", "title": "Alpha", "parent": null },
+            { "id": "beta", "title": "Beta", "parent": null }
+        ],
+        "has_more": false,
+        "next_after": null
+    }})
+    .to_string()
+    .into_bytes()
+}
+
+/// One page's blocks in preorder: the page record itself, then one paragraph.
+fn page_blocks() -> Vec<u8> {
+    serde_json::json!({ "page": {
+        "blocks": [
+            {
+                "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+                "text": "Alpha", "checked": false, "children": ["alpha-1"]
+            },
+            {
+                "id": "alpha-1", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "the first paragraph", "checked": false, "children": []
+            }
+        ],
+        "next_after": null
+    }})
+    .to_string()
+    .into_bytes()
+}
+
+/// The grouped thread read, answered the way the node answers it: one group
+/// per target, each thread carrying its WHOLE conversation. One open thread on
+/// the page, one long one on the paragraph, and one already settled.
+fn threads() -> Vec<u8> {
+    serde_json::json!({ "threads": [
+        { "target": "alpha", "threads": [
+            { "id": "t-page", "target": "alpha", "opener": "acct:1", "resolved": false,
+              "comments": [{ "id": "c1", "author": "acct:1", "text": "the page reads well" }] }
+        ]},
+        { "target": "alpha-1", "threads": [
+            { "id": "t-block", "target": "alpha-1", "opener": "acct:1", "resolved": false,
+              "comments": [
+                  { "id": "c2", "author": "acct:1", "text": "the opening claim" },
+                  { "id": "c3", "author": "acct:2", "text": "first reply" },
+                  { "id": "c4", "author": "acct:2", "text": "second reply" },
+                  { "id": "c5", "author": "acct:2", "text": "third reply" },
+                  { "id": "c6", "author": "acct:2", "text": "fourth reply" }
+              ] },
+            { "id": "t-done", "target": "alpha-1", "opener": "acct:1", "resolved": true,
+              "comments": [{ "id": "c7", "author": "acct:1", "text": "settled already" }] }
+        ]}
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+/// The canned reply for one kernel read, chosen by the query it carries: the
+/// page index, one page's blocks, the grouped thread read, or — on the
+/// identity module, which is where the names live — the account directory.
+fn answered(request: &Request) -> Vec<u8> {
+    let ask: serde_json::Value =
+        serde_json::from_slice(&request.payload).expect("a view ask decodes");
+    let query = &ask["query"];
+    if ask["target"] == "identity" {
+        return serde_json::json!({ "accounts": [] })
+            .to_string()
+            .into_bytes();
+    }
+    assert_eq!(ask["target"], "pages", "a pages view asks the pages module");
+    match query {
+        _ if !query["list_pages"].is_null() => page_list(),
+        _ if !query["get_page"].is_null() => page_blocks(),
+        _ if !query["threads_for_targets"].is_null() => threads(),
+        other => panic!("unexpected view ask {other}"),
+    }
+}
+
+/// Boots, connects, and answers every read the register costs until the view
+/// goes quiet — a landed register re-keys the subscription on the page it
+/// found, so it settles over more than one round. Returns the settled frame
+/// and the id of the live `rpc.live` subscription.
+fn connected_with_register() -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "pages.props").id;
+    let mut frame = tick_native(vec![item(session_id, &session(true))]);
+    let mut live = request(&frame, "rpc.live").id;
+    for _ in 0..16 {
+        if let Some(request) = frame.requests.iter().find(|one| one.kind == "rpc.live") {
+            live = request.id;
+        }
+        let read = frame
+            .requests
+            .iter()
+            .find(|one| one.kind == "rpc.view" || one.kind == "rpc.query");
+        let Some(read) = read else {
+            return (frame, live);
+        };
+        let reply = answered(read);
+        frame = tick_native(vec![answer(read.id, &reply)]);
+    }
+    panic!("the register never settled")
+}
+
+/// At boot the view asks for the session only; connected, it reads the
+/// workspace itself and the fold is the whole screen — the sidebar, the
+/// header and the document.
 #[test]
-fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_card_draft() {
-    let (_, frame) = shown(&facts());
+fn a_connected_view_reads_its_own_workspace() {
+    let frame = boot();
+    assert_eq!(
+        kinds(&frame.requests),
+        ["pages.props"],
+        "only the session at boot: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+
+    let (frame, _live) = connected_with_register();
+    for expected in ["Pages", "Alpha", "Beta"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+}
+
+/// A pages block re-reads the workspace through the live subscription.
+#[test]
+fn a_live_hit_reads_the_workspace_again() {
+    let (_, live) = connected_with_register();
+    let frame = tick_native(vec![item(live, b"{}")]);
+    assert_eq!(kinds(&frame.requests), ["rpc.view"], "{:?}", frame.requests);
+    let ask: serde_json::Value =
+        serde_json::from_slice(&frame.requests[0].payload).expect("a view ask decodes");
+    assert!(
+        !ask["query"]["list_pages"].is_null(),
+        "the re-read starts at the workspace index: {ask}"
+    );
+}
+
+/// A create mints its id through the kernel and leaves as `op.submit`
+/// carrying the module's own `create_page`. The guest has no clock and no
+/// entropy, so the id is the one thing it cannot make for itself.
+#[test]
+fn a_create_mints_its_id_and_leaves_as_a_signed_op() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(press(&frame, "New page"));
+    let frame = tick_native(type_into(&frame, "New page", "Runbook"));
+    let frame = tick_native(press(&frame, "Create page"));
+
+    let mint = request(&frame, "host.id");
+    assert_eq!(mint.payload, b"page", "the prefix names the kind of record");
+
+    let frame = tick_native(vec![answer(mint.id, b"page-1757000000-1")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "create_page": {
+                "page_id": "page-1757000000-1", "title": "Runbook", "blocks": []
+            }}
+        })
+    );
+}
+
+/// The sidebar's drag is the view's own arithmetic, clamped at both ends.
+#[test]
+fn the_sidebar_drag_is_clamped_at_both_ends() {
+    assert_eq!(sidebar_width_after_delta(240.0, 40.0, 1400.0), 280.0);
+    assert!(sidebar_width_after_delta(240.0, -400.0, 1400.0) >= 120.0);
+    assert!(sidebar_width_after_delta(240.0, 4000.0, 1400.0) <= 1400.0);
+}
+
+/// The comments card, opened from the header chip: page scope, unpinned.
+fn page_card() -> Frame {
+    let (frame, _) = connected_with_register();
+    tick_native(press(&frame, "Comments"))
+}
+
+/// The events the host sends when the reader presses the margin badge beside
+/// document line `line` — the gesture that opens THAT block's conversation.
+fn margin_press(frame: &Frame, line: u32) -> Vec<Event> {
+    let editor = frame
+        .root
+        .as_ref()
+        .and_then(find_editor)
+        .expect("the document editor is on screen");
+    let Node::Editor {
+        document, options, ..
+    } = editor
+    else {
+        unreachable!("find_editor answers editors")
+    };
+    let binding = options.binding.as_ref().expect("editor commit route");
+    vec![Event::EditorTransaction {
+        handler: binding.on_event,
+        event: wire::EditorTransactionEvent::Interaction {
+            id: wire::EditorTransactionId {
+                instance: 0,
+                document: document.document.clone(),
+                reset: document.reset,
+                sequence: document.revision,
+                attempt: 0,
+                text_revision: document.text_revision,
+                revision: document.revision,
+            },
+            state: document.clone(),
+            action: wire::editor_presentation::EditorInteraction::Margin { line },
+            input_time_ms: 0,
+        },
+    }]
+}
+
+/// The card is ONE scope's threads, listed expanded and grouped under the
+/// block each anchors to — there is nothing to drill into. Replies are held to
+/// three; the settled thread waits behind its own toggle; and the header chip
+/// counts what is OUTSTANDING, not what was ever said.
+#[test]
+fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
+    let (frame, _) = connected_with_register();
+    assert!(
+        has_text(&frame, "2"),
+        "the chip counts the two OPEN threads: {:?}",
+        texts(&frame)
+    );
+
+    let frame = tick_native(press(&frame, "Comments"));
     for expected in [
-        "Pages",
-        "Alpha",
-        "Beta",
-        "✓ synced",
-        "Comments",
-        "No comments on this page yet",
+        "This page · 2 threads",
+        "This page",
+        "“the first paragraph”",
+        "the page reads well",
+        "the opening claim",
+        "first reply",
+        "second reply",
+        "third reply",
+        "1 more replies",
+        "Resolved · 1",
+        "Comment on this page",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -166,608 +301,190 @@ fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_ca
             texts(&frame)
         );
     }
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(type_into(&frame, "Start a thread…", "half a thought"));
-    assert!(frame.requests.is_empty(), "typing runs no handler");
-    let frame = tick_native(press(&frame, "Beta"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.choose");
-    assert_eq!(
-        serde_json::from_slice::<Choose>(&intent.payload).expect("decodes"),
-        Choose {
-            id: "beta".into(),
-            comment_draft: "half a thought".into()
-        }
+    assert!(
+        !has_text(&frame, "fourth reply"),
+        "the tail of a long thread stays folded: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "settled already"),
+        "a settled thread is filed away: {:?}",
+        texts(&frame)
     );
 }
 
+/// The fold is the reader's own: unfolding one thread shows its whole tail and
+/// nothing leaves the view.
 #[test]
-fn a_create_a_search_and_a_post_leave_with_what_was_typed() {
-    let (_, frame) = shown(&facts());
-    let frame = tick_native(type_into(&frame, "New page", "  Gamma  "));
-    let frame = tick_native(type_into(&frame, "Search pages…", "quorum"));
-    let frame = tick_native(type_into(&frame, "Start a thread…", "looks right"));
-    let frame = tick_native(submit(&frame, "New page"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.create");
-    assert_eq!(
-        serde_json::from_slice::<Create>(&intent.payload).expect("decodes"),
-        Create {
-            title: "Gamma".into(),
-            comment_draft: "looks right".into()
-        }
-    );
-    let frame = tick_native(submit(&frame, "Search pages…"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.search");
-    assert_eq!(
-        serde_json::from_slice::<Search>(&intent.payload).expect("decodes"),
-        Search {
-            query: "quorum".into()
-        }
-    );
-    let frame = tick_native(press(&frame, "Post"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.post");
-    assert_eq!(
-        serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
-        Post {
-            text: "looks right".into(),
-            thread_id: String::new()
-        }
-    );
-    // the field cleared with the act: the button is dark now
+fn unfolding_a_thread_shows_its_whole_tail() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Show every reply"));
     assert!(
-        matches!(
-            ui_lang_guest::testing::find(&frame, "PagesView/root/pages/comments-card/post"),
-            Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
-        ),
+        has_text(&frame, "fourth reply") && has_text(&frame, "Fewer replies"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        frame.requests.is_empty(),
+        "a fold is view-local: {:?}",
+        frame.requests
+    );
+}
+
+/// The settled threads sit under one toggle at the foot, and open with their
+/// own Reopen rather than a Resolve.
+#[test]
+fn the_resolved_toggle_opens_the_settled_threads() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Resolved threads"));
+    assert!(
+        has_text(&frame, "settled already") && has_text(&frame, "Reopen"),
         "{:?}",
         texts(&frame)
     );
 }
 
+/// A group's quote is the way IN to that block's scope, and the way back out
+/// is the card's own "← This page". Neither costs a read: the register already
+/// answered for the page and every block on it.
 #[test]
-fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
-    let (subscription, frame) = shown(&facts());
-    let _ = tick_native(type_into(&frame, "Start a thread…", "mine"));
-    // the same seed pushed again changes nothing …
-    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
-    let frame = tick_native(press(&frame, "Post"));
-    assert_eq!(
-        serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
-        Post {
-            text: "mine".into(),
-            thread_id: String::new()
-        }
-    );
-    // … a moved seed replaces the field
-    let returned = PagesProps {
-        seed_rev: 1,
-        comment_seed: "the refused one".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&returned))]);
-    let frame = tick_native(press(&frame, "Post"));
-    assert_eq!(
-        serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
-        Post {
-            text: "the refused one".into(),
-            thread_id: String::new()
-        }
-    );
-}
-
-/// The events the host sends when the reader drags a resize handle sideways.
-fn drag(frame: &Frame, key: &str, dx: f64) -> Vec<Event> {
-    let Some(Node::ResizeHandle {
-        on_drag: Some(handler),
-        ..
-    }) = find(frame, key)
-    else {
-        panic!("no resize handle {key:?}");
-    };
-    vec![Event::Drag {
-        handler: *handler,
-        dx,
-        dy: 0.0,
-    }]
-}
-
-fn list_width(frame: &Frame) -> f32 {
-    let Some(Node::Container {
-        width: Some(Length::Fixed(width)),
-        ..
-    }) = find(frame, "PagesView/root/pages/page-list")
-    else {
-        panic!("no page list in {:?}", texts(frame));
-    };
-    *width
-}
-
-#[test]
-fn the_page_list_is_the_readers_to_size_and_never_crowds_the_document() {
-    assert_eq!(sidebar_width_after_delta(230.0, 60.0, 1280.0), 290.0);
-    assert_eq!(sidebar_width_after_delta(230.0, -400.0, 1280.0), 180.0);
-    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 1280.0), 420.0);
-    // A narrow console keeps half its width for the document …
-    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 600.0), 300.0);
-    // … and a window narrower than two list minimums still gets a list.
-    assert_eq!(sidebar_width_after_delta(230.0, 0.0, 200.0), 180.0);
-
-    let (_, frame) = shown(&facts());
-    assert_eq!(list_width(&frame), 230.0);
-    let handle = "PagesView/root/pages/sidebar-resize";
-    let frame = tick_native(drag(&frame, handle, 60.0));
-    assert!(frame.requests.is_empty(), "sizing the list is view-local");
-    assert_eq!(list_width(&frame), 290.0);
-    let frame = tick_native(drag(&frame, handle, 500.0));
-    assert_eq!(list_width(&frame), 420.0);
-    let frame = tick_native(drag(&frame, handle, -500.0));
-    assert_eq!(list_width(&frame), 180.0);
-}
-
-#[test]
-fn the_header_menu_names_the_delete_before_it_arms_it() {
-    let menu = "PagesView/root/pages/page-menu";
-    let (_, frame) = shown(&facts());
-    // The `⋯` arms nothing on its own: it opens a menu, view-locally …
-    assert!(find(&frame, menu).is_none());
-    let frame = tick_native(press(&frame, "Page actions"));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    assert!(find(&frame, menu).is_some(), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "Delete page…"), "{:?}", texts(&frame));
-    // … and the named item is what arms the confirm dialog, closing behind it.
-    let frame = tick_native(press(&frame, "Delete page…"));
-    assert_eq!(one_intent(&frame).kind, "pages.arm_delete");
-    assert!(find(&frame, menu).is_none(), "the menu left with the act");
-}
-
-#[test]
-fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
-    use ui_lang_guest::{testing, wire};
-    use wire::editor_document::{EditorDocumentRef, EditorTransferId, EditorTransferSender};
-    let text = "Title\n[문서](https://example.com)";
-    let reference = EditorDocumentRef {
-        document: "page-alpha".into(),
-        reset: 1,
-        revision: 0,
-        text_revision: 0,
-        byte_len: text.len() as u32,
-        cursor: wire::EditorCursor {
-            position: wire::EditorPosition { line: 1, column: 1 },
-            selection: None,
-        },
-    };
-    let mut props = facts();
-    props.document_source = wire::encode(&pages_view::document_source::DocumentIdentity {
-        document: reference.document.clone(),
-        reset: reference.reset,
-    });
-    let (_, mut frame) = shown(&props);
-    let mut root = frame.root.clone().unwrap();
-    let source = frame
-        .requests
-        .iter()
-        .find(|request| request.kind == "pages.document")
-        .unwrap()
-        .id;
-    let mut sender = EditorTransferSender::new(
-        EditorTransferId {
-            instance: 1,
-            document: reference.document.clone(),
-            reset: 1,
-            serial: 1,
-            attempt: 0,
-        },
-        reference.clone(),
-    )
-    .unwrap();
-    while let Some(transfer) = sender.next_frame(&reference, text).unwrap() {
-        frame = tick_native(vec![item(source, &wire::encode(&transfer))]);
-        if let Some(next) = &frame.root {
-            root = next.clone();
-        } else {
-            wire::apply(&mut root, frame.patches.clone()).unwrap();
-        }
-    }
-    let focus_request = |frame: &Frame| {
-        let request = frame
-            .requests
-            .iter()
-            .find(|request| request.kind == "host.widget")
-            .unwrap();
-        assert_eq!(
-            wire::decode::<wire::WidgetCommand>(&request.payload).unwrap(),
-            wire::WidgetCommand::Focused {
-                target: "PagesView/root/pages/document".into()
-            }
-        );
-        request.id
-    };
-    let first = focus_request(&frame);
-    let mut reply = |id, focused| {
-        let frame = tick_native(vec![wire::Event::Response {
-            id,
-            result: Ok(wire::encode(&focused)),
-            done: true,
-        }]);
-        if let Some(next) = &frame.root {
-            root = next.clone();
-        } else {
-            wire::apply(&mut root, frame.patches.clone()).unwrap();
-        }
-        let shown = Frame {
-            root: Some(root.clone()),
-            ..Default::default()
-        };
-        let Some(wire::Node::Editor {
-            options, document, ..
-        }) = testing::find(&shown, "PagesView/root/pages/document")
-        else {
-            panic!("editor");
-        };
-        assert_eq!(document.byte_len, text.len() as u32);
-        assert_eq!(document.cursor, reference.cursor);
-        let paint = options.presentation.as_ref().unwrap();
-        paint
-            .spans
-            .iter()
-            .filter(|span| span.line == 1)
-            .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
-            .map(|span| &text[6 + span.start as usize..6 + span.end as usize])
-            .collect::<String>()
-    };
-    assert_eq!(reply(first, true), "[문서](https://example.com)");
-    let release = || wire::Event::Mouse {
-        event: wire::mouse::Event::ButtonReleased(wire::mouse::Button::Left),
-        captured: true,
-    };
-    let old = focus_request(&tick_native(vec![release()]));
-    let latest = focus_request(&tick_native(vec![release()]));
-    assert_eq!(reply(latest, false), "문서");
-    assert_eq!(
-        reply(old, true),
-        "문서",
-        "late responses cannot reopen source syntax"
-    );
-    let next = focus_request(&tick_native(vec![release()]));
-    assert_eq!(reply(next, true), "[문서](https://example.com)");
-    // Tab is usually captured by the mounted widgets before this observation.
-    use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
-    let tab = wire::Event::Keyboard {
-        event: wire::keyboard::Event::Release(KeyState {
-            key: Key::Named(Named::Tab),
-            modified_key: Key::Named(Named::Tab),
-            physical_key: Physical::Unidentified(NativeCode::Unidentified),
-            location: Location::Standard,
-            modifiers: Modifiers::default(),
-        }),
-        captured: true,
-    };
-    let tab_query = focus_request(&tick_native(vec![tab]));
-    assert_eq!(reply(tab_query, false), "문서");
-}
-
-#[test]
-fn initial_loading_empty_and_recovered_pages_have_visible_states() {
-    let loading = PagesProps {
-        connected: true,
-        loading: true,
-        ..PagesProps::default()
-    };
-    let (subscription, frame) = shown(&loading);
-    assert!(has_text(&frame, "Loading pages…"));
-    assert!(!has_text(&frame, "No page selected"));
-    let empty = PagesProps {
-        loading: false,
-        ..loading
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&empty))]);
-    assert!(has_text(&frame, "No page selected"));
-    assert!(!has_text(&frame, "Loading pages…"));
-    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
-    assert!(has_text(&frame, "Alpha"));
-    assert!(!has_text(&frame, "Loading pages…"));
-    assert!(!has_text(&frame, "No page selected"));
-    let disconnected = PagesProps::default();
-    let frame = tick_native(vec![item(subscription, &encoded(&disconnected))]);
-    assert!(has_text(&frame, "Not connected"));
-    assert!(!has_text(&frame, "Loading pages…"));
-}
-
-#[test]
-fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
-    boot_native();
-    let boot = tick_native(Vec::new());
-    let subscription = boot
-        .requests
-        .iter()
-        .find(|request| request.kind == "pages.props")
-        .unwrap()
-        .id;
-    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
-    assert!(has_text(&frame, "Pages could not load"));
-    assert!(
-        !has_text(&frame, "Not connected"),
-        "a props error is not a network status"
-    );
-    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
-    assert!(!has_text(&frame, "Pages could not load"));
-    let _ = tick_native(type_into(&frame, "Start a thread…", "keep this draft"));
-    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
-    assert!(has_text(&frame, "Pages could not load"));
-    assert!(
-        texts(&frame)
-            .iter()
-            .any(|text| text.contains("missing field"))
-    );
-    assert!(
-        has_text(&frame, "Alpha"),
-        "keep the last readable page visible"
-    );
-    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
-    assert!(!has_text(&frame, "Pages could not load"));
-    let frame = tick_native(press(&frame, "Post"));
-    assert_eq!(
-        serde_json::from_slice::<Post>(&one_intent(&frame).payload)
-            .unwrap()
-            .text,
-        "keep this draft"
-    );
-}
-
-#[test]
-fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
-    let (subscription, frame) = shown(&facts());
-    let frame = tick_native(type_into(&frame, "Start a thread…", "draft from Alpha"));
-    let post = press(&frame, "Post");
-    // The delete is a named item in the header menu now, so open the menu
-    // while the facts still stand and queue the press from inside it.
-    let opened = tick_native(press(&frame, "Page actions"));
-    let delete = press(&opened, "Delete page");
-    let choose = press(&frame, "Beta");
-    // The host has moved to Beta, but an incomplete update cannot replace
-    // the Alpha facts that the reader still sees.
-    let malformed = br#"{"connected":true,"active_page":"beta"}"#;
-    let frame = tick_native(vec![item(subscription, malformed)]);
-    assert!(has_text(&frame, "Pages could not load"));
-    assert!(has_text(&frame, "draft from Alpha"));
-    assert!(matches!(
-        ui_lang_guest::testing::find(&frame, "PagesView/root/pages/comments-card/post"),
-        Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
-    ));
-    for queued in [post, delete, choose] {
-        let frame = tick_native(queued);
-        assert!(
-            frame.requests.is_empty(),
-            "stale actions must not reach the host"
-        );
-    }
-    let beta = PagesProps {
-        active_page: "beta".into(),
-        active_page_title: "Beta".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&beta))]);
-    assert!(!has_text(&frame, "Pages could not load"));
-    let frame = tick_native(press(&frame, "Post"));
-    let request = one_intent(&frame);
-    assert_eq!(request.kind, "pages.post");
-    assert_eq!(
-        serde_json::from_slice::<Post>(&request.payload)
-            .unwrap()
-            .text,
-        "draft from Alpha"
-    );
-}
-
-/// Keys of every button on the frame — how a test names the one it wants when
-/// several carry the same words.
-fn button_keys(frame: &Frame) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut walk = |node: &mut Node| {
-        if let Node::Button { key, .. } = node {
-            keys.push(key.clone());
-        }
-    };
-    frame.root.clone().unwrap().for_each_mut(&mut walk);
-    keys
-}
-
-#[test]
-fn page_scope_groups_the_threads_under_the_block_each_one_marks() {
-    let props = PagesProps {
-        comment_rows: conversation(),
-        thread_total: 4,
-        scope_label: "This page · 4 threads".into(),
-        ..facts()
-    };
-    let (_, frame) = shown(&props);
-    let shown_texts = texts(&frame);
-    // One group header per commented block, plus the page's own threads under
-    // a plain "This page" — and every open thread is already expanded.
-    for expected in [
-        "This page",
-        "“Paragraph 7”",
-        "“Paragraph 9”",
-        "Is the whole page ready?",
-        "This paragraph reads backwards.",
-        "And the number is wrong.",
-        "Elsewhere entirely.",
-    ] {
-        assert!(
-            has_text(&frame, expected),
-            "missing {expected:?} in {shown_texts:?}"
-        );
-    }
-    // The two threads on Paragraph 7 are independent cards, not one merged
-    // conversation, and the group is drawn once for both.
-    assert_eq!(
-        shown_texts
-            .iter()
-            .filter(|text| *text == "“Paragraph 7”")
-            .count(),
-        1,
-        "{shown_texts:?}"
-    );
-    // A thread with five replies shows three and folds the rest.
-    assert!(has_text(&frame, "reply three"), "{shown_texts:?}");
-    assert!(!has_text(&frame, "reply four"), "{shown_texts:?}");
-    assert!(has_text(&frame, "2 more replies"), "{shown_texts:?}");
-    let frame = tick_native(press(&frame, "Show every reply"));
-    assert!(frame.requests.is_empty(), "folding a thread is view-local");
-    assert!(has_text(&frame, "reply five"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "Fewer replies"), "{:?}", texts(&frame));
-
-    // A group header is the way IN to that block's own scope. The page's own
-    // group is not one: it is already the scope the card is showing.
+fn narrowing_to_a_block_and_widening_back_re_slice_the_rows_in_hand() {
+    let frame = page_card();
     let frame = tick_native(press(&frame, "Comments on this block"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.narrow");
-    assert_eq!(
-        serde_json::from_slice::<Narrow>(&intent.payload).expect("decodes"),
-        Narrow {
-            target: "block-7".into()
-        }
-    );
-}
-
-#[test]
-fn a_settled_thread_waits_behind_its_own_toggle() {
-    let props = PagesProps {
-        comment_rows: conversation(),
-        scope_label: "This page · 4 threads".into(),
-        ..facts()
-    };
-    let (_, frame) = shown(&props);
-    assert!(has_text(&frame, "Resolved · 1"), "{:?}", texts(&frame));
     assert!(
-        !has_text(&frame, "Settled long ago."),
-        "a resolved thread is not in the list: {:?}",
+        frame.requests.is_empty(),
+        "narrowing re-slices rows already in hand: {:?}",
+        frame.requests
+    );
+    assert!(
+        has_text(&frame, "the opening claim") && !has_text(&frame, "the page reads well"),
+        "the block's scope drops the page's own thread: {:?}",
         texts(&frame)
     );
-    let frame = tick_native(press(&frame, "Resolved threads"));
-    assert!(frame.requests.is_empty(), "the toggle is view-local");
-    assert!(has_text(&frame, "Settled long ago."), "{:?}", texts(&frame));
-    // …and it offers Reopen rather than Resolve, with no reply box.
-    assert!(has_text(&frame, "Reopen"), "{:?}", texts(&frame));
-    let frame = tick_native(press(&frame, "Reopen thread"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.resolve");
-    assert_eq!(
-        serde_json::from_slice::<Resolve>(&intent.payload).expect("decodes"),
-        Resolve {
-            id: "seven-done".into(),
-            resolved: false
-        }
-    );
-}
-
-#[test]
-fn a_badge_opened_block_scope_is_the_whole_card_and_its_replies_name_their_thread() {
-    // What the host pushes when a margin badge on Paragraph 7 is pressed: the
-    // scope is that block, pinned, and the rows are already narrowed to it.
-    let rows: Vec<PageCommentThreadRow> = conversation()
-        .into_iter()
-        .filter(|row| row.thread.target == "block-7")
-        .collect();
-    let props = PagesProps {
-        comment_rows: rows,
-        scope_target: "block-7".into(),
-        scope_pinned: true,
-        scope_label: "“Paragraph 7”".into(),
-        compose_hint: "New thread on “Paragraph 7”".into(),
-        thread_total: 4,
-        ..facts()
-    };
-    let (subscription, frame) = shown(&props);
-    let shown_texts = texts(&frame);
-    // BOTH open threads on the block, each expanded, and nothing from any
-    // other block.
     assert!(
-        has_text(&frame, "This paragraph reads backwards."),
-        "{shown_texts:?}"
-    );
-    assert!(
-        has_text(&frame, "And the number is wrong."),
-        "{shown_texts:?}"
-    );
-    assert!(!has_text(&frame, "Elsewhere entirely."), "{shown_texts:?}");
-    assert!(
-        !has_text(&frame, "Is the whole page ready?"),
-        "{shown_texts:?}"
-    );
-    // A badge-opened card offers no way out to the page, and needs no group
-    // header: the card's own title already names the block.
-    assert!(!has_text(&frame, "← This page"), "{shown_texts:?}");
-    assert!(
-        shown_texts
-            .iter()
-            .filter(|text| *text == "“Paragraph 7”")
-            .count()
-            == 1,
-        "the title names the scope once: {shown_texts:?}"
+        has_text(&frame, "New comment on “the first paragraph”"),
+        "the composer follows the scope: {:?}",
+        texts(&frame)
     );
 
-    // A REPLY NAMES ITS THREAD. The resting line becomes the box when pressed.
-    let reply_keys: Vec<String> = button_keys(&frame)
-        .into_iter()
-        .filter(|key| key.contains("reply-on"))
-        .collect();
-    assert_eq!(reply_keys.len(), 2, "one reply affordance per open thread");
-    let frame = tick_native(press(&frame, &reply_keys[1]));
-    assert!(frame.requests.is_empty(), "picking a thread is view-local");
-    let frame = tick_native(type_into(&frame, "Reply…", "  seconded  "));
-    let frame = tick_native(press(&frame, "Post reply"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.post");
-    assert_eq!(
-        serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
-        Post {
-            text: "seconded".into(),
-            thread_id: "seven-b".into()
-        }
-    );
-
-    // THE COMPOSER AT THE FOOT OPENS A NEW THREAD on the same scope — an
-    // empty thread id — which is how a third thread on this block is started.
-    let frame = tick_native(vec![item(subscription, &encoded(&props))]);
-    let frame = tick_native(type_into(&frame, "Start a thread…", "a third point"));
-    let frame = tick_native(press(&frame, "PagesView/root/pages/comments-card/post"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "pages.post");
-    assert_eq!(
-        serde_json::from_slice::<Post>(&intent.payload).expect("decodes"),
-        Post {
-            text: "a third point".into(),
-            thread_id: String::new()
-        }
-    );
-}
-
-#[test]
-fn a_chip_opened_card_narrowed_to_a_block_can_widen_back() {
-    let props = PagesProps {
-        comment_rows: conversation()
-            .into_iter()
-            .filter(|row| row.thread.target == "block-7")
-            .collect(),
-        scope_target: "block-7".into(),
-        scope_pinned: false,
-        scope_label: "“Paragraph 7”".into(),
-        ..facts()
-    };
-    let (_, frame) = shown(&props);
-    assert!(has_text(&frame, "← This page"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "All comments on this page"));
-    assert_eq!(one_intent(&frame).kind, "pages.widen");
+    assert!(
+        has_text(&frame, "the page reads well") && has_text(&frame, "This page · 2 threads"),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// A MARGIN BADGE OPENS ITS BLOCK'S CONVERSATION, and that block is the whole
+/// card: the page is not what the badge was pointing at, so the way back out
+/// to it is withheld.
+#[test]
+fn a_margin_badge_pins_the_card_to_its_own_block() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(margin_press(&frame, 1));
+    assert!(
+        has_text(&frame, "the opening claim") && !has_text(&frame, "the page reads well"),
+        "the badge opens its block's scope: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "← This page"),
+        "a pinned card withholds the way back out: {:?}",
+        texts(&frame)
+    );
+}
+
+/// The composer at the card's foot ALWAYS opens a new thread on the scope it
+/// is showing: in page scope that is the page itself, never a reply.
+#[test]
+fn the_foot_composer_opens_a_new_thread_on_the_scope() {
+    let frame = page_card();
+    let frame = tick_native(type_into(&frame, "Start a thread…", "a fresh remark"));
+    let frame = tick_native(press(&frame, "Post"));
+
+    let mint = request(&frame, "host.id");
+    assert_eq!(mint.payload, b"thread", "a new thread mints a thread id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-1")]);
+    let mint = request(&frame, "host.id");
+    assert_eq!(mint.payload, b"comment");
+    let frame = tick_native(vec![answer(mint.id, b"comment-1")]);
+
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "add_comment": {
+                "thread_id": "thread-1", "comment_id": "comment-1",
+                "target": "alpha", "text": "a fresh remark"
+            }}
+        })
+    );
+}
+
+/// A REPLY NAMES ITS THREAD AND INHERITS ITS ANCHOR — the node validates the
+/// pair, so a block-anchored thread replied to with the page id is refused.
+#[test]
+fn a_reply_inherits_its_threads_own_anchor() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Reply to this thread"));
+    let frame = tick_native(type_into(&frame, "Reply…", "agreed"));
+    let frame = tick_native(press(&frame, "Post reply"));
+
+    let mint = request(&frame, "host.id");
+    assert_eq!(
+        mint.payload, b"comment",
+        "a reply joins a thread that already has an id"
+    );
+    let frame = tick_native(vec![answer(mint.id, b"comment-2")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["add_comment"]["target"], "alpha",
+        "the reply anchors where its thread does: {op}"
+    );
+    assert_eq!(op["payload"]["add_comment"]["thread_id"], "t-page");
+}
+
+/// Resolving is per thread, and it leaves as the module's own op.
+#[test]
+fn a_thread_is_resolved_where_it_stands() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Resolve thread"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "resolve_thread": { "thread_id": "t-page", "resolved": true } }
+        })
+    );
+}
+
+/// A STALE CARD POSTS NOWHERE. A thread id the rows no longer carry answers no
+/// target at all, and the submit refuses rather than anchoring the words
+/// somewhere else.
+#[test]
+fn a_stale_thread_id_names_no_target() {
+    let rows = vec![PageCommentThreadRow {
+        thread: PageCommentThread {
+            id: "t-block".into(),
+            target: "alpha-1".into(),
+            ..PageCommentThread::default()
+        },
+        anchor: "“the first paragraph”".into(),
+    }];
+    assert_eq!(comment_post_target(&rows, "t-block", "alpha"), "alpha-1");
+    assert_eq!(comment_post_target(&rows, "", "alpha"), "alpha");
+    assert_eq!(comment_post_target(&rows, "t-gone", "alpha"), "");
 }
 
 /// The screen after the pane sensor reports `width`: the card is placed against
 /// the document pane, so this is the one measurement all three placements read.
-fn at_pane(props: &PagesProps, width: f32) -> Frame {
-    let (_, frame) = shown(props);
+fn at_pane(width: f32) -> Frame {
+    let frame = page_card();
     let mut root = frame.root.clone().expect("a first root");
     let next = tick_native(measure(
         &frame,
@@ -778,7 +495,7 @@ fn at_pane(props: &PagesProps, width: f32) -> Frame {
     match &next.root {
         Some(replacement) => root = replacement.clone(),
         None => {
-            ui_lang_guest::wire::apply(&mut root, next.patches.clone()).expect("patches");
+            wire::apply(&mut root, next.patches.clone()).expect("patches");
         }
     }
     Frame {
@@ -842,20 +559,20 @@ fn card_placed(frame: &Frame, pane: f32, card: f32) -> (f32, f32) {
     (x.evaluate(geometry), y.evaluate(geometry))
 }
 
+/// THE THREE PLACEMENTS, each read off the pane the card was opened in.
 #[test]
 fn the_comment_card_answers_the_pane_it_is_opened_in() {
-    let props = facts();
     // WIDE: the document keeps its own width and the card floats in the margin
     // it leaves, a gutter inside the pane's right edge and a gutter below the
     // header — this rail is page-scoped, so it has no line to sit on.
-    let beside = at_pane(&props, 1200.0);
+    let beside = at_pane(1200.0);
     assert_eq!(max_widths(beside.root.as_ref().unwrap()), vec![766.0]);
     assert_eq!(card_width(&beside), 340.0);
     assert_eq!(card_placed(&beside, 1200.0, 340.0), (1200.0 - 356.0, 16.0));
 
     // TIGHTER: no margin to float in, so the document gives up exactly the card
     // and its two gutters and the text reflows left of it.
-    let squeeze = at_pane(&props, 1000.0);
+    let squeeze = at_pane(1000.0);
     let document = 1000.0 - 340.0 - 32.0;
     assert_eq!(max_widths(squeeze.root.as_ref().unwrap()), vec![document]);
     assert_eq!(card_width(&squeeze), 340.0);
@@ -869,15 +586,17 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     // NARROW: nothing is beside anything. The document takes its full width
     // back and the card drops onto its text column at full width, into the gap
     // the reserve opens under the title.
-    let inline = at_pane(&props, 900.0);
+    let inline = at_pane(900.0);
     assert_eq!(max_widths(inline.root.as_ref().unwrap()), vec![766.0]);
     assert_eq!(card_width(&inline), 766.0 - 62.0);
     assert_eq!(card_placed(&inline, 900.0, 704.0), (22.0, 67.3));
 }
 
+/// A PLACEMENT IS VIEW-LOCAL: crossing a threshold moves the card and nothing
+/// else — no read, no write, and not a character of what is half-typed in it.
 #[test]
 fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
-    let (_, frame) = shown(&facts());
+    let frame = page_card();
     let frame = tick_native(measure(
         &frame,
         "PagesView/root/pages/pane-measure",
@@ -885,7 +604,6 @@ fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
         700.0,
     ));
     let frame = tick_native(type_into(&frame, "Start a thread…", "half a thought"));
-    // The same rail, the same draft, narrower pane — and no intent leaves for it.
     let frame = tick_native(measure(
         &frame,
         "PagesView/root/pages/pane-measure",
@@ -894,11 +612,15 @@ fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
     ));
     assert!(frame.requests.is_empty(), "a placement is view-local");
     let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    assert_eq!(mint.payload, b"thread");
+    let frame = tick_native(vec![answer(mint.id, b"thread-1")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-1")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<Post>(&one_intent(&frame).payload).expect("decodes"),
-        Post {
-            text: "half a thought".into(),
-            thread_id: String::new()
-        }
+        op["payload"]["add_comment"]["text"], "half a thought",
+        "the draft survived the placement change"
     );
 }

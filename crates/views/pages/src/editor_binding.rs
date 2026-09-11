@@ -150,7 +150,7 @@ impl BindingState {
         }
         self.history.at_reset(state.reset);
         let doc = document(state.text, state.cursor);
-        let mut navigation = crate::document_source::Navigation::default();
+        let mut navigation = crate::document_sync::Navigation::default();
         let comment_pick = matches!(action, wire::editor_presentation::EditorInteraction::MenuPick { tag } if tag == "comment");
         if comment_pick {
             navigation.comment_line = self

@@ -115,7 +115,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, page_delete_armed)
+  let escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open)
   // THE COMPOSER'S FORMATTING CHORDS ARE NOT HERE ANY MORE. They land at the
   // widget that has the caret — `RichTextEditor::on_chord` (ducktape-ui#711)
   // is offered exactly the presses the bubble contract releases — so the
@@ -127,7 +127,6 @@ on global_key_pressed(event)
   return if empty(escape_key) && palette_key == "none"
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
-  page_delete_armed = page_delete_armed && escape_key != "page_delete"
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   invalidate lane=palette_search

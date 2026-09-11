@@ -6,7 +6,6 @@ enum LiveKind
   ready
   chat
   bell
-  pages
   plane
   resync
 
@@ -149,12 +148,6 @@ enum WelcomeDoor
   create
   login
 
-enum AutosaveStatus
-  idle
-  saving
-  saved
-  error
-
 // The duck:// module table's verdict on a clicked or embedded link
 // (`resolve_duck_link`): which existing navigation it maps onto. `unknown` is
 // a malformed/unknown ref; `web` is an http(s) URL for the OS opener;
@@ -227,29 +220,12 @@ enum SettingsIntent
   dark
   notifications
 
-// What the pages view asks of the app, one per act the screen offers.
-// The drafts are the view's: a create carries its title, a search its
-// query, a post its text, and the acts that abandon the rail's comment
-// carry it for the recovered-drafts plate.
+// WHAT THE PAGES VIEW STILL ASKS OF THE APP. The Pages tab reads its own
+// workspace and signs its own writes over the kernel contract, so what is left
+// here are the two OS doors: the clipboard, and the ONE open plane a
+// `duck://` address in a document goes through.
 enum PagesIntent
-  toggle_create
-  create
-  choose
-  search
-  clear_search
-  arm_delete
-  disarm_delete
-  delete
-  open_hit
-  use_draft
-  discard_draft
-  edited
-  toggle_comments
-  close_comments
-  narrow_comments
-  widen_comments
-  resolve
-  post
+  open_link
   copy
 // WHAT THE CHAT VIEW STILL ASKS OF THE APP. The Chat tab reads its own room
 // and signs its own writes over the kernel contract, so what is left here is

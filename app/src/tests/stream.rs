@@ -22,21 +22,9 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // `channel_id` from the account number it resolved itself, and `account_number`
     // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
     // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 6] = [
+    const MIRRORS: [(&str, &[&str]); 5] = [
         ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
-        // The card's rows are its SCOPE's threads with their anchors resolved,
-        // so narrowing and widening invalidate the mirror exactly as a new
-        // thread list or a moved page does.
-        (
-            "block_comment_rows",
-            &[
-                "blocks",
-                "block_comment_threads",
-                "active_page",
-                "inline_comment_target",
-            ],
-        ),
         (
             "huddle_rows",
             &["huddle_roster", "call_peers", "call_muted"],
@@ -154,18 +142,17 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     // a resync carrying no chat news leaves the window — and its banner — alone
     let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
         chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general", "",
-            Vec::new(),
-        )
+        ..live_refresh(app.hydration_generation, "general")
     }));
     assert!(
         app.history_view,
-        "a pages-only resync did not touch the timeline, so the window stands"
+        "a plane-only resync did not touch the timeline, so the window stands"
     );
 
     // one that carries chat replaced it with the latest page
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation, "general", "",
-        Vec::new(),
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
     )));
     assert!(
         !app.history_view,
@@ -179,42 +166,6 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     created.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChannelCreated(created));
     assert!(!app.history_view);
-}
-
-/// A CHAT-ONLY RESYNC MUST NOT CLAIM THE PAGE IT CARRIES NO NEWS ABOUT. The
-/// click blanks the pane and moves `active_page`; a resync that arrives with
-/// `pages_loaded == false` keeps the empty `blocks` and canonicalises
-/// `title + []` into a document the node never sent. Stamping `buffer_page`
-/// for that fabrication hands `page_autosave_tick` a blank document it is
-/// willing to write over the real page.
-#[test]
-fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
-    let mut app = reading_alpha();
-    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
-    assert!(app.buffer_page.is_empty(), "the click released the buffer");
-
-    let mut chat_only = live_refresh(app.hydration_generation, "", "", Vec::new());
-    chat_only.pages_loaded = false;
-    chat_only.active_page = String::new();
-    let _ = app.__update(__DucktapeMessage::LiveResynced(chat_only));
-
-    assert!(
-        app.buffer_page.is_empty(),
-        "a resync carrying no page news must not claim the page as the buffer's"
-    );
-
-    // And the tick still refuses, which is the consequence that matters.
-    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
-        message: "node blip".into(),
-        committed: false,
-    }));
-    app.page_text = ("h").to_string();
-    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
-    assert_eq!(
-        app.block_autosave_status,
-        AutosaveStatus::Idle,
-        "a fabricated buffer must never be saved into a real page"
-    );
 }
 
 /// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.
@@ -310,8 +261,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
         head_seq,
     };
     let resync = |app: &Ducktape, channels: Vec<backend::ChatChannel>| {
-        let mut refresh =
-            live_refresh(app.hydration_generation, "dm-1", "", Vec::new());
+        let mut refresh = live_refresh(app.hydration_generation, "dm-1");
         refresh.channels = channels;
         __DucktapeMessage::LiveResynced(refresh)
     };

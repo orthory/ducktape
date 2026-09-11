@@ -82,7 +82,7 @@ pub async fn connect(
         // views load while the workspace does, and this answers with both
         // in hand, so the tabs it opens onto never draw a view on its way
         let views = crate::module_view::connected(&rpc);
-        let workspace = load_workspace(&rpc, None, None, generation).await?;
+        let workspace = load_workspace(&rpc, None, generation).await?;
         views.settled().await;
         Ok::<_, String>(workspace)
     }
@@ -559,14 +559,15 @@ pub(crate) async fn folded_update(
     // A push reports APPLICATION, which is the acceptance gap closed and the
     // FOLD gap still open: the node's block loop writes the op feed and the
     // index folds behind it on its own runner (only the sim's
-    // `wait_folds_drained` ever joins the two). Every structural pages op sets
-    // `load_pages` below, and that reload reads the folded view — so without
-    // this the pane installs a tree that predates the very op that prompted
-    // it, with no further op coming to correct it.
+    // `wait_folds_drained` ever joins the two). A reload prompted by this push
+    // reads the folded view — so without this it installs a tree that predates
+    // the very op that prompted it, with no further op coming to correct it.
+    // The kernel's `rpc.view` waits on the same record, which is what gives a
+    // module view reading its own plane the same guarantee.
     //
-    // Recorded HERE, once, rather than carried down through the update, the
-    // handler's debounce and the resync extern's argument list: this is where
-    // the height is learned, and `load_pages_data` already waits on the record
+    // Recorded HERE, once, rather than carried down through the update and
+    // the handler's debounce: this is where the height is learned, and every
+    // read that must not answer behind it waits on the record
     // (`rpc.rs`, `SEEN_BLOCKS`).
     if let Ok(client) = rpc_client(rpc) {
         note_module_block(&client, module, op.height);
@@ -625,10 +626,8 @@ pub(crate) async fn folded_update(
                 height,
                 module: "chat".into(),
                 load_chat: false,
-                load_pages: false,
                 debounce: false,
                 chat: vec![delta],
-                pages: PagesDelta::default(),
                 bell: BellDelta::default(),
                 permit: LivePermit::default(),
             })
@@ -654,10 +653,8 @@ pub(crate) async fn folded_update(
                     height,
                     module: "inbox".into(),
                     load_chat: false,
-                    load_pages: false,
                     debounce: false,
                     chat: Vec::new(),
-                    pages: PagesDelta::default(),
                     bell,
                     permit: LivePermit::default(),
                 }),
@@ -665,34 +662,6 @@ pub(crate) async fn folded_update(
                 Err(_) => None,
             }
         }
-        "pages" => match pages::client::delta_from_op(&payload) {
-            Ok(delta) => {
-                let folded = delta.kind == "text";
-                Some(LiveUpdate {
-                    kind: crate::LiveKind::Pages,
-                    status: format!("Live · block {height}"),
-                    height,
-                    module: "pages".into(),
-                    load_chat: false,
-                    // A TEXT EDIT FOLDS; EVERYTHING ELSE RELOADS. The page autosave
-                    // commits one `UpdateText` per tick while a reader types, and
-                    // each used to buy a `load_pages_data`: three SEQUENTIAL
-                    // queries — the page index, every block of the open page, and a
-                    // `ThreadsForTargets` whose body carries every block id. Your
-                    // own keystrokes came back on your own stream and made you
-                    // re-read the document you were typing into, against a read
-                    // path that is checkpoint-gated.
-                    load_pages: !folded,
-                    // nothing to coalesce when nothing is fetched.
-                    debounce: !folded,
-                    chat: Vec::new(),
-                    pages: delta,
-                    bell: BellDelta::default(),
-                    permit: LivePermit::default(),
-                })
-            }
-            Err(_) => Some(live_resync("pages", height)),
-        },
         // THE RELOAD PLANES. No client fold exists for these modules and none
         // is worth writing: a validator set changes when someone joins, a
         // proposal when someone votes, an account when someone renames a
@@ -705,10 +674,11 @@ pub(crate) async fn folded_update(
         // nothing at all on a block that does not touch them.
         //
         // Model configuration and run activity both refresh the Agents view.
-        // `forge` is here because the app holds no forge state at all: the
-        // plane arm is what tells a module view's `rpc.live` subscription,
-        // and the forge view re-reads exactly what it has open.
-        "valset" | "governance" | "identity" | "agent" | "runs" | "files" | "forge" => {
+        // `pages` and `forge` are here because the app holds no state of
+        // either any more: the plane arm is what tells a module view's
+        // `rpc.live` subscription, and each view re-reads exactly what it
+        // has open.
+        "valset" | "governance" | "identity" | "agent" | "runs" | "files" | "pages" | "forge" => {
             Some(live_plane(module, height))
         }
         _ => None,
@@ -745,20 +715,14 @@ pub(crate) async fn load_channel_row(
     Ok(room.map(|(channel, _roster)| channel))
 }
 
-/// One scoped catch-up load, flag-selected per plane: the chat slices
-/// (channel list + active window + members) and/or the pages slices (page
-/// list + active blocks). Runs on stream `ready` (the subscribe→hydrate
-/// ordering race), on a `resync` (lag or an unfoldable op), and debounced
-/// after pages deltas — never per chat commit. Unloaded planes come back
-/// with their `*_loaded` flag false and the handler keeps current state.
+/// One scoped catch-up load of the chat slices: the channel list, the active
+/// window and its members. Runs on stream `ready` (the subscribe→hydrate
+/// ordering race) and on a `resync` (lag or an unfoldable op), never per chat
+/// commit. A resync for a plane this app folds nothing for comes back with
+/// `chat_loaded` false and the handler keeps current state.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LiveRefresh {
     pub generation: i64,
-    /// The `pages_fold_serial` the request snapshotted, echoed back so
-    /// `live_resynced` can tell whether a text fold landed while this reply
-    /// was in flight (#1041). A mismatch gates ONLY the fold-owned fields —
-    /// page titles and block texts — never the structural pages half.
-    pub fold_serial: i64,
     pub chat_loaded: bool,
     pub channels: Vec<ChatChannel>,
     pub active_channel: String,
@@ -767,29 +731,17 @@ pub struct LiveRefresh {
     pub active_channel_members_only: bool,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
-    pub pages_loaded: bool,
-    pub pages: Vec<PageItem>,
-    pub blocks: Vec<PageBlock>,
-    pub active_page: String,
-    pub active_page_title: String,
-    pub active_page_parent: String,
-    pub comment_thread_total: i64,
-    pub commented_block_hits: Vec<String>,
 }
 
-/// `planes` is `chat` | `pages` | `both` — the flat Ice surface's
-/// discriminant for which slices to load ([`resync_planes`] builds it).
-// the Ice extern boundary is a flat parameter list by construction — the
-// same allowance every other wide extern in this module carries.
-#[allow(clippy::too_many_arguments)]
+/// One scoped catch-up load of the chat slices. `load_chat` false is the
+/// resync of a plane this app folds nothing for — it answers with
+/// `chat_loaded` false and the handler keeps what it has.
 pub async fn live_resync_load(
     rpc: String,
     channel_id: String,
-    page_id: String,
-    planes: String,
+    load_chat: bool,
     debounce: bool,
     generation: i64,
-    fold_serial: i64,
     attempt: i64,
 ) -> Result<LiveRefresh, HydrationError> {
     if debounce {
@@ -802,7 +754,6 @@ pub async fn live_resync_load(
         let rpc = rpc_client(&rpc)?;
         let mut refresh = LiveRefresh {
             generation,
-            fold_serial,
             chat_loaded: false,
             channels: Vec::new(),
             active_channel: String::new(),
@@ -811,69 +762,20 @@ pub async fn live_resync_load(
             active_channel_members_only: false,
             huddle_roster: Vec::new(),
             channel_members: Vec::new(),
-            pages_loaded: false,
-            pages: Vec::new(),
-            blocks: Vec::new(),
-            active_page: String::new(),
-            active_page_title: String::new(),
-            active_page_parent: String::new(),
-            comment_thread_total: 0,
-            commented_block_hits: Vec::new(),
         };
-        let load_chat = planes == "chat" || planes == "both";
-        let load_pages = planes == "pages" || planes == "both";
-        // `both` is the arm the boot pays: the stream's `ready` event resyncs
-        // each plane the moment the console connects. The two planes share
-        // nothing, so they run together rather than one behind the other.
-        let (chat, pages) = tokio::try_join!(
-            async {
-                match load_chat {
-                    true => load_chat_data(
-                        &rpc,
-                        (!channel_id.is_empty()).then_some(channel_id.as_str()),
-                    )
-                    .await
-                    .map(Some),
-                    false => Ok(None),
-                }
-            },
-            async {
-                match load_pages {
-                    true => {
-                        // A LIVE REFRESH FOLLOWS SOMEONE ELSE'S WRITE, and the
-                        // op that prompted it was recorded when it arrived
-                        // (`folded_update`), so this read waits for the fold to
-                        // carry it — the structural half of the reply is
-                        // applied unconditionally, with no later op to correct
-                        // a tree that predates the push.
-                        load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
-                            .await
-                            .map(Some)
-                    }
-                    false => Ok(None),
-                }
-            }
-        )?;
-        if let Some(chat) = chat {
-            refresh.chat_loaded = true;
-            refresh.channels = chat.channels;
-            refresh.active_channel = chat.active_channel;
-            refresh.active_channel_name = chat.active_channel_name;
-            refresh.active_channel_archived = chat.active_channel_archived;
-            refresh.active_channel_members_only = chat.active_channel_members_only;
-            refresh.huddle_roster = chat.huddle_roster;
-            refresh.channel_members = chat.channel_members;
+        if !load_chat {
+            return Ok(refresh);
         }
-        if let Some(pages) = pages {
-            refresh.pages_loaded = true;
-            refresh.pages = pages.pages;
-            refresh.blocks = pages.blocks;
-            refresh.active_page = pages.active_page;
-            refresh.active_page_title = pages.active_page_title;
-            refresh.active_page_parent = pages.active_page_parent;
-            refresh.comment_thread_total = pages.comment_thread_total;
-            refresh.commented_block_hits = pages.commented_block_hits;
-        }
+        let chat =
+            load_chat_data(&rpc, (!channel_id.is_empty()).then_some(channel_id.as_str())).await?;
+        refresh.chat_loaded = true;
+        refresh.channels = chat.channels;
+        refresh.active_channel = chat.active_channel;
+        refresh.active_channel_name = chat.active_channel_name;
+        refresh.active_channel_archived = chat.active_channel_archived;
+        refresh.active_channel_members_only = chat.active_channel_members_only;
+        refresh.huddle_roster = chat.huddle_roster;
+        refresh.channel_members = chat.channel_members;
         Ok(refresh)
     }
     .await
@@ -891,16 +793,6 @@ pub async fn live_resync_load(
 /// module as an argument keeps it to a single predicate for every plane.
 pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bool {
     kind == crate::LiveKind::Plane && module == want
-}
-
-/// The planes discriminant for [`live_resync_load`].
-pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
-    match (load_chat, load_pages) {
-        (true, true) => "both".into(),
-        (true, false) => "chat".into(),
-        (false, true) => "pages".into(),
-        (false, false) => String::new(),
-    }
 }
 
 // per-field keepers: apply a refreshed value only when its plane loaded —
@@ -1001,190 +893,6 @@ pub fn huddle_after_load(
         channel: loaded_channel,
         channel_name: loaded_channel_name,
     }
-}
-
-pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
-    if loaded { next } else { current }
-}
-
-/// Does this pages reply still answer for the page the app is on?
-///
-/// A live resync is issued with whatever page was active AT THE TIME and then
-/// runs several queries. A mutation landing in between leaves the reply
-/// speaking for a document nobody is looking at — measured on a page create:
-/// the create's own reload corrected the selection to the new page, and a
-/// resync issued a moment earlier for the OLD page answered afterwards and
-/// pulled the reader back to it. Its blocks, title and comment counts are all
-/// for that other document, so none of them may land.
-///
-/// Two replies are still current: one that resolved to the page the app is on,
-/// and one whose index no longer holds that page at all — there the reply's
-/// fallback is the honest answer and the app must follow it.
-pub fn pages_reply_answers_current(pages: Vec<PageItem>, replied: String, current: String) -> bool {
-    current.is_empty() || replied == current || !pages.iter().any(|page| page.id == current)
-}
-
-pub fn keep_strs(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<String> {
-    if loaded { next } else { current }
-}
-
-pub fn keep_blocks(loaded: bool, next: Vec<PageBlock>, current: Vec<PageBlock>) -> Vec<PageBlock> {
-    if loaded { next } else { current }
-}
-
-/// Fold one committed text edit into the open document's blocks.
-///
-/// The whole fold, because text is the whole of what an `UpdateText` changes
-/// that this shell can draw: `page_blocks` copies `block.text` verbatim and
-/// carries no mark field, so this produces exactly what a reload would have.
-///
-/// A `block_id` this list does not hold is NOT an error — block ids are minted,
-/// so it belongs to a page nobody is looking at, and the reader of that page
-/// gets it from their own load. Same for any non-`text` delta: those already
-/// carry `load_pages`, and folding them would mean re-deriving `prefix`,
-/// `child_count` and sibling order from an op that names none of them.
-pub fn apply_page_text(mut blocks: Vec<PageBlock>, delta: PagesDelta) -> Vec<PageBlock> {
-    if delta.kind != "text" {
-        return blocks;
-    }
-    let Some(block) = blocks.iter_mut().find(|block| block.id == delta.block_id) else {
-        return blocks;
-    };
-    block.text = delta.text;
-    blocks
-}
-
-/// Fold a committed RENAME into the open page's title.
-///
-/// `UpdateText` against a PAGE block is the rename op — there is no other one
-/// (`pages::interface`, `block_ops`) — and the module-side classifier calls it
-/// `text` like any other edit, because a payload naming one block id cannot
-/// know which ids are pages. This shell can: `active_page` IS that id.
-///
-/// Without this the rename folded into NOTHING and was not merely invisible.
-/// `page_blocks` drops the page head (`load.rs`, `.skip(1)`), so the block fold
-/// never matches it; `load_pages` is false because the op classified as text;
-/// and the title is line 0 of the buffer, so the reader's next keystroke made
-/// `save_page_document` compare its stale line 0 against a FRESH read of the
-/// node and write the old title back over the new one. A rename by anyone else
-/// was reverted on chain by the next person to type.
-pub fn apply_page_title(title: String, delta: PagesDelta, active_page: String) -> String {
-    let renames_open_page = delta.kind == "text" && delta.block_id == active_page;
-    if renames_open_page {
-        return delta.text;
-    }
-    title
-}
-
-/// The same rename, in the page list — for ANY page, not just the open one.
-///
-/// The list holds page ids, so the delta's `block_id` landing in it IS the
-/// test, and the module is what makes that sound: page ids ARE block ids in
-/// one global namespace, and both writers enforce global uniqueness against
-/// the whole store — `InsertBlock` refuses an id that already exists
-/// (`block_ops.rs`, `PageError::DuplicateBlock`) and `CreatePage` refuses one
-/// already held by a non-page block (`page_ops.rs`). So a body block's id can
-/// never equal a page id, and a body edit can never rewrite a row here. (The
-/// app's own `fresh_id` prefixes are a local convention and prove nothing —
-/// ids are client-minted, and another writer need not use them.)
-///
-/// The empty title becomes `Untitled` because THAT IS WHAT A RELOAD PRODUCES
-/// (`load.rs`, `page_items`), and a fold must land exactly where the reload it
-/// replaces would have. Clearing line 0 submits an `UpdateText` with empty
-/// text, so this is reachable from this very editor; without it the row and
-/// the doc tab would go blank until some unrelated op bought a reload.
-/// `active_page_title` deliberately does NOT normalize — a reload leaves it
-/// verbatim (`load.rs`, `active_page_title`), so folding it verbatim matches.
-pub fn apply_page_rename(mut pages: Vec<PageItem>, delta: PagesDelta) -> Vec<PageItem> {
-    if delta.kind != "text" {
-        return pages;
-    }
-    let Some(page) = pages.iter_mut().find(|page| page.id == delta.block_id) else {
-        return pages;
-    };
-    page.title = match delta.text.is_empty() {
-        true => "Untitled".into(),
-        false => delta.text,
-    };
-    pages
-}
-
-/// Did this delta FOLD into pages state rather than buy a reload?
-///
-/// The stream decoder's own classification (`load_pages: !folded` above): a
-/// `text` delta — a body edit or a rename — lands through `apply_page_text` /
-/// `apply_page_title` / `apply_page_rename` and fetches nothing. Everything
-/// else sets `load_pages`, which bumps the hydration generation and orphans
-/// any resync reply in flight. That asymmetry is what makes one serial
-/// sufficient for #1041: text folds are the ONLY pages writes that can land
-/// inside a still-current reply window, so a moved serial names exactly the
-/// folded fields as the divergence.
-pub fn pages_delta_folds(delta: PagesDelta) -> bool {
-    delta.kind == "text"
-}
-
-/// The row-title half of #1041's selective merge.
-///
-/// A reply the fold outran takes its page LIST from the reply — the list is
-/// the whole index, and a row the reply carries that state does not is
-/// structural news the read was issued for — but every shared row keeps the
-/// title STATE holds: inside a still-current window the only way the two can
-/// disagree is a rename that folded after the reply's reads executed. When
-/// the reads DID see the rename the two titles agree, so over-keeping (the
-/// serial cannot tell those orderings apart) costs nothing.
-pub fn keep_folded_page_titles(
-    fold_outran_reply: bool,
-    next: Vec<PageItem>,
-    current: Vec<PageItem>,
-) -> Vec<PageItem> {
-    if !fold_outran_reply {
-        return next;
-    }
-    let folded_titles: BTreeMap<&str, &str> = current
-        .iter()
-        .map(|page| (page.id.as_str(), page.title.as_str()))
-        .collect();
-    next.into_iter()
-        .map(|mut page| {
-            if let Some(title) = folded_titles.get(page.id.as_str()) {
-                page.title = (*title).to_string();
-            }
-            page
-        })
-        .collect()
-}
-
-/// The block-TEXT half of the same merge. Structure — which blocks exist,
-/// their order, kind, depth — is the reply's: it is what the read was issued
-/// for, and no structural delta can land inside a still-current window
-/// without orphaning the reply. Text is the fold's: `apply_page_text` writes
-/// nothing else, and a folded text lost to a pre-fold reply is not merely
-/// stale on screen — a clean buffer rebuilt from it makes the reader's next
-/// keystroke plan the OLD text back onto the chain (`document_plan` is a
-/// two-way diff, and body lines have no authorship guard the way the title
-/// has `title_write_owed`). Pending optimistic blocks are no fold, so they
-/// are not an overlay source; `merge_pending_blocks` re-seats them.
-pub fn keep_folded_block_texts(
-    fold_outran_reply: bool,
-    next: Vec<PageBlock>,
-    current: Vec<PageBlock>,
-) -> Vec<PageBlock> {
-    if !fold_outran_reply {
-        return next;
-    }
-    let folded_texts: BTreeMap<&str, &str> = current
-        .iter()
-        .filter(|block| !block.pending)
-        .map(|block| (block.id.as_str(), block.text.as_str()))
-        .collect();
-    next.into_iter()
-        .map(|mut block| {
-            if let Some(text) = folded_texts.get(block.id.as_str()) {
-                block.text = (*text).to_string();
-            }
-            block
-        })
-        .collect()
 }
 
 pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {

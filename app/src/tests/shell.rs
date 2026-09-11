@@ -654,7 +654,6 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
         status: "Live".into(),
         height: -1,
         load_chat: true,
-        load_pages: true,
         ..backend::LiveUpdate::default()
     }));
     assert_eq!(
@@ -1002,9 +1001,12 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .any(|line| line.trim_start().starts_with("reply_draft =")),
         "root state reclaimed `reply_draft`"
     );
+    // The page's own address is the pages view's, like everything else on
+    // that screen: the app holds the page a `duck://` link asked for and
+    // nothing more.
     let page_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
     assert!(!root_state.contains("page_link"));
-    assert!(page_handlers.contains("let page_link = document.link"));
+    assert!(!page_handlers.contains("page_link"));
 
     let native_surfaces = concat!(
         include_str!("../backend/live.rs"),
@@ -1307,9 +1309,12 @@ fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
         .1;
     let (signature, body) = ladder.split_once(") -> String {").expect("the ladder");
     let body = body.split_once("\n}\n").expect("the ladder ends").0;
+    // Split on the COMMA, not the line: a signature short enough to fit on one
+    // line is the shape a ladder with no per-tab rung left naturally takes, and
+    // a line-wise read sees only its first parameter.
     let layers: Vec<&str> = signature
-        .lines()
-        .filter_map(|line| line.trim().split_once(':'))
+        .split(',')
+        .filter_map(|parameter| parameter.trim().split_once(':'))
         .map(|(name, _)| name)
         .collect();
     let guards: Vec<(&str, &str)> = body
@@ -1396,51 +1401,37 @@ fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
     }
 }
 
-/// A TAB MOVE RETIRES THE MENUS THE TAB IT LEFT OWNED.
+/// A TAB MOVE RETIRES WHAT THE TAB IT LEFT PUT ON SCREEN — and after the view
+/// migration that is exactly one thing: the hydration banner.
 ///
-/// Nothing did: `select_shell_tab` left every menu flag set, which is the whole
-/// reason the escape ladder has to be scoped tab by tab (#1132). The scoping
-/// stays — a rung must not answer for a surface that is not on screen, however
-/// the flag got there — and this is the other half of it: an armed delete
-/// confirm that survives a tab round trip is a mouse click away from deleting
-/// the page the reader forgot she armed, and a ⋯ menu is not state anyone
-/// expects to come back to.
+/// The menu flags this rule was written for (#1132's chat ⋯ menus, the pages
+/// armed delete) left with their screens: each one is now guest state that the
+/// guest retires itself, which is why `select_shell_tab` no longer asks whether
+/// the tab actually moved. The banner cannot follow them — it is the KERNEL's
+/// own report that a load failed, so it is cleared here, ABOVE both early
+/// returns. Leaving it up after a navigation tells the reader the pane she just
+/// opened is broken, a lie the banner has no way to walk back: it is dismissed
+/// by hand or not at all.
 #[test]
-fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
+fn a_tab_move_retires_the_banner_of_the_screen_it_left() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.shell_tab = ShellTab::Chat;
-    app.page_delete_armed = true;
+    app.error = "the room would not load".into();
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
 
-    assert!(
-        !app.page_delete_armed,
-        "an armed delete never rides a tab move"
-    );
+    assert_eq!(app.error, "", "a banner never rides a tab move");
+    assert_eq!(app.shell_tab, ShellTab::Node);
 
-    // The disconnected path returns before the generation bumps, and retires
-    // the same set — the clear sits above both early returns, like `error`.
+    // The chat/pages return and the disconnected return each skip the
+    // generation bumps below, and neither may keep a stale banner alive.
     let (mut app, _) = Ducktape::__boot();
     app.shell_tab = ShellTab::Pages;
-    app.page_delete_armed = true;
+    app.error = "the page would not load".into();
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert!(!app.page_delete_armed);
+    assert_eq!(app.error, "");
     assert_eq!(app.shell_tab, ShellTab::Chat);
-
-    // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
-    // from the seat that is already active, and Settings' rows emit their own
-    // tab while the reader is on it — so an unconditional retire is one click
-    // from destroying an armed confirm on the screen she never left.
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Pages;
-    app.page_delete_armed = true;
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
-    assert!(
-        app.page_delete_armed,
-        "clicking the tab you are on retires nothing"
-    );
 }
 
 /// THE FIVE IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only

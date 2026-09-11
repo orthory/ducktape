@@ -55,6 +55,13 @@
 //!   `badge` event with `{"count": N}` in its detail; `host.roster`
 //!   `{scope, members}` — the mention vocabulary of the host composer a
 //!   view docked over `scope`.
+//! - `host.id` `<prefix>` — one id, unique on this device, for a module
+//!   whose records are addressed by ids its WRITER mints. A view has no
+//!   clock and no entropy of its own, so the app mints it.
+//! - `clock.ticks` `<period, i64 ms little-endian>` — a subscription that
+//!   gets one item per period. A wasm module has no clock, so an Ice
+//!   `every`/`repeat` in a view is this door; the window thread keeps the
+//!   deadline and the shell draws the frame it comes due on.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
@@ -69,6 +76,9 @@ use super::{Guest, ModuleViewEvent, Slot, wire};
 const MAX_BLOCKS: usize = 1_000;
 /// The most a `blob.get` may pull: a frame's worth, as the loader's own cap.
 const MAX_BLOB_BYTES: usize = 16 << 20;
+/// The longest `host.id` prefix: a word naming the kind of record, not a
+/// payload of its own.
+const MAX_ID_PREFIX: usize = 32;
 /// The most one `rpc.stream` frame may carry into a view. A node frame is a
 /// line of a run's output or the like; a frame past this is the node
 /// misbehaving, and the subscription ends rather than growing the guest.
@@ -91,10 +101,26 @@ impl Replies {
         pending.append(&mut events);
     }
 
-    /// Whether a query or a submit is still on its way: the widget keeps
-    /// polling until none is.
+    /// Whether a query or a submit is still on its way.
     pub(super) fn any_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    /// WHETHER THE VIEW IS STILL OWED A FRAME, which is the in-flight count
+    /// AND the answers already lying here. The two are one fact to a caller
+    /// and reading only the count loses a race it loses often: a request is
+    /// spawned inside a redraw, and a node that answers before that redraw
+    /// returns has already given the count back — leaving an answer nobody
+    /// is coming back for. The widget then stops polling and the view sits
+    /// on "Loading…" until an unrelated event wakes it; a test's pump
+    /// returns and reads a screen that never got its rows.
+    ///
+    /// Under the events lock, because that is the lock [`Replies::settled`]
+    /// takes to give a count back: with it held, empty and zero together
+    /// mean nothing can arrive that no one is waiting for.
+    pub(super) fn answer_owed(&self) -> bool {
+        let events = self.events.lock().expect("kernel replies");
+        !events.is_empty() || self.in_flight.load(Ordering::SeqCst) > 0
     }
 
     /// Blocks until nothing is in flight.
@@ -220,6 +246,30 @@ pub(super) fn answer(
                 None => guest.refuse(id, "`host.badge` carries no count".into()),
             }
         }
+        ("clock", "ticks") => {
+            let period = tick_period(payload);
+            match period {
+                Some(period) => guest.clocks.push(Clock {
+                    id,
+                    period,
+                    due: std::time::Instant::now() + period,
+                }),
+                None => guest.refuse(id, "`clock.ticks` names no period".into()),
+            }
+        }
+        ("host", "id") => {
+            let prefix = std::str::from_utf8(payload).unwrap_or_default().trim();
+            let named = !prefix.is_empty()
+                && prefix.len() <= MAX_ID_PREFIX
+                && prefix.bytes().all(|byte| byte.is_ascii_alphanumeric());
+            match named {
+                true => guest.reply(
+                    id,
+                    Ok(crate::backend::fresh_id(prefix).into_bytes()),
+                ),
+                false => guest.refuse(id, "`host.id` names no prefix".into()),
+            }
+        }
         _ => return false,
     }
     true
@@ -309,6 +359,56 @@ fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
 /// A node stream the kernel is running for one subscription. Dropped with
 /// the guest that asked, or with the cancel that retires it — and dropping
 /// it ends the socket, so a view that is replaced leaves nothing reading.
+/// One `clock.ticks` subscription: the period the view asked for, and when
+/// its next item is due.
+pub(super) struct Clock {
+    pub(super) id: u64,
+    period: std::time::Duration,
+    due: std::time::Instant,
+}
+
+/// The shortest and longest period a view may ask the clock for. Below the
+/// floor a tick is a spin the window thread pays for every frame; above the
+/// ceiling it is not a period but a date, which a view has no business
+/// keeping — it reads the node for that.
+const MIN_TICK_MS: i64 = 16;
+const MAX_TICK_MS: i64 = 60 * 60 * 1_000;
+
+/// A `clock.ticks` payload: the period in milliseconds, little-endian, as
+/// `ui_lang_guest::every` writes it.
+fn tick_period(payload: &[u8]) -> Option<std::time::Duration> {
+    let millis = i64::from_le_bytes(<[u8; 8]>::try_from(payload).ok()?);
+    let named = (MIN_TICK_MS..=MAX_TICK_MS).contains(&millis);
+    named.then(|| std::time::Duration::from_millis(millis as u64))
+}
+
+/// Every clock item due at `now`, and the deadline re-armed for each. The
+/// instant is an argument so the rule is decided, not timed: the widget
+/// hands it `Instant::now()`, a test hands it the deadline it chose.
+pub(super) fn ticked(clocks: &mut [Clock], now: std::time::Instant) -> Vec<wire::Event> {
+    let mut items = Vec::new();
+    for clock in clocks.iter_mut() {
+        if clock.due > now {
+            continue;
+        }
+        // ONE ITEM PER REDRAW, however far behind: a window that was not
+        // drawn for a minute owes the view one tick, not four thousand.
+        clock.due = now + clock.period;
+        items.push(wire::Event::Response {
+            id: clock.id,
+            result: Ok(Vec::new()),
+            done: false,
+        });
+    }
+    items
+}
+
+/// When the nearest clock item comes due, for the redraw the widget asks
+/// the shell to schedule.
+pub(super) fn next_tick(clocks: &[Clock]) -> Option<std::time::Instant> {
+    clocks.iter().map(|clock| clock.due).min()
+}
+
 pub(super) struct NodeStream(tokio::task::JoinHandle<()>);
 
 impl Drop for NodeStream {
@@ -640,12 +740,25 @@ fn query(
     })
 }
 
+/// One index-tier view read, AFTER the module's fold has caught up with
+/// everything this client knows it wrote.
+///
+/// A derived read model folds BEHIND the block loop, so a view read fired on
+/// the heels of this view's own `op.submit` answers a tier that predates it:
+/// the moved block back where it was, the deleted line still alive, the line
+/// just typed missing. A module whose records the view then plans against
+/// (the pages document save) turns that into a DUPLICATE write, so the wait
+/// belongs on the kernel's read rather than in each view that has to
+/// remember it. `crate::backend::await_seen_fold` waits for nothing when
+/// nothing is outstanding, which is every read a view makes that did not
+/// just write.
 fn view(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
     Box::pin(async move {
         let target = target_of(&ask)?;
+        crate::backend::await_seen_fold(&client, &target, &ask["query"]).await;
         let reply: serde_json::Value = client
             .view(&target, &ask["query"])
             .await
@@ -1055,6 +1168,36 @@ mod tests {
             }]
         );
         assert!(!replies.any_in_flight());
+    }
+
+    /// AN ANSWER THAT BEAT THE REDRAW THAT ASKED FOR IT IS STILL OWED A
+    /// FRAME. The in-flight count is given back the moment the answer is
+    /// written, so a node quick enough to answer inside the redraw leaves
+    /// the count at zero with the answer undrained — and a caller reading
+    /// only the count walks away from it, which is a view stuck on
+    /// "Loading…" until something unrelated wakes it.
+    #[test]
+    fn an_answer_already_written_is_owed_a_frame_with_nothing_in_flight() {
+        let replies = std::sync::Arc::new(Replies::default());
+        assert!(!replies.answer_owed(), "nothing asked, nothing owed");
+
+        replies.in_flight.fetch_add(1, Ordering::SeqCst);
+        let running = replies.clone();
+        // port 1 is nothing's: the refusal is composed without a node, which
+        // is what makes this answer land inside the caller's own redraw
+        let client = ducktape_rpc::Client::new("http://127.0.0.1:1").expect("a client");
+        runtime().spawn(async move {
+            let result = admin(client, serde_json::json!({"route": "/etc/passwd"})).await;
+            running.deliver(3, result);
+        });
+        replies.wait_idle();
+
+        assert!(!replies.any_in_flight(), "the count came back");
+        assert!(replies.answer_owed(), "and the answer is still here");
+        let mut landed = Vec::new();
+        replies.drain_into(&mut landed);
+        assert_eq!(landed.len(), 1);
+        assert!(!replies.answer_owed(), "drained, and nothing is owed");
     }
 
     /// A subscription the view abandons is aborted mid-wait — a socket

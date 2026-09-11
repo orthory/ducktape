@@ -640,20 +640,6 @@ pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<S
     Ok(value.to_string())
 }
 
-pub(crate) fn bounded_exact_text(
-    value: String,
-    field: &str,
-    limit: usize,
-) -> Result<String, String> {
-    let invalid = value.len() > limit || value.chars().any(|character| character == '\0');
-    if invalid {
-        return Err(format!(
-            "{field} must be at most {limit} bytes and contain no NUL"
-        ));
-    }
-    Ok(value)
-}
-
 pub(crate) fn required_id(value: String, subject: &str) -> Result<String, String> {
     bounded_text(value, &format!("{subject} id"), 512)
 }

@@ -196,11 +196,13 @@ view
         chat:
           extern chat_view(dark, connected, connected_rpc, network_name, network_chain_id, status, block_height, account_number, settings_user_key, dm_peers_generation, rooms, dm_rows, channel_create_open, active_channel, active_dm_peer, active_dm, chat_land_seq, unread_boundary, mutation_phase, loading, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, shift_held, chat_copy_chord_serial, chat_sent_serial, chat_pending_sends, live_agents) #chat -> chat_view_event _
 
-        // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
-        // strip and the comments rail go in as props; the document is the
-        // app's editor, painted into the view's slot by the host.
+        // Pages is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the chain among them, because a `duck://page/…` address
+        // carries it — and the view reads the workspace, the open document
+        // and its comment threads off the node itself, signing every write
+        // through `op.submit`. The editor is the guest's own.
         pages:
-          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, inline_comment_target, block_comments_pinned, block_comment_thread_total, block_comment_rows, block_comment_threads_loading) #pages -> pages_view_event _
+          extern pages_view(dark, connected, network_chain_id, page_route, page_route_serial) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
         // go in — the chain among them, because a draft belongs to the

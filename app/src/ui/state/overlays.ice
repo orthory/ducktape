@@ -11,8 +11,9 @@ state
   palette_draft = ""
   // The chat float's discriminant, honest here for the same reason a captured
   // query is unnecessary: `palette_changed` runs on EVERY keystroke and moves
-  // this, so no phase can outlive the draft that earned it (see
-  // `page_search_query` for the class the pages search needed a string for).
+  // this, so no phase can outlive the draft that earned it (the pages view's
+  // own `page_search_query` carries the class an enter-to-submit search needs
+  // a captured string for).
   // `done` is an answer; a failure returns to `idle`, and `idle` under a live
   // draft is the panel's FAILURE arm — see `screens/overlays.ice`.
   palette_search_phase:SearchPhase = SearchPhase.idle
