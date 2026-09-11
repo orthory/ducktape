@@ -41,6 +41,7 @@ extern crate::host
   pure hex(digest:&str) -> str
   pure plural(count:i64, one:&str, many:&str) -> str
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
+  pure ledger_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
 
 state
   active_palette:palette[AppTheme] = AppTheme.app
@@ -66,6 +67,8 @@ state
   query = ""
   kind = "all"
   selected:i64 = 0
+  viewport_width = 1280.0
+  ledger_width = 340.0
   host_error = ""
   // an act's acknowledgement — `host::notify` returns nothing to bind
   sent = false
@@ -144,6 +147,13 @@ on pick_explorer_kind(next)
 on select_explorer_block(height)
   selected = height
 
+on ledger_resized(dx, _dy)
+  ledger_width = ledger_width_after_delta(ledger_width, dx, viewport_width)
+
+on viewport_changed(width, _height)
+  viewport_width = width
+  ledger_width = ledger_width_after_delta(ledger_width, 0.0, width)
+
 view
   box #root
     with
@@ -151,6 +161,8 @@ view
       h=fill
       bg=bg
     col w=fill h=fill
+      sensor show=viewport_changed resize=viewport_changed
+        space w=fill h=0.0
       col
         with
           w=fill
@@ -427,10 +439,10 @@ view
             with
               w=fill
               h=fill
-              gap=10.0
-            box
+              gap=0.0
+            box #ledger-pane
               with
-                w=340.0
+                w=ledger_width
                 h=fill
                 p=6.0
                 bg=muted_bg
@@ -454,6 +466,9 @@ view
                     ExplorerBlockRow block selected=(block.height == selected)
                       events
                         select_explorer_block -> select_explorer_block _
+            resize-handle #ledger-resize drag=ledger_resized cursor=resize-horizontal
+              box #ledger-divider w=10.0 h=fill
+                space w=1.0 h=1.0
             box
               with
                 w=fill

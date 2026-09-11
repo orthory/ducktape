@@ -1402,6 +1402,11 @@ pub fn verdict_pick_label(current: &str, key: &str, label: &str) -> String {
     }
 }
 
+pub fn tree_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.45).clamp(180.0, 480.0);
+    (width + delta).clamp(180.0, maximum)
+}
+
 /// A Markdown document reads through the document surface; forge carries no
 /// language field, so the path is the one discriminator.
 pub fn markdown_path(path: &str) -> bool {

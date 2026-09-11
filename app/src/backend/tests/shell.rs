@@ -148,46 +148,6 @@ fn the_roster_answers_admin_tier_and_filters() {
     assert_eq!(member_tier(&answered_without_this_node), "guest");
 }
 
-/// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
-/// two VALSET queries — validators and residents — while the roster under it
-/// also draws every registered agent, which holds no valset standing at all. On
-/// the demo workspace that printed `1 validator · 0 residents` over two rows:
-/// both numbers true, the sentence not, because it measured a different set
-/// than the one on screen. The subtitle now splits the rows on `is_agent`, the
-/// same predicate the Humans / Agents chips use, so its two counts partition
-/// the list and sum to the All chip.
-#[test]
-fn the_members_subtitle_folds_the_rows_the_screen_lists() {
-    let member = |key: &str, role: &str| MemberRow {
-        key: key.into(),
-        label: key.into(),
-        is_agent: role == "agent",
-        role: role.into(),
-        is_this_node: false,
-        model: String::new(),
-        live: true,
-    };
-    let rows = vec![
-        member("aa", "validator"),
-        member("bb", "resident"),
-        member("triage", "agent"),
-    ];
-    assert_eq!(members_summary(true, &rows), "2 humans · 1 agent");
-    // singulars, and the count that used to be the whole subtitle.
-    assert_eq!(members_summary(true, &rows[..1]), "1 human · 0 agents");
-
-    // The invariant under the wording: every number in the subtitle is a slice
-    // of the list, so they add up to the row count. The valset fold never did.
-    let counted: usize = members_summary(true, &rows)
-        .split(" · ")
-        .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
-        .sum();
-    assert_eq!(
-        counted,
-        rows.len(),
-        "the Members subtitle must sum to the roster printed under it"
-    );
-}
 
 #[test]
 fn the_huddle_roster_marks_the_row_this_device_holds() {

@@ -554,8 +554,8 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 ///
 /// The invariant, stated mechanically: a screen may touch a LIST-TYPED register
 /// prop only under a `connected` gate, or on a line that carries `connected`
-/// itself (a header subtitle folding rows through `members_summary(connected,
-/// rows)` is already honest).
+/// itself (a header subtitle that folds its rows under a `connected` gate is
+/// already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
     const EXEMPT: [&str; 0] = [];
@@ -644,9 +644,10 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         .collect();
     sites.sort_unstable();
     // Approvals', Members', Agents', Settings' and Files' subtitles are their
-    // module views' now, gated the same way in `crates/views/*` (Settings'
-    // members line is folded host-side, `members_summary` in
-    // `module_view.rs`; Files' crumb tally in its guest's `host.rs`).
+    // module views' now, gated the same way in `crates/views/*` — Settings'
+    // headcount folds the standing IT reads (`fold_standing`, and an
+    // unanswered roster reads as nothing at all), Files' crumb tally lives in
+    // its guest's `host.rs`.
     let expected: [&str; 0] = [];
 
     assert_eq!(
@@ -781,38 +782,6 @@ fn a_failed_connect_retries_instead_of_giving_up() {
             "{path} brought back the shared failure arm"
         );
     }
-}
-
-/// THE BEHAVIOUR THE SWEEPS ABOVE ONLY SPELL. Boot the console, drop the
-/// connection, and the four subtitles go silent instead of reporting the zeros
-/// an unfetched listing folds to.
-#[test]
-fn a_disconnected_console_reports_no_counts_at_all() {
-    let (mut app, _) = Ducktape::__boot();
-    app.members_rows = vec![backend::MemberRow {
-        key: "aa".into(),
-        label: "aa".into(),
-        role: "validator".into(),
-        is_this_node: true,
-        is_agent: false,
-        model: String::new(),
-        live: true,
-    }];
-    app.connected = true;
-    assert_eq!(
-        backend::members_summary(app.connected, &app.members_rows),
-        "1 human · 0 agents"
-    );
-
-    // The node goes down. Everything above was a reading; none of it is one
-    // now. (The Files tally went with its screen into the `files` module
-    // view, where its guest tests hold it to the same rule.)
-    app.connected = false;
-    assert_eq!(
-        backend::members_summary(app.connected, &app.members_rows),
-        "",
-        "Members printed a count off a node that answered nothing"
-    );
 }
 
 /// A SEARCH THAT ERRORED IS NOT A SEARCH THAT FOUND NOTHING. `search_chat_submit`

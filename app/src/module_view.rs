@@ -195,16 +195,18 @@ pub fn event_num(event: &ModuleViewEvent, field: &str) -> f64 {
 
 // ---------- the node seat ----------
 
-/// The Node tab: the facts the app holds, drawn by the `node` view. Its
-/// intents come back as `copy` (`text`, `label`), `tab` (`tab`) and
-/// `log_filter` (`filter`); the native log ring's own events come back as
-/// `log_timeline`, drained by [`node_log_timeline_drain`].
-///
-/// The timeline and its source are stashed for the surface the view leaves
-/// a slot for: the host paints the app-held ring there, on its own clock.
+/// The Node tab, drawn by the `node` view over the KERNEL CONTRACT: the app
+/// pushes SESSION FACTS ONLY — connected, dark, this seat's admin standing
+/// and tier, the app's own connection reading, the workspace directory the
+/// daemon runs out of, and the wall clock. Not one of those is on a `/v1`
+/// route, which is why they cross; everything that is (the status facts, the
+/// peers sample, the code registry, and the node's own log ring) the view
+/// reads for itself through `rpc.status` / `rpc.peers` / `rpc.query` /
+/// `rpc.stream`. The live tracing filter goes back as `rpc.admin`, and the
+/// one intent that comes back is `copy` — the clipboard is an OS door.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
+    reason = "the Ice extern hands the session's facts one by one"
 )]
 pub fn node_view(
     dark: bool,
@@ -212,88 +214,19 @@ pub fn node_view(
     admin: bool,
     tier: &str,
     status: &str,
-    loading: bool,
-    module_rows: &[crate::backend::ModuleRow],
-    node_key: &str,
-    node_data_dir: &str,
-    node_height: i64,
-    node_checkpoint: i64,
-    node_last_finalized: i64,
-    node_reachable_label: &str,
-    node_quorum_label: &str,
-    node_version: &str,
-    node_root_hash: &str,
-    sync_line: &str,
-    node_phase_since: i64,
-    node_sync_retries: i64,
-    node_sync_failures: i64,
-    node_sync_last_error: &str,
-    node_peers: &[crate::backend::PeerRow],
+    data_dir: &str,
     wall_now: i64,
-    timeline: &crate::backend::NodeLogTimelineState,
-    source: &str,
 ) -> Element<'static, ModuleViewEvent> {
-    node_timeline().lock().expect("node timeline").shown =
-        Some((timeline.clone(), source.to_owned()));
     let props = serde_json::json!({
-        "node_key": node_key,
-        "node_data_dir": node_data_dir,
-        "tier": tier,
-        "admin": admin,
-        "status": status,
-        "loading": loading,
-        "module_rows": module_rows,
-        "node_height": node_height,
-        "node_checkpoint": node_checkpoint,
-        "node_last_finalized": node_last_finalized,
-        "node_reachable_label": node_reachable_label,
-        "node_quorum_label": node_quorum_label,
-        "node_version": node_version,
-        "node_root_hash": node_root_hash,
-        "sync_line": sync_line,
-        "node_phase_since": node_phase_since,
-        "node_sync_retries": node_sync_retries,
-        "node_sync_failures": node_sync_failures,
-        "node_sync_last_error": node_sync_last_error,
-        "node_peers": node_peers,
-        "wall_now": wall_now,
         "connected": connected,
         "dark": dark,
+        "admin": admin,
+        "tier": tier,
+        "status": status,
+        "data_dir": data_dir,
+        "wall_now": wall_now,
     });
     module_view("node", serde_json::to_vec(&props).expect("props encode"))
-}
-
-pub fn node_intent(event: &ModuleViewEvent) -> crate::NodeIntent {
-    match event.kind.as_str() {
-        "tab" => crate::NodeIntent::Tab,
-        "log_filter" => crate::NodeIntent::LogFilter,
-        "log_timeline" => crate::NodeIntent::LogTimeline,
-        _ => crate::NodeIntent::Copy,
-    }
-}
-
-/// The tab a `tab` intent names; a name the screen has no tab for is the
-/// overview.
-pub fn node_event_tab(event: &ModuleViewEvent) -> crate::NodeTab {
-    match event_text(event, "tab").as_str() {
-        "permissions" => crate::NodeTab::Permissions,
-        "activity" => crate::NodeTab::Activity,
-        "modules" => crate::NodeTab::Modules,
-        _ => crate::NodeTab::Overview,
-    }
-}
-
-/// Applies what the reader did in the native log ring since the last drain
-/// — a scroll, a selection, a return to the tail — to the timeline the app
-/// holds, in the order it happened.
-pub fn node_log_timeline_drain(
-    mut state: crate::backend::NodeLogTimelineState,
-) -> crate::backend::NodeLogTimelineState {
-    let events = std::mem::take(&mut node_timeline().lock().expect("node timeline").events);
-    for event in events {
-        state = crate::backend::node_log_timeline_apply(state, event);
-    }
-    state
 }
 
 // ---------- the explorer seat ----------
@@ -325,15 +258,26 @@ pub fn explorer_view(
 
 // ---------- the settings seat ----------
 
-/// The Settings tab: this device's preferences, the account and its keys, the
-/// signing seat and the workspace's lifecycle, drawn by the `settings` view.
-/// The roster folds to the readings the card shows, the mutation phase to
-/// the two flags the buttons gate on, and the password to whether the seat is
-/// held — the password itself never crosses. Its intents come back one per
-/// act (`settings_intent`), carrying only what the reader typed.
+/// The Settings tab, drawn by the `settings` view over the KERNEL CONTRACT.
+///
+/// What crosses is SESSION facts: the colour mode, whether there is a
+/// connection and what the titlebar calls it (so the screen and the titlebar
+/// cannot disagree), whether the signing seat is held, and the state of the
+/// wallet/account machinery that is the kernel's alone — the keystore's
+/// reading, a browser ceremony in flight, the ticket one minted, and the
+/// account this device belongs to, which the rail, the bell and the agents
+/// view all read too. The password and the key bytes never cross; the seated
+/// key's PUBLIC half does, because the view resolves its own account by it.
+///
+/// What does NOT cross is what the view reads for itself: this node's
+/// standing on the network and the account's key associations.
+///
+/// Its intents come back one per act (`settings_intent`), carrying only what
+/// the reader typed — creating an account, minting a ticket, registering a
+/// passkey, unlocking and locking the seat are operations the kernel signs.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
+    reason = "the Ice extern hands the session's facts one by one"
 )]
 pub fn settings_view(
     dark: bool,
@@ -344,6 +288,7 @@ pub fn settings_view(
     appearance: crate::Appearance,
     desktop_notifications: bool,
     password: &str,
+    seat_key: &str,
     account_name: &str,
     network_name: &str,
     connected_rpc: &str,
@@ -353,17 +298,10 @@ pub fn settings_view(
     account_ceremony_left: &str,
     settings_key_state: &str,
     settings_key_path: &str,
-    members_rows: &[crate::backend::MemberRow],
-    members_answered: bool,
     account_number: &str,
-    account_renaming: bool,
     account_exists: bool,
-    account_keys: i64,
-    account_key_rows: &[crate::backend::AccountKeyRow],
     account_busy: bool,
     account_ticket: &str,
-    drafts_cleared: i64,
-    drafts_scope: &str,
 ) -> Element<'static, ModuleViewEvent> {
     let appearance = match appearance {
         crate::Appearance::System => "system",
@@ -380,6 +318,7 @@ pub fn settings_view(
         "appearance": appearance,
         "desktop_notifications": desktop_notifications,
         "unlocked": !password.is_empty(),
+        "seat_key": seat_key,
         "account_name": account_name,
         "network_name": network_name,
         "connected_rpc": connected_rpc,
@@ -389,19 +328,10 @@ pub fn settings_view(
         "account_ceremony_left": account_ceremony_left,
         "settings_key_state": settings_key_state,
         "settings_key_path": settings_key_path,
-        "tier": crate::backend::member_tier(members_rows),
-        "admin": crate::backend::members_is_admin(members_rows),
-        "members_line": crate::backend::members_summary(connected, members_rows),
-        "members_answered": members_answered,
         "account_number": account_number,
-        "account_renaming": account_renaming,
         "account_exists": account_exists,
-        "account_keys": account_keys,
-        "account_key_rows": account_key_rows,
         "account_busy": account_busy,
         "account_ticket": account_ticket,
-        "drafts_cleared": drafts_cleared,
-        "drafts_scope": drafts_scope,
     });
     module_view(
         "settings",
@@ -1023,25 +953,7 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
     matches!(args.get(index), Some(wire::SurfaceValue::Bool(true)))
 }
 
-/// The native log ring behind the node view's slot: the timeline the app
-/// last drew the tab with, and what the reader did in it since the app
-/// last drained. One per process, like the view it belongs to.
-#[derive(Default)]
-struct NodeTimeline {
-    shown: Option<(crate::backend::NodeLogTimelineState, String)>,
-    events: Vec<crate::backend::NodeLogTimelineEvent>,
-}
-
-fn node_timeline() -> &'static Mutex<NodeTimeline> {
-    static TIMELINE: OnceLock<Mutex<NodeTimeline>> = OnceLock::new();
-    TIMELINE.get_or_init(Mutex::default)
-}
-
-/// The surfaces a module's view may leave slots for. The node view's
-/// `node_log_timeline` is the app's own ring, painted from the timeline the
-/// tab was last drawn with; what the reader does in it is queued for
-/// [`node_log_timeline_drain`], and the guest — which declared the slot as
-/// `-> unit` — hears only that something happened. The files view's three
+/// The surfaces a module's view may leave slots for. The files view's three
 /// are the preview's readers: the picture viewer over the Files surface's
 /// store, the highlighted code reader, and the Markdown document, whose
 /// activated link goes back to the guest's own handler as a string.
@@ -1126,25 +1038,6 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
-    if module == "node" {
-        surfaces.insert(
-            "node_log_timeline".into(),
-            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
-                let shown = node_timeline().lock().expect("node timeline").shown.clone();
-                let Some((timeline, source)) = shown else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::node_log_timeline(timeline, source).map(|event| {
-                    node_timeline()
-                        .lock()
-                        .expect("node timeline")
-                        .events
-                        .push(event);
-                    wire::SurfaceValue::Unit
-                })
-            }),
-        );
-    }
     surfaces
 }
 
@@ -1162,7 +1055,10 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         // program account before it registers, and `open_run`/`open_link`
         // navigate other tabs.
         "agents" => &["register", "open_run", "open_link"],
-        "node" => &["copy", "tab", "log_filter"],
+        // the node view speaks the kernel contract: it reads the node's own
+        // status, peers, registry and log ring itself and retunes the live
+        // tracing filter through `rpc.admin`. `copy` is the clipboard door.
+        "node" => &["copy"],
         // the explorer view reads and searches through the kernel: the only
         // thing it asks the app for is the clipboard
         "explorer" => &["copy"],
@@ -3519,9 +3415,8 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 6] = [
+        let other_route_only: [(&str, &str, &[&str]); 5] = [
             ("agents", "agents_intent", &[]),
-            ("node", "node_intent", &["log_timeline"]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &["composer"]),
             ("pages", "pages_intent", &[]),
@@ -4073,70 +3968,69 @@ pub(crate) mod tests {
     }
 
     /// The bundled Node view through the host: offline plate, then the
-    /// facts; the Activity tab asks for its tab as an intent and leaves the
-    /// log ring's slot to the host's own surface, whose events come back as
-    /// the drain intent rather than going to the guest.
+    /// SESSION — and off the session alone it reads the node's own facts
+    /// for itself, holding one `rpc.live` subscription on the block plane.
+    /// It leaves no host surface: the log ring is the guest's now.
     #[test]
-    fn the_staged_node_view_boots_takes_the_facts_and_leaves_the_log_ring_to_the_host() {
+    fn the_staged_node_view_boots_and_reads_the_node_through_the_kernel() {
         let Some(staged) = staged("node") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("node", &staged).expect("the view loads");
-        assert!(guest.surfaces.contains_key("node_log_timeline"));
+        assert!(
+            guest.surfaces.is_empty(),
+            "the node view leaves no host surface"
+        );
         guest.redraw(&None);
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
             "{:?}",
             texts(&guest)
         );
-        let props = Some(
+
+        let session = Some(
             serde_json::to_vec(&serde_json::json!({
-                "node_key": "ab12cd34", "node_data_dir": "/var/ducktape/demo",
-                "tier": "validator", "admin": true, "status": "Live", "loading": false,
-                "module_rows": [], "node_height": 84912, "node_checkpoint": 84900,
-                "node_last_finalized": 1700000000, "node_reachable_label": "3",
-                "node_quorum_label": "3", "node_version": "0.4.2", "node_root_hash": "c0ffee",
-                "sync_line": "live", "node_phase_since": 1700000000, "node_sync_retries": 0,
-                "node_sync_failures": 0, "node_sync_last_error": "", "node_peers": [],
-                "wall_now": 1700000030, "connected": true, "dark": false
+                "connected": true, "dark": false, "admin": true, "tier": "validator",
+                "status": "Live", "data_dir": "/var/ducktape/demo", "wall_now": 1700000030
             }))
             .expect("props encode"),
         );
-        guest.redraw(&props);
+        guest.redraw(&session);
+        let planes: Vec<&str> = guest
+            .live_subscriptions
+            .iter()
+            .map(|(_, plane)| plane.as_str())
+            .collect();
+        assert_eq!(
+            planes,
+            ["block", "block"],
+            "the status facts and the peers sample each follow the block plane"
+        );
+        // no node behind the kernel: the status read is refused, and the
+        // view says so in place — but the session facts are its own
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["This node", "ab12cd34", "h 84,912", "0.4.2"] {
+        for expected in ["This node", "/var/ducktape/demo"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
             );
         }
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
         assert!(surface_names(&guest).is_empty());
-
-        guest.deliver(Output::Activate(button_message(&guest, "Node activity")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "tab".into(),
-                detail: r#"{"tab":"activity"}"#.into(),
-            }]
-        );
-        assert_eq!(surface_names(&guest), ["node_log_timeline"]);
-
-        // what the reader does in the host's ring never reaches the guest
-        guest.deliver(Output::Surface {
-            handler: None,
-            value: wire::SurfaceValue::Unit,
-        });
-        assert!(guest.pending.is_empty());
-        assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "log_timeline".into(),
-                detail: String::new(),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The bundled Pages view through the host: session facts in, the
@@ -4405,33 +4299,37 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
-    /// The bundled Settings view through the host: the facts, then a
-    /// rename that leaves as an intent carrying the trimmed name — and the
-    /// password crosses in as a flag only.
+    /// The bundled Settings view through the host, on the KERNEL CONTRACT:
+    /// session facts go in — the seat as a FLAG and its PUBLIC key, never the
+    /// password — the view subscribes to its own reads (this node's standing
+    /// and the seat's key associations, both refused here with no node), and
+    /// the one thing that leaves is an intent the kernel would sign.
     #[test]
     fn the_staged_settings_view_boots_takes_the_facts_and_sends_a_rename() {
         let Some(staged) = staged("settings") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("settings", &staged).expect("the view loads");
         guest.redraw(&None);
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
         let props = Some(
             serde_json::to_vec(&serde_json::json!({
                 "dark": false, "connected": true, "loading": false, "status": "Connected",
                 "busy": false, "recovering": false, "appearance": "system",
                 "desktop_notifications": true, "unlocked": true,
+                "seat_key": "ab12cd34",
                 "account_name": "duck", "network_name": "testnet",
                 "connected_rpc": "http://127.0.0.1:1",
                 "account_ceremony_phase": "", "account_ceremony_qr": "",
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
-                "tier": "validator", "admin": true,
-                "members_line": "3 humans · 1 agent", "members_answered": true,
-                "account_number": "42", "account_renaming": false, "account_exists": true,
-                "account_keys": 2,
-                "account_key_rows": [{"scheme": "ed25519", "pubkey": "ab12cd34", "label": "laptop"}],
-                "account_busy": false, "account_ticket": "",
-                "drafts_cleared": 0, "drafts_scope": ""
+                "account_number": "42", "account_exists": true,
+                "account_busy": false, "account_ticket": ""
             }))
             .expect("props encode"),
         );

@@ -12,22 +12,14 @@ state
   account_number = ""
   account_name = ""
   account_bio = ""
-  account_keys:i64 = 0
   account_generation:i64 = 0
-  account_renaming = false
-  // The account's key associations, as the settings card lists them.
-  account_key_rows:[AccountKeyRow] = []
-  // One identity op in flight (create / mint / join / remove) — the buttons
-  // wait on it the way Rename waits on `account_renaming`.
+  // ONE IDENTITY OP IN FLIGHT — rename, create, mint, join or remove. Every
+  // one of them is signed here, so this is the kernel's fact and the card
+  // that offers them waits on it.
   account_busy = false
   // "Add a device": the ticket minted for the other device's pasted key
   // (shown until the next op clears it).
   account_ticket = ""
-  // THE DRAFTS ARE THE SETTINGS VIEW'S. What the app owes it is which of
-  // them a committed op consumed: the count moves once per op and the scope
-  // names the drafts (`name`, `keys`, `label`, `account`).
-  settings_drafts_cleared:i64 = 0
-  settings_drafts_scope = ""
   // The console's "no account on this network" banner, dismissable for the
   // session; and the Settings card's reading of a QR ceremony (phase is
   // `working | show_qr | done | failed`, "" for none).
@@ -37,10 +29,6 @@ state
   account_ceremony_detail = ""
   account_ceremony_left = ""
 
-  node_log_timeline:NodeLogTimelineState = node_log_timeline_state()
-  node_log_filter = ""
-  node_peers:[PeerRow] = []
-  node_peers_generation:i64 = 0
   node_version = ""
   node_root_hash = ""
   // The chain id the connected node serves — what an AddKey consent minted
@@ -57,11 +45,9 @@ state
   node_sync_retries:i64 = 0
   node_sync_failures:i64 = 0
   node_sync_last_error = ""
-  node_tab:NodeTab = NodeTab.overview
 
   // Optional consensus readings are stored as rendered labels so absence is
   // never coerced to a measured zero.
   node_view_label = "—"
   node_quorum_label = "—"
   node_reachable_label = "—"
-  module_rows:[ModuleRow] = []

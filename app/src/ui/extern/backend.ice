@@ -207,7 +207,6 @@ extern crate::backend
   pure files_write_gate(dir:str, me:str) -> str
   files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure plural(count:i64, one:&str, many:&str) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
@@ -224,27 +223,12 @@ extern crate::backend
   pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str
   pure initial_of(name:&str) -> str
   pure initials_of(name:&str) -> str
-  NodeLogLine(cursor:str, line:str)
-  NodeLogTimelineState()
-  sync node_log_timeline_state() -> NodeLogTimelineState
-  sync node_log_timeline_reset() -> NodeLogTimelineState
-  pure node_log_timeline_push(state:NodeLogTimelineState, line:NodeLogLine) -> NodeLogTimelineState
-  pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
   NodeFacts(public_key:str, version:str, root_hash:str, chain_id:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str) -> NodeFacts ! AppError
   pure optional_number(value:i64?) -> str
-  PeerRow(key:str, role:str, live:bool)
-  PeersData(generation:i64, peers:[PeerRow])
-  stream node_logs(rpc:str) -> NodeLogLine
   pure sync_label(phase:&str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
-  stream node_peers_live(rpc:str) -> PeersData
-  load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
-  ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
-  ModulesData(rows:[ModuleRow])
-  load_modules(rpc:str) -> ModulesData ! AppError
-  AccountKeyRow(scheme:str, pubkey:str, label:str, added_at:i64)
-  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64, key_rows:[AccountKeyRow])
+  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   // the welcome step's two probes, before any console exists: the chain a
   // picked network names (every key consent is chain-scoped), and a test

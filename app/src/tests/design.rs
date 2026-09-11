@@ -412,7 +412,12 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
     ));
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(chat_screen.contains("box w=236.0 h=fill bg=sidebar clip=true"));
+    assert!(chat_screen.contains(
+        "box #channel-sidebar w=sidebar_width h=fill bg=sidebar clip=true"
+    ));
+    assert!(chat_screen.contains(
+        "resize-handle #sidebar-resize drag=emit(resize_sidebar, _, _) cursor=resize-horizontal"
+    ));
     // the pages sidebar keeps the same plate from the `pages` view — the
     // width is the reader's to drag now, opening on the 230 it always had
     assert!(
@@ -477,6 +482,67 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     for authored in [&shell, &authored_pages, &*SCREENS] {
         assert!(!authored.contains("shadow=black/"));
         assert!(!authored.contains("shadow=shadow "));
+    }
+}
+
+#[test]
+fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
+    let cases: [(String, &[(&str, &str)]); 7] = [
+        (
+            inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice")),
+            &[
+                ("#sidebar-resize", "cursor=resize-horizontal"),
+                ("#details-resize", "cursor=resize-horizontal"),
+                ("#thread-resize", "cursor=resize-horizontal"),
+            ],
+        ),
+        (
+            inlined(include_str!("../../../crates/views/files/src/ui/files.ice")),
+            &[
+                ("#tree-resize", "cursor=resize-horizontal"),
+                ("#preview-resize", "cursor=resize-vertical"),
+                ("#object-resize", "cursor=resize-horizontal"),
+            ],
+        ),
+        (
+            inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice")),
+            &[("#sidebar-resize", "cursor=resize-horizontal")],
+        ),
+        (
+            inlined(include_str!(
+                "../../../crates/views/explorer/src/ui/app.ice"
+            )),
+            &[("#ledger-resize", "cursor=resize-horizontal")],
+        ),
+        (
+            inlined(include_str!("../../../crates/views/members/src/ui/app.ice")),
+            &[("#member-resize", "cursor=resize-horizontal")],
+        ),
+        (
+            inlined(include_str!("../../../crates/views/agents/src/ui/app.ice")),
+            &[
+                ("#editor-resize", "cursor=resize-horizontal"),
+                ("#journal-resize", "cursor=resize-horizontal"),
+            ],
+        ),
+        (
+            inlined(include_str!(
+                "../../../crates/views/forge/src/ui/components.ice"
+            )),
+            &[("#tree-resize", "cursor=resize-horizontal")],
+        ),
+    ];
+    for (source, handles) in cases {
+        for (handle, expected_cursor) in handles {
+            let line = source
+                .lines()
+                .find(|line| line.contains(&format!("resize-handle {handle} ")))
+                .unwrap_or_else(|| panic!("missing native handle {handle}"));
+            assert!(
+                line.contains(expected_cursor),
+                "{handle} gives no resize cursor: {line}"
+            );
+        }
     }
 }
 

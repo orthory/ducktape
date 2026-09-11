@@ -1,66 +1,6 @@
 use super::*;
 
 #[test]
-fn a_count_of_one_takes_the_singular_noun() {
-    assert_eq!(plural(1, "agent", "agents"), "1 agent");
-    assert_eq!(plural(0, "agent", "agents"), "0 agents");
-    assert_eq!(plural(2, "agent", "agents"), "2 agents");
-    // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(members_summary(true, &[]), "");
-}
-
-/// A SUBTITLE THAT COUNTS NOTHING, OVER A PLATE THAT ALREADY SAID SO. Approvals
-/// read `0 open · 0 settled` directly above "No proposals yet — a membership or
-/// configuration change opens the first one." Both halves of the subtitle were
-/// zero, so it repeated the plate in digits. #996 settled the rule for the
-/// bell's `0 unread` and Channel details' `MEMBERS 0`; these four folds are the
-/// sites it did not reach, and each of their screens plates the empty case in
-/// words already.
-///
-/// A zero BESIDE a real reading is a different thing and stays: `1 human ·
-/// 0 agents` is the sentence doing its job. The Agents subtitle is the
-/// `agents` module view's now, held to the same rule in `crates/views/agents`.
-#[test]
-fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
-    let human = MemberRow {
-        key: "aa".into(),
-        label: "aa".into(),
-        is_agent: false,
-        role: "validator".into(),
-        is_this_node: false,
-        model: String::new(),
-        live: true,
-    };
-
-    // Nothing there: the plate on each screen says it in words.
-    assert_eq!(members_summary(true, &[]), "");
-
-    // Something there: every subtitle speaks, zeros included.
-    assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
-}
-
-#[test]
-fn a_log_line_splits_into_time_level_and_message() {
-    let parts =
-        split_log_line("2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident".into());
-    assert_eq!(parts.time, "2026-07-27T09:12:44.918Z");
-    assert_eq!(parts.level, "INFO");
-    assert_eq!(parts.message, "ducktape::join: admitted resident");
-
-    let micro =
-        split_log_line("2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into());
-    assert_eq!(
-        micro.time, "2026-08-14T01:02:03.918Z",
-        "the ring's microsecond timer is trimmed to the column's millisecond width"
-    );
-    assert_eq!(micro.level, "DEBUG");
-
-    let prose = split_log_line("no level here".into());
-    assert_eq!(prose.level, "");
-    assert_eq!(prose.message, "no level here");
-}
-
-#[test]
 fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");

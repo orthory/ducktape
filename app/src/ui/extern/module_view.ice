@@ -30,18 +30,23 @@ extern crate::module_view
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool
-  component node_view(dark:bool, connected:bool, admin:bool, tier:&str, status:&str, loading:bool, module_rows:&[ModuleRow], node_key:&str, node_data_dir:&str, node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:&str, node_quorum_label:&str, node_version:&str, node_root_hash:&str, sync_line:&str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:&str, node_peers:&[PeerRow], wall_now:i64, timeline:&NodeLogTimelineState, source:&str) -> ModuleViewEvent
-  pure node_intent(event:&ModuleViewEvent) -> NodeIntent
-  pure node_event_tab(event:&ModuleViewEvent) -> NodeTab
-  // what the reader did in the native log ring since the last drain,
-  // applied to the timeline the app holds
-  pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
+  // Node speaks the KERNEL CONTRACT too: only what no `/v1` route publishes
+  // goes in — this seat's standing, the app's connection reading, the
+  // daemon's workspace directory and the clock — and the view reads the
+  // node's own status, peers, registry and log ring for itself. The one
+  // intent back is the clipboard.
+  component node_view(dark:bool, connected:bool, admin:bool, tier:&str, status:&str, data_dir:&str, wall_now:i64) -> ModuleViewEvent
   // The Explorer speaks the KERNEL CONTRACT: session facts go in (the two
   // node facts are the titlebar's own, so the screen cannot disagree with
   // it), the view reads the block window and runs its search through the
   // kernel, and the one intent back is `copy`.
   component explorer_view(dark:bool, connected:bool, head:i64, sync_line:&str) -> ModuleViewEvent
-  component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
+  // Settings speaks the KERNEL CONTRACT: what goes in is session facts —
+  // the seat, the connection the titlebar names, and the wallet/account
+  // machinery that is the kernel's alone. This node's standing and the
+  // account's key associations the view reads for itself, and every act
+  // comes back as one intent the kernel signs.
+  component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, seat_key:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, account_number:&str, account_exists:bool, account_busy:bool, account_ticket:&str) -> ModuleViewEvent
   pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
   // Files speaks the KERNEL CONTRACT: session facts go in, the view reads
   // and writes duckfs through the kernel (`files.get`, `op.submit`), and the

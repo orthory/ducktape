@@ -726,9 +726,18 @@ pub fn copy_range_label(count: i64) -> String {
     }
 }
 
-pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
-    // Keep the channel list, divider and a readable conversation alongside it.
-    let maximum = (viewport - 236.0 - 10.0 - 320.0).clamp(280.0, 640.0);
+pub fn sidebar_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(180.0, 420.0);
+    (width + delta).clamp(180.0, maximum)
+}
+
+pub fn details_width_after_delta(width: f64, delta: f64, viewport: f64, sidebar: f64) -> f64 {
+    let maximum = (viewport - sidebar - 20.0 - 320.0).clamp(260.0, 520.0);
+    (width + delta).clamp(260.0, maximum)
+}
+
+pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64, sidebar: f64) -> f64 {
+    let maximum = (viewport - sidebar - 20.0 - 320.0).clamp(280.0, 640.0);
     (width + delta).clamp(280.0, maximum)
 }
 

@@ -420,8 +420,6 @@ on network_entered
   messages = []
   // A new network mounts a fresh timeline at its tail — see `state/chat.ice`.
   chat_at_tail = true
-  node_log_filter = ""
-  node_log_timeline = node_log_timeline_reset()
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false

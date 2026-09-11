@@ -7,7 +7,17 @@
 use forge_view::host::Session;
 use forge_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Request};
+use ui_lang_guest::wire::{Event, Frame, Node, Request};
+
+fn node_ending(frame: &Frame, suffix: &str) -> Node {
+    fn find(node: &Node, suffix: &str) -> Option<Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node.clone());
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
 
 fn kinds(requests: &[Request]) -> Vec<&str> {
     requests
@@ -330,4 +340,34 @@ fn a_conflicting_merge_submits_nothing() {
         "{:?}",
         texts(&drive.frame)
     );
+}
+
+#[test]
+fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
+    use ui_lang_guest::wire::{Length, mouse};
+
+    let (drive, _) = namespace("duck://forge/core");
+    let width = |frame: &Frame| match node_ending(frame, "/tree-pane") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed tree pane: {node:?}"),
+    };
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&drive.frame, "/tree-resize")
+    else {
+        panic!("tree resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    assert_eq!(width(&drive.frame), 258.0);
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: 42.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 300.0);
 }

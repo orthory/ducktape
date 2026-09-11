@@ -148,17 +148,6 @@ enum WelcomeDoor
   create
   login
 
-// SETTINGS' GROUPS, as the one thing the screen branches on. Settings was a
-// single reflowing grid of eight cards, so one topic (identity, its keys, the
-// seat that signs with them) landed in whichever column the width happened to
-// give it, and the destructive act sat at the bottom of the same list as the
-// theme switch. Each variant is one group of settings, and the danger zone is
-// a place you go rather than a card you scroll past.
-enum NodeTab
-  overview
-  permissions
-  activity
-  modules
 
 // The duck:// module table's verdict on a clicked or embedded link
 // (`resolve_duck_link`): which existing navigation it maps onto. `unknown` is
@@ -207,14 +196,6 @@ enum AgentsIntent
   register
   open_run
   open_link
-
-// what the Node view asks of the app: a clipboard write, the tab it is on,
-// the log filter, or the native log ring reporting what the reader did
-enum NodeIntent
-  copy
-  tab
-  log_filter
-  log_timeline
 
 // what the Settings view asks of the app: one variant per act the screen
 // offers, each carrying only what the reader typed (a name, a key, a ticket,

@@ -1,15 +1,5 @@
 use super::*;
 
-/// First 12 hex chars of a digest — the display form where a screen has no
-/// detail to show the whole value in.
-pub(crate) fn short_digest(digest: &str) -> String {
-    let mut short: String = digest.chars().take(12).collect();
-    if digest.chars().count() > 12 {
-        short.push('…');
-    }
-    short
-}
-
 /// The global-key router for the command palette: platform-Command+K
 /// toggles, Escape closes an open palette; anything else is `none`.
 pub fn palette_key_action(

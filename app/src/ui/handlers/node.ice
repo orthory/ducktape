@@ -1,31 +1,14 @@
-// THIS NODE — the facts /v1/status publishes, its peers, its log stream, and
-// the dedicated operator screen that draws them.
-
-on node_log_line(line)
-  node_log_timeline = node_log_timeline_push(node_log_timeline, line)
-
+// THIS NODE — the facts /v1/status publishes, and the operator screen that
+// draws them.
+//
+// The Node view speaks the kernel contract for everything it reads and for
+// the one thing it writes; the clipboard is the one OS door left, and it is
+// the same act as `copy_to_clipboard`.
 on node_view_event(event)
-  match node_intent(event)
-    NodeIntent.copy
-      toast = event_text(event, "label")
-      toast_age = 0
-      task clipboard write event_text(event, "text")
-    NodeIntent.tab
-      node_tab = node_event_tab(event)
-      return if node_tab != NodeTab.modules || !connected
-      run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
-    NodeIntent.log_filter
-      node_log_filter = event_text(event, "filter")
-      node_log_timeline = node_log_timeline_filter(node_log_timeline, node_log_filter)
-    NodeIntent.log_timeline
-      node_log_timeline = node_log_timeline_drain(node_log_timeline)
-
-on peers_loaded(next)
-  return if next.generation != node_peers_generation
-  node_peers = next.peers
-
-on peers_failed(cause)
-  return if cause.generation != node_peers_generation
+  return if event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 // The consensus facts /v1/status already publishes and the console dropped:
 // app-hash, view, quorum, reachable validators, finality and the gc watermark.
@@ -98,12 +81,6 @@ on node_status_pushed(next)
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
 
-// The peers table's own push, from the tab-gated subscription beside it.
-on node_peers_pushed(next)
-  node_peers = next.peers
-
-// Overview | Permissions | Activity | Modules on the Node rail surface. The
-// log stream subscribes only while its tab is visible.
 on settings_loaded(next)
   return if next.generation != settings_generation
   node_data_dir = next.data_dir
@@ -119,13 +96,15 @@ on settings_loaded(next)
 on settings_failed(cause)
   return if cause.generation != settings_generation
 
-// SETTINGS is a MODULE-OWNED VIEW (module_view.rs): the facts go in as props
-// and every act comes back as ONE intent this handler signs. The four rail
-// handlers Settings shares with the rest of the console (the tab, reconnect,
-// the network switch, the theme) are reached by a `flow` so their bodies
-// stay in one place; everything Settings alone does is an arm here. The
-// drafts are the view's: an intent carries what the reader typed, and an op
-// that consumed a draft says so through `settings_drafts_cleared`.
+// SETTINGS is a MODULE-OWNED VIEW on the KERNEL CONTRACT (module_view.rs):
+// session facts go in as props and every act comes back as ONE intent this
+// handler signs, because every act it offers is the kernel's — the seat's
+// password, an account founded or renamed, a key minted, joined or dropped,
+// a browser ceremony. The four rail handlers Settings shares with the rest
+// of the console (the tab, reconnect, the network switch, the theme) are
+// reached by a `flow` so their bodies stay in one place. The drafts and the
+// gating are the VIEW's: an intent carries only what the reader typed, and
+// the view spends a draft when the fact it asked for moves.
 on settings_view_event(event)
   match settings_intent(event)
     SettingsIntent.tab
@@ -160,8 +139,8 @@ on settings_view_event(event)
         from run lock_signer()
         discard
     SettingsIntent.rename
-      return if !connected || !account_exists || account_renaming || empty(event_text(event, "name"))
-      account_renaming = true
+      return if !connected || !account_exists || account_busy || empty(event_text(event, "name"))
+      account_busy = true
       error = ""
       run every set_account_name(connected_rpc, password, event_text(event, "name")) -> account_renamed _ | account_rename_failed _
     // THE FOUR IDENTITY OPS — found, mint a ticket, join with one, remove a
@@ -199,8 +178,12 @@ on settings_view_event(event)
       account_busy = true
       error = ""
       run every join_with_ticket(connected_rpc, password, event_text(event, "ticket")) -> account_changed _ | account_op_failed _
+    // The last key is never removable — the identity module refuses it
+    // ("cannot remove the last key of an account") and the view, which reads
+    // the associations, does not offer the button. The count is not a fact
+    // the kernel holds any more.
     SettingsIntent.key_remove
-      return if !connected || !account_exists || account_busy || empty(password) || account_keys <= 1
+      return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
       run every remove_account_key(connected_rpc, password, event_text(event, "pubkey")) -> account_changed _ | account_op_failed _
@@ -303,12 +286,3 @@ on toast_tick
   return if toast_age < 9
   toast = ""
   toast_age = 0
-
-// The Modules tab picks its own seat AND fetches its own reading — a tab whose
-// list is only filled by a refresh somewhere else opens empty on first click.
-on modules_loaded(next)
-  module_rows = next.rows
-  error = ""
-
-on modules_failed(cause)
-  error = cause.message

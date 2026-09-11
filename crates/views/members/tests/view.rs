@@ -7,7 +7,17 @@
 use members_view::host::{Copy, Session};
 use members_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ui_lang_guest::wire::{Frame, Request};
+use ui_lang_guest::wire::{Event, Frame, Node, Request};
+
+fn node_ending(frame: &Frame, suffix: &str) -> Node {
+    fn find(node: &Node, suffix: &str) -> Option<Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node.clone());
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
 
 /// This node's key, as the node reports it and the valset lists it.
 const THIS_NODE: &str = "01020304";
@@ -141,6 +151,36 @@ fn a_connected_view_reads_its_own_roster() {
     let frame = tick_native(press(&frame, "Show agents only"));
     assert!(has_text(&frame, "Reviewer Bot"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, THIS_NODE), "{:?}", texts(&frame));
+}
+
+#[test]
+fn the_member_record_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
+    use ui_lang_guest::wire::{Length, mouse};
+
+    let frame = opened(true, "Reviewer Bot");
+    let width = |frame: &Frame| match node_ending(frame, "/member") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed member pane: {node:?}"),
+    };
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&frame, "/member-resize")
+    else {
+        panic!("member resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    assert_eq!(width(&frame), 312.0);
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: -48.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 360.0);
 }
 
 /// A valset block re-reads the roster through the live subscription.

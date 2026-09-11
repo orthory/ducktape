@@ -54,443 +54,6 @@ pub async fn load_settings_facts(
     })
 }
 
-/// One log line for the operator pane.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct NodeLogLine {
-    pub cursor: String,
-    pub line: String,
-}
-
-pub type NodeLogTimelineEvent = ui_lang_components::ui::log_timeline::LogTimelineEvent<String>;
-
-/// Retained native timeline state plus the bounded rows it renders.
-///
-/// Clone snapshots the same mounted widget state; the old value is replaced by
-/// the Ice assignment that requested the clone.
-#[derive(Debug)]
-pub struct NodeLogTimelineState {
-    timeline: ui_lang_components::ui::log_timeline::LogTimelineState<String>,
-    lines: Arc<[NodeLogLine]>,
-    visible: Arc<[NodeLogLine]>,
-    filter: String,
-}
-
-impl Clone for NodeLogTimelineState {
-    fn clone(&self) -> Self {
-        Self {
-            timeline: self.timeline.update_snapshot(),
-            lines: Arc::clone(&self.lines),
-            visible: Arc::clone(&self.visible),
-            filter: self.filter.clone(),
-        }
-    }
-}
-
-const NODE_LOG_LIMIT: usize = 4_096;
-const NODE_LOG_TRIM: usize = 1_024;
-
-fn node_log_timeline_config() -> ui_lang_components::ui::log_timeline::VirtualListConfig {
-    ui_lang_components::ui::log_timeline::VirtualListConfig::new(26.0)
-        .expect("node log row geometry is fixed")
-        .overscan(4)
-}
-
-pub fn node_log_timeline_state() -> NodeLogTimelineState {
-    NodeLogTimelineState {
-        timeline: ui_lang_components::ui::log_timeline::LogTimelineState::new(
-            ui_lang_components::ui::log_timeline::VirtualListId::new("node-log-timeline"),
-        ),
-        lines: Arc::from([]),
-        visible: Arc::from([]),
-        filter: String::new(),
-    }
-}
-
-pub fn node_log_timeline_reset() -> NodeLogTimelineState {
-    node_log_timeline_state()
-}
-
-pub fn node_log_timeline_push(
-    mut state: NodeLogTimelineState,
-    line: NodeLogLine,
-) -> NodeLogTimelineState {
-    // ponytail: a bounded linear duplicate guard is smaller than retaining a
-    // second cursor index; revisit only if the 4,096-line ceiling moves.
-    let duplicate = state.lines.iter().any(|held| held.cursor == line.cursor);
-    if duplicate {
-        return state;
-    }
-    let mut lines = Vec::from(state.lines.as_ref());
-    lines.push(line);
-    if lines.len() > NODE_LOG_LIMIT {
-        lines.drain(..NODE_LOG_TRIM);
-    }
-    state.lines = lines.into();
-    node_log_timeline_reconcile(state)
-}
-
-pub fn node_log_timeline_filter(
-    mut state: NodeLogTimelineState,
-    filter: String,
-) -> NodeLogTimelineState {
-    state.filter = filter.trim().to_lowercase();
-    node_log_timeline_reconcile(state)
-}
-
-fn node_log_timeline_reconcile(mut state: NodeLogTimelineState) -> NodeLogTimelineState {
-    let visible: Arc<[NodeLogLine]> = state
-        .lines
-        .iter()
-        .filter(|line| state.filter.is_empty() || line.line.to_lowercase().contains(&state.filter))
-        .cloned()
-        .collect::<Vec<_>>()
-        .into();
-    let config = node_log_timeline_config();
-    let append = state
-        .timeline
-        .reconcile(&visible, |line| line.cursor.clone(), config);
-    if append.is_err() {
-        state
-            .timeline
-            .replace(&visible, |line| line.cursor.clone(), config)
-            .expect("node log cursors are unique");
-    }
-    state.visible = visible;
-    state
-}
-
-pub fn node_log_timeline_apply(
-    mut state: NodeLogTimelineState,
-    event: NodeLogTimelineEvent,
-) -> NodeLogTimelineState {
-    state.timeline.apply(event, node_log_timeline_config());
-    state
-}
-
-/// The ring as the Node tab's slot paints it — owned, because the slot is a
-/// host surface that outlives the call that drew it.
-pub fn node_log_timeline(
-    state: NodeLogTimelineState,
-    source: String,
-) -> iced::Element<'static, NodeLogTimelineEvent> {
-    use iced::widget::{Space, button, column, container, row, text};
-    use iced::{Border, Color, Font, Length};
-    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
-    use ui_lang_components::ui::theme::DARK;
-
-    let inspection = state.timeline.inspect(node_log_timeline_config());
-    let mono = Font {
-        family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
-        ..Font::DEFAULT
-    };
-    // ALWAYS A BUTTON, NEVER A BUTTON-OR-A-TEXT. A `button` carries widget
-    // state and a `text` carries none, so alternating the two at one position
-    // hands iced a state slot whose type changed under it — `Tree`'s downcast
-    // then aborts the process (`iced_core widget/tree.rs`), and this position
-    // flips the moment a line arrives while the reader is scrolled back. The
-    // resting state is the same button with no `on_press`, which is how iced
-    // spells "not pressable", and the label carries the difference.
-    let following_tail = inspection.following_tail;
-    let tail_label = match following_tail {
-        true => "LIVE".to_owned(),
-        false => format!("RESUME · {} NEW", inspection.unread_count),
-    };
-    let tail_color = match following_tail {
-        true => DARK.palette.success,
-        false => DARK.palette.foreground,
-    };
-    let tail: iced::Element<'_, NodeLogTimelineEvent> =
-        button(text(tail_label).size(10).font(mono).color(tail_color))
-            .padding([3, 7])
-            .style(move |theme, status| match following_tail {
-                // resting: the word IS the status, so it wears no chrome
-                true => button::Style {
-                    background: None,
-                    text_color: DARK.palette.success,
-                    ..button::text(theme, status)
-                },
-                false => button::secondary(theme, status),
-            })
-            .on_press_maybe((!following_tail).then_some(LogTimelineEvent::ResumeTail))
-            .into();
-    let header = row![
-        text("NODE LOG")
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.foreground),
-        text(source)
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.muted_foreground),
-        Space::new().width(Length::Fill),
-        tail,
-    ]
-    .spacing(8)
-    .align_y(iced::Alignment::Center);
-    // THE LIST IS ALWAYS MOUNTED, and the empty note rides ON it rather than
-    // instead of it. `log_timeline` is a stateful virtual list and the note is
-    // a plain container: swapping one for the other at this position is the
-    // crash above, and this position swaps the FIRST time a line arrives —
-    // which is every visit to this tab. A stack keeps both children present
-    // with stable types; the note draws nothing when its text is empty.
-    let empty_note = match (state.visible.is_empty(), state.lines.is_empty()) {
-        (false, _) => "",
-        (true, true) => "Waiting for the node's log ring…",
-        (true, false) => "No lines match this filter.",
-    };
-    let timeline: iced::Element<'static, NodeLogTimelineEvent> = log_timeline(
-        &state.timeline,
-        &state.visible,
-        node_log_timeline_config(),
-        "Node log",
-        |line| line.cursor.clone(),
-        |line| line.line.clone(),
-        |_, line, _selected| {
-            let parts = split_log_line(line.line.clone());
-            let level_color = match parts.level.as_str() {
-                "ERROR" => DARK.palette.destructive,
-                "WARN" => DARK.palette.warning,
-                "INFO" => DARK.palette.success,
-                "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
-                _ => Color::TRANSPARENT,
-            };
-            row![
-                // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
-                // need ~158 px; 150 let the tail paint over the level.
-                text(parts.time)
-                    .size(11)
-                    .font(mono)
-                    .color(DARK.palette.muted_foreground)
-                    .width(170),
-                text(parts.level)
-                    .size(11)
-                    .font(mono)
-                    .color(level_color)
-                    .width(48),
-                text(parts.message)
-                    .size(11)
-                    .font(mono)
-                    .color(DARK.palette.foreground),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .into()
-        },
-        |event| event,
-        &DARK,
-    );
-    let body = iced::widget::stack![
-        timeline,
-        container(
-            text(empty_note)
-                .size(12)
-                .font(mono)
-                .color(DARK.palette.muted_foreground),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_y(Length::Fill),
-    ];
-    container(column![header, body].spacing(10))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(15)
-        .style(|_| container::Style {
-            background: Some(DARK.palette.background.into()),
-            text_color: Some(DARK.palette.foreground),
-            border: Border {
-                color: DARK.palette.border,
-                width: 1.0,
-                radius: 12.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
-/// The node's live log ring as an app stream — reconnects with backoff and
-/// resumes from the last cursor, exactly like the module stream.
-pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeLogLine> {
-    struct State {
-        rpc: String,
-        cursor: Option<String>,
-        stream: Option<
-            iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<ducktape_rpc::LogLine>>,
-        >,
-        retry_attempt: u32,
-    }
-    iced::futures::stream::unfold(
-        State {
-            rpc,
-            cursor: None,
-            stream: None,
-            retry_attempt: 0,
-        },
-        |mut state| async move {
-            loop {
-                if state.stream.is_none() && state.retry_attempt > 0 {
-                    tokio::time::sleep(retry_delay(state.retry_attempt)).await;
-                }
-                if state.stream.is_none() {
-                    let Ok(rpc) = rpc_client(&state.rpc) else {
-                        state.retry_attempt = state.retry_attempt.saturating_add(1);
-                        continue;
-                    };
-                    match rpc.log_events(state.cursor.clone()).await {
-                        Ok(stream) => state.stream = Some(stream),
-                        Err(_) => {
-                            state.retry_attempt = state.retry_attempt.saturating_add(1);
-                            continue;
-                        }
-                    }
-                }
-                match state
-                    .stream
-                    .as_mut()
-                    .expect("stream initialized")
-                    .next()
-                    .await
-                {
-                    Some(Ok(line)) => {
-                        state.retry_attempt = 0;
-                        state.cursor = Some(line.cursor.clone());
-                        return Some((
-                            NodeLogLine {
-                                cursor: line.cursor,
-                                line: line.line,
-                            },
-                            state,
-                        ));
-                    }
-                    Some(Err(_)) | None => {
-                        state.stream = None;
-                        state.retry_attempt = state.retry_attempt.saturating_add(1);
-                    }
-                }
-            }
-        },
-    )
-    .boxed()
-}
-
-/// One tracing line, split for the dark log console's three columns.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct LogParts {
-    pub time: String,
-    pub level: String,
-    pub message: String,
-}
-
-/// The ring's tracing timer prints microseconds (`…T09:12:44.918273Z`, 27
-/// chars) but the console column is sized for milliseconds — an iced text
-/// widget never clips itself, so the extra digits paint over the level
-/// column. Trim the fraction to three digits; any other shape passes through.
-fn trim_time_to_millis(time: &str) -> String {
-    let Some((secs, frac)) = time.rsplit_once('.') else {
-        return time.to_string();
-    };
-    let Some(digits) = frac.strip_suffix('Z') else {
-        return time.to_string();
-    };
-    let trimmable = digits.len() > 3 && digits.bytes().all(|b| b.is_ascii_digit());
-    if !trimmable {
-        return time.to_string();
-    }
-    format!("{secs}.{}Z", &digits[..3])
-}
-
-/// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
-/// three columns. A line that does not carry a level is all message.
-pub fn split_log_line(line: String) -> LogParts {
-    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
-    let mut fields = line.split_whitespace();
-    let Some(first) = fields.next() else {
-        return LogParts {
-            time: String::new(),
-            level: String::new(),
-            message: line,
-        };
-    };
-    let timestamped =
-        first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
-    let (time, level_field) = match timestamped {
-        true => (
-            trim_time_to_millis(first),
-            fields.next().unwrap_or_default(),
-        ),
-        false => (String::new(), first),
-    };
-    if !LEVELS.contains(&level_field) {
-        return LogParts {
-            time,
-            level: String::new(),
-            message: line,
-        };
-    }
-    let cut = line
-        .find(level_field)
-        .map_or(line.len(), |at| at + level_field.len());
-    LogParts {
-        time,
-        level: level_field.to_string(),
-        message: line[cut..].trim_start().to_string(),
-    }
-}
-
-#[cfg(test)]
-mod log_timeline_tests {
-    use super::*;
-
-    #[test]
-    fn timeline_keeps_unique_history_and_replaces_on_filter_changes() {
-        let mut state = node_log_timeline_state();
-        state = node_log_timeline_push(
-            state,
-            NodeLogLine {
-                cursor: "1".into(),
-                line: "INFO admitted resident".into(),
-            },
-        );
-        state = node_log_timeline_push(
-            state,
-            NodeLogLine {
-                cursor: "1".into(),
-                line: "duplicate cursor".into(),
-            },
-        );
-        state = node_log_timeline_push(
-            state,
-            NodeLogLine {
-                cursor: "2".into(),
-                line: "WARN retrying dial".into(),
-            },
-        );
-
-        assert_eq!(state.lines.len(), 2);
-        assert_eq!(state.visible.len(), 2);
-        assert_eq!(
-            state
-                .timeline
-                .inspect(node_log_timeline_config())
-                .list
-                .logical_items,
-            2
-        );
-
-        state = node_log_timeline_filter(state, " warn ".into());
-        assert_eq!(state.visible.len(), 1);
-        assert_eq!(state.visible[0].cursor, "2");
-        assert_eq!(
-            state
-                .timeline
-                .inspect(node_log_timeline_config())
-                .list
-                .logical_items,
-            1
-        );
-    }
-}
-
 /// The node's consensus/storage facts — everything `/v1/status` publishes that
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -719,26 +282,6 @@ pub fn optional_number(value: Option<i64>) -> String {
     }
 }
 
-/// One direct peer, as `GET /v1/peers` actually reports it.
-///
-/// There is NO per-peer height on that surface — the envelope carries this
-/// node's own, and stamping it on every row would print the same number beside
-/// every peer and call it theirs. `role` is the standing the peers view does
-/// carry (`validator` / `resident`), absent on a lane that cannot read the
-/// valset — and absent renders as nothing, which is the honest answer.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct PeerRow {
-    pub key: String,
-    pub role: String,
-    pub live: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct PeersData {
-    pub generation: i64,
-    pub peers: Vec<PeerRow>,
-}
-
 /// THE NODE'S OWN STATUS, PUSHED, ON EVERY TAB.
 ///
 /// Cheap to hold anywhere the console is standing: the node answers `status`
@@ -746,42 +289,12 @@ pub struct PeersData {
 /// one read per heartbeat. That is what lets a sync reading follow the reader
 /// around instead of living on one tab — the node's phase is a fact about the
 /// node, not about the surface you happen to have open.
+///
+/// Reconnects with backoff, parsed with the SAME reader the HTTP load uses. A
+/// dropped socket is not a reason to blank the surface: the facts on screen
+/// were true when they were sampled, so the subscription is rebuilt and they
+/// stand until a fresher document replaces them.
 pub fn node_status_live(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeFacts> {
-    snapshot_stream(rpc, Snapshot::Status)
-}
-
-/// THE DIRECT-PEER SAMPLE, PUSHED, ONLY WHERE IT IS DRAWN.
-///
-/// Every sample encodes the node's ENTIRE metrics registry, so the Ice `when`
-/// gate on this subscription is the whole budget: leaving the tab stops the
-/// encode at the source rather than throttling it here.
-pub fn node_peers_live(rpc: String) -> iced::futures::stream::BoxStream<'static, PeersData> {
-    snapshot_stream(rpc, Snapshot::Peers)
-}
-
-/// Which snapshot topic a stream carries, and how its document is read.
-///
-/// One discriminant rather than two copies of the reconnect loop: the loops
-/// were identical and the only difference was the topic and the reader.
-#[derive(Clone, Copy)]
-enum Snapshot {
-    Status,
-    Peers,
-}
-
-/// One snapshot topic, reconnecting with backoff, parsed with the SAME reader
-/// the HTTP load uses.
-///
-/// A dropped socket is not a reason to blank the surface: the rows on screen
-/// were true when they were sampled. Rebuild the subscription and keep them
-/// until a fresher sample replaces them.
-fn snapshot_stream<T: Send + 'static>(
-    rpc: String,
-    topic: Snapshot,
-) -> iced::futures::stream::BoxStream<'static, T>
-where
-    Snapshot: SnapshotReader<T>,
-{
     struct State {
         rpc: String,
         stream: Option<
@@ -805,11 +318,7 @@ where
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
                         continue;
                     };
-                    let opened = match topic {
-                        Snapshot::Status => client.status_events().await,
-                        Snapshot::Peers => client.peers_events().await,
-                    };
-                    match opened {
+                    match client.status_events().await {
                         Ok(stream) => state.stream = Some(stream),
                         Err(_) => {
                             state.retry_attempt = state.retry_attempt.saturating_add(1);
@@ -826,7 +335,7 @@ where
                 {
                     Some(Ok(document)) => {
                         state.retry_attempt = 0;
-                        return Some((topic.read(&document), state));
+                        return Some((node_facts(&document), state));
                     }
                     Some(Err(_)) | None => {
                         state.stream = None;
@@ -837,206 +346,6 @@ where
         },
     )
     .boxed()
-}
-
-/// How one snapshot topic's document becomes the value the console holds.
-trait SnapshotReader<T> {
-    fn read(&self, document: &serde_json::Value) -> T;
-}
-
-impl SnapshotReader<NodeFacts> for Snapshot {
-    fn read(&self, document: &serde_json::Value) -> NodeFacts {
-        node_facts(document)
-    }
-}
-
-impl SnapshotReader<PeersData> for Snapshot {
-    fn read(&self, document: &serde_json::Value) -> PeersData {
-        PeersData {
-            generation: -1,
-            peers: peer_rows(document),
-        }
-    }
-}
-
-/// The peer rows a `/v1/peers` document carries — the ONE reader, shared by
-/// the HTTP load and the pushed `peers` snapshot. A second copy of these key
-/// names is exactly how the table came to read three the node never served.
-///
-/// THE KEYS THE NODE ACTUALLY SERVES. This read `key`/`height`/`live` and
-/// `crates/noded/src/peers.rs` serves none of the three, so every row rendered a
-/// blank name, a zero, and an offline dot — for peers that were connected.
-fn peer_rows(reply: &serde_json::Value) -> Vec<PeerRow> {
-    reply["peers"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|peer| PeerRow {
-            key: short_label(peer["peer"].as_str().unwrap_or_default()),
-            role: peer["role"].as_str().unwrap_or_default().to_string(),
-            live: peer["connected"].as_bool().unwrap_or(false),
-        })
-        .collect()
-}
-
-/// Load the peers standing view.
-pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, HydrationError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        let reply = rpc.peers().await?;
-        Ok(PeersData {
-            generation,
-            peers: peer_rows(&reply),
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// One registered module, as the node itself reports it.
-///
-/// There is no MARKETPLACE behind this row and there cannot be: a publisher, a
-/// verification badge, an install count and a catalog description exist in no
-/// module, no index and no manifest. This is the INSTALLED/RUNTIME truth —
-/// what is registered, at which code, with which swap pending.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct ModuleRow {
-    pub id: String,
-    /// `workspace` | `developer` | `automation` | `system` — the presentation
-    /// category the status projection attaches by id. Never consensus state.
-    pub category: String,
-    /// The module's own state root, short form.
-    pub root: String,
-    /// The active component's sha256, short form. Empty when this network runs
-    /// no modules registry (the daemon's default set does not).
-    pub code_hash: String,
-    /// The scheduled swap's target hash, short form; empty when none is armed.
-    pub pending_hash: String,
-    /// The pending swap's activation height (0 when none is armed).
-    pub activation_height: i64,
-    /// Validators that have verified the pending bytes locally.
-    pub readiness: i64,
-    /// The pending swap has full coverage and will activate at its height.
-    pub ready: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ModulesData {
-    pub rows: Vec<ModuleRow>,
-}
-
-/// The registered module set: `/v1/status` publishes id, root and category for
-/// every module, and the modules registry (where a network runs one) adds the
-/// active code hash and any armed swap.
-///
-/// The registry half is BEST EFFORT on purpose — the daemon's default module
-/// set has no `modules`, and a network without one still has a real,
-/// complete registered set to show.
-pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let status = client.status_json().await?;
-        let code = module_code_by_id(&client).await;
-        let rows = status["modules"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|module| {
-                let id = module["id"].as_str().unwrap_or_default().to_string();
-                let registry = code.get(&id);
-                let pending =
-                    registry.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
-                ModuleRow {
-                    category: module["category"].as_str().unwrap_or_default().to_string(),
-                    root: short_digest(module["root"].as_str().unwrap_or_default()),
-                    code_hash: registry
-                        .map(|entry| {
-                            short_digest(&hex_encode(&json_bytes(&entry["active_code_hash"])))
-                        })
-                        .unwrap_or_default(),
-                    pending_hash: short_digest(&hex_encode(&json_bytes(&pending["code_hash"]))),
-                    activation_height: pending["activation_height"].as_i64().unwrap_or(0),
-                    readiness: count_i64(
-                        pending["readiness"]
-                            .as_array()
-                            .map_or(0, |signals| signals.len()),
-                    ),
-                    ready: pending_is_ready(&pending),
-                    id,
-                }
-            })
-            .collect();
-        Ok(ModulesData { rows })
-    }
-    .await
-    .map_err(app_error)
-}
-
-/// whether a `ScheduledSwap`'s readiness latch has closed: `ready_at` is the
-/// block it closed in, `null` until then (and the whole `pending` is `null`
-/// when nothing is scheduled).
-fn pending_is_ready(pending: &serde_json::Value) -> bool {
-    !pending["ready_at"].is_null()
-}
-
-#[cfg(test)]
-mod module_row_tests {
-    use super::pending_is_ready;
-
-    /// the Modules row's readiness flag keys on `ScheduledSwap.ready_at` —
-    /// the block the latch closed in, `null` until then. the literal is the
-    /// real `modules::interface::{ModuleCode, ScheduledSwap}` serde field
-    /// set (both `deny_unknown_fields`); this crate cannot decode the typed
-    /// struct (no `modules` dependency), so the field names are pinned here.
-    #[test]
-    fn a_pending_swap_is_ready_once_ready_at_is_set() {
-        let entry = |ready_at: serde_json::Value| {
-            serde_json::json!({
-                "module_id": "x",
-                "active_code_hash": [],
-                "history": [],
-                "pending": {
-                    "name": "n",
-                    "activation_height": 9,
-                    "code_hash": [],
-                    "readiness": [],
-                    "ready_at": ready_at,
-                }
-            })
-        };
-        assert!(pending_is_ready(&entry(serde_json::json!(6))["pending"]));
-        assert!(!pending_is_ready(
-            &entry(serde_json::Value::Null)["pending"]
-        ));
-        // nothing scheduled: the whole `pending` is null.
-        assert!(!pending_is_ready(&serde_json::Value::Null));
-    }
-}
-
-/// `ModulesQuery::ModuleStatus` keyed by module id, empty when this network
-/// runs no modules registry.
-async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::Value> {
-    let Ok(reply) = client
-        .query::<_, serde_json::Value>("modules", &serde_json::json!("module_status"))
-        .await
-    else {
-        return BTreeMap::new();
-    };
-    reply["module_status"]["modules"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| {
-            let id = entry["module_id"].as_str()?.to_string();
-            Some((id, entry))
-        })
-        .collect()
 }
 
 /// One curated skill as the record carries it: a duckfs subtree, pinned at a
@@ -1328,8 +637,10 @@ async fn newest_program_account(
 }
 
 /// The local account picture: whether the local user key belongs to an
-/// account, and that account's public face. `number` is the decimal account
-/// number — "" when there is none.
+/// account, and that account's public face — what the rail, the bell, the
+/// titlebar and the agents view all read. `number` is the decimal account
+/// number — "" when there is none. The key ASSOCIATIONS are not here: the
+/// settings view reads those for itself through the kernel.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AccountData {
     pub generation: i64,
@@ -1337,8 +648,6 @@ pub struct AccountData {
     pub number: String,
     pub name: String,
     pub bio: String,
-    pub keys: i64,
-    pub key_rows: Vec<AccountKeyRow>,
 }
 
 impl AccountData {
@@ -1349,36 +658,7 @@ impl AccountData {
             number: String::new(),
             name: String::new(),
             bio: String::new(),
-            keys: 0,
-            key_rows: Vec::new(),
         }
-    }
-}
-
-/// One key association as the settings card lists it: the scheme token the
-/// CLI prints, the hex key, the label ("" when none) and the admission time.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct AccountKeyRow {
-    pub scheme: String,
-    pub pubkey: String,
-    pub label: String,
-    pub added_at: i64,
-}
-
-fn key_row(key: identity::KeyView) -> AccountKeyRow {
-    AccountKeyRow {
-        scheme: scheme_token(key.scheme).to_string(),
-        pubkey: hex_encode(&key.pubkey),
-        label: key.label.unwrap_or_default(),
-        added_at: i64::try_from(key.added_at).unwrap_or(i64::MAX),
-    }
-}
-
-fn scheme_token(scheme: identity::KeyScheme) -> &'static str {
-    match scheme {
-        identity::KeyScheme::Ed25519 => "ed25519",
-        identity::KeyScheme::Secp256k1 => "secp256k1",
-        identity::KeyScheme::Secp256r1 => "secp256r1",
     }
 }
 
@@ -1410,8 +690,6 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             number: account.number.to_string(),
             name: account.name,
             bio: account.bio.unwrap_or_default(),
-            keys: count_i64(account.keys.len()),
-            key_rows: account.keys.into_iter().map(key_row).collect(),
         })
     }
     .await
