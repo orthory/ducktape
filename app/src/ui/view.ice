@@ -117,9 +117,9 @@ view
           tab=shell_tab
           bell_count=bell_unread
           bell_sev=bell_worst_severity(bell_items)
-          approvals=open_proposals(gov_rows)
+          approvals=gov_open
           account=account_name
-          agent_live=any_agent_active(agents_rows)
+          agent_live=agents_live
           tier=member_tier(members_rows)
           answered=members_answered
           root_hash=node_root_hash
@@ -207,13 +207,21 @@ view
         // computed here, once.
         files:
           extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes, connected_rpc, network_chain_id, connect_generation, fs_preview_base, fs_save_reply) #files -> files_view_event _
+        // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads the roster off the node itself and
+        // writes through `op.submit` (signed with the seated key). The
+        // app's own `members_rows` stays — it is the SESSION fact of who
+        // this node is on this network, which the rail, the forge gate and
+        // the approvals gate all read.
         members:
-          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
+          extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
-          // the register whole, with the editor's pick lists and the signing
-          // account; every write comes back as an intent the roster handler
-          // signs
-          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
+          // Agents is a VIEW ON THE KERNEL CONTRACT: session facts go in —
+          // the signing account and the run another tab opened for the
+          // reader — and the view reads its own register and signs its own
+          // writes through `op.submit`. What comes back is its working
+          // count, a registration, and two navigations.
+          extern agents_view(dark, connected, account_number, agents_open_run, agents_opened) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
         // the code browse's listing and file, and the discussion go in as
         // props; every act comes back as an intent the handler signs. The
@@ -221,11 +229,12 @@ view
         // chat composer over the item's channel — so its words stay here.
         forge:
           extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_repos, forge_list_phase, forge_repo, forge_repo_phase, forge_branches, forge_tree_branch(forge_branches, forge_tree_branch, forge_tree_rev), forge_tab, forge_items, forge_item_number, forge_item_phase, forge_item_kind, forge_item_title, forge_item_state, forge_item_author, forge_item_branches, forge_item_body, forge_item_blocks, forge_item_files_changed, forge_item_additions, forge_item_deletions, forge_item_diff, forge_item_diff_truncated, forge_item_merge_oid, forge_item_source_oid, forge_item_approvals, forge_item_change_requests, forge_item_reviews, forge_merge_conflicts, forge_merge_busy, forge_review_verdict, forge_review_busy, forge_comment_staged, forge_discussion, forge_linked_note, forge_landed_seq, forge_landed_tick, forge_tree_path, forge_tree_rev, forge_tree_entries, forge_tree_born, forge_tree_truncated, forge_tree_phase, forge_file_path, forge_file_text, forge_file_binary, forge_file_truncated, forge_file_picture, forge_file_width, forge_file_height, forge_file_note, forge_file_header(forge_opened_dir, forge_opened_rev, forge_tree_path, forge_tree_rev, forge_file_path), forge_file_phase, forge_drafts_cleared, forge_drafts_scope, composer_scope(connected_rpc, forge_item_channel), (loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending))) #forge -> forge_view_event _
-        // Approvals is a MODULE-OWNED VIEW: the register the app holds goes
-        // in as props, and what the reader does comes back as an intent the
-        // handler below signs — the guest sees no key and no endpoint.
+        // Approvals is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads its own register and writes through
+        // `op.submit` (signed with the seated key), and the one event back
+        // is the tab badge — the guest sees no key and no endpoint.
         governance:
-          extern governance_view(dark, connected, members_is_admin(members_rows), gov_answered, gov_voting, gov_rows) #governance -> governance_view_event _
+          extern governance_view(dark, connected, members_is_admin(members_rows)) #governance -> governance_view_event _
         // Node is a MODULE-OWNED VIEW too: the facts the app holds go in as
         // props; the tab, the log filter and a clipboard copy come back as
         // intents. The live log ring stays native — the view leaves a slot
@@ -237,11 +246,14 @@ view
         // back as an intent the handler signs. The drafts are the view's.
         settings:
           extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
-        // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
-        // the last search go in as props; a refresh, a search, its clearing
-        // and a copy come back as intents the handler acts on.
+        // The Explorer is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in — the live head and the sync line among them, because
+        // they are the titlebar's own readings and a second source would
+        // disagree with it — and the view reads the block window and runs its
+        // workspace search through the kernel. A clipboard copy is the one
+        // intent that comes back.
         explorer:
-          extern explorer_view(dark, connected, explorer_loading, explorer_blocks, explorer_ops, block_height, sync_label(node_phase, node_sync_applied, node_sync_target), explorer_hits, explorer_kinds, explorer_partial, explorer_searching, explorer_sent_query) #explorer -> explorer_view_event _
+          extern explorer_view(dark, connected, block_height, sync_label(node_phase, node_sync_applied, node_sync_target)) #explorer -> explorer_view_event _
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

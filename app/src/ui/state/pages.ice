@@ -14,6 +14,7 @@ state
 
   block_comments_open = false
   block_comments_target = ""
+  inline_comment_target = ""
   block_comments_generation:i64 = 0
   block_comment_threads:[PageCommentThread] = []
   block_comment_rows:[PageCommentThreadRow] = []

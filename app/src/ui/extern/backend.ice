@@ -66,8 +66,6 @@ extern crate::backend
   AppError(message:str, committed:bool)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
-  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
-  pure live_run_for(rows:&[LiveAgentRow], dispatch_id:&str) -> LiveRun
   LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   task note_window_focus(focused:bool) -> unit
   component forge_markdown(source:str, doc:str, dark:bool) -> str
@@ -250,7 +248,6 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
@@ -366,45 +363,16 @@ extern crate::backend
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
-  AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
-  // the run tracker: every run off the runs journal, and the journal of
-  // the one the reader opened
-  RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
-  RunLink(relation:str, kind:str, label:str, url:str)
-  RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
-  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str])
-  load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
-  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
-  pure empty_run_journal() -> RunJournal
-  pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
-  // the editor's whole draft record, as the Agents view hands it back
-  save_agent(rpc:str, password:str, draft:str) -> bool ! AppError
   // provision the program account under the signing account, then register
+  // — the one agent write the Agents view cannot sign for itself, because
+  // the program it binds is the runs module's own composition
   register_agent(rpc:str, password:str, controller:str, draft:str) -> bool ! AppError
-  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
-  GovernanceData(generation:i64, proposals:[ProposalRow])
-  load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
-  governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError
-  governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
-  governance_propose(rpc:str, password:str, action:str, target_key:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   pure members_is_admin(rows:&[MemberRow]) -> bool
   pure member_tier(rows:&[MemberRow]) -> str
-  ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
-  ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
-  ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
-  pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
-  load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
-  ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
-  KindCount(kind:str, label:str, count:i64)
-  ExplorerResults(hits:[ExplorerHit], kinds:[KindCount], partial:str)
-  search_workspace(rpc:str, text:str) -> ExplorerResults
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
   load_desktop_notifications() -> bool
@@ -459,7 +427,6 @@ extern crate::backend
   pure keep_folded_page_titles(fold_outran_reply:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure keep_folded_block_texts(fold_outran_reply:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure plane_live_hit(kind:LiveKind, module:str, want:str) -> bool
-  pure agents_plane_hit(kind:LiveKind, module:str) -> bool
   pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
   pure keep_str(loaded:bool, next:&str, current:&str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool

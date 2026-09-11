@@ -250,25 +250,11 @@ enum ForgeIntent
   copy
   composer
 
-// What a `governance` module view asks of the app: the two writes the
-// Approvals screen makes, routed to the handlers that sign them.
-enum GovIntent
-  vote
-  execute
-
-// what the Members view asks of the app: a clipboard write, an agent's
-// paused state, or a membership ballot
-enum RosterIntent
-  copy
-  agent_status
-  propose
-
-// what the Agents view asks of the app: an agent's paused state, a record
-// rewritten from the editor's draft, a new agent registered from one, or the
-// journal of a run the reader opened
+// what the Agents view asks of the app: how many of its agents are working
+// (the rail's pulse), a new agent registered from the editor's draft, or a
+// place to open — the reads and the other writes are the view's own
 enum AgentsIntent
-  status
-  save
+  badge
   register
   open_run
   open_link
@@ -280,14 +266,6 @@ enum NodeIntent
   tab
   log_filter
   log_timeline
-
-// what the Explorer view asks of the app: reload the ledger, a clipboard
-// write, a workspace search, or dropping the standing answer
-enum ExplorerIntent
-  refresh
-  copy
-  search
-  clear
 
 // what the Files view asks of the app: one variant per act the browser
 // offers, from a navigation to a write

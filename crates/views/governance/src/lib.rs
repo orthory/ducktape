@@ -2,11 +2,13 @@
 //! is being asked to make, and the ones it has settled, rendered from a
 //! wasm component the desktop app loads from a file.
 //!
-//! The view is a pure function of what the host pushes in (`governance.props`,
-//! one item per change) and speaks back only in intents (`governance.vote`,
-//! `governance.execute`). Loading, credentials, signing and the write itself
-//! stay in the desktop app, which is what keeps this component free of every
-//! network and key concern: a guest that sees no key cannot leak one.
+//! The kernel pushes session facts only (`governance.props`: connected,
+//! admin, dark). The view reads its own register through the kernel's
+//! `rpc.query` / `rpc.blocks`, re-reads it on every `rpc.live` hit for the
+//! governance plane, and a vote or a settle leaves as `op.submit` — the
+//! governance message the kernel signs with the seated key. The endpoint,
+//! the key and the password never cross: a guest that sees no key cannot
+//! leak one.
 
 pub mod host;
 

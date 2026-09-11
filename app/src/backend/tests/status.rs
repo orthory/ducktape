@@ -61,93 +61,6 @@ fn a_log_line_splits_into_time_level_and_message() {
 }
 
 #[test]
-fn explorer_ops_keep_the_full_hash_and_pretty_print_json_payloads() {
-    let op_hash = "dd".repeat(32);
-    let rows = vec![serde_json::json!({
-        "height": 7,
-        "hash": "aa".repeat(32),
-        "commit_hash": "bb".repeat(32),
-        "ops": [
-            {
-                "proposer": "cc".repeat(32),
-                "target": "files",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": "{\"put\":{\"path\":\"/shared/a.png\"}}",
-                "operations": []
-            },
-            {
-                "proposer": "cc".repeat(32),
-                "target": "chat",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": "plain prose, not a document",
-                "operations": []
-            }
-        ]
-    })];
-    // the window lists newest first: ops arrive [files, chat] and reverse.
-    let data = explorer_window(1, &rows);
-    assert_eq!(
-        data.ops[1].op_hash, op_hash,
-        "the op hash is the blob key — the card carries it whole"
-    );
-    assert_eq!(
-        data.ops[1].payload, "{\n  \"put\": {\n    \"path\": \"/shared/a.png\"\n  }\n}",
-        "a JSON payload renders pretty-printed"
-    );
-    assert_eq!(
-        data.ops[0].payload, "plain prose, not a document",
-        "a non-JSON payload stays verbatim"
-    );
-    // the block hash, the commit and the proposer cross WHOLE and bare: the
-    // view adds the `0x`, and a digest cut here is one no screen can recover
-    assert_eq!(data.blocks[0].hash, "aa".repeat(32));
-    assert_eq!(data.blocks[0].commit, "bb".repeat(32));
-    assert_eq!(data.ops[0].proposer, "cc".repeat(32));
-}
-
-/// A DIGEST INSIDE A PAYLOAD IS A DIGEST. Module messages carry theirs as
-/// `Vec<u8>` (forge's `new_oid`, runs' `recipe_hash`, the registry's
-/// `code_hash`), and serde prints those as decimal arrays — a wall of
-/// three-digit numbers where a hash belongs, in the same card as two hashes
-/// written in hex. Short arrays are left alone: they are counts, not keys.
-#[test]
-fn payload_byte_arrays_read_as_hex_beside_the_hashes_they_belong_with() {
-    let oid: Vec<u8> = (1..=20).collect();
-    let rows = vec![serde_json::json!({
-        "height": 7,
-        "hash": "aa".repeat(32),
-        "commit_hash": "bb".repeat(32),
-        "ops": [{
-            "proposer": "cc".repeat(32),
-            "target": "forge",
-            "disposition": "applied",
-            "op_hash": "dd".repeat(32),
-            "payload": serde_json::to_string(&serde_json::json!({
-                "push": { "new_oid": oid, "counts": [1, 2, 3] }
-            })).expect("payload encodes"),
-            "operations": []
-        }]
-    })];
-
-    let data = explorer_window(1, &rows);
-
-    assert!(
-        data.ops[0]
-            .payload
-            .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\""),
-        "the oid reads as one hex key: {}",
-        data.ops[0].payload
-    );
-    assert!(
-        data.ops[0].payload.contains("\"counts\": [\n      1,"),
-        "a short list of numbers is still a list of numbers: {}",
-        data.ops[0].payload
-    );
-}
-
-#[test]
 fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");
@@ -326,36 +239,6 @@ fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
     assert_eq!(
         expires_in_blocks((now - 60) * 1_000, 84_912, now),
         "expired"
-    );
-}
-
-#[test]
-fn a_proposal_renders_its_payload_and_its_frozen_bar() {
-    let view = serde_json::json!({
-        "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
-        "voting_rule": { "threshold": { "required_yes": 4 } }
-    });
-    assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
-    // a threshold's bar does not move with the no votes.
-    assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
-    assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
-
-    // a participating majority's quorum is TURNOUT, and passing also needs
-    // yes > no — reading `quorum` straight into a yes counter says "quorum
-    // met" at 3/3 on a vote of 3 yes / 3 no, which does not settle.
-    let majority = serde_json::json!({ "participating_majority": { "quorum": 6 } });
-    assert_eq!(yes_needed(&majority, 0), 6);
-    assert_eq!(
-        yes_needed(&majority, 2),
-        4,
-        "two no votes count toward turnout"
-    );
-    assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
-
-    assert_eq!(tagged_name(&view["action"]), "add_validator");
-    assert_eq!(
-        gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
-        "ship it"
     );
 }
 

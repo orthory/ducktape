@@ -91,8 +91,8 @@ selected_message_seq > 0 || message_action != MessageAction.editing)"
     assert!(lifecycle.contains(
         "block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)"
     ));
-    // the live comment-list callback settles state and stops — re-entering
-    // the resync from inside it would loop the rail against the page.
+    // The list callback may open the chosen inline thread, but never reloads
+    // its own page thread list.
     let pages_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
     let comment_callbacks = pages_handlers
         .split_once("on block_threads_loaded(next)\n")
@@ -101,7 +101,9 @@ selected_message_seq > 0 || message_action != MessageAction.editing)"
         .split_once("\non load_more_block_threads")
         .unwrap()
         .0;
-    assert!(!comment_callbacks.contains("run "));
+    assert!(!comment_callbacks.contains("load_page_threads("));
+    assert!(comment_callbacks.contains("return if empty(inline_comment_target)"));
+    assert!(comment_callbacks.contains("selected == active_block_comment_thread"));
 }
 
 #[test]
@@ -518,27 +520,38 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     assert_eq!(app.buffer_page, "alpha");
 }
 
-/// The artifact hangs comments off the document as a docked 306px rail on
-/// the sidebar ladder, NOT as a floating card over it — a card would cover
-/// the block it is about the moment the block sits on the right half.
+/// Opening comments preserves the document layout and leaves input outside
+/// the floating card available.
 #[test]
-fn block_comments_dock_a_rail_beside_the_document() {
+fn block_comments_float_a_card_over_the_document() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
     // the pages screen is the `pages` view's now (crates/views/pages).
     let pages = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
-    // the rail is a sibling of the document, separated by the same 1px rule
-    // every other docked column uses — never an overlay layer.
-    let rail = pages
+    // the card is a full-size positioning layer pinning a fixed-width card to
+    // the right edge through a native float, without a modal backdrop.
+    let card = pages
         .split_once("if connected && !empty(active_page) && block_comments_open\n")
         .unwrap()
         .1;
-    let mut opening = rail.lines().map(str::trim);
-    assert_eq!(opening.next(), Some("box w=1.0 h=fill bg=separator"));
-    assert_eq!(opening.next(), Some("space w=1.0 h=1.0"));
+    let mut opening = card.lines().map(str::trim);
+    assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0"));
     assert_eq!(
         opening.next(),
-        Some("box w=306.0 h=fill bg=sidebar clip=true")
+        Some("float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset")
     );
+    assert_eq!(
+        opening.next(),
+        Some(
+            "box #comments-card w=340.0 h=shrink max-h=comments_height bg=elevated r=12.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0 border=separator border-w=1.0 clip=true"
+        )
+    );
+    assert!(!pages.contains("w=306.0"));
+    // A STACK LAYER DECLARED AFTER THE DOCUMENT ARM, or it would paint under
+    // the text it covers and the editor would own the pointer through it. The
+    // delete confirm still outranks it: that one IS an overlay with a scrim.
+    let layer = pages.find("if connected && !empty(active_page) && block_comments_open");
+    assert!(pages.find("slot document") < layer);
+    assert!(layer < pages.find("overlay when=page_delete_armed"));
     assert!(!pages.contains("close_block_comments backdrop=transparent"));
     assert!(pages.contains("-> emit(close_block_comments)"));
     assert!(pages.contains("#page-comment(active_page)"));
@@ -546,7 +559,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     assert!(!pages.contains("Saving"));
 
     // The control is a DOCUMENT ACTION in the header now, not a row buried in
-    // a per-block menu — the rail was always page-scoped.
+    // a per-block menu — the card was always page-scoped.
     assert!(pages.contains("button label=\"Comments\""));
     assert!(pages.contains("-> emit(toggle_block_comments)"));
     let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
@@ -560,14 +573,14 @@ fn block_comments_dock_a_rail_beside_the_document() {
         "run every post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
     ));
     assert!(handlers.contains(
-        "let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)"
+        "let fresh_target = keep_str(!empty(inline_comment_target), inline_comment_target, caret_target)"
     ));
     // Opening a thread rides the thread's OWN anchor — a block-anchored
     // thread opened with the page id is refused by the node.
     assert!(handlers.contains("on open_block_comment_thread(event)"));
     assert!(handlers.contains("let target = event_text(event, \"target\")"));
     // The guest editor shares the screen's document slot and keeps comment
-    // counts in its declarative presentation, beside the existing rail.
+    // counts in its declarative presentation, under the comments card.
     let guest_source = include_str!("../../../crates/views/pages/src/ui/app.ice");
     assert!(guest_source.contains("editor #document <-> document -> document_committed _"));
     let guest = inlined(guest_source);
@@ -1385,5 +1398,79 @@ fn an_armed_page_delete_answers_escape_and_seals_the_document() {
         app.page_text.clone(),
         "one",
         "Undo belongs to the guest binding"
+    );
+}
+
+#[test]
+fn a_document_comment_badge_opens_its_own_thread_and_rejects_old_replies() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.mutation_phase = MutationPhase::Idle;
+    app.active_page = "page".into();
+    app.block_comments_open = true;
+    app.block_comments_target = "page".into();
+    app.inline_comment_target = "block-b".into();
+    app.block_comments_generation = 10;
+    app.block_comment_threads_loading = true;
+    let thread = |id: &str, target: &str, resolved| backend::PageCommentThread {
+        id: id.into(),
+        target: target.into(),
+        resolved,
+        author: "Reader".into(),
+        meta: String::new(),
+        comment_count: 1,
+    };
+    let threads = vec![
+        thread("other", "block-a", false),
+        thread("resolved", "block-b", true),
+        thread("wanted", "block-b", false),
+    ];
+    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+        backend::BlockThreadListData {
+            generation: 10,
+            target: "page".into(),
+            from: 0,
+            threads,
+            total: 3,
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert_eq!(app.active_block_comment_thread, "wanted");
+    assert_eq!(app.active_thread_target, "block-b");
+    assert!(app.block_thread_comments_loading);
+    assert_eq!(app.block_comment_rows.len(), 2);
+    assert!(
+        app.block_comment_rows
+            .iter()
+            .all(|row| row.thread.target == "block-b")
+    );
+    let _ = app.__update(__DucktapeMessage::BlockCommentPageLoaded(
+        backend::BlockCommentData {
+            generation: 9,
+            target: "block-a".into(),
+            thread_id: "other".into(),
+            from: 0,
+            comments: Vec::new(),
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert!(
+        app.block_thread_comments_loading,
+        "the old thread must not complete this load"
+    );
+    let _ = app.__update(__DucktapeMessage::CloseBlockCommentThread);
+    assert!(app.inline_comment_target.is_empty());
+    assert_eq!(app.block_comment_rows.len(), 3);
+    assert!(app.active_block_comment_thread.is_empty());
+    app.inline_comment_target = "block-b".into();
+    app.caret_comment_target = "block-a".into();
+    app.block_comment_draft = "A new comment on B".into();
+    let _ = app.__update(__DucktapeMessage::PostBlockCommentSubmit);
+    assert_eq!(
+        app.active_thread_target, "block-b",
+        "moving the caret must not retarget the open composer"
     );
 }

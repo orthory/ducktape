@@ -182,6 +182,7 @@ pub struct Rail {
 /// `pages.open_thread` — open one comment thread on its own anchor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenThread {
+    pub comment_draft: String,
     pub id: String,
     pub target: String,
 }
@@ -318,10 +319,11 @@ pub fn close_comments(comment_draft: &str) -> bool {
     )
 }
 
-pub fn open_thread(id: &str, target: &str) -> bool {
+pub fn open_thread(id: &str, target: &str, comment_draft: &str) -> bool {
     notify(
         "pages.open_thread",
         &OpenThread {
+            comment_draft: comment_draft.into(),
             id: id.into(),
             target: target.into(),
         },
@@ -337,9 +339,8 @@ pub fn more_threads() -> bool {
     true
 }
 
-pub fn close_thread() -> bool {
-    host::notify("pages.close_thread", &[]);
-    true
+pub fn close_thread(comment_draft: &str) -> bool {
+    notify("pages.close_thread", &Rail { comment_draft: comment_draft.into() })
 }
 
 pub fn more_comments() -> bool {
@@ -379,6 +380,20 @@ pub fn keep_str(keep: bool, next: &str, current: &str) -> String {
     if keep { next } else { current }.to_owned()
 }
 
+/// The page list's narrowest and widest, in logical pixels: under the first a
+/// page title is a column of syllables, over the second the list is reading
+/// the document's own room.
+const SIDEBAR_MINIMUM: f64 = 180.0;
+const SIDEBAR_MAXIMUM: f64 = 420.0;
+
+/// Where a drag on the list's edge leaves it. The document keeps at least half
+/// the window whatever the reader drags, so a narrow console cannot be dragged
+/// down to a sliver of page.
+pub fn sidebar_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(SIDEBAR_MINIMUM, SIDEBAR_MAXIMUM);
+    (width + delta).clamp(SIDEBAR_MINIMUM, maximum)
+}
+
 /// A search answer is standing when the query it was sent for is still what
 /// the box holds and the round trip is over.
 pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
@@ -416,10 +431,11 @@ pub fn seeded(moved: bool, seed: &str, draft: &str) -> String {
 
 /// Only the accepted canonical reference crosses back. The app resolves its
 /// bytes from the matching host editor and keeps the ordinary save/CAS path.
-pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>) -> bool {
+pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>, comment_draft: &str) -> bool {
     host::notify(
         "pages.edited",
         &serde_json::to_vec(&crate::document_source::Accepted {
+            comment_draft: comment_draft.into(),
             source,
             reference,
             navigation,
@@ -445,4 +461,41 @@ pub fn installed(document: &ui_lang_guest::Editor, source: Vec<u8>) -> bool {
         .expect("installed document metadata"),
     );
     true
+}
+
+/// Screen placement is local presentation state; the host still validates the line.
+pub fn comment_navigation(navigation: Vec<u8>) -> bool {
+    ui_lang_guest::wire::decode::<crate::document_source::Navigation>(&navigation)
+        .is_ok_and(|navigation| navigation.comment_line.is_some())
+}
+
+pub fn comment_card_height(thread: &str, anchor_y: f64, viewport_height: f64) -> f64 {
+    let available = (viewport_height - 83.0).max(0.0);
+    if !thread.is_empty() || anchor_y >= 0.0 {
+        available.min(400.0)
+    } else {
+        available
+    }
+}
+
+pub fn comment_card_offset(anchor_y: f64, viewport_height: f64) -> f64 {
+    // The document starts below the 50px header and 1px separator; the card
+    // has a 16px inset. Keep its 400px body above the bottom inset.
+    (anchor_y - 67.0).clamp(0.0, (viewport_height - 483.0).max(0.0))
+}
+
+pub fn comment_anchor_after_props(
+    current_page: &str,
+    next_page: &str,
+    open: bool,
+    anchor: f64,
+) -> f64 {
+    if current_page != next_page || !open {
+        -1.0
+    } else {
+        anchor
+    }
+}
+pub fn comment_anchor_after_navigation(opens: bool, pointer: f64, anchor: f64) -> f64 {
+    if opens { pointer } else { anchor }
 }

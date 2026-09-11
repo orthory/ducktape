@@ -44,6 +44,19 @@ const CODE_PLATE_PAD: f32 = 15.0;
 /// shaped run and takes the caret's column with it. The reference uses the
 /// same hair-width value for the same reason.
 const HIDDEN_SIZE: f32 = 0.01;
+/// The checkbox: one em square, drawn as the span highlight around the tick
+/// glyph alone. The three advances under it are Geist's own at `BODY_SIZE`
+/// (`[`/`]` 0.347em, a space 0.25em, an `x` 0.585em) — the box is PAINT, so
+/// the glyphs are what have to be shimmed to the width it wants.
+const TICK_BOX: f32 = BODY_SIZE;
+const BRACKET_EM: f32 = 0.347;
+const SPACE_ADVANCE: f32 = 0.25 * BODY_SIZE;
+const TICK_ADVANCE: f32 = 0.585 * BODY_SIZE;
+/// The width the three glyphs occupy, held CONSTANT across both states. An
+/// `x` is 4.7px wider than the space it replaces, so ticking a todo widened
+/// its box and shoved the whole line's text right; the brackets shrink to
+/// absorb the difference, which also keeps the tick centred in its square.
+const TICK_RUN: f32 = 2.0 * BRACKET_EM * BODY_SIZE + SPACE_ADVANCE;
 /// One nesting step, as left padding. The two spaces the depth is SPELLED
 /// with measure ~8px in the body face — legible as "something is different",
 /// useless as "this item belongs to that one".
@@ -88,9 +101,18 @@ pub enum Mark {
     /// A line's leading whitespace. Collapsed to nothing — the nesting step
     /// it stands for is painted as the line's left padding instead.
     Indent(Style),
-    /// A todo's `[ ]`/`[x]` — drawn as a checkbox (the span highlight is the
-    /// box), never as bracket glyphs.
+    /// A todo's tick — the ONE glyph between the brackets, ` ` or `x`. Its
+    /// span highlight is the checkbox, and a done todo paints the glyph in
+    /// the page's own ground so the box reads as ticked.
     Tick {
+        checked: bool,
+        style: Style,
+    },
+    /// A todo's `[` or `]`. Never seen either way — the box is the tick's —
+    /// but SIZED rather than collapsed: the pair is the shim that holds the
+    /// three-glyph run at one width, so a column of todos keeps one box
+    /// column and the body does not move when one is ticked.
+    TickEdge {
         checked: bool,
         style: Style,
     },
@@ -325,7 +347,8 @@ fn highlight(
     }
     // The marker run. A list keeps its own — it IS the bullet the reader
     // sees — but a todo's bullet yields to the checkbox: the `- ` reveals
-    // only under the caret and the `[ ]` run IS the box, always.
+    // only under the caret, and the three `[ ]` glyphs split so the box can
+    // be a square around the MIDDLE one instead of a band across all three.
     match prefix {
         Prefix::Body => {}
         Prefix::List => match ticked {
@@ -339,8 +362,22 @@ fn highlight(
                     },
                 ));
                 marks.push((
-                    content - 4..content - 1,
+                    content - 4..content - 3,
+                    Mark::TickEdge {
+                        checked: ticked_done,
+                        style,
+                    },
+                ));
+                marks.push((
+                    content - 3..content - 2,
                     Mark::Tick {
+                        checked: ticked_done,
+                        style,
+                    },
+                ));
+                marks.push((
+                    content - 2..content - 1,
+                    Mark::TickEdge {
                         checked: ticked_done,
                         style,
                     },
@@ -422,6 +459,8 @@ struct Ink {
     comment_wash: Color,
     rule: Color,
     tick_fill: Color,
+    /// The `x` on a filled checkbox: the page's own ground, showing through.
+    tick_mark: Color,
 }
 
 const fn rgb8(r: u8, g: u8, b: u8) -> Color {
@@ -458,6 +497,7 @@ const LIGHT: Ink = Ink {
     comment_wash: wash(0xa0, 0x5a, 0x3c, 0.09),
     rule: wash(0x3a, 0x38, 0x33, 0.16),
     tick_fill: rgb8(0xa0, 0x5a, 0x3c),
+    tick_mark: rgb8(0xfd, 0xfd, 0xfb),
 };
 
 const DARK: Ink = Ink {
@@ -474,6 +514,7 @@ const DARK: Ink = Ink {
     comment_wash: wash(0xc9, 0x8a, 0x63, 0.13),
     rule: wash(0xd4, 0xd2, 0xca, 0.18),
     tick_fill: rgb8(0xc9, 0x8a, 0x63),
+    tick_mark: rgb8(0x1b, 0x1a, 0x16),
 };
 
 fn ink(dark: bool) -> &'static Ink {
@@ -530,6 +571,21 @@ fn code_plate(ink: &Ink) -> TextHighlight {
     }
 }
 
+/// What the tick glyph itself measures: a space, or the `x` that replaces it.
+fn tick_advance(checked: bool) -> f32 {
+    match checked {
+        true => TICK_ADVANCE,
+        false => SPACE_ADVANCE,
+    }
+}
+
+/// The size a bracket renders at, so the invisible pair fills whatever the
+/// tick leaves of `TICK_RUN`. Unticked that is the body size; ticked the
+/// wider `x` squeezes them.
+fn bracket_size(checked: bool) -> f32 {
+    (TICK_RUN - tick_advance(checked)) / 2.0 / BRACKET_EM
+}
+
 /// The paint for one run. This is the whole visual contract of the surface.
 pub fn format(mark: &Mark, dark: bool) -> Format {
     let mut format = paint(mark, dark);
@@ -551,7 +607,8 @@ fn block_pad(mark: &Mark) -> [f32; 2] {
         | Mark::Body(style)
         | Mark::ListMarker(style)
         | Mark::Marker { style, .. }
-        | Mark::Tick { style, .. } => style,
+        | Mark::Tick { style, .. }
+        | Mark::TickEdge { style, .. } => style,
         Mark::Title => return [BLOCK_PAD; 2],
         Mark::Fence { .. } | Mark::CodeBody => return [0.0; 2],
     };
@@ -571,7 +628,8 @@ fn nest(mark: &Mark) -> f32 {
         | Mark::Body(style)
         | Mark::ListMarker(style)
         | Mark::Marker { style, .. }
-        | Mark::Tick { style, .. } => style,
+        | Mark::Tick { style, .. }
+        | Mark::TickEdge { style, .. } => style,
         // The title is line 0 and a fence keeps the indentation it is written
         // with — neither nests.
         Mark::Title | Mark::Fence { .. } | Mark::CodeBody => return 0.0,
@@ -631,12 +689,15 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             format
         }
         Mark::Tick { checked, style } => {
-            // The bracket glyphs are scaffolding: the box the reader sees is
-            // the span highlight drawn around them — an outline until the
-            // todo is done, a filled square after.
+            // The box the reader sees is this one glyph's span highlight — an
+            // outline until the todo is done, a filled square after, and the
+            // `x` itself paints in the page's own ground on that fill.
             let mut format = body_format(style, ink);
-            format.color = Some(Color::TRANSPARENT);
             format.strikethrough = None;
+            format.color = Some(match checked {
+                true => ink.tick_mark,
+                false => Color::TRANSPARENT,
+            });
             // The collapsed `- ` bullet beside this run cannot carry the line,
             // so the tick holds the body metrics ABSOLUTELY — the same job the
             // body run does for a heading's hidden marker.
@@ -651,17 +712,29 @@ fn paint(mark: &Mark, dark: bool) -> Format {
                 border: Border {
                     color: line,
                     width: 1.4,
-                    radius: 4.0.into(),
+                    radius: 3.0.into(),
                 },
             });
-            // Paint-only NEGATIVE padding: the span box spans the line's full
-            // height, and the checkbox wants to hug the glyph row instead.
+            // Paint-only padding, and the whole reason the box is square: the
+            // span is ONE glyph and the highlight grows from its advance, so
+            // each side takes half of what the glyph leaves of the box. The
+            // vertical is negative — the span is the line's full height.
+            let side = (TICK_BOX - tick_advance(checked)) / 2.0;
+            let lift = (BODY_SIZE * BODY_LINE_HEIGHT - TICK_BOX) / 2.0;
             format.padding = Padding {
-                top: -4.5,
-                bottom: -4.5,
-                left: -0.5,
-                right: -0.5,
+                top: -lift,
+                bottom: -lift,
+                left: side,
+                right: side,
             };
+            format
+        }
+        Mark::TickEdge { checked, style } => {
+            let mut format = body_format(style, ink);
+            format.strikethrough = None;
+            format.color = Some(Color::TRANSPARENT);
+            format.size = Some(Pixels(bracket_size(checked)));
+            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
             format
         }
         Mark::Body(style) => body_format(style, ink),
@@ -895,15 +968,22 @@ mod tests {
         let (marks, _) = highlight("- [ ] ship", false, false, false);
         assert_eq!(marks[0].0, 0..2);
         assert!(matches!(marks[0].1, Mark::Marker { hidden: true, .. }));
-        assert_eq!(marks[1].0, 2..5);
-        assert!(matches!(marks[1].1, Mark::Tick { checked: false, .. }));
+        // The box covers EXACTLY the middle column; the brackets either side
+        // are their own invisible runs.
+        assert_eq!(marks[1].0, 2..3);
+        assert!(matches!(marks[1].1, Mark::TickEdge { checked: false, .. }));
+        assert_eq!(marks[2].0, 3..4);
+        assert!(matches!(marks[2].1, Mark::Tick { checked: false, .. }));
+        assert_eq!(marks[3].0, 4..5);
+        assert!(matches!(marks[3].1, Mark::TickEdge { checked: false, .. }));
         // The body starts at the gap so the box keeps its breathing room.
-        assert_eq!(marks[2].0, 5..10);
-        assert!(matches!(marks[2].1, Mark::Body(_)));
-        // The box is the span highlight; the bracket glyphs are invisible.
-        let tick = format(&marks[1].1, false);
+        assert_eq!(marks[4].0, 5..10);
+        assert!(matches!(marks[4].1, Mark::Body(_)));
+        // An empty box is an outline around an invisible space.
+        let tick = format(&marks[2].1, false);
         assert_eq!(tick.color, Some(Color::TRANSPARENT));
         assert!(tick.highlight.is_some());
+        assert_eq!(format(&marks[1].1, false).color, Some(Color::TRANSPARENT));
         // A plain bullet keeps its visible marker, exactly as before.
         let (bullet, _) = highlight("- plain", false, false, false);
         assert!(matches!(bullet[0].1, Mark::ListMarker(_)));
@@ -912,14 +992,59 @@ mod tests {
     #[test]
     fn a_done_todo_fills_the_box_and_strikes_the_text() {
         let (marks, _) = highlight("- [x] done", false, false, false);
-        assert!(matches!(marks[1].1, Mark::Tick { checked: true, .. }));
-        let Mark::Body(style) = marks[2].1 else {
+        assert!(matches!(marks[2].1, Mark::Tick { checked: true, .. }));
+        // A filled box carries a VISIBLE mark, in the ground colour — a bare
+        // fill reads as a swatch, not as a ticked box.
+        let tick = format(&marks[2].1, false);
+        assert_eq!(tick.color, Some(LIGHT.tick_mark));
+        assert_eq!(
+            tick.highlight.expect("a filled box").background,
+            LIGHT.tick_fill.into()
+        );
+        assert!(tick.strikethrough.is_none());
+        let Mark::Body(style) = marks[4].1 else {
             unreachable!("a body run")
         };
         assert!(style.done);
-        let body = format(&marks[2].1, false);
+        let body = format(&marks[4].1, false);
         assert!(body.strikethrough.is_some());
         assert_eq!(body.color, Some(LIGHT.muted));
+    }
+
+    /// The owner's complaint, as arithmetic: the box was three glyphs wide by
+    /// one line tall (a rectangle), and it changed width when ticked. It is
+    /// one square em now, in the same column either way.
+    #[test]
+    fn the_checkbox_is_one_square_column_ticked_or_not() {
+        let box_of = |checked: bool| {
+            let paint = format(
+                &Mark::Tick {
+                    checked,
+                    style: Style::default(),
+                },
+                false,
+            );
+            let width = tick_advance(checked) + paint.padding.left + paint.padding.right;
+            let height = BODY_SIZE * BODY_LINE_HEIGHT + paint.padding.top + paint.padding.bottom;
+            // Where the box starts, measured from the run's own origin: the
+            // tick glyph sits one bracket in.
+            let left = bracket_size(checked) * BRACKET_EM - paint.padding.left;
+            (width, height, left)
+        };
+        let close = |left: f32, right: f32, what: &str| {
+            assert!((left - right).abs() < 0.01, "{what}: {left} vs {right}");
+        };
+        for checked in [false, true] {
+            let (width, height, _) = box_of(checked);
+            close(width, TICK_BOX, "box width");
+            close(height, TICK_BOX, "box height");
+            // The run is one width either way — the brackets absorb the `x`.
+            let run = 2.0 * bracket_size(checked) * BRACKET_EM + tick_advance(checked);
+            close(run, TICK_RUN, "run width");
+        }
+        // ...so the box lands in the same column, ticked or not.
+        close(box_of(false).2, box_of(true).2, "box column");
+        close(bracket_size(false), BODY_SIZE, "an empty box's brackets");
     }
 
     /// The nesting step is drawn as the line's left padding, not as the two

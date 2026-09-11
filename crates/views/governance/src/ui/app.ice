@@ -1,6 +1,8 @@
-// APPROVALS, as a module-owned view. The screen is a pure function of the
-// props the host pushes (`props()` — one item per change) and speaks back in
-// two intents. It shares the desktop app's theme file, so its ink and plates
+// APPROVALS, as a module-owned view. The kernel pushes session facts only
+// (`session()` — one item per change); the register is read here through
+// `rpc.query`, re-read on every governance block (`rpc.live`), and a vote
+// or a settle leaves as `op.submit` the kernel signs. It shares the desktop
+// app's theme file, so its ink and plates
 // are the app's own tokens; what it cannot share yet is the app's shared kit
 // (named fonts, `wrap=none`, line heights and component uses do not cross
 // the tree wire), so the plates below are the kit's shapes spelled flat, in
@@ -15,12 +17,21 @@ use "../../../../../app/src/ui/theme.ice"
 
 extern crate::host
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
-  GovernanceProps(rows:[ProposalRow], voting:str, admin:bool, connected:bool, answered:bool, dark:bool)
+  Session(connected:bool, admin:bool, dark:bool)
   QuorumSeat(filled:bool)
-  PropsItem(next:GovernanceProps, error:str)
-  subscription props() -> PropsItem
+  SessionItem(next:Session, error:str)
+  RegisterItem(rows:[ProposalRow], error:str)
+  ActItem(proposal_id:str, error:str)
+  subscription session() -> SessionItem
+  // the register, read by this view: once per connection, then again on
+  // every governance block
+  subscription register(connection:i64) -> RegisterItem
+  // every write's outcome, as the kernel answers it
+  subscription acts() -> ActItem
+  pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
   sync vote(proposal_id:str, approve:bool) -> bool
   sync execute(proposal_id:str) -> bool
+  sync badge(open:i64) -> bool
   pure proposals_summary(connected:bool, rows:&[ProposalRow]) -> str
   pure pending_label(rows:&[ProposalRow]) -> str
   pure open_proposals(rows:&[ProposalRow]) -> i64
@@ -39,37 +50,53 @@ extern crate::host
 state
   active_palette:palette[AppTheme] = AppTheme.app
   rows:[ProposalRow] = []
+  // the proposal a write is in flight for, or empty
   voting = ""
   admin = false
   connected = false
+  // moves when the session comes up: the register is read afresh
+  connection_serial:i64 = 0
   answered = false
   host_error = ""
+  badge_sent = false
 
-// The register is the host's: one subscription, one item per change. A
-// subscription, not a mount task, so a replacement restored from this
-// view's state asks for the register again on its own.
+// Subscriptions, not mount tasks, so a replacement restored from this
+// view's state asks for the session and the register again on its own.
 subscribe
-  props() -> props_arrived _
+  session() -> session_arrived _
+  register(connection_serial) when connected -> register_arrived _
+  acts() -> act_done _
 
-on props_arrived(item)
+on session_arrived(item)
   host_error = item.error
   return if !empty(item.error)
   let next = item.next
-  rows = next.rows
-  voting = next.voting
+  connection_serial = connection_serial_after(connected, next.connected, connection_serial)
   admin = next.admin
   connected = next.connected
-  answered = next.answered
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
 
+on register_arrived(item)
+  host_error = item.error
+  answered = true
+  return if !empty(item.error)
+  rows = item.rows
+  badge_sent = badge(open_proposals(rows))
+
+on act_done(item)
+  voting = ""
+  host_error = item.error
+
 on gov_vote(proposal_id, approve)
   return if !connected || !empty(voting)
+  voting = proposal_id
   let _sent = vote(proposal_id, approve)
 
 on gov_execute(proposal_id)
   return if !connected || !empty(voting)
+  voting = proposal_id
   let _sent = execute(proposal_id)
 
 // The card's pieces as components — the tree target inlines a component

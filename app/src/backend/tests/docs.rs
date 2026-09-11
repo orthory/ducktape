@@ -401,21 +401,23 @@ fn a_page_search_hit_names_the_page_it_came_from() {
     assert_eq!(hits[0].kind, "Text");
 
     // THE CALL SITES. A pure join proves nothing about what the surfaces
-    // render, and the Explorer's double print lived at ITS call site.
-    const SEARCH: &str = include_str!("../search.rs");
-    let page_arm = SEARCH
+    // render, and the Explorer's double print lived at ITS call site — which
+    // is the Explorer view's own crate now: it reads the index row itself and
+    // joins the titles for the same reason this one does.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let page_arm = EXPLORER
         .split("kind: \"page\".into(),")
         .nth(1)
         .expect("the page hit arm")
-        .split("}));")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        page_arm.contains("title: hit.page_title,") && page_arm.contains("snippet: hit.text,"),
+        page_arm.contains("titles") && page_arm.contains("snippet: text(&hit[\"text\"]),"),
         "the Explorer heads a page hit with its page and keeps the block text as the snippet"
     );
     assert!(
-        !page_arm.contains("title: hit.text"),
+        !page_arm.contains("title: text(&hit[\"text\"])"),
         "titling the row with the block text is what printed the same sentence twice"
     );
 

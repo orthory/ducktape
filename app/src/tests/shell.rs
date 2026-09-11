@@ -322,7 +322,7 @@ fn peer_readers_use_the_names_the_node_serves() {
 /// an already-running replace lane.
 ///
 /// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
-/// writer, so its governance/agents runs must NOT carry a second
+/// writer, so its governance run must NOT carry a second
 /// `shell_tab ==` gate. Gating both leaves the approvals badge dark until you
 /// open Approvals — which is the one thing the badge exists to spare you.
 #[test]
@@ -336,20 +336,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_load_selected",
             "members",
             "members_generation",
-        ),
-        (
-            "load_governance",
-            "governance_load",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
-        ),
-        (
-            "load_agents",
-            "agents_load",
-            "agents_load_selected",
-            "agents",
-            "agents_generation",
         ),
         (
             "load_account",
@@ -383,12 +369,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_generation",
         ),
         (
-            "load_governance",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
-        ),
-        (
             "load_account",
             "account_load_selected",
             "identity",
@@ -407,23 +387,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         assert!(
             lifecycle.contains(&live),
             "a {module} commit must refresh {loader} on any tab: {live}"
-        );
-    }
-
-    // THE AGENTS PROJECTION IS THE ONE PLANE TWO MODULES WRITE, so its live
-    // arm is the one that does not ride `plane_live_hit`: `agent` commits the
-    // registration and `runs` commits the liveness `AgentRow.live` is read
-    // from (`agents_with_a_run_in_flight`). BOTH lines take the predicate —
-    // a bump without the load refetches nothing, and a load without the bump
-    // answers on a generation `agents_loaded` rejects. Narrow either back to
-    // `"agent"` and the Forge seat's dot goes dark for the length of a run.
-    for line in [
-        "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
-        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n          try request -> done request\n          done -> agents_load_selected _",
-    ] {
-        assert!(
-            lifecycle.contains(line),
-            "the agents live arm must ride the two-module predicate: {line}"
         );
     }
 
@@ -447,14 +410,11 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // A selector is a queued message. If an older one lands after a newer
     // intent, it must not start and replace the newer lane.
     for (selected, generation) in [
-        ("explorer_load_selected", "explorer_generation"),
         ("files_list_selected", "fs_generation"),
         ("files_history_selected", "fs_generation"),
         ("members_load_selected", "members_generation"),
-        ("governance_load_selected", "gov_generation"),
         ("settings_load_selected", "settings_generation"),
         ("peers_load_selected", "node_peers_generation"),
-        ("agents_load_selected", "agents_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
         ("forge_load_selected", "forge_generation"),
@@ -469,7 +429,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     }
 
     for (selected, unmounted) in [
-        ("explorer_load_selected", "shell_tab != ShellTab.explorer"),
         ("files_list_selected", "shell_tab != ShellTab.files"),
         ("files_history_selected", "shell_tab != ShellTab.files"),
         ("settings_load_selected", "shell_tab != ShellTab.settings"),
@@ -529,61 +488,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     assert_ne!(
         app.settings_generation, in_flight,
         "entering Settings must issue a fresh read"
-    );
-}
-
-/// THE AGENTS BUMP IS THE SAME HALF, AND `run replace` DOES NOT COVER IT.
-/// Replacing a lane aborts work still running there, but it cannot retract a
-/// completion the runtime has already queued — that reply is delivered
-/// anyway, and an unconditional bump on the way out is precisely what makes
-/// `agents_loaded` throw it away. The Forge seat's live dot reads those rows
-/// on EVERY tab, so opening the destination pane does not re-earn them: the
-/// next `agent` or `runs` op does, and for a run that just started that op is
-/// the one that ends it.
-#[test]
-fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-
-    // the run's own commit is what asks for the rows; its generation is the
-    // one the reply below carries.
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: LiveKind::Plane,
-        status: "Live".into(),
-        height: 12,
-        module: "runs".into(),
-        ..backend::LiveUpdate::default()
-    }));
-    let in_flight = app.agents_generation;
-
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
-    let _ = app.__update(__DucktapeMessage::AgentsLoaded(backend::AgentsData {
-        generation: in_flight,
-        agents: vec![backend::AgentRow {
-            id: "agent-1".into(),
-            name: "ChiefDuck".into(),
-            initials: "CH".into(),
-            capability: "mock-llm-1".into(),
-            status: "active".into(),
-            owner_handle: String::new(),
-            controller: String::new(),
-            live: true,
-            skills: Vec::new(),
-        }],
-        runs: Vec::new(),
-        capabilities: Vec::new(),
-    }));
-    assert!(
-        backend::any_agent_active(&app.agents_rows),
-        "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
-    );
-
-    // and the tab that DOES draw the rows still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Agents));
-    assert_ne!(
-        app.agents_generation, in_flight,
-        "entering Agents must issue a fresh read"
     );
 }
 
@@ -1198,32 +1102,17 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 /// value must carry its name, one set must not have two names on one screen,
 /// and no row may contradict the name the screen prints over it.
 ///
-/// AND WHAT THE SCREEN LOADS MUST LAND IN ITS OWN STATE. Search is interaction
-/// state owned by `ExplorerScreen`; its reply and both reset paths must still
-/// carry every field the view reads.
+/// AND WHAT THE SCREEN READS MUST LAND IN ITS OWN STATE. Search is the view's
+/// own; its answer and both reset paths must still carry every field the
+/// screen reads.
+///
+/// The DERIVATIONS this used to pin beside the copy — the dispatch trace's
+/// units and the op-carrying filter — moved into the guest with the reads that
+/// produce them, and are pinned in `crates/views/explorer/tests/readings.rs`.
 #[test]
 fn the_explorer_names_what_it_shows() {
-    // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
-    // serves. Both units appear once singular and once plural, so a hand-rolled
-    // `{n} msgs` that skips the `plural` seam fails here.
-    let hops = vec![
-        serde_json::json!({
-            "module": "chat", "origin": "external",
-            "emitted_msgs": 1, "emitted_events": 0,
-        }),
-        serde_json::json!({
-            "module": "attribution", "origin": "module:chat",
-            "emitted_msgs": 0, "emitted_events": 2,
-        }),
-    ];
-    assert_eq!(
-        backend::explorer_trace(Some(&hops)),
-        "chat · 1 msg · 0 events → attribution · 0 msgs · 2 events",
-        "every count in the trace names what it counts"
-    );
-
-    // The Explorer is a module-owned view: its screen is the guest's source,
-    // and the answer to its search lands in the app's handler.
+    // The Explorer is a module-owned view: the screen, the search and its
+    // resets are all the guest's source.
     let guest = inlined(include_str!(
         "../../../crates/views/explorer/src/ui/app.ice"
     ));
@@ -1231,7 +1120,6 @@ fn the_explorer_names_what_it_shows() {
     let explorer = explorer
         .split_once("\ncomponent ")
         .map_or(explorer, |(body, _)| body);
-    let answers = inlined(include_str!("../ui/handlers/overlays.ice"));
 
     // ONE SET, ONE NAME. The subtitle and the "No blocks yet" plate describe
     // the same list and had drifted — only the plate knew the list is filtered.
@@ -1258,42 +1146,10 @@ fn the_explorer_names_what_it_shows() {
         );
     }
 
-    // AND NO ROW MAY CONTRADICT THAT SENTENCE — which is a claim about the
-    // DATA, not about the copy, because `/v1/blocks` is not uniformly filtered.
-    // Three of its four row writers drop an op-less block; the fourth,
-    // `boundary_block_row` (`bin/node/src/explorer.rs`, applied in
-    // `replica/park.rs`), writes the follower's ascension tip with `hash: ""`
-    // and no ops. `bin/node/src/main.rs` routes every key that is neither a
-    // validator nor seated by the checkpoint into `replica::run` — every joined
-    // member until promotion — so that row drew a blank hash and `0 ops`
-    // directly under the subtitle asserted above, and opened to an empty pane.
-    let served = [
-        serde_json::json!({
-            "height": 41, "hash": "", "commit_hash": "aa11bb22cc33dd44", "ops": [],
-        }),
-        serde_json::json!({
-            "height": 42, "hash": "ee55ff66aa77bb88", "commit_hash": "cc99dd00ee11ff22",
-            "ops": [{
-                "proposer": "abc123def456789a", "disposition": "applied", "target": "chat",
-                "op_hash": "0f1e2d3c4b5a6978", "payload": "hi", "operations": hops,
-            }],
-        }),
-    ];
-    let window = backend::explorer_window(0, &served);
-    assert_eq!(
-        window
-            .blocks
-            .iter()
-            .map(|block| (block.height, block.op_count))
-            .collect::<Vec<_>>(),
-        vec![(42, 1)],
-        "the Explorer listed a block carrying no operations under a subtitle \
-         that says every row carried some"
-    );
-    assert!(
-        window.ops.iter().all(|op| op.height == 42),
-        "an op was attributed to a block the list does not hold"
-    );
+    // AND NO ROW MAY CONTRADICT THAT SENTENCE — a claim about the DATA, not
+    // about the copy, because `/v1/blocks` is not uniformly filtered. That
+    // gate is the view's own fold now (`explorer_window`), pinned beside it in
+    // `crates/views/explorer/tests/readings.rs`.
 
     // AND EVERY VALUE IN THE OP DETAIL CARRIES ITS NAME. `by` was already
     // right and is pinned with the two that were not, so the rule reads as a
@@ -1328,32 +1184,17 @@ fn the_explorer_names_what_it_shows() {
     // CALLS IT AN ANSWER. `partial` is the field this rule was written for:
     // without it the strip's kinds and the hit count are still rendered, so the
     // screen goes back to presenting whatever survived as the whole truth.
-    let loaded = ice_handler_body(&answers, "explorer_results_loaded");
+    let answered = ice_handler_body(&guest, "search_arrived");
     // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
     // the hits and the strip; a `partial` left standing keeps naming a source
     // that failed to answer a query the reader has since cleared or replaced.
-    let intents = ice_handler_body(&answers, "explorer_view_event");
-    let resets = ["ExplorerIntent.search", "ExplorerIntent.clear"].map(|opener| {
-        intents
-            .split_once(opener)
-            .unwrap_or_else(|| panic!("`{opener}` is where it was"))
-            .1
-            .split_once("\n    ExplorerIntent.")
-            .map_or_else(
-                || intents.split_once(opener).expect("the arm").1,
-                |(arm, _)| arm,
-            )
-    });
-    for (field, cleared) in [
-        ("explorer_hits", "[]"),
-        ("explorer_kinds", "[]"),
-        ("explorer_partial", r#""""#),
-    ] {
-        let answered = field.trim_start_matches("explorer_");
+    let resets = ["search_submit", "clear_explorer_search"]
+        .map(|handler| ice_handler_body(&guest, handler));
+    for (field, cleared) in [("hits", "[]"), ("kinds", "[]"), ("partial", r#""""#)] {
         assert!(
-            loaded.contains(&format!("{field} = next.{answered}")),
+            answered.contains(&format!("{field} = item.{field}")),
             "`{field}` comes back from the search and nothing lands it in \
-             the screen's local state"
+             the screen's own state"
         );
         for reset in &resets {
             assert!(

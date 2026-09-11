@@ -17,8 +17,11 @@
 //! in its place instead of taking the window with it.
 
 mod display_budget;
+mod kernel;
 
 pub(crate) mod pages_document;
+
+pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -76,23 +79,19 @@ const LOAD_POLL: Duration = Duration::from_millis(50);
 
 // ---------- the Approvals seat ----------
 
-/// The Approvals tab: the governance register as the app has it, drawn by
-/// the `governance` view. Its intents come back as `vote` and `execute`,
-/// each with an [`Intent`] in `detail`.
+/// The Approvals tab, drawn by the `governance` view over the KERNEL
+/// CONTRACT: the app pushes session facts only, the view reads its own
+/// register through `rpc.query` / `rpc.blocks` / `rpc.live`, and a vote or
+/// a settle comes back as `op.submit`, signed here with the seated key. The
+/// one event the app hears is the kernel's `badge` (the tab's open count).
 pub fn governance_view(
     dark: bool,
     connected: bool,
     admin: bool,
-    answered: bool,
-    voting: &str,
-    rows: &[crate::backend::ProposalRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
-        "rows": rows,
-        "voting": voting,
         "admin": admin,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
     module_view(
@@ -101,165 +100,61 @@ pub fn governance_view(
     )
 }
 
-/// A vote or a settle, as the governance view sends it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct Intent {
-    pub proposal_id: String,
-    pub approve: bool,
-}
-
-pub fn gov_intent(event: &ModuleViewEvent) -> crate::GovIntent {
-    match event.kind.as_str() {
-        "execute" => crate::GovIntent::Execute,
-        _ => crate::GovIntent::Vote,
-    }
-}
-
-pub fn gov_event_proposal(event: &ModuleViewEvent) -> String {
-    intent(event)
-        .map(|intent| intent.proposal_id)
-        .unwrap_or_default()
-}
-
-pub fn gov_event_approves(event: &ModuleViewEvent) -> bool {
-    intent(event).is_some_and(|intent| intent.approve)
-}
-
-fn intent(event: &ModuleViewEvent) -> Option<Intent> {
-    serde_json::from_str(&event.detail).ok()
-}
-
 // ---------- the roster seats ----------
 
-/// The Members tab: the roster as the app has it, drawn by the `members`
-/// view. Its intents come back as `copy` (`text`, `label`), `agent_status`
-/// (`agent_id`, `paused`) and `propose` (`action`, `key`), each a JSON object
-/// in `detail` the `event_text` / `event_flag` readings pick apart.
+/// The Members tab, on the KERNEL CONTRACT: session facts go in, the view
+/// reads the roster itself off the node and signs its writes through
+/// `op.submit`. The one intent left is `copy` (`text`, `label`) — the
+/// clipboard is an OS door the kernel has not opened.
 pub fn members_view(
     dark: bool,
     connected: bool,
     admin: bool,
-    answered: bool,
-    rows: &[crate::backend::MemberRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
-        "rows": rows,
         "admin": admin,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
     module_view("members", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The Agents tab: the register as the app has it, drawn by the `agents`
-/// view — every record whole, the capability tags the network announces,
-/// the action vocabulary, and the signing account (`account`, its decimal
-/// number) so the view offers the editor to a record's controller; beside
-/// it the run tracker, every run off the runs journal, the journal of the
-/// one the reader opened (`open_run`, its dispatch id) with the chips of
-/// every place it touched, and that run's live progress while it works.
-/// Its intents come back as `status` (`agent_id`, `paused`), `save` and
-/// `register` (both the whole draft record as JSON, `AgentDraft`),
-/// `open_run` (`dispatch_id`, "" to close) and `open_link` (`url`, a chip's
-/// duck:// address for the open plane).
-/// Every committed write bumps `committed`, which tells the view its drafts
-/// were consumed.
-#[allow(clippy::too_many_arguments)]
+/// The Agents tab, drawn by the `agents` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, the signing
+/// account (`account`, its decimal number) and the run another tab opened
+/// for the reader (`open_run`, its dispatch id; `opened` counts the doors)
+/// — and the view reads the register, the run tracker and one run's
+/// journal for itself through `rpc.query` / `rpc.view`, re-reading on
+/// every `rpc.live` hit for the `runs` and `identity` planes. A pause or a
+/// save leaves as `op.submit`, signed here with the seated key.
+///
+/// What still comes back as an intent: `badge` (how many of its agents are
+/// working — the rail's pulse), `register` (a new agent, whose program
+/// account only the app can provision), `open_run` (`dispatch_id`, "" to
+/// close) and `open_link` (`url`, a chip's duck:// address).
 pub fn agents_view(
     dark: bool,
     connected: bool,
-    answered: bool,
     account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
     open_run: &str,
     opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
 ) -> Element<'static, ModuleViewEvent> {
-    module_view(
-        "agents",
-        agents_props(
-            dark,
-            connected,
-            answered,
-            account,
-            committed,
-            rows,
-            runs,
-            open_run,
-            opened,
-            journal,
-            live,
-            capabilities,
-        ),
-    )
-}
-
-/// The exact bytes [`agents_view`] pushes — named so a test can assert what
-/// this app SENDS rather than a shape it wrote out by hand beside it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agents_props(
-    dark: bool,
-    connected: bool,
-    answered: bool,
-    account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
-    open_run: &str,
-    opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
-) -> Vec<u8> {
-    // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
-    // guest draws nothing with, and `link`/`account`/`op` are the fence the app
-    // installs an answer by — a guest cannot check them and has no reason to
-    // see which operation number it is looking at. The reading's error is the
-    // app's banner, not a field the guest re-renders.
-    const APP_ONLY: [&str; 4] = ["rpc", "link", "account", "op"];
-    let mut book = serde_json::to_value(journal).expect("the run journal encodes");
-    if let Some(book) = book.as_object_mut() {
-        for app_only in APP_ONLY.iter().chain(["error"].iter()) {
-            book.remove(*app_only);
-        }
-    }
     let props = serde_json::json!({
-        "rows": rows,
-        "runs": runs,
+        "account": account,
         "open_run": open_run,
         "opened": opened,
-        "journal": book,
-        "live": live,
-        "capabilities": capabilities,
-        "account": account,
-        "committed": committed,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
-    serde_json::to_vec(&props).expect("props encode")
+    module_view("agents", serde_json::to_vec(&props).expect("props encode"))
 }
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
-        "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
         "open_run" => crate::AgentsIntent::OpenRun,
         "open_link" => crate::AgentsIntent::OpenLink,
-        _ => crate::AgentsIntent::Status,
-    }
-}
-
-pub fn roster_intent(event: &ModuleViewEvent) -> crate::RosterIntent {
-    match event.kind.as_str() {
-        "agent_status" => crate::RosterIntent::AgentStatus,
-        "propose" => crate::RosterIntent::Propose,
-        _ => crate::RosterIntent::Copy,
+        _ => crate::AgentsIntent::Badge,
     }
 }
 
@@ -406,55 +301,29 @@ pub fn node_log_timeline_drain(
 
 // ---------- the explorer seat ----------
 
-/// The Explorer tab: the ledger and the answer to the last workspace search
-/// as the app holds them, drawn by the `explorer` view. Its intents come
-/// back as `refresh`, `copy` (`text`, `label`), `search` (`query`) and
-/// `clear`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
+/// The Explorer tab, drawn by the `explorer` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, and the two node
+/// facts the titlebar already holds, so the screen's head and the titlebar's
+/// cannot disagree. The view reads the block window itself through
+/// `rpc.blocks` (re-read on `rpc.live` for the `block` plane) and runs the
+/// workspace search over `rpc.query` / `rpc.view`. The one intent that comes
+/// back is `copy` (`text`, `label`) — the clipboard is an OS door.
 pub fn explorer_view(
     dark: bool,
     connected: bool,
-    loading: bool,
-    blocks: &[crate::backend::ExplorerBlock],
-    ops: &[crate::backend::ExplorerOp],
     head: i64,
     sync_line: &str,
-    hits: &[crate::backend::ExplorerHit],
-    kinds: &[crate::backend::KindCount],
-    partial: &str,
-    searching: bool,
-    sent_query: &str,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "connected": connected,
-        "loading": loading,
         "dark": dark,
-        "blocks": blocks,
-        "ops": ops,
         "head": head,
         "sync_line": sync_line,
-        "hits": hits,
-        "kinds": kinds,
-        "partial": partial,
-        "searching": searching,
-        "sent_query": sent_query,
     });
     module_view(
         "explorer",
         serde_json::to_vec(&props).expect("props encode"),
     )
-}
-
-pub fn explorer_intent(event: &ModuleViewEvent) -> crate::ExplorerIntent {
-    match event.kind.as_str() {
-        "refresh" => crate::ExplorerIntent::Refresh,
-        "search" => crate::ExplorerIntent::Search,
-        "clear" => crate::ExplorerIntent::Clear,
-        _ => crate::ExplorerIntent::Copy,
-    }
 }
 
 // ---------- the settings seat ----------
@@ -1708,17 +1577,20 @@ fn surface_intent(module: &str) -> &'static str {
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
-        "governance" => &["vote", "execute"],
-        "members" => &["copy", "agent_status", "propose"],
-        "agents" => &[
-            "status",
-            "save",
-            "register",
-            "open_run",
-            "open_link",
-        ],
+        // the governance view speaks the kernel contract only: its writes
+        // are `op.submit`, never an intent the app decodes
+        "governance" => &[],
+        // members speaks it too; `copy` is the clipboard door, not a write
+        "members" => &["copy"],
+        // the agents view speaks the kernel contract: its pause and its save
+        // are `op.submit`. `register` stays an intent because it provisions a
+        // program account before it registers, and `open_run`/`open_link`
+        // navigate other tabs.
+        "agents" => &["register", "open_run", "open_link"],
         "node" => &["copy", "tab", "log_filter"],
-        "explorer" => &["refresh", "copy", "search", "clear"],
+        // the explorer view reads and searches through the kernel: the only
+        // thing it asks the app for is the clipboard
+        "explorer" => &["copy"],
         "chat" => &[
             "search",
             "clear_search",
@@ -2613,6 +2485,14 @@ struct Guest {
     files_save_namespace: Option<String>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
+    /// The kernel's answers to this guest's node calls, on their way in.
+    replies: Arc<kernel::Replies>,
+    /// The guest's `rpc.live` subscriptions, each with the plane it named:
+    /// told on every block that moves that plane.
+    live_subscriptions: Vec<(u64, String)>,
+    /// The guest's `rpc.stream` subscriptions, each holding the node socket
+    /// the kernel opened for it: retired with the cancel, and with the guest.
+    streams: Vec<(u64, kernel::NodeStream)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3280,6 +3160,9 @@ impl Guest {
             files_save_namespace: (module == "files")
                 .then(|| crate::backend::fresh_operation_id("files-view".into())),
             intents: Vec::new(),
+            replies: Arc::default(),
+            live_subscriptions: Vec::new(),
+            streams: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3371,6 +3254,7 @@ impl Guest {
             return false;
         }
         self.sync_props(props);
+        self.replies.drain_into(&mut self.pending);
         pages_document::drive(self);
         if self.staged {
             // a replacement's first tree is already here; only its
@@ -3409,6 +3293,10 @@ impl Guest {
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
+            self.live_subscriptions.retain(|(live, _)| *live != id);
+            // dropping the stream aborts it: the node socket goes with the
+            // subscription the view abandoned
+            self.streams.retain(|(stream, _)| *stream != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -3430,6 +3318,10 @@ impl Guest {
             return;
         }
         let (capability, operation) = kind.split_once('.').unwrap_or((kind.as_str(), ""));
+        // the kernel contract first: what every view may ask, module-free
+        if kernel::answer(self, capability, operation, id, &payload) {
+            return;
+        }
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
@@ -3857,6 +3749,13 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         if guest.redraw(props) {
             shell.request_redraw();
         }
+        // a node call the kernel is running for the view lands between
+        // frames: poll for it, as the tab polls for a view still loading
+        if guest.replies.any_in_flight() {
+            shell.request_redraw_at(window::RedrawRequest::At(
+                iced::time::Instant::now() + LOAD_POLL,
+            ));
+        }
         let native_frame_ready = same_instance
             && self.rev == guest.frame_rev
             && guest.fault.is_none()
@@ -4001,8 +3900,8 @@ pub(crate) mod tests {
         first.init("benchmark").unwrap();
         let initialized = before.elapsed();
         let before = Instant::now();
-        first.redraw(&register());
-        first.redraw(&register());
+        first.redraw(&session_props());
+        first.redraw(&session_props());
         assert!(first.fault.is_none(), "{:?}", first.fault);
         assert!(
             texts(&first).iter().any(|text| text == "node-7"),
@@ -4065,49 +3964,16 @@ pub(crate) mod tests {
         assert_eq!(retained.entries[0].hash, [99; 32]);
     }
 
-    fn event(kind: &str, detail: &str) -> ModuleViewEvent {
-        ModuleViewEvent {
-            kind: kind.into(),
-            detail: detail.into(),
-        }
-    }
-
-    #[test]
-    fn an_intent_is_read_off_the_guests_json() {
-        let vote = event("vote", r#"{"proposal_id":"prop-1","approve":false}"#);
-        assert!(matches!(gov_intent(&vote), crate::GovIntent::Vote));
-        assert_eq!(gov_event_proposal(&vote), "prop-1");
-        assert!(!gov_event_approves(&vote));
-        let settle = event("execute", r#"{"proposal_id":"prop-2","approve":true}"#);
-        assert!(matches!(gov_intent(&settle), crate::GovIntent::Execute));
-        assert_eq!(gov_event_proposal(&settle), "prop-2");
-    }
-
-    /// Malformed JSON names no proposal, and the handler's empty-id guard
-    /// is what refuses it.
-    #[test]
-    fn a_malformed_intent_names_no_proposal() {
-        let broken = event("vote", "not json");
-        assert_eq!(gov_event_proposal(&broken), "");
-        assert!(!gov_event_approves(&broken));
-    }
 
     /// Only the operations a module declares reach the app; the props
     /// subscription and the log are the host's, everything else is refused.
+    /// The governance view declares none: it speaks the kernel contract.
     #[test]
     fn only_declared_intents_are_routed() {
-        assert_eq!(intents_of("governance"), ["vote", "execute"]);
-        assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
-        assert_eq!(
-            intents_of("agents"),
-            [
-                "status",
-                "save",
-                "register",
-                "open_run",
-                "open_link",
-            ]
-        );
+        assert!(intents_of("governance").is_empty());
+        assert_eq!(intents_of("members"), ["copy"]);
+        // the agents view signs its own pause and save through `op.submit`
+        assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(!chat.contains(&"edit"));
@@ -4136,12 +4002,9 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 10] = [
-            ("governance", "gov_intent", &[]),
-            ("members", "roster_intent", &[]),
+        let other_route_only: [(&str, &str, &[&str]); 7] = [
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
-            ("explorer", "explorer_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
             ("pages", "pages_intent", &["edited"]),
@@ -4193,32 +4056,6 @@ pub(crate) mod tests {
                 "{module}: the door admits {left_to_the_wildcard:?}, which {decoder} decodes only by its wildcard ({wildcard_verdict})"
             );
         }
-    }
-
-    /// A roster intent is read field by field off its JSON; a missing or
-    /// malformed field is empty or false, which the handler's guards refuse.
-    #[test]
-    fn a_roster_intent_is_read_field_by_field() {
-        let pause = event(
-            "agent_status",
-            r#"{"agent_id":"reviewer-bot","paused":true}"#,
-        );
-        assert!(matches!(
-            roster_intent(&pause),
-            crate::RosterIntent::AgentStatus
-        ));
-        assert_eq!(event_text(&pause, "agent_id"), "reviewer-bot");
-        assert!(event_flag(&pause, "paused"));
-        let ballot = event("propose", r#"{"action":"add_validator","key":"res-1"}"#);
-        assert!(matches!(
-            roster_intent(&ballot),
-            crate::RosterIntent::Propose
-        ));
-        assert_eq!(event_text(&ballot, "key"), "res-1");
-        assert!(!event_flag(&ballot, "paused"));
-        let broken = event("copy", "not json");
-        assert!(matches!(roster_intent(&broken), crate::RosterIntent::Copy));
-        assert_eq!(event_text(&broken, "text"), "");
     }
 
     /// Every text in the tree the host holds, in tree order.
@@ -4323,18 +4160,23 @@ pub(crate) mod tests {
         found
     }
 
-    /// The bundled component, end to end through the host: it boots on the
-    /// offline plate, takes the register the app pushes, and a press on its
-    /// card comes back as the intent the handler signs. Needs `make views`;
-    /// without the staged component the test says so and does nothing.
+    /// The bundled component, end to end through the host, on the kernel
+    /// contract: it boots on the offline plate, and once the session says
+    /// connected it reads its own register — an `rpc.live` subscription
+    /// the kernel keeps, and an `rpc.query` the kernel refuses here (no
+    /// node) — so the refusal is what the screen shows, and a block on the
+    /// governance plane makes it ask again. Needs `make views`; without the
+    /// staged component the test says so and does nothing.
     #[test]
-    fn the_staged_governance_view_boots_takes_the_register_and_votes() {
+    fn the_staged_governance_view_boots_and_reads_its_register_through_the_kernel() {
         let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../target/views/governance_view.wasm");
         if !staged.is_file() {
             eprintln!("skipped: no {} — run `make views`", staged.display());
             return;
         }
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
         let no_props = None;
         assert!(
@@ -4343,7 +4185,7 @@ pub(crate) mod tests {
         );
         assert!(
             guest.props_subscription.is_some(),
-            "the view subscribes to its props"
+            "the view subscribes to its session"
         );
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
@@ -4356,47 +4198,41 @@ pub(crate) mod tests {
             "the header leaves the deployment's seal to the host"
         );
 
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "rows": [{
-                    "id": "prop-1", "action": "add_validator", "detail": "node-7",
-                    "proposer": "robin", "status": "open", "deadline": 4200,
-                    "approvals": 1, "rejections": 0, "rule": "threshold",
-                    "required_yes": 2, "electorate": 4, "open": true, "settled_height": 0
-                }],
-                "voting": "", "admin": true, "connected": true, "answered": true, "dark": false
-            }))
-            .expect("props encode"),
+        // connected: the view asks the kernel for its register
+        let session = session_props();
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription on its plane"
         );
-        guest.redraw(&props);
+        // no node behind the kernel: the query is refused, and the view
+        // says so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in [
-            "1 pending",
-            "prop-1",
-            "1 approval · 1 more for quorum",
-            "Approve →",
-        ] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        // The same props again are not delivered again.
         assert!(
-            !guest.redraw(&props),
-            "unchanged props leave the view quiet"
+            shown.iter().any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        // the same session again is not delivered again
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
 
-        guest.deliver(Output::Activate(button_message(&guest, "Approve")));
-        guest.redraw(&props);
-        assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "vote".into(),
-                detail: r#"{"proposal_id":"prop-1","approve":true}"#.into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        // a block on the governance plane: the live item lands and the
+        // view reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The staged path for `module`, or None with a note when `make views`
@@ -4410,6 +4246,12 @@ pub(crate) mod tests {
         for _ in 0..128 {
             let busy = guest.redraw(props);
             assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            // a node call the kernel is running for the view: its answer
+            // is the next redraw's, so wait for it, never for a clock
+            if guest.replies.any_in_flight() {
+                guest.replies.wait_idle();
+                continue;
+            }
             if !busy && guest.inputs.editor_documents_status() == Ok(true) {
                 return;
             }
@@ -4434,209 +4276,62 @@ pub(crate) mod tests {
         None
     }
 
-    /// The bundled Members view through the host: it boots offline, takes
-    /// the roster, opens a record on a press, and the record's write comes
-    /// back as the intent the handler signs.
+    /// The bundled Members view through the host, on the kernel contract:
+    /// it boots on the offline plate, and once the session says connected
+    /// it reads the roster itself — an `rpc.live` subscription the kernel
+    /// keeps on the VALSET plane (another module's, which the kernel
+    /// serves an audited view), and an `rpc.status` the kernel refuses here
+    /// (no node) — so the refusal is what the screen shows, and a block on
+    /// the valset plane makes it ask again.
     #[test]
-    fn the_staged_members_view_boots_takes_the_roster_and_pauses_an_agent() {
+    fn the_staged_members_view_reads_its_roster_off_the_valset_plane() {
         let Some(staged) = staged("members") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("members", &staged).expect("the view loads");
-        guest.redraw(&None);
+        let no_props = None;
+        guest.redraw(&no_props);
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
             "{:?}",
             texts(&guest)
         );
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "rows": [
-                    {"key": "val-1", "label": "Ada", "role": "validator",
-                     "is_this_node": true, "is_agent": false, "model": "", "live": true},
-                    {"key": "reviewer-bot", "label": "Reviewer Bot", "role": "agent",
-                     "is_this_node": false, "is_agent": true, "model": "review", "live": true}
-                ],
-                "admin": true, "connected": true, "answered": true, "dark": false
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in [
-            "1 human · 1 agent",
-            "Ada",
-            "this node",
-            "Reviewer Bot",
-            "AGENT",
-        ] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
 
-        guest.deliver(Output::Activate(button_message(&guest, "Reviewer Bot")));
-        guest.redraw(&props);
-        assert!(
-            texts(&guest).iter().any(|text| text == "agent id"),
-            "the record opened: {:?}",
-            texts(&guest)
-        );
-        guest.deliver(Output::Activate(button_message(&guest, "Pause agent")));
-        guest.redraw(&props);
+        let session = session_props();
+        guest.redraw(&session);
         assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "agent_status".into(),
-                detail: r#"{"agent_id":"reviewer-bot","paused":true}"#.into(),
-            }]
+            guest.live_subscriptions,
+            [(guest.live_subscriptions[0].0, "valset".to_string())],
+            "the view holds one `rpc.live` subscription, on the valset plane"
         );
-        assert!(guest.fault.is_none());
-    }
-
-    /// The bundled Agents view through the host: offline plate, then the
-    /// register; nothing leaves it until a reader edits a record.
-    #[test]
-    fn the_staged_agents_view_boots_and_takes_the_register() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        guest.redraw(&None);
-        assert!(
-            texts(&guest).iter().any(|text| text == "Not connected"),
-            "{:?}",
-            texts(&guest)
-        );
-        // the props the app ENCODES, not a hand-written shape beside the
-        // encoder: a field the encoder dropped, or the guest stopped taking,
-        // fails here
-        let skill = |name: &str, always: bool| crate::backend::AgentSkill {
-            name: name.into(),
-            source_prefix: format!("/shared/skills/{name}"),
-            source_snapshot: String::new(),
-            always,
-        };
-        let reviewer = crate::backend::AgentRow {
-            id: "reviewer-bot".into(),
-            name: "Reviewer Bot".into(),
-            initials: "RB".into(),
-            capability: "review".into(),
-            status: "paused".into(),
-            owner_handle: "eddy".into(),
-            controller: "7".into(),
-            live: false,
-            skills: vec![
-                skill("review", true),
-                skill("style", false),
-                skill("tests", false),
-            ],
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "",
-            0,
-            &[reviewer],
-            &[],
-            "",
-            0,
-            &crate::backend::RunJournal::default(),
-            &crate::backend::LiveRun::default(),
-            &["claude".into(), "review".into()],
-        ));
-        guest.redraw(&props);
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["1 agent · 0 working", "Reviewer Bot", "PAUSED", "eddy"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert!(guest.intents.is_empty());
-        assert!(guest.fault.is_none());
-    }
-
-    #[test]
-    fn the_staged_agents_view_renders_semantic_actions_and_opens_the_exact_target() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        let run = crate::backend::RunRow {
-            run_id: "machine-run-hash".into(),
-            dispatch_id: "machine-dispatch-hash".into(),
-            agent_id: "reviewer".into(),
-            agent_name: "Reviewer".into(),
-            origin: "#Engineering · Message 42".into(),
-            state: "running".into(),
-            dispatched: "h 1".into(),
-            settled: String::new(),
-            attempt: 1,
-            holder: String::new(),
-            actions: 1,
-            degraded: false,
-            reason: String::new(),
-            output_ref: String::new(),
-            pr_number: 0,
-        };
-        let target = crate::backend::RunLink {
-            relation: "target".into(),
-            kind: "chat".into(),
-            label: "#Engineering · Eddy: Bound and scroll".into(),
-            url: "duck://channel/room?net=a1b2c3d4#42".into(),
-        };
-        let journal = crate::backend::RunJournal {
-            dispatch_id: run.dispatch_id.clone(),
-            entries: vec![crate::backend::JournalEntry {
-                height: "h 2".into(),
-                kind: "action".into(),
-                summary: "React 👀".into(),
-                status: "Completed".into(),
-                targets: vec![target.clone()],
-            }],
-            ..Default::default()
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "7",
-            0,
-            &[],
-            std::slice::from_ref(&run),
-            &run.dispatch_id,
-            1,
-            &journal,
-            &crate::backend::LiveRun::default(),
-            &[],
-        ));
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["React 👀", "Completed", &target.label] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected}"
-            );
-        }
         assert!(
-            !shown
+            shown
                 .iter()
-                .any(|text| text.contains("machine-dispatch-hash"))
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
         );
-        assert!(guest.fault.is_none());
-        guest.deliver(Output::Activate(button_message(&guest, &target.label)));
-        guest.redraw(&props);
-        let intent = guest.intents.last().expect("target navigation");
-        assert_eq!(intent.kind, "open_link");
-        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
-            target.url
-        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+
+        // a block on the valset plane: the live item lands and the view
+        // reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// Every host surface in the guest's tree, by name.
@@ -4825,140 +4520,72 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Explorer view through the host: the ledger, then a
-    /// search that leaves as an intent and lands back as props.
+    /// The bundled Explorer view end to end through the host, on the kernel
+    /// contract: it boots on the offline plate, and once the session says
+    /// connected it reads the block window itself — an `rpc.live`
+    /// subscription on the `block` plane that the kernel keeps, and an
+    /// `rpc.blocks` the kernel refuses here (no node), so the refusal is what
+    /// the screen shows. A block on that plane makes it read again. What the
+    /// window folds to is pinned in the view's own tests, which drive the same
+    /// compiled Ice through the wire.
     #[test]
-    fn the_staged_explorer_view_boots_takes_the_ledger_and_asks_for_a_search() {
+    fn the_staged_explorer_view_boots_and_reads_its_window_through_the_kernel() {
         let Some(staged) = staged("explorer") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
         guest.redraw(&None);
-        let props = Some(
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "the offline plate is what an unconnected Explorer shows"
+        );
+
+        let session = Some(
             serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": [{"height": 84912, "hash": "9f3e", "commit": "c0ffee", "op_count": 1}],
-                "ops": [{"height": 84912, "proposer": "val-1", "target": "chat",
-                         "disposition": "applied", "op_hash": "ab12cd34", "payload": "post",
-                         "trace": "chat · 1 msg"}],
-                "head": 84912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+                "connected": true, "dark": false, "head": 84_912, "sync_line": "live"
             }))
             .expect("props encode"),
         );
-        guest.redraw(&props);
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription for the block plane"
+        );
+        assert_eq!(guest.live_subscriptions[0].1, "block");
+        // no node behind the kernel: the read is refused, and the view says
+        // so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["Explorer", "h 84,912"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        guest.deliver(Output::Activate(button_message(&guest, "Refresh")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "refresh".into(),
-                detail: "null".into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// EVERY DIGEST THE LEDGER PUBLISHES REACHES THE SCREEN WHOLE, IN HEX.
-    /// The rows are the node's own `GET /v1/blocks` shape, the props are what
-    /// `explorer_window` makes of them — the production conversion, not a
-    /// hand-built prop — and the reader is the bundled wasm guest. Nothing
-    /// between the two may cut a digest or leave one in decimal: the block
-    /// hash on the list row, the commit hash and the op hash in the detail,
-    /// and the `new_oid` inside the payload all read `0x` and every character
-    /// — and the copy intent carries the bare key the blob route takes.
-    #[test]
-    fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
-        let Some(staged) = staged("explorer") else {
-            return;
-        };
-        let hash = "9f3e".repeat(16);
-        let commit = "c0ffee11".repeat(8);
-        let op_hash = "dd".repeat(32);
-        let oid: Vec<u8> = (1..=20).collect();
-        let rows = vec![serde_json::json!({
-            "height": 84_912,
-            "hash": hash,
-            "commit_hash": commit,
-            "ops": [{
-                "proposer": "cc".repeat(32),
-                "target": "forge",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": serde_json::to_string(&serde_json::json!({
-                    "push": { "new_oid": oid }
-                }))
-                .expect("payload encodes"),
-                "operations": []
-            }]
-        })];
-        let ledger = crate::backend::explorer_window(1, &rows);
-
-        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": ledger.blocks, "ops": ledger.ops,
-                "head": 84_912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-
-        let whole = format!("0x{hash}");
-        let listed = texts(&guest);
         assert!(
-            listed.contains(&whole),
-            "the list row carries the whole block hash: {listed:?}"
-        );
-        // and nothing on it is a cut-down version of that hash — the guard
-        // that fails the moment a landmark form comes back.
-        let abbreviated = listed
-            .iter()
-            .find(|text| text.starts_with("0x9f3e") && **text != whole);
-        assert!(
-            abbreviated.is_none(),
-            "the list carries the whole hash, not {abbreviated:?}"
-        );
-
-        guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
-        guest.redraw(&props);
-        let opened = texts(&guest);
-        for expected in [format!("0x{commit}"), format!("0x{op_hash}")] {
-            assert!(
-                opened.iter().any(|text| text == &expected),
-                "missing {expected:?} in {opened:?}"
-            );
-        }
-        assert!(
-            opened
+            shown
                 .iter()
-                .any(|text| text
-                    .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
-            "the payload's digest is hex too: {opened:?}"
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
 
-        // AND THE CLIPBOARD GETS THE KEY, not the reading of it: `0x` is for
-        // the eye, and `GET /v1/files/blob/{op_hash}` takes the bare digest.
-        guest.deliver(Output::Activate(button_message(&guest, "Copy op hash")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "copy".into(),
-                detail: format!(r#"{{"text":"{op_hash}","label":"Op hash copied"}}"#),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        // a block: the live item lands and the view reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The bundled Settings view through the host: the facts, then a
@@ -5535,20 +5162,28 @@ pub(crate) mod tests {
     pub(super) static FIRST_FRAME_TRAPS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    /// One open proposal, as the host pushes the register.
-    fn register() -> Option<Vec<u8>> {
+    /// The session facts a kernel-contract view is pushed: connected, as an
+    /// admin. Governance and members take the same three.
+    fn session_props() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "rows": [{
-                    "id": "prop-1", "action": "add_validator", "detail": "node-7",
-                    "proposer": "robin", "status": "open", "deadline": 4200,
-                    "approvals": 1, "rejections": 0, "rule": "threshold",
-                    "required_yes": 2, "electorate": 4, "open": true, "settled_height": 0
-                }],
-                "voting": "", "admin": true, "connected": true, "answered": true, "dark": false
+                "admin": true, "connected": true, "dark": false
             }))
             .expect("props encode"),
         )
+    }
+
+    /// The node's `proposals` reply the governance view reads for itself
+    /// through the kernel: one open proposal, `prop-1`.
+    fn proposals_reply() -> serde_json::Value {
+        serde_json::json!({ "proposals": [{
+            "proposal_id": "prop-1",
+            "action": { "add_validator": { "key": [7, 7, 7, 7] } },
+            "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+            "status": "open", "votes": [[[1], true]], "voter_kind": "validator_node",
+            "electorate": [[[1], 1], [[2], 1], [[3], 1], [[4], 1]],
+            "voting_rule": { "threshold": { "required_yes": 2 } }
+        }]})
     }
 
     /// Holds the node's next blob answer until released.
@@ -6485,6 +6120,314 @@ pub(crate) mod tests {
                 .iter()
                 .all(|event| matches!(event, wire::Event::Response { result: Err(_), .. }))
         );
+    }
+
+    #[test]
+    fn pages_floating_comments_preserve_document_layout_and_pointer_routing() {
+        use iced::advanced::renderer::Headless as _;
+        use iced_test::runtime::{UserInterface, user_interface};
+
+        struct Bounds {
+            editor: Option<Rectangle>,
+            focused: bool,
+            post: Option<Rectangle>,
+            card: Option<Rectangle>,
+            card_text: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+                if id
+                    == Some(&iced::widget::Id::from(
+                        "PagesView/root/pages/comments-card",
+                    ))
+                {
+                    self.card = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.editor = Some(bounds);
+                    self.focused = state.is_focused();
+                }
+            }
+            fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "No comments yet" {
+                    self.card_text = Some(bounds);
+                }
+                if text == "Post" {
+                    self.post = Some(bounds);
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let original = (0..80)
+            .map(|n| format!("Paragraph {n}: editable document text.\n"))
+            .collect::<String>();
+        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        facts["comment_seed"] = "A comment".into();
+        facts["seed_rev"] = 1.into();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(1100.0, 700.0);
+        let mut closed_bounds = None;
+        for open in [false, true] {
+            facts["block_comments_open"] = open.into();
+            let props = Some(serde_json::to_vec(&facts).unwrap());
+            settle_documents(&mut guest, &props);
+            let mut ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut bounds = Bounds {
+                editor: None,
+                focused: false,
+                post: None,
+                card: None,
+                card_text: None,
+            };
+            ui.operate(&renderer, &mut bounds);
+            let editor = bounds.editor.expect("document editor");
+            if !open {
+                closed_bounds = Some(editor);
+                continue;
+            }
+            assert_eq!(
+                Some(editor),
+                closed_bounds,
+                "comments must not resize or move the document"
+            );
+            let card = bounds.card.expect("comment card bounds");
+            let translation = Vector::new(size.width - card.x - card.width - 16.0, 0.0);
+            let post = bounds.post.expect("floating Post button").center() + translation;
+            let card_point = bounds.card_text.expect("comment card content").center() + translation;
+            assert!(
+                editor.contains(card_point),
+                "comments must overlap the document, not dock beside it"
+            );
+            let key = "PagesView/root/pages/document";
+            let cursor = guest
+                .inputs
+                .editor_document(key)
+                .unwrap()
+                .reference()
+                .cursor;
+            let mut covered = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(card_point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut covered,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                !bounds.focused,
+                "the card must shield the covered editor from clicks"
+            );
+            for output in covered {
+                guest.deliver(output);
+            }
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(post),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            assert!(
+                guest.intents.iter().any(|event| event.kind == "post"),
+                "the card must receive its own click"
+            );
+            assert_eq!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .reference()
+                    .cursor,
+                cursor,
+                "clicking the card must not move the underlying caret"
+            );
+            let outside = iced::Point::new(editor.x + 60.0, editor.y + 20.0);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                bounds.focused,
+                "the positioning layer must not intercept clicks outside the card"
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character("X".into()),
+                    modified_key: iced::keyboard::Key::Character("X".into()),
+                    physical_key: iced::keyboard::key::Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::default(),
+                    text: Some("X".into()),
+                    repeat: false,
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            // Native redraws drain editor input queued behind the pointer transaction.
+            loop {
+                for output in outputs.drain(..) {
+                    guest.deliver(output);
+                }
+                settle_documents(&mut guest, &props);
+                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                if !guest.inputs.editor_transactions_pending() {
+                    break;
+                }
+                ui.update(
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
+                    mouse::Cursor::Available(outside),
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+            }
+            assert!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .text()
+                    .contains('X'),
+                "document typing must remain live beside the card"
+            );
+            let capture = |ui: &mut UserInterface<'_, Output, iced::Theme, iced::Renderer>,
+                           renderer: &mut iced::Renderer| {
+                ui.draw(
+                    renderer,
+                    &iced::Theme::Light,
+                    &renderer::Style {
+                        text_color: iced::Color::BLACK,
+                    },
+                    mouse::Cursor::Unavailable,
+                );
+                renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
+            };
+            ui.update(
+                &[],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
+            let before = capture(&mut ui, &mut renderer);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            let after = capture(&mut ui, &mut renderer);
+            let region = |pixels: &[u8], x: usize, y: usize, width: usize, height: usize| -> Vec<u8> {
+                (y..y + height)
+                    .flat_map(|y| {
+                        pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            };
+            assert!(
+                region(&before, editor.x as usize + 10, 150, 220, 350)
+                    != region(&after, editor.x as usize + 10, 150, 220, 350),
+                "wheel outside the card must scroll the document"
+            );
+            assert!(
+                region(&before, 800, card.y as usize + 5, 250, card.height as usize - 10) == region(&after, 800, card.y as usize + 5, 250, card.height as usize - 10),
+                "scrolling the document must not scroll the card"
+            );
+            let directory =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
+            std::fs::create_dir_all(&directory).unwrap();
+            image::RgbaImage::from_raw(1100, 700, after)
+                .unwrap()
+                .save(directory.join("floating-comments.png"))
+                .unwrap();
+            facts["active_thread"] = "thread-b".into();
+            facts["active_thread_anchor"] = "“Paragraph 7”".into();
+            facts["comments"] = serde_json::json!([{
+                "id": "reply-b", "ordinal": 1, "author": "Reader",
+                "meta": "just now", "text": "Only this thread is shown here."
+            }]);
+            let props = Some(serde_json::to_vec(&facts).unwrap());
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            ui.update(
+                &[],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert_eq!(bounds.editor, closed_bounds);
+            assert!(
+                bounds.card.unwrap().height < 400.0,
+                "individual threads fit their content within a bounded card"
+            );
+            let frame = capture(&mut ui, &mut renderer);
+            image::RgbaImage::from_raw(1100, 700, frame)
+                .unwrap()
+                .save(directory.join("individual-comment.png"))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -8188,7 +8131,7 @@ pub(crate) mod tests {
     /// shows — what a swap must carry from A into B's first tree.
     fn facts(module: &str) -> (Option<Vec<u8>>, &'static str) {
         match module {
-            "governance" => (register(), "prop-1"),
+            "governance" => (session_props(), "prop-1"),
             "files" => (files_facts(), "README.md"),
             "pages" => (pages_facts(), "Alpha"),
             "chat" => (chat_facts(), "first light"),
@@ -8219,6 +8162,8 @@ pub(crate) mod tests {
                 deployment(&component, "b.svg"),
             );
             let node = FakeDeployment::serving(module, &a);
+            // the governance view reads its register off the node itself
+            node.answer_query("governance", proposals_reply());
             let client = fake_node(node.clone()).await;
 
             let mounted = fresh(module);
@@ -8306,7 +8251,7 @@ pub(crate) mod tests {
         let Slot::Ready(guest) = &mut locked.slot else {
             panic!("the view of A");
         };
-        assert!((0..4).any(|_| !guest.redraw(&register())));
+        assert!((0..4).any(|_| !guest.redraw(&session_props())));
         assert!(guest.settled(), "{:?}", guest.fault);
         assert!(guest.ever_valid_tree);
         guest.pending.push(wire::Event::Resync);

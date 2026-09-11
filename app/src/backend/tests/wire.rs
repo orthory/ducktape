@@ -1,162 +1,5 @@
 use super::*;
 
-/// A SEARCH COSTS ITS SLOWEST SOURCE, NOT THEIR SUM. `search_workspace` awaited
-/// six independent sources one after another, and nothing in it reads what
-/// another leg produced. Warm that is worth nothing — every leg answers in a
-/// few milliseconds. COLD it is the whole cost: a module's first touch measured
-/// 10-54 s against this app's 30 s client ceiling, so serial is several
-/// ceilings end to end and fanned out is one.
-///
-/// THE OVERLAP IS THE GUARANTEE, SO THE OVERLAP IS WHAT IS PINNED — observed
-/// from outside the process by a node that answers nothing until all six legs
-/// are in flight together. The pin this replaced greped the join's text for six
-/// names, which folding two legs into one `async { a.await; b.await }` inside
-/// the join defeats while staying green.
-///
-/// The row order is asserted in the same run: a fan-out that silently reordered
-/// the results would be a different defect.
-///
-/// This does NOT contradict the `join_all` ban in backend/document.rs: that one
-/// guards the WRITE chain, where an op built on the block before it must land
-/// after it.
-#[tokio::test(flavor = "current_thread")]
-async fn a_workspace_search_reaches_its_six_sources_together() {
-    let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
-    let rpc = node_that_answers_only_a_full_fan_out(8, &[], watch.clone()).await;
-
-    let results = search_workspace(rpc, "needle".into()).await;
-
-    assert_eq!(
-        watch.lock().expect("stub watch").overlapped,
-        [
-            "chat", "files", "forge", "pages", "runs", "tasks", "tasks", "tasks"
-        ],
-        "every round trip a workspace search opens with must be in flight at \
-         once — anything missing here waited on another request's reply. The \
-         repeats are the leg that reads more than one thing: tasks walks three \
-         status pages."
-    );
-    // Every lane answered, so nothing is held back.
-    assert_eq!(results.partial, "");
-    // And the rows land in the order the screen shows them. The tasks lane is
-    // three status pages behind one source, hence the run-length squash.
-    let mut order: Vec<String> = results.hits.iter().map(|hit| hit.kind.clone()).collect();
-    order.dedup();
-    assert_eq!(order, ["page", "code", "file", "task", "run"]);
-    // The page row heads with its PAGE, which is the second wave's whole job —
-    // and the reason `list_pages` is a lane of its own rather than a substring
-    // collision with the search it follows. Served the search's reply instead,
-    // the title lookup fails and every page hit falls back to "Untitled".
-    let page = results
-        .hits
-        .iter()
-        .find(|hit| hit.kind == "page")
-        .expect("the pages lane answered");
-    assert_eq!(page.title, "The needle page");
-}
-
-/// A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. All six
-/// legs failed silently — `if let Ok(..)` on two, `return Vec::new()` on the
-/// rest — and the node's per-module cold start runs tens of seconds against a
-/// 30 s client ceiling, so a timeout was the ordinary case, not the exotic one.
-/// A search that reached the node and lost three of its six sources still
-/// rendered a confident count, a full chip strip reading 0 for kinds it never
-/// read, and — when the survivors were empty — "Nothing matched that query in
-/// this workspace". Three lies off one timeout, in the app that spent the night
-/// learning to say nothing rather than something false.
-///
-/// EVERY LEG, NOT THE ONE I FIXED FIRST. The round-2 version refused the forge
-/// lane alone, and reverting the silence report on chat, files or tasks — two
-/// of them the `return Vec::new()` swallowers — kept the suite green. The
-/// defect was class-wide, so the pin walks the class: each source in turn is
-/// the one that does not answer.
-#[tokio::test(flavor = "current_thread")]
-async fn a_search_that_lost_a_source_says_which_one() {
-    /// The six sources, each with the name the screen must call it by and the
-    /// hit kind it contributes. One table: a seventh source added to
-    /// `search_workspace` with no silence report has to be added here to pass,
-    /// and then fails.
-    const SOURCES: [(&str, &str, &str); 6] = [
-        ("chat", "Messages", "message"),
-        ("pages", "Pages", "page"),
-        ("forge", "Code", "code"),
-        ("files", "Files", "file"),
-        ("tasks", "Tasks", "task"),
-        ("runs", "Runs", "run"),
-    ];
-
-    for (leg, label, silent_kind) in SOURCES {
-        let leg_alone: &'static [&'static str] = match leg {
-            "chat" => &["chat"],
-            "pages" => &["pages"],
-            "forge" => &["forge"],
-            "files" => &["files"],
-            "tasks" => &["tasks"],
-            _ => &["runs"],
-        };
-        let rpc = node_that_answers_only_a_full_fan_out(8, leg_alone, Default::default()).await;
-
-        let results = search_workspace(rpc, "needle".into()).await;
-
-        assert_eq!(
-            results.partial,
-            format!("{label} did not answer — these results are incomplete."),
-            "the screen must name the source it did not read"
-        );
-        // The chip strip's contract is "a count of 0 means nothing matched,
-        // never no loader", so the source that never ran keeps no chip at all.
-        let chips: Vec<&str> = results
-            .kinds
-            .iter()
-            .map(|kind| kind.kind.as_str())
-            .collect();
-        let answered: Vec<&str> = SOURCES
-            .iter()
-            .map(|(_, _, kind)| *kind)
-            .filter(|kind| *kind != silent_kind)
-            .collect();
-        assert_eq!(chips, answered, "{label} was refused, so it keeps no chip");
-        // And the answer that did arrive is untouched, in screen order —
-        // degrading the survivors would be the opposite mistake. The chat lane
-        // carries no rows on purpose (see `SEARCH_LANES`); every other source
-        // contributes exactly one.
-        let mut rows: Vec<&str> = results.hits.iter().map(|hit| hit.kind.as_str()).collect();
-        rows.dedup();
-        let carried: Vec<&str> = ["page", "code", "file", "task", "run"]
-            .into_iter()
-            .filter(|kind| *kind != silent_kind)
-            .collect();
-        assert_eq!(
-            rows, carried,
-            "with {label} silent the other sources still land, in screen order"
-        );
-    }
-
-    // CARDINALITY. Every case above refuses exactly ONE source, and a filter
-    // keyed on `silent.first()` instead of `silent.contains(..)` passes all six
-    // — the reviewer changed that one token and the suite stayed green while a
-    // second silent source got a chip reading 0, against the strip's own "a
-    // count of 0 means nothing matched, never no loader". Two at once is the
-    // case the PR body's own headline scenario describes.
-    let rpc =
-        node_that_answers_only_a_full_fan_out(8, &["chat", "pages"], Default::default()).await;
-    let results = search_workspace(rpc, "needle".into()).await;
-    assert_eq!(
-        results.partial, "Messages, Pages did not answer — these results are incomplete.",
-        "both silent sources are named, in screen order"
-    );
-    let chips: Vec<&str> = results
-        .kinds
-        .iter()
-        .map(|kind| kind.kind.as_str())
-        .collect();
-    assert_eq!(
-        chips,
-        ["code", "file", "task", "run"],
-        "NEITHER refused source keeps a chip — not just the first one"
-    );
-}
-
 /// The key file's own reading, WITHOUT its password — what the launch window
 /// and the identity cache both resolve through. A plaintext or garbled file is
 /// not "a key we could not open", it is not a key.
@@ -843,14 +686,13 @@ fn hydration_retry_is_capped() {
     assert_eq!(retry_delay(99), Duration::from_secs(16));
 }
 
-/// A `runs` OP IS A SIGNAL, NOT A FOLD. Nothing on screen draws a run row: the
-/// fact that module feeds is `AgentRow.live`, joined into the AGENTS
-/// projection out of another module's state (`agents_with_a_run_in_flight`).
-/// So there is nothing local to fold into, and the only useful shape is a
-/// plane update naming `runs` — which the handler answers by refetching that
-/// projection, the Forge seat's live dot with it.
+/// A `runs` OP IS A SIGNAL, NOT A FOLD. The app holds no run state at all:
+/// the agents view reads its own register, and what it needs off this op is
+/// only that the plane moved. So the only useful shape is a plane update
+/// naming `runs`, which the lifecycle hands the kernel's `rpc.live` — and
+/// the view re-reads.
 #[tokio::test(flavor = "current_thread")]
-async fn a_runs_op_asks_the_agents_projection_to_refetch() {
+async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let update = folded_update(
         "",
@@ -876,17 +718,19 @@ async fn a_runs_op_asks_the_agents_projection_to_refetch() {
     assert_eq!(update.height, 7);
     assert!(
         !update.load_chat && !update.load_pages,
-        "the signal buys the agents projection, not a chat or pages slice"
+        "the signal buys a plane hit, not a chat or pages slice"
     );
 }
 
 /// A PLANE WITH NO SUBSCRIPTION IS A DEAD ARM, and a silent one. `folded_update`
 /// can only route an op the stream was asked to deliver, so the subscribe list
 /// and its match arms are one contract kept in two places. `runs` is the case
-/// that proved it: `AgentRow.live` is read from that module, the Forge seat
-/// draws a live dot off the joined row, and nothing ever said the module
-/// changed — so the dot stayed dark for the length of a run. The EXACT list is
-/// the pin, because a topic dropped here fails nothing else.
+/// that proved it: an agent's liveness is committed there, the rail draws a
+/// live dot off it, and nothing ever said the module changed — so the dot
+/// stayed dark for the length of a run. A view on the kernel contract is
+/// told a plane moved through THIS list too (`rpc.live`), so a topic dropped
+/// here silences that view as well. The EXACT list is the pin, because a
+/// topic dropped here fails nothing else.
 #[test]
 fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     const LIVE: &str = include_str!("../live.rs");
@@ -921,27 +765,6 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
             "files",
         ]
     );
-}
-
-/// Model configuration and run activity share the runs plane. Generic program
-/// changes are not model-registry changes.
-#[test]
-fn the_agents_plane_hit_tracks_models_and_current_identity_control() {
-    for (kind, module, want) in [
-        (crate::LiveKind::Plane, "agent", false),
-        (crate::LiveKind::Plane, "runs", true),
-        (crate::LiveKind::Plane, "identity", true),
-        (crate::LiveKind::Plane, "valset", false),
-        (crate::LiveKind::Chat, "agent", false),
-        (crate::LiveKind::Chat, "runs", false),
-        (crate::LiveKind::Resync, "runs", false),
-    ] {
-        assert_eq!(
-            agents_plane_hit(kind, module.into()),
-            want,
-            "{kind:?} / {module}"
-        );
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -261,7 +261,6 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/state/core.ice"),
         include_str!("../ui/state/chat.ice"),
         include_str!("../ui/state/shell.ice"),
-        include_str!("../ui/state/explorer.ice"),
         include_str!("../ui/state/roster.ice"),
         include_str!("../ui/state/forge.ice"),
         include_str!("../ui/state/node.ice"),
@@ -414,10 +413,15 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     ));
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat_screen.contains("box w=236.0 h=fill bg=sidebar clip=true"));
-    // the pages sidebar keeps the same plate from the `pages` view
+    // the pages sidebar keeps the same plate from the `pages` view — the
+    // width is the reader's to drag now, opening on the 230 it always had
     assert!(
         inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
-            .contains("box w=230.0 h=fill bg=sidebar clip=true")
+            .contains("box #page-list w=sidebar_width h=fill bg=sidebar clip=true")
+    );
+    assert!(
+        include_str!("../../../crates/views/pages/src/ui/app.ice")
+            .contains("\n  sidebar_width = 230.0\n")
     );
 
     // THE WAY BACK TO NOW IS A FLOAT, NOT A BAND. There is no amber "Viewing
