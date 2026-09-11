@@ -240,11 +240,14 @@ view
         // back as an intent the handler signs. The drafts are the view's.
         settings:
           extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
-        // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
-        // the last search go in as props; a refresh, a search, its clearing
-        // and a copy come back as intents the handler acts on.
+        // The Explorer is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in — the live head and the sync line among them, because
+        // they are the titlebar's own readings and a second source would
+        // disagree with it — and the view reads the block window and runs its
+        // workspace search through the kernel. A clipboard copy is the one
+        // intent that comes back.
         explorer:
-          extern explorer_view(dark, connected, explorer_loading, explorer_blocks, explorer_ops, block_height, sync_label(node_phase, node_sync_applied, node_sync_target), explorer_hits, explorer_kinds, explorer_partial, explorer_searching, explorer_sent_query) #explorer -> explorer_view_event _
+          extern explorer_view(dark, connected, block_height, sync_label(node_phase, node_sync_applied, node_sync_target)) #explorer -> explorer_view_event _
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

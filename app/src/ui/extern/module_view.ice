@@ -34,8 +34,11 @@ extern crate::module_view
   // what the reader did in the native log ring since the last drain,
   // applied to the timeline the app holds
   pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
-  component explorer_view(dark:bool, connected:bool, loading:bool, blocks:&[ExplorerBlock], ops:&[ExplorerOp], head:i64, sync_line:&str, hits:&[ExplorerHit], kinds:&[KindCount], partial:&str, searching:bool, sent_query:&str) -> ModuleViewEvent
-  pure explorer_intent(event:&ModuleViewEvent) -> ExplorerIntent
+  // The Explorer speaks the KERNEL CONTRACT: session facts go in (the two
+  // node facts are the titlebar's own, so the screen cannot disagree with
+  // it), the view reads the block window and runs its search through the
+  // kernel, and the one intent back is `copy`.
+  component explorer_view(dark:bool, connected:bool, head:i64, sync_line:&str) -> ModuleViewEvent
   component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
   pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
   component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64, rpc:&str, chain:&str, connection:i64, preview_base:&str, save_reply:&FsSaveHistory) -> ModuleViewEvent

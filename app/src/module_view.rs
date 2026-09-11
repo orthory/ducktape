@@ -313,55 +313,29 @@ pub fn node_log_timeline_drain(
 
 // ---------- the explorer seat ----------
 
-/// The Explorer tab: the ledger and the answer to the last workspace search
-/// as the app holds them, drawn by the `explorer` view. Its intents come
-/// back as `refresh`, `copy` (`text`, `label`), `search` (`query`) and
-/// `clear`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
+/// The Explorer tab, drawn by the `explorer` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, and the two node
+/// facts the titlebar already holds, so the screen's head and the titlebar's
+/// cannot disagree. The view reads the block window itself through
+/// `rpc.blocks` (re-read on `rpc.live` for the `block` plane) and runs the
+/// workspace search over `rpc.query` / `rpc.view`. The one intent that comes
+/// back is `copy` (`text`, `label`) — the clipboard is an OS door.
 pub fn explorer_view(
     dark: bool,
     connected: bool,
-    loading: bool,
-    blocks: &[crate::backend::ExplorerBlock],
-    ops: &[crate::backend::ExplorerOp],
     head: i64,
     sync_line: &str,
-    hits: &[crate::backend::ExplorerHit],
-    kinds: &[crate::backend::KindCount],
-    partial: &str,
-    searching: bool,
-    sent_query: &str,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "connected": connected,
-        "loading": loading,
         "dark": dark,
-        "blocks": blocks,
-        "ops": ops,
         "head": head,
         "sync_line": sync_line,
-        "hits": hits,
-        "kinds": kinds,
-        "partial": partial,
-        "searching": searching,
-        "sent_query": sent_query,
     });
     module_view(
         "explorer",
         serde_json::to_vec(&props).expect("props encode"),
     )
-}
-
-pub fn explorer_intent(event: &ModuleViewEvent) -> crate::ExplorerIntent {
-    match event.kind.as_str() {
-        "refresh" => crate::ExplorerIntent::Refresh,
-        "search" => crate::ExplorerIntent::Search,
-        "clear" => crate::ExplorerIntent::Clear,
-        _ => crate::ExplorerIntent::Copy,
-    }
 }
 
 // ---------- the settings seat ----------
@@ -1625,7 +1599,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         // navigate other tabs.
         "agents" => &["register", "open_run", "open_link"],
         "node" => &["copy", "tab", "log_filter"],
-        "explorer" => &["refresh", "copy", "search", "clear"],
+        // the explorer view reads and searches through the kernel: the only
+        // thing it asks the app for is the clipboard
+        "explorer" => &["copy"],
         "chat" => &[
             "search",
             "clear_search",
@@ -4036,10 +4012,9 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 8] = [
+        let other_route_only: [(&str, &str, &[&str]); 7] = [
             ("members", "roster_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
-            ("explorer", "explorer_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
             ("pages", "pages_intent", &["edited"]),
@@ -4584,140 +4559,72 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Explorer view through the host: the ledger, then a
-    /// search that leaves as an intent and lands back as props.
+    /// The bundled Explorer view end to end through the host, on the kernel
+    /// contract: it boots on the offline plate, and once the session says
+    /// connected it reads the block window itself — an `rpc.live`
+    /// subscription on the `block` plane that the kernel keeps, and an
+    /// `rpc.blocks` the kernel refuses here (no node), so the refusal is what
+    /// the screen shows. A block on that plane makes it read again. What the
+    /// window folds to is pinned in the view's own tests, which drive the same
+    /// compiled Ice through the wire.
     #[test]
-    fn the_staged_explorer_view_boots_takes_the_ledger_and_asks_for_a_search() {
+    fn the_staged_explorer_view_boots_and_reads_its_window_through_the_kernel() {
         let Some(staged) = staged("explorer") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
         guest.redraw(&None);
-        let props = Some(
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "the offline plate is what an unconnected Explorer shows"
+        );
+
+        let session = Some(
             serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": [{"height": 84912, "hash": "9f3e", "commit": "c0ffee", "op_count": 1}],
-                "ops": [{"height": 84912, "proposer": "val-1", "target": "chat",
-                         "disposition": "applied", "op_hash": "ab12cd34", "payload": "post",
-                         "trace": "chat · 1 msg"}],
-                "head": 84912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+                "connected": true, "dark": false, "head": 84_912, "sync_line": "live"
             }))
             .expect("props encode"),
         );
-        guest.redraw(&props);
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription for the block plane"
+        );
+        assert_eq!(guest.live_subscriptions[0].1, "block");
+        // no node behind the kernel: the read is refused, and the view says
+        // so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["Explorer", "h 84,912"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        guest.deliver(Output::Activate(button_message(&guest, "Refresh")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "refresh".into(),
-                detail: "null".into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// EVERY DIGEST THE LEDGER PUBLISHES REACHES THE SCREEN WHOLE, IN HEX.
-    /// The rows are the node's own `GET /v1/blocks` shape, the props are what
-    /// `explorer_window` makes of them — the production conversion, not a
-    /// hand-built prop — and the reader is the bundled wasm guest. Nothing
-    /// between the two may cut a digest or leave one in decimal: the block
-    /// hash on the list row, the commit hash and the op hash in the detail,
-    /// and the `new_oid` inside the payload all read `0x` and every character
-    /// — and the copy intent carries the bare key the blob route takes.
-    #[test]
-    fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
-        let Some(staged) = staged("explorer") else {
-            return;
-        };
-        let hash = "9f3e".repeat(16);
-        let commit = "c0ffee11".repeat(8);
-        let op_hash = "dd".repeat(32);
-        let oid: Vec<u8> = (1..=20).collect();
-        let rows = vec![serde_json::json!({
-            "height": 84_912,
-            "hash": hash,
-            "commit_hash": commit,
-            "ops": [{
-                "proposer": "cc".repeat(32),
-                "target": "forge",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": serde_json::to_string(&serde_json::json!({
-                    "push": { "new_oid": oid }
-                }))
-                .expect("payload encodes"),
-                "operations": []
-            }]
-        })];
-        let ledger = crate::backend::explorer_window(1, &rows);
-
-        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": ledger.blocks, "ops": ledger.ops,
-                "head": 84_912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-
-        let whole = format!("0x{hash}");
-        let listed = texts(&guest);
         assert!(
-            listed.contains(&whole),
-            "the list row carries the whole block hash: {listed:?}"
-        );
-        // and nothing on it is a cut-down version of that hash — the guard
-        // that fails the moment a landmark form comes back.
-        let abbreviated = listed
-            .iter()
-            .find(|text| text.starts_with("0x9f3e") && **text != whole);
-        assert!(
-            abbreviated.is_none(),
-            "the list carries the whole hash, not {abbreviated:?}"
-        );
-
-        guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
-        guest.redraw(&props);
-        let opened = texts(&guest);
-        for expected in [format!("0x{commit}"), format!("0x{op_hash}")] {
-            assert!(
-                opened.iter().any(|text| text == &expected),
-                "missing {expected:?} in {opened:?}"
-            );
-        }
-        assert!(
-            opened
+            shown
                 .iter()
-                .any(|text| text
-                    .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
-            "the payload's digest is hex too: {opened:?}"
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
 
-        // AND THE CLIPBOARD GETS THE KEY, not the reading of it: `0x` is for
-        // the eye, and `GET /v1/files/blob/{op_hash}` takes the bare digest.
-        guest.deliver(Output::Activate(button_message(&guest, "Copy op hash")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "copy".into(),
-                detail: format!(r#"{{"text":"{op_hash}","label":"Op hash copied"}}"#),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        // a block: the live item lands and the view reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The bundled Settings view through the host: the facts, then a
@@ -6252,6 +6159,287 @@ pub(crate) mod tests {
                 .iter()
                 .all(|event| matches!(event, wire::Event::Response { result: Err(_), .. }))
         );
+    }
+
+    #[test]
+    fn pages_floating_comments_preserve_document_layout_and_pointer_routing() {
+        use iced::advanced::renderer::Headless as _;
+        use iced_test::runtime::{UserInterface, user_interface};
+
+        struct Bounds {
+            editor: Option<Rectangle>,
+            focused: bool,
+            post: Option<Rectangle>,
+            card: Option<Rectangle>,
+            card_text: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+                if id
+                    == Some(&iced::widget::Id::from(
+                        "PagesView/root/pages/comments-card",
+                    ))
+                {
+                    self.card = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.editor = Some(bounds);
+                    self.focused = state.is_focused();
+                }
+            }
+            fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "No comments yet" {
+                    self.card_text = Some(bounds);
+                }
+                if text == "Post" {
+                    self.post = Some(bounds);
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let original = (0..80)
+            .map(|n| format!("Paragraph {n}: editable document text.\n"))
+            .collect::<String>();
+        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        facts["comment_seed"] = "A comment".into();
+        facts["seed_rev"] = 1.into();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(1100.0, 700.0);
+        let mut closed_bounds = None;
+        for open in [false, true] {
+            facts["block_comments_open"] = open.into();
+            let props = Some(serde_json::to_vec(&facts).unwrap());
+            settle_documents(&mut guest, &props);
+            let mut ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut bounds = Bounds {
+                editor: None,
+                focused: false,
+                post: None,
+                card: None,
+                card_text: None,
+            };
+            ui.operate(&renderer, &mut bounds);
+            let editor = bounds.editor.expect("document editor");
+            if !open {
+                closed_bounds = Some(editor);
+                continue;
+            }
+            assert_eq!(
+                Some(editor),
+                closed_bounds,
+                "comments must not resize or move the document"
+            );
+            let card = bounds.card.expect("comment card bounds");
+            let translation = Vector::new(size.width - card.x - card.width - 16.0, 0.0);
+            let post = bounds.post.expect("floating Post button").center() + translation;
+            let card_point = bounds.card_text.expect("comment card content").center() + translation;
+            assert!(
+                editor.contains(card_point),
+                "comments must overlap the document, not dock beside it"
+            );
+            let key = "PagesView/root/pages/document";
+            let cursor = guest
+                .inputs
+                .editor_document(key)
+                .unwrap()
+                .reference()
+                .cursor;
+            let mut covered = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(card_point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut covered,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                !bounds.focused,
+                "the card must shield the covered editor from clicks"
+            );
+            for output in covered {
+                guest.deliver(output);
+            }
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(post),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            assert!(
+                guest.intents.iter().any(|event| event.kind == "post"),
+                "the card must receive its own click"
+            );
+            assert_eq!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .reference()
+                    .cursor,
+                cursor,
+                "clicking the card must not move the underlying caret"
+            );
+            let outside = iced::Point::new(editor.x + 60.0, editor.y + 20.0);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert!(
+                bounds.focused,
+                "the positioning layer must not intercept clicks outside the card"
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character("X".into()),
+                    modified_key: iced::keyboard::Key::Character("X".into()),
+                    physical_key: iced::keyboard::key::Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::default(),
+                    text: Some("X".into()),
+                    repeat: false,
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            // Native redraws drain editor input queued behind the pointer transaction.
+            loop {
+                for output in outputs.drain(..) {
+                    guest.deliver(output);
+                }
+                settle_documents(&mut guest, &props);
+                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                if !guest.inputs.editor_transactions_pending() {
+                    break;
+                }
+                ui.update(
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
+                    mouse::Cursor::Available(outside),
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+            }
+            assert!(
+                guest
+                    .inputs
+                    .editor_document(key)
+                    .unwrap()
+                    .text()
+                    .contains('X'),
+                "document typing must remain live beside the card"
+            );
+            let capture = |ui: &mut UserInterface<'_, Output, iced::Theme, iced::Renderer>,
+                           renderer: &mut iced::Renderer| {
+                ui.draw(
+                    renderer,
+                    &iced::Theme::Light,
+                    &renderer::Style {
+                        text_color: iced::Color::BLACK,
+                    },
+                    mouse::Cursor::Unavailable,
+                );
+                renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
+            };
+            ui.update(
+                &[],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
+            let before = capture(&mut ui, &mut renderer);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
+                })],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            let after = capture(&mut ui, &mut renderer);
+            let region = |pixels: &[u8], x: usize, width: usize| -> Vec<u8> {
+                (150..500)
+                    .flat_map(|y| {
+                        pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            };
+            assert!(
+                region(&before, editor.x as usize + 10, 220)
+                    != region(&after, editor.x as usize + 10, 220),
+                "wheel outside the card must scroll the document"
+            );
+            assert!(
+                region(&before, 800, 250) == region(&after, 800, 250),
+                "scrolling the document must not scroll the card"
+            );
+            let directory =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
+            std::fs::create_dir_all(&directory).unwrap();
+            image::RgbaImage::from_raw(1100, 700, after)
+                .unwrap()
+                .save(directory.join("floating-comments.png"))
+                .unwrap();
+        }
     }
 
     #[test]

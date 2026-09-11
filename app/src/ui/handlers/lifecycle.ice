@@ -249,13 +249,6 @@ on workspace_connected(next)
   mutation_phase = MutationPhase.idle
   hydration_retry_attempt = 0
   error = ""
-  explorer_generation = explorer_generation + 1
-  invalidate lane=workspace_search
-  explorer_hits = []
-  explorer_kinds = []
-  explorer_partial = ""
-  explorer_searching = false
-  explorer_sent_query = ""
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. A run
@@ -274,7 +267,6 @@ on workspace_connected(next)
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
     run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
-    run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
@@ -786,7 +778,6 @@ on select_shell_tab(next)
   error = ""
   return if !connected
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
-  explorer_generation = explorer_generation + 1
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   account_generation = account_generation + 1
@@ -803,16 +794,11 @@ on select_shell_tab(next)
   // on every members-only room.
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
-  explorer_loading = shell_tab == ShellTab.explorer
   fs_loading = shell_tab == ShellTab.files
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
   parallel
-    flow
-      from done load_request(shell_tab == ShellTab.explorer, connected_rpc, "", explorer_generation)
-      try request -> done request
-      done -> explorer_load_selected _
     flow
       from done load_request(shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
       try request -> done request
@@ -846,12 +832,6 @@ on select_shell_tab(next)
 // optional `try` emits no message when false. A newer intent, tab, or network
 // can land before the selected message, so each destination rejects an
 // obsolete request before it starts the normal compiler `run replace` lane.
-on explorer_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != explorer_generation
-  let unmounted = shell_tab != ShellTab.explorer
-  return if obsolete_request || unmounted
-  run replace lane=explorer_load load_explorer(request.rpc, request.generation) -> explorer_loaded _ | explorer_failed _
-
 on files_list_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
   let unmounted = shell_tab != ShellTab.files

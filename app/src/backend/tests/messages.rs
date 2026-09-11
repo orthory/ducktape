@@ -150,21 +150,27 @@ fn a_search_hit_names_its_room_exactly_once() {
         "the room comes first, then the sequence"
     );
 
-    const SEARCH: &str = include_str!("../search.rs");
-    let message_arm = SEARCH
+    // The Explorer reads the same index row in its own crate, and composes
+    // that meta exactly ONCE — the room, then the sequence. Composing the
+    // channel on top of a meta that already carried it is what printed it
+    // twice.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let message_arm = EXPLORER
         .split("kind: \"message\".into(),")
         .nth(1)
         .expect("the message hit arm")
-        .split("});")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        message_arm.contains("meta: hit.meta,"),
-        "the Explorer carries the meta through"
+        message_arm.contains(r#""{} · #{}""#),
+        "the room comes first, then the sequence"
     );
-    assert!(
-        !message_arm.contains("hit.channel_id, hit.meta"),
-        "composing the channel again is what printed it twice"
+    assert_eq!(
+        message_arm.matches("channel_id").count(),
+        2,
+        "the channel names the row's meta and its target, and nothing else: \
+         {message_arm}"
     );
 }
 
@@ -240,24 +246,29 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
         "quackbot"
     );
 
-    // The call site itself, pinned: the message arm must carry the author
-    // through, never re-format it. Without this the assertions above hold
-    // while the Explorer goes on printing "system".
-    const SEARCH: &str = include_str!("../search.rs");
-    let message_arm = SEARCH
+    // ONE FORMATTING PASS, AT THE SOURCE. `author_display` above is the app's
+    // pass over a RENDERED handle; running it a second time over its own
+    // output found no `user:`/`agent:` prefix to split and fell through to
+    // "system", which is how every Explorer message hit lost its author. The
+    // Explorer reads the index row in its own crate now, so its `author` is
+    // the raw handle and `author_name` is that single pass — pinned here so a
+    // second one cannot come back.
+    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
+    let message_arm = EXPLORER
         .split("kind: \"message\".into(),")
         .nth(1)
         .expect("the message hit arm")
-        .split("});")
+        .split(".collect()")
         .next()
         .expect("arm body");
     assert!(
-        message_arm.contains("title: hit.author,"),
-        "the message hit carries the display name it was handed"
+        message_arm.contains("title: author_name(hit[\"author\"]"),
+        "the message hit names its author off the index row's own handle"
     );
-    assert!(
-        !message_arm.contains("author_name("),
-        "re-formatting it is what produced `system`"
+    assert_eq!(
+        message_arm.matches("author_name(").count(),
+        1,
+        "formatting the author twice is what produced `system`: {message_arm}"
     );
 }
 
