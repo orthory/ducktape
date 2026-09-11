@@ -57,6 +57,7 @@ extern crate::host
   pure empty_run() -> RunRow
   pure link_glyph(kind:&str) -> str
   pure journal_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
+  pure editor_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure open_run(dispatch_id:&str) -> bool
   pure open_link(url:&str) -> bool
   pure skill_count(skills:&[AgentSkill]) -> i64
@@ -103,6 +104,7 @@ state
   // register's `open_run` is the truth and a press here is the request.
   open_run = ""
   journal_width = 400.0
+  editor_width = 400.0
   viewport_width = 1280.0
   expanded_receipt = ""
   open_row:RunRow = empty_run()
@@ -155,9 +157,13 @@ subscribe
 on journal_resized(dx, _dy)
   journal_width = journal_width_after_delta(journal_width, -dx, viewport_width)
 
+on editor_resized(dx, _dy)
+  editor_width = editor_width_after_delta(editor_width, -dx, viewport_width)
+
 on viewport_changed(width, _height)
   viewport_width = width
   journal_width = journal_width_after_delta(journal_width, 0.0, width)
+  editor_width = editor_width_after_delta(editor_width, 0.0, width)
 
 on toggle_receipt(value)
   expanded_receipt = pick_str(expanded_receipt != value, value, "")
@@ -1093,9 +1099,12 @@ view
           // list. Every control is live for the controller and read-only for
           // anyone else — the record is still worth reading whole.
           if !empty(selected) || creating
+            resize-handle #editor-resize drag=editor_resized cursor=resize-horizontal
+              box #editor-divider w=10.0 h=fill
+                space w=1.0 h=1.0
             box #editor
               with
-                w=400.0
+                w=editor_width
                 h=fill
                 bg=surface
                 border=border

@@ -714,6 +714,21 @@ pub fn markdown_path(path: &str) -> bool {
     lower.ends_with(".md") || lower.ends_with(".markdown")
 }
 
+pub fn tree_width_after_delta(width: f64, delta: f64, viewport: f64, object: f64) -> f64 {
+    let maximum = (viewport - object - 20.0 - 360.0).clamp(160.0, 360.0);
+    (width + delta).clamp(160.0, maximum)
+}
+
+pub fn preview_height_after_delta(height: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport - 300.0).clamp(180.0, 560.0);
+    (height + delta).clamp(180.0, maximum)
+}
+
+pub fn object_width_after_delta(width: f64, delta: f64, viewport: f64, tree: f64) -> f64 {
+    let maximum = (viewport - tree - 20.0 - 360.0).clamp(240.0, 520.0);
+    (width + delta).clamp(240.0, maximum)
+}
+
 /// The entry `path` names in the rows on hand, or a blank one.
 pub fn entry_named(entries: &[FsEntry], path: &str) -> FsEntry {
     entries

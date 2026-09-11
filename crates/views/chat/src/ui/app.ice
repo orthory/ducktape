@@ -126,7 +126,9 @@ extern crate::host
   pure run_in_thread(live:&LiveRunHint, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
   pure message_target_key(messages:&[ChatMessage], target:i64, changed:bool) -> i64
-  pure thread_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
+  pure sidebar_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
+  pure details_width_after_delta(width:f64, delta:f64, viewport:f64, sidebar:f64) -> f64
+  pure thread_width_after_delta(width:f64, delta:f64, viewport:f64, sidebar:f64) -> f64
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure reaction_palette() -> [str]
@@ -196,6 +198,8 @@ state
   thread_selected_rev = 0
   thread_message_action:MessageAction = MessageAction.toolbar
   chat_viewport_width = 1280.0
+  sidebar_width = 236.0
+  details_width = 320.0
   thread_width = 330.0
   thread_has_more = false
   thread_next_reply_seq = 0
@@ -223,12 +227,22 @@ state
 subscribe
   props() -> props_arrived _
 
+on sidebar_resized(dx, _dy)
+  sidebar_width = sidebar_width_after_delta(sidebar_width, dx, chat_viewport_width)
+  details_width = details_width_after_delta(details_width, 0.0, chat_viewport_width, sidebar_width)
+  thread_width = thread_width_after_delta(thread_width, 0.0, chat_viewport_width, sidebar_width)
+
+on details_resized(dx, _dy)
+  details_width = details_width_after_delta(details_width, -dx, chat_viewport_width, sidebar_width)
+
 on thread_resized(dx, _dy)
-  thread_width = thread_width_after_delta(thread_width, -dx, chat_viewport_width)
+  thread_width = thread_width_after_delta(thread_width, -dx, chat_viewport_width, sidebar_width)
 
 on chat_viewport_changed(width, _height)
   chat_viewport_width = width
-  thread_width = thread_width_after_delta(thread_width, 0.0, width)
+  sidebar_width = sidebar_width_after_delta(sidebar_width, 0.0, width)
+  details_width = details_width_after_delta(details_width, 0.0, width, sidebar_width)
+  thread_width = thread_width_after_delta(thread_width, 0.0, width, sidebar_width)
 
 on props_arrived(item)
   host_error = item.error
@@ -512,6 +526,8 @@ view
   sensor show=chat_viewport_changed resize=chat_viewport_changed
     ChatScreen search_draft<->search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
       with
+        sidebar_width
+        details_width
         thread_width
         endpoint
         network_name
@@ -600,6 +616,8 @@ view
         unarchive_channel_submit -> unarchive_channel_submit
         add_channel_member_submit -> add_channel_member_submit
         remove_channel_member_submit -> remove_channel_member_submit _
+        resize_sidebar -> sidebar_resized _ _
+        resize_details -> details_resized _ _
         resize_thread -> thread_resized _ _
         close_thread -> close_thread
         open_thread_message_actions -> open_thread_message_actions _ _ _

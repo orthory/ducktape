@@ -860,6 +860,11 @@ pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }
 
+pub fn ledger_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(260.0, 520.0);
+    (width + delta).clamp(260.0, maximum)
+}
+
 /// The display name for a rendered author handle (`user:{id}`, `acct:{n}`,
 /// `module:{id}`, or `system`) with no name directory in frame: a user is
 /// named by the shortened key. The directory the desktop app holds is the

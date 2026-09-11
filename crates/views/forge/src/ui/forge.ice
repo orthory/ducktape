@@ -13,7 +13,7 @@
 // is the path only while the reader still stands where the file was
 // opened (same directory, same commit) — empty retires the preview.
 
-component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
+component ForgeScreen(tree_width:f64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -32,6 +32,7 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
     forge_open_file(str)
     open_message_link(str)
     copy_to_clipboard(str, str)
+    resize_tree(f64, f64)
   col w=fill h=fill
     // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
     // both of them read. `connected` already disabled every act here, while the
@@ -291,6 +292,7 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
               "code"
                 ForgeCodeBrowser #code
                   with
+                    tree_width
                     tree_path
                     tree_rev
                     tree_entries
@@ -312,6 +314,7 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
                     open_message_link
                     forge_open_dir
                     forge_open_file
+                    resize_tree
               "issues"
                 ForgeTrackerList
                   with
@@ -806,13 +809,15 @@ component LinkedNote(note:ChatMessage)
             forward
               open_message_link
 
-component ForgeCodeBrowser(tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, dark:bool)
+component ForgeCodeBrowser(tree_width:f64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, dark:bool)
   emits
     open_message_link(str)
     forge_open_dir(str)
     forge_open_file(str)
+    resize_tree(f64, f64)
   ForgeCodeTab
     with
+      tree_width
       path=file_header
       message=""
       author=""
@@ -1056,3 +1061,5 @@ component ForgeCodeBrowser(tree_path:str, tree_rev:str, tree_entries:[TreeEntry]
                   size=11.5
                   wrap=none
                   @text-label
+    forward
+      resize_tree
