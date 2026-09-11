@@ -2501,6 +2501,9 @@ struct Guest {
     /// The guest's `rpc.live` subscriptions, each with the plane it named:
     /// told on every block that moves that plane.
     live_subscriptions: Vec<(u64, String)>,
+    /// The guest's `rpc.stream` subscriptions, each holding the node socket
+    /// the kernel opened for it: retired with the cancel, and with the guest.
+    streams: Vec<(u64, kernel::NodeStream)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3170,6 +3173,7 @@ impl Guest {
             intents: Vec::new(),
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
+            streams: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3301,6 +3305,9 @@ impl Guest {
                 self.props_subscription = None;
             }
             self.live_subscriptions.retain(|(live, _)| *live != id);
+            // dropping the stream aborts it: the node socket goes with the
+            // subscription the view abandoned
+            self.streams.retain(|(stream, _)| *stream != id);
         }
         self.fault.is_none()
             && (self.frame.busy

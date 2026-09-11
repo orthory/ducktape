@@ -611,3 +611,100 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
         280.0
     );
 }
+
+/// THE RUN AS IT RUNS. The open run's progress is the node's own output
+/// stream for that dispatch, opened through `rpc.stream` and folded HERE:
+/// the tool it is using, the steps it took, the answer forming. A run the
+/// stream says nothing about draws no panel at all, and what reaches the
+/// screen is a tool's NAME, never its arguments or its output.
+#[test]
+fn the_open_run_draws_the_node_output_as_it_arrives() {
+    let (frame, left) = connect(booted(), "7", "dispatch-gone", 1);
+    let opened = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .expect("the view opens the open run's output stream");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&opened.payload).expect("decodes"),
+        json!({
+            "topic": "run-output:dispatch-gone",
+            "params": {"run": "dispatch-gone"},
+        }),
+        "the topic is the run's, and the upgrade names the run it asks for"
+    );
+    assert!(
+        !has_text(&frame, "Using Bash"),
+        "a run with no output draws no panel: {:?}",
+        texts(&frame)
+    );
+
+    let line = |body: Value| {
+        item(
+            opened.id,
+            json!({"topic": "run-output:dispatch-gone", "item": {"line": body.to_string()}})
+                .to_string()
+                .as_bytes(),
+        )
+    };
+    let frame = tick_native(vec![line(json!({
+        "type": "assistant",
+        "message": {"content": [{
+            "type": "tool_use",
+            "name": "Bash",
+            "input": {"command": "cat /etc/shadow"},
+        }]},
+    }))]);
+    assert!(has_text(&frame, "Using Bash"), "{:?}", texts(&frame));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("/etc/shadow")),
+        "a tool's arguments never reach the screen: {:?}",
+        texts(&frame)
+    );
+
+    // a step, with the detail its label carries
+    let frame = tick_native(vec![line(json!({
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "cargo test"},
+    }))]);
+    assert!(
+        has_text(&frame, "Command: cargo test"),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // and the answer as it forms
+    let frame = tick_native(vec![line(json!({
+        "type": "result",
+        "result": "the register is green",
+    }))]);
+    for expected in ["Answering", "the register is green", "Command: cargo test"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+
+    // a frame for another topic is not this run's
+    let frame = tick_native(vec![item(
+        opened.id,
+        json!({"topic": "run-output:someone-else", "item": {"line": "{\"type\":\"result\",\"result\":\"not ours\"}"}})
+            .to_string()
+            .as_bytes(),
+    )]);
+    assert!(
+        !has_text(&frame, "not ours"),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // closing the run takes the panel with it
+    let frame = tick_native(press(&frame, "Close journal"));
+    assert!(
+        !has_text(&frame, "the register is green"),
+        "{:?}",
+        texts(&frame)
+    );
+}

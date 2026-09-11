@@ -9,7 +9,10 @@
 //! `rpc.view`, re-read on every `rpc.live` hit for the `runs` and `identity`
 //! planes, and a pause, a resume or a save leaves as `op.submit` carrying
 //! the runs message the kernel signs with the SEATED key — the view never
-//! sees the key, the endpoint or the password.
+//! sees the key, the endpoint or the password. The open run's progress is
+//! the node's own output stream, opened with `rpc.stream` under that same
+//! key: the kernel hands over the node's frames verbatim, and every reading
+//! folded out of them is here.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +39,16 @@ const JOURNAL_ENTRY_LIMIT: usize = 128;
 
 /// How many touched places one run's chip row draws.
 const MAX_TOUCHED_PLACES: usize = 128;
+
+/// The live panel's bounds: the steps it keeps, the answer it previews, and
+/// how much of a step's detail rides its label.
+const MAX_LIVE_ACTIVITY: usize = 12;
+const MAX_LIVE_PREVIEW_BYTES: usize = 512;
+const ACTIVITY_DETAIL_CHARS: usize = 60;
+/// A step's raw detail, before the label clips it further.
+const ACTIVITY_DETAIL_BYTES: usize = 1_200;
+/// A tool name is a label, not a transcript.
+const TOOL_NAME_BYTES: usize = 80;
 
 pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
@@ -1420,6 +1433,219 @@ fn completed_forge_target(
         target: field("target_branch"),
         candidates,
     })
+}
+
+// ---------- the run as it runs ----------
+
+/// One step the open run has taken, and whether it finished.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveActivity {
+    pub label: String,
+    pub done: bool,
+}
+
+/// The progress of the run the reader has open: the node's own output for
+/// that dispatch, folded. `present` is false until a line arrives — a run
+/// that settled, was never dispatched here, or whose output this device may
+/// not read produces none, and the panel stays off rather than guessing.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub present: bool,
+    pub status: String,
+    pub activity: Vec<LiveActivity>,
+    pub answer_preview: String,
+}
+
+pub fn empty_live() -> LiveRun {
+    LiveRun::default()
+}
+
+/// The open run's progress, off the node's own output stream: `rpc.stream`
+/// opens `run-output:<dispatch>` under the seated key — the node admits the
+/// key that asked for the run and nobody else — and hands the view every
+/// frame verbatim. Every reading below is folded HERE; the kernel carries
+/// bytes and knows nothing about a run.
+pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun> {
+    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+        let topic = format!("run-output:{open_run}");
+        let ask = serde_json::json!({
+            "topic": topic,
+            "params": { "run": open_run },
+        });
+        let frames = host::subscribe(
+            "rpc.stream",
+            &serde_json::to_vec(&ask).expect("a request encodes"),
+        );
+        // the empty reading first: this subscription is keyed on the run, so
+        // a door onto another one starts here and the run before it cannot
+        // linger under the new name
+        stream::once(std::future::ready(LiveRun::default())).chain(frames.scan(
+            LiveRun::default(),
+            move |run, frame| {
+                fold_output(run, &topic, frame);
+                std::future::ready(Some(run.clone()))
+            },
+        ))
+    })
+}
+
+/// One frame of the node's output stream, folded into the panel's reading.
+/// A frame this view cannot read — another topic, a refusal, a line that is
+/// not a provider event — leaves the reading as it was.
+fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
+    let Ok(bytes) = frame else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    if value["topic"].as_str() != Some(topic) {
+        return;
+    }
+    let Some(line) = value["item"]["line"].as_str() else {
+        return;
+    };
+    let Some(output) = provider_output(line) else {
+        return;
+    };
+    run.present = true;
+    match output {
+        Output::Status(title) => run.status = title,
+        Output::Activity {
+            title,
+            detail,
+            done,
+        } => {
+            let label = match detail.is_empty() {
+                true => title.clone(),
+                false => format!("{title}: {}", clip(&detail, ACTIVITY_DETAIL_CHARS)),
+            };
+            match run.activity.iter_mut().find(|act| act.label == label) {
+                Some(act) => act.done |= done,
+                None => run.activity.push(LiveActivity { label, done }),
+            }
+            let overflow = run.activity.len().saturating_sub(MAX_LIVE_ACTIVITY);
+            run.activity.drain(..overflow);
+            run.status = title;
+        }
+        Output::Preview(answer) => {
+            run.answer_preview = clip(&answer, MAX_LIVE_PREVIEW_BYTES);
+            run.status = "Answering".into();
+        }
+    }
+}
+
+/// What one line of a run's output says about it. ONE tagged value: the
+/// providers spell their events differently, and everything past the parse
+/// reads this and not their JSON.
+enum Output {
+    /// the run named what it is doing now
+    Status(String),
+    /// one step, with the detail its label carries and whether it finished
+    Activity {
+        title: String,
+        detail: String,
+        done: bool,
+    },
+    /// the answer as it forms
+    Preview(String),
+}
+
+/// One line of a run's stdout, as the panel reads it. Tool NAMES describe
+/// observed activity; arguments, tool output and thinking blocks never
+/// reach the screen.
+fn provider_output(line: &str) -> Option<Output> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let claude_kind = value["type"].as_str().unwrap_or_default();
+    if claude_kind == "result" {
+        return Some(Output::Preview(value["result"].as_str()?.to_owned()));
+    }
+    if claude_kind == "assistant" {
+        let blocks = value["message"]["content"].as_array()?;
+        let tool = blocks
+            .iter()
+            .rev()
+            .find(|block| block["type"] == "tool_use")?;
+        let name = clip(tool["name"].as_str()?, TOOL_NAME_BYTES);
+        return Some(Output::Status(format!("Using {name}")));
+    }
+    if claude_kind == "user" {
+        let blocks = value["message"]["content"].as_array()?;
+        let result = blocks
+            .iter()
+            .rev()
+            .find(|block| block["type"] == "tool_result")?;
+        let failed = result["is_error"] == true;
+        let title = match failed {
+            true => "Tool failed · waiting for agent",
+            false => "Tool finished · waiting for agent",
+        };
+        return Some(Output::Status(title.into()));
+    }
+    let item = &value["item"];
+    let item_kind = item["type"]
+        .as_str()
+        .or_else(|| item["item_type"].as_str())
+        .unwrap_or_default();
+    if item_kind == "agent_message" {
+        let answer = item["text"].as_str().or_else(|| item["message"].as_str())?;
+        return Some(Output::Preview(answer.to_owned()));
+    }
+    let (title, detail) = match item_kind {
+        "reasoning" => (
+            "Reasoning".to_owned(),
+            json_text(item.get("text").or_else(|| item.get("summary"))),
+        ),
+        "command_execution" => (
+            "Command".to_owned(),
+            json_text(
+                item.get("command")
+                    .or_else(|| item.get("aggregated_output")),
+            ),
+        ),
+        "mcp_tool_call" => {
+            let server = item["server"].as_str().unwrap_or("tool");
+            let tool = item["tool"].as_str().unwrap_or("call");
+            (format!("{server} · {tool}"), json_text(item.get("arguments")))
+        }
+        "web_search" => ("Web search".to_owned(), json_text(item.get("query"))),
+        _ => return None,
+    };
+    Some(Output::Activity {
+        title,
+        detail: clip(&detail, ACTIVITY_DETAIL_BYTES),
+        done: claude_kind.ends_with("completed"),
+    })
+}
+
+/// A field that may be a string, a list of them, or something structured:
+/// read as the words a label can carry.
+fn json_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// `text` at most `limit` bytes, ending on a character boundary, with an
+/// ellipsis when it was cut.
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= limit)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &text[..end])
 }
 
 // ---------- the writes ----------

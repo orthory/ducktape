@@ -26,6 +26,8 @@ extern crate::host
   JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
+  LiveActivity(label:str, done:bool)
+  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
   Session(connected:bool, dark:bool, account:str, open_run:str, opened:i64)
   SessionItem(next:Session, error:str)
   RegisterItem(rows:[AgentRow], runs:[RunRow], capabilities:[str], error:str)
@@ -37,6 +39,9 @@ extern crate::host
   subscription register(connection:i64) -> RegisterItem
   // the open run's journal, on the same cadence
   subscription run_journal(open_run:str, connection:i64) -> JournalItem
+  // the open run AS IT RUNS, off the node's own output stream: one item per
+  // frame the node sends for that dispatch, folded
+  subscription live_run(open_run:str, connection:i64) -> LiveRun
   // every write's outcome, as the kernel answers it
   subscription acts() -> ActItem
   pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
@@ -48,6 +53,7 @@ extern crate::host
   pure run_named(runs:&[RunRow], run_id:&str) -> RunRow
   pure run_at(runs:&[RunRow], dispatch_id:&str) -> RunRow
   pure empty_journal() -> RunJournal
+  pure empty_live() -> LiveRun
   pure empty_run() -> RunRow
   pure link_glyph(kind:&str) -> str
   pure journal_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
@@ -84,6 +90,9 @@ state
   rows:[AgentRow] = []
   runs:[RunRow] = []
   journal:RunJournal = empty_journal()
+  // the open run's progress, off the node's output stream: absent until a
+  // line arrives, so a settled run draws no panel
+  live:LiveRun = empty_live()
   // which panel the reader is on: the registry (who may act) or the runs
   // tracker (what they did, and how it settled). Mutually exclusive by
   // construction — one value, and every panel's content is gated on it.
@@ -140,6 +149,7 @@ subscribe
   session() -> session_arrived _
   register(connection_serial) when connected -> register_arrived _
   run_journal(open_run, connection_serial) when (connected && !empty(open_run)) -> journal_arrived _
+  live_run(open_run, connection_serial) when (connected && !empty(open_run)) -> live_arrived _
   acts() -> act_done _
 
 on journal_resized(dx, _dy)
@@ -212,6 +222,11 @@ on journal_arrived(item)
   return if !empty(item.error) || item.journal.dispatch_id != open_run
   journal = item.journal
 
+// The open run moved: one frame of its output, already folded. The
+// subscription is keyed on the run, so an item is always the open one's.
+on live_arrived(item)
+  live = item
+
 // A write the kernel answered. A refusal is shown in place; a commit means
 // the drafts it carried are spent, which the next register re-seeds from.
 on act_done(item)
@@ -271,6 +286,7 @@ on close_run
   open_run = ""
   open_row = empty_run()
   journal = empty_journal()
+  live = empty_live()
   sent = open_run("")
 
 // A chip pressed: the app's open plane warps to the place it names.
@@ -726,6 +742,53 @@ view
                               size=10.0
                               @text-meta
                               @font-mono
+                  // THE RUN AS IT RUNS: its status, the steps it has taken
+                  // and the answer forming, off the node's own output stream
+                  // for this dispatch (`rpc.stream`, under the seated key).
+                  // The chat stream only hints that a run is working under
+                  // its message; this is where the progress is drawn.
+                  if live.present
+                    box #live
+                      with
+                        w=fill
+                        px=12.0
+                        py=9.0
+                        bg=warning_bg
+                        border=warning_line
+                        border-w=1.0
+                        r=8.0
+                      col w=fill gap=4.0
+                        text live.status
+                          with
+                            w=fill
+                            size=12.0
+                            @text-fg
+                            @font-medium
+                        for act in live.activity
+                          row w=fill gap=5.0 align=center
+                            if act.done
+                              text "✓"
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            if !act.done
+                              text "…"
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            text act.label
+                              with
+                                w=fill
+                                size=11.0
+                                @text-meta
+                        if !empty(live.answer_preview)
+                          text live.answer_preview
+                            with
+                              w=fill
+                              size=12.0
+                              @text-meta
                   // RELEVANT: where the run came from and every place it
                   // touched, folded from its journal's receipts — the thread
                   // that summoned it, the pages and blocks it wrote, the PR
