@@ -10,7 +10,6 @@ pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> L
         debounce: false,
         chat: Vec::new(),
         bell: BellDelta::default(),
-        forge: ForgeRefresh::default(),
         permit: LivePermit::default(),
     }
 }

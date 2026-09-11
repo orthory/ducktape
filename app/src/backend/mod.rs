@@ -35,12 +35,6 @@ pub use ::chat::client::{
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
 pub use ::chat::client::{BoundAccount, THREAD_HOT_WINDOW_LIMIT, author_name, paragraph_blocks};
-// forge's client view model, same arrangement: the tracker rows, the item
-// pane (reviews + merge-box tallies), and the op-refresh classification.
-pub use ::forge::client::{
-    ForgeRefresh, ItemRow as ForgeItem, ReviewCommentRow as ForgeReviewComment,
-    ReviewRow as ForgeReview,
-};
 pub use inbox::client::{BellDelta, BellItem};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
@@ -234,8 +228,6 @@ pub struct LiveUpdate {
     /// view rebuild per bounded batch, not one of each per operation.
     pub chat: Vec<ChatDelta>,
     pub bell: BellDelta,
-    /// one committed forge op's invalidation scope (`kind == LiveKind::Forge`).
-    pub forge: ForgeRefresh,
     /// Subscription backpressure, not UI state. The next socket publication
     /// cannot be read until the generated app message carrying this token has
     /// finished its update and all of its clones have been dropped.
@@ -284,7 +276,6 @@ impl Default for LiveUpdate {
             debounce: false,
             chat: Vec::new(),
             bell: BellDelta::default(),
-            forge: ForgeRefresh::default(),
             permit: LivePermit::default(),
         }
     }

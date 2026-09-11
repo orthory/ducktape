@@ -346,16 +346,8 @@ fn opening_a_network_clears_the_previous_networks_state() {
     // The page a `duck://page/…` address asked for is the one pages fact the
     // app still holds — and it named the network being left.
     app.page_route = "node-a-page".into();
-    app.forge_list_phase = ForgePhase::Ready;
-    app.forge_repo = "same-repo".into();
-    app.forge_repo_phase = ForgePhase::Ready;
-    app.forge_item_number = 1;
-    app.forge_item_phase = ForgePhase::Ready;
-    app.forge_tree_entries = vec![backend::TreeEntry {
-        name: "src".into(),
-        path: "src".into(),
-        kind: "dir".into(),
-    }];
+    app.forge_link = "duck://forge/core/pull/1".into();
+    app.forge_note_pending = "op-a".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
     // AND A COMPOSER WITH WORDS IN IT, typed against node A. A channel id is a
@@ -394,16 +386,10 @@ fn opening_a_network_clears_the_previous_networks_state() {
         "node a draft",
         "and it is still node A's, waiting where it was typed"
     );
-    assert_eq!(app.forge_list_phase, ForgePhase::Idle);
-    assert!(app.forge_repo.is_empty());
-    assert_eq!(app.forge_repo_phase, ForgePhase::Idle);
-    assert_eq!(app.forge_item_number, 0);
-    assert_eq!(app.forge_item_phase, ForgePhase::Idle);
-    // The review and comment drafts are the Forge view's: the reset tells
-    // it every draft was consumed, and the code browse it drew goes too.
-    assert_eq!(app.forge_drafts_cleared, 1);
-    assert_eq!(app.forge_drafts_scope, "item");
-    assert!(app.forge_tree_entries.is_empty());
+    // The forge screen is the Forge VIEW's: what the app clears is the link
+    // it last routed there, which named node A, and the note it had in flight.
+    assert!(app.forge_link.is_empty());
+    assert!(app.forge_note_pending.is_empty());
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 

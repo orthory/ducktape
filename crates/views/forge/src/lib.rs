@@ -1,9 +1,11 @@
 //! Forge as a module-owned view: the repo overview, one repo's code, pull
 //! requests and issues, and an item's merge box, reviews and discussion,
-//! drawn from the facts the desktop app pushes. Every act — opening a repo
-//! or an item, a directory or file pick, a review with its staged line
-//! comments, a merge — leaves as an intent the app signs.
+//! all read off the node through the kernel contract. Opening a repo, an
+//! item, a directory or a file is this view's own state and its own read; a
+//! review and a merge leave as `op.submit`, signed by the kernel with the
+//! seated key. The app holds no forge state at all.
 
+pub mod blocks;
 pub mod host;
 
 ui_lang::include_app!("src/ui/app.ice");

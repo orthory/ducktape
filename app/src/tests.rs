@@ -8,7 +8,6 @@ mod canary;
 mod connection;
 mod design;
 mod font_fallback;
-mod forge;
 mod huddle_live;
 mod messages;
 mod rooms;

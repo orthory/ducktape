@@ -744,3 +744,83 @@ fn a_failed_run_shows_its_terminal_state() {
         );
     });
 }
+
+#[test]
+fn notification_reveals_its_message_once_and_keeps_both_sides() {
+    on_a_deep_stack(|| {
+        let mut props = facts();
+        props.active_thread_seq = 1;
+        props.thread_target_seq = 3;
+        props.thread_messages = (1..=5)
+            .map(|seq| message(seq, &format!("reply {seq}")))
+            .collect();
+        props.thread_messages[2].view_key = 300;
+        let (subscription, frame) = shown(&props);
+        let commands: Vec<_> = frame
+            .requests
+            .iter()
+            .filter(|request| request.kind == "host.widget")
+            .map(|request| {
+                ui_lang_guest::wire::decode::<ui_lang_guest::wire::WidgetCommand>(&request.payload)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            matches!(&commands[0], ui_lang_guest::wire::WidgetCommand::ScrollToKey { target, key: 300 } if target.ends_with("chat/thread-pane/thread-stream"))
+        );
+        for text in ["reply 2", "reply 3", "reply 4"] {
+            assert!(has_text(&frame, text));
+        }
+        props.thread_messages.push(message(6, "new reply"));
+        let frame = tick_native(vec![item(subscription, &encoded(&props))]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .all(|request| request.kind != "host.widget")
+        );
+        props.thread_target_seq = 4;
+        let frame = tick_native(vec![item(subscription, &encoded(&props))]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "host.widget")
+        );
+    });
+}
+
+#[test]
+fn history_navigation_reveals_the_root_but_its_action_menu_does_not_scroll() {
+    on_a_deep_stack(|| {
+        let mut props = facts();
+        props.history_view = true;
+        props.selected_message_seq = 1;
+        let (subscription, frame) = shown(&props);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "host.widget")
+        );
+        props.selected_message_seq = 2;
+        let frame = tick_native(vec![item(subscription, &encoded(&props))]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .all(|request| request.kind != "host.widget")
+        );
+        props.loading = true;
+        tick_native(vec![item(subscription, &encoded(&props))]);
+        props.loading = false;
+        let frame = tick_native(vec![item(subscription, &encoded(&props))]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "host.widget")
+        );
+    });
+}

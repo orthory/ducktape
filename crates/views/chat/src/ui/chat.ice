@@ -747,7 +747,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           w=fill
                           h=shrink
                           anchor-y=end
-                          auto=true
+                          auto=!history_view
                           // PREFETCH BEFORE THE HARD STOP. The offset is
                           // relative to the ANCHOR, which is the end here, so
                           // 1.0 is the top of the scrollback — `chat_scrolled`
@@ -1707,13 +1707,13 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                   // the middle of the pane with dead space above it. A channel
                   // is a running feed anchored at now, which is why that one
                   // grows up from its composer and this one does not.
-                  scroll
+                  scroll #thread-stream
                     with
                       dir=vertical
                       w=fill
                       h=fill
                       anchor-y=end
-                      auto=true
+                      auto=(thread_target_seq <= 0)
                     // The 16px right inset doubles as the scrollbar
                     // clearance the code/quote slabs needed (#927).
                     //

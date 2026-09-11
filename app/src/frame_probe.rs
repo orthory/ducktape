@@ -689,9 +689,7 @@ fn live_chat_batches_take_one_shipping_app_message() {
         live_updated.contains("match next.kind"),
         "live_updated must dispatch once on its closed LiveKind"
     );
-    for variant in [
-        "retry", "tip", "ready", "chat", "bell", "forge", "plane", "resync",
-    ] {
+    for variant in ["retry", "tip", "ready", "chat", "bell", "plane", "resync"] {
         assert_eq!(
             live_updated.matches(&format!("LiveKind.{variant}")).count(),
             1,

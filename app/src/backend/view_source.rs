@@ -367,7 +367,7 @@ pub(crate) mod tests {
                             .next()
                             .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
                             .and_then(|ask| {
-                                ask.as_object()?.keys().next().map(String::clone)
+                                ask.as_object()?.keys().next().cloned()
                             });
                         let answered = shape.and_then(|shape| {
                             let views = deployment.index_views.lock().unwrap();

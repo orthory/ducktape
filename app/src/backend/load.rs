@@ -673,28 +673,39 @@ pub(crate) async fn query_thread_page(
     })
 }
 
-pub(crate) async fn load_sparse_thread_data(
+pub(crate) async fn load_target_thread_data(
     rpc: &RpcClient,
     channel_id: &str,
     root_seq: u64,
     target_seq: u64,
 ) -> Result<ThreadData, String> {
-    let root = load_message_at(rpc, channel_id, root_seq).await?;
     let target = load_message_at(rpc, channel_id, target_seq).await?;
     if target.thread != Some(root_seq) {
         return Err("search result does not belong to the selected thread".into());
     }
+    let mut thread = load_thread_data(rpc, channel_id, root_seq).await?;
     let facts = ReaderFacts::current().await;
-    Ok(ThreadData {
-        root_seq: number_i64(root_seq),
-        target_seq: number_i64(target_seq),
-        messages: vec![
-            chat_message(root, facts.reader()),
-            chat_message(target, facts.reader()),
-        ],
-        next_reply_seq: 0,
-        has_more: false,
-    })
+    // Keep the conversation contiguous, including the page after a target
+    // at a page boundary. The cursor still offers any remaining replies.
+    while thread.has_more && thread.next_reply_seq <= number_i64(target_seq) {
+        let page = query_thread_page(
+            rpc,
+            channel_id,
+            root_seq,
+            Some(thread.next_reply_seq as u64),
+        )
+        .await?;
+        thread.messages.extend(
+            page.replies
+                .into_iter()
+                .map(|row| chat_message(row, facts.reader())),
+        );
+        thread.next_reply_seq = number_i64(page.next_reply_seq.unwrap_or(0));
+        thread.has_more = page.has_more;
+    }
+    mark_message_groups(&mut thread.messages[1..]);
+    thread.target_seq = number_i64(target_seq);
+    Ok(thread)
 }
 
 pub(crate) async fn load_thread_data(
