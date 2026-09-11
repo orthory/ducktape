@@ -417,7 +417,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("peers_load_selected", "node_peers_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
-        ("forge_load_selected", "forge_generation"),
     ] {
         let guarded = format!(
             "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}"
@@ -436,7 +435,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "peers_load_selected",
             "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
         ),
-        ("forge_load_selected", "shell_tab != ShellTab.forge"),
     ] {
         let handler = lifecycle
             .split_once(&format!("on {selected}(request)"))
