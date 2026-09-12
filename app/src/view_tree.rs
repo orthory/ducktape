@@ -1251,6 +1251,13 @@ impl ViewTree {
                     options,
                 )
                 .child(content.clone());
+                let intrinsic_label = options.wrapping == Some(wire::Wrapping::None)
+                    && matches!(width, None | Some(wire::Length::Shrink));
+                if intrinsic_label {
+                    // Shrink-sized labels keep their natural width; a Fill
+                    // sibling takes the remaining space, not their letters.
+                    element = element.flex_shrink_0();
+                }
                 if let Some(size) = size {
                     element = element.text_size(px(*size));
                 }
@@ -4106,6 +4113,31 @@ mod tests {
                 ),
             ],
         };
+        let mut header = row.clone();
+        if let wire::Node::Linear { children, .. } = &mut header {
+            *children = vec![
+                text("label", "Pages".into(), None, Some(wire::Wrapping::None)),
+                wire::Node::Space {
+                    width: Some(wire::Length::Fill),
+                    height: None,
+                },
+                text(
+                    "actions",
+                    "New page".into(),
+                    Some(wire::Length::Fixed(100.)),
+                    Some(wire::Wrapping::None),
+                ),
+            ];
+        }
+        let mut reference = row.clone();
+        if let wire::Node::Linear { children, .. } = &mut reference {
+            *children = vec![text(
+                "reference",
+                "Pages".into(),
+                None,
+                Some(wire::Wrapping::None),
+            )];
+        }
         let root = wire::Node::Linear {
             key: "column".into(),
             axis: wire::Axis::Column,
@@ -4119,7 +4151,7 @@ mod tests {
             max_width: Some(620.),
             clip: false,
             wrap: None,
-            children: vec![paragraph, row],
+            children: vec![paragraph, row, reference, header],
         };
         let window = cx.open_window(size(px(800.), px(500.)), |_, _| ViewTree::new(root));
         let tree = window.root(cx).unwrap();
@@ -4129,6 +4161,11 @@ mod tests {
             let paragraph = tree.measured_bounds("paragraph").unwrap();
             let hash = tree.measured_bounds("hash").unwrap();
             let count = tree.measured_bounds("count").unwrap();
+            assert_eq!(
+                tree.measured_bounds("label").unwrap().size.width,
+                tree.measured_bounds("reference").unwrap().size.width,
+                "intrinsic labels cannot lose letters to a Fill spacer"
+            );
             assert!(paragraph.size.width <= px(620.));
             assert!(
                 paragraph.size.height > hash.size.height,
