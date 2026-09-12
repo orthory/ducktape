@@ -3581,7 +3581,7 @@ fn text_options(
     if options.wrapping == Some(wire::Wrapping::None) {
         // A non-wrapping label still owns only its allocated box. In a row,
         // painting the full intrinsic line would cover the following fields.
-        element = element.whitespace_nowrap().overflow_hidden();
+        element = element.truncate();
     }
     element
 }
@@ -4181,6 +4181,10 @@ mod tests {
             },
         );
         assert_eq!(nowrap.style().overflow.x, Some(gpui_kit::Overflow::Hidden));
+        assert!(
+            nowrap.text_style().text_overflow.is_some(),
+            "the native text shaper must truncate glyphs, not only the containing box"
+        );
     }
 
     #[gpui_kit::test]
