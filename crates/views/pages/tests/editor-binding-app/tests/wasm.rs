@@ -98,13 +98,16 @@ fn load(text: &str) -> (Guest, wire::Frame) {
     use wire::editor_document::{EditorDocumentRef, EditorTransferId, EditorTransferSender};
     let mut guest = Guest::open();
     let initial = guest.frame(vec![]);
-    let frame = guest.frame(ducktape_view_guest::testing::press(&initial, "Load document"));
+    let frame = guest.frame(ducktape_view_guest::testing::press(
+        &initial,
+        "Load document",
+    ));
     let request = frame
         .requests
         .iter()
-        .find(|r| r.kind == "pages.document")
+        .find(|r| r.kind == "fixture.document")
         .expect("actual source subscription");
-    let identity: pages_editor_binding_fixture::document_source::DocumentIdentity =
+    let identity: pages_editor_binding_fixture::fixture_source::DocumentIdentity =
         wire::decode(&request.payload).unwrap();
     let source = EditorDocumentRef {
         document: identity.document.clone(),

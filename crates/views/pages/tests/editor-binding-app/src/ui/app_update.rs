@@ -17,7 +17,7 @@ if (item.source != self.source.reference) { return ::ducktape_view_guest::Task::
 { let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.load_error, __ice_next) { self.load_error = __ice_next; self.__ice_rev[6] += 1; } }
 if (!(item.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
 { let __ice_next = item.notice.to_owned(); if ::ducktape_view_guest::state_changed!(self.formatting_notice, __ice_next) { self.formatting_notice = __ice_next; self.__ice_rev[0] += 1; } }
-{ let __reset = self.document.reset_revision(); let __next = crate::document_ingress::document_editor(item.text.to_owned(), item.cursor.clone()); self.document.replace(__next, __reset); }; self.__ice_rev[1] += 1;
+{ let __reset = self.document.reset_revision(); let __next = crate::fixture_source::document_editor(item.text.to_owned(), item.cursor.clone()); self.document.replace(__next, __reset); }; self.__ice_rev[1] += 1;
 { let __ice_next = item.source.clone(); if ::ducktape_view_guest::state_changed!(self.installed_source, __ice_next) { self.installed_source = __ice_next; self.__ice_rev[5] += 1; } }
 { let __ice_next = crate::editor_binding::initial_menu(); if ::ducktape_view_guest::state_changed!(self.menu, __ice_next) { self.menu = __ice_next; self.__ice_rev[3] += 1; } }
 ::ducktape_view_guest::Task::none()
