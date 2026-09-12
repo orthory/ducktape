@@ -1,47 +1,15 @@
 use super::*;
 
-/// A TYPED CHARACTER COSTS ONE VIEW REBUILD, NOT TWO.
-///
-/// iced 0.14 rebuilds the whole UI once per message batch and has no dirty
-/// check. A `keyboard press` with no `status=` fires for keys a focused widget
-/// already CONSUMED, and the message it publishes cannot join the batch that
-/// widget's own message is in — it leaves through the event-loop proxy and
-/// comes back a turn later. So an unfiltered global key subscription charged
-/// every character typed into a composer a SECOND full ChatScreen build+layout,
-/// which `frame_probe`'s keystroke gate could not see: that gate drives the
-/// widget's message alone.
-///
-/// The arbitration is mechanical, so it is pinned rather than commented. Every
-/// `keyboard press` names a `status=`, and the one that takes the CAPTURED half
-/// is gated on the escape ladder's OWN reading of whether a transient layer is
-/// up — iced's single-line input consumes Escape, and that is the only reason
-/// the captured half exists. With no layer open a captured key has nothing to
-/// dismiss, which is exactly the state a reader typing into a composer is in.
-///
-/// Pinned as a SET, for the reason the node streams below are: a `contains` is
-/// equally satisfied by a second, unfiltered subscription sitting beside the
-/// right one.
-///
-/// THE FOURTH ONE IS THE COMMAND CHORDS, AND IT IS ARMED, NOT STANDING. ⌘Q and ⌘W have to
-/// reach the launch window too, so it cannot hide behind the `connected ||
-/// palette_open` gate the first line uses — and a fourth standing subscription
-/// is exactly the second rebuild per character this test exists to refuse. It
-/// pays nothing instead because `cmd_held` gates it: the modifier stream (which
-/// fires only when a modifier moves) arms the press route, so the route does
-/// not exist while anyone is typing. Dropping `when cmd_held` is the regression
-/// — the app would still quit on ⌘Q, and every keystroke would pay for it.
-///
-/// THE FIFTH IS THE CHAT'S ⌘C, armed by the chat tab. It is a separate route
-/// and not an arm on the chord dispatch for exactly the reason above: the
-/// chord's route is armed by ⌘ alone and therefore exists on every screen,
-/// while this one exists only where a copy range can be — the selection itself
-/// is the view's now, so a keystroke typed in Pages, Forge or the console
-/// cannot be taxed by it.
+/// Plain typing must not also dispatch a shell reducer message. The native
+/// pre-action interceptor claims only shell commands in its own window; other
+/// keys return before the reducer. Modifier changes and Chat's copy fallback
+/// remain separate, filtered routes rather than another per-character update.
 #[test]
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert_eq!(shell.matches("Message::GlobalKeyPressed(key)").count(), 1);
-    assert!(shell.contains("ifglobal{this.model.update"));
+    assert!(shell.contains("if!global{return;}Message::GlobalKeyPressed(key)"));
+    assert!(shell.contains("ifwindow.window_handle().window_id()!=window_id{return;}"));
     assert_eq!(
         shell.matches("Message::ModifierStateChanged(").count(),
         1,
