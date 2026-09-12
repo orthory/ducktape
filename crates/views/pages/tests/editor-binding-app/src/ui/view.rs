@@ -73,7 +73,7 @@ __ice_generated_items_5061676573456469746f7246697874757265! {
 #[allow(unused_parens)]
 impl PagesEditorFixture {
 fn __palette(&self) -> __IcePalette {
-__IcePalette { name: "app", colors: [::ducktape_view_guest::wire::Rgba::from_rgba8(255, 255, 255, 1.000000), ::ducktape_view_guest::wire::Rgba::from_rgba8(0, 0, 0, 1.000000), ::ducktape_view_guest::wire::Rgba::from_rgba8(255, 0, 0, 1.000000), ::ducktape_view_guest::wire::Rgba::from_rgba8(255, 0, 255, 1.000000)] }
+__IcePalette { name: "app", colors: [::ducktape_view_guest::wire::Rgba([255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 1.000000]), ::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]), ::ducktape_view_guest::wire::Rgba([255.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]), ::ducktape_view_guest::wire::Rgba([255.0 / 255.0, 0.0 / 255.0, 255.0 / 255.0, 1.000000])] }
 }
 }
 }

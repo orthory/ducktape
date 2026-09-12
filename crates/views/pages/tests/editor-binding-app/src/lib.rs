@@ -15,6 +15,8 @@ pub mod editor;
 pub mod editor_binding;
 #[path = "../../../src/editor_menu.rs"]
 pub mod editor_menu;
+#[path = "../../../src/editor_view.rs"]
+pub mod editor_view;
 pub mod fixture_source;
 pub mod fixture {
     use crate::fixture_source::DocumentSource;
