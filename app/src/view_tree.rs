@@ -16,13 +16,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext as _, Bounds, BoxShadow, Context, CursorStyle, Div,
-    Element, ElementId, Entity, EventEmitter, Focusable as _, FontWeight, GlobalElementId,
-    HighlightStyle, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement as _, IntoElement,
-    LayoutId, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    StrikethroughStyle, Styled, StyledImage as _, StyledText, Subscription, TextLayout,
-    UnderlineStyle, Window, auto, canvas, div, fill, img, point, px, relative, rgb, size, svg,
+    Element, ElementId, Entity, EntityInputHandler as _, EventEmitter, Focusable as _, FollowMode,
+    FontWeight, GlobalElementId, HighlightStyle, HitboxBehavior, Hsla, Image, ImageFormat,
+    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, ListAlignment,
+    ListSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement as _, StrikethroughStyle,
+    Styled, StyledImage as _, StyledText, Subscription, Task, TextLayout, UnderlineStyle, Window,
+    auto, canvas, div, fill, img, point, px, relative, rgb, size, svg,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2156,20 +2157,21 @@ impl ViewTree {
         }
         if let Some(handler) = on_scroll {
             let handler = *handler;
-            element = element.on_scroll_wheel(cx.listener(move |_, event, _, cx| {
-                let (delta, pixels) = match event.delta {
-                    ScrollDelta::Pixels(delta) => {
-                        (point(f32::from(delta.x), f32::from(delta.y)), true)
-                    }
-                    ScrollDelta::Lines(delta) => (delta, false),
-                };
-                cx.emit(wire::Event::Scroll {
-                    handler,
-                    dx: delta.x,
-                    dy: delta.y,
-                    pixels,
-                });
-            }));
+            element =
+                element.on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, _, cx| {
+                    let (delta, pixels) = match event.delta {
+                        ScrollDelta::Pixels(delta) => {
+                            (point(f32::from(delta.x), f32::from(delta.y)), true)
+                        }
+                        ScrollDelta::Lines(delta) => (delta, false),
+                    };
+                    cx.emit(wire::Event::Scroll {
+                        handler,
+                        dx: delta.x,
+                        dy: delta.y,
+                        pixels,
+                    });
+                }));
         }
         element
             .child(self.node(content, window, cx))
@@ -3656,7 +3658,7 @@ mod tests {
             0.0,
             std::f32::consts::TAU,
         );
-        assert_eq!(path.matches('A').count(), 2);
+        assert_eq!(path.as_str().matches('A').count(), 2);
         let pixels = wire::ImageData::Rgba {
             width: 1,
             height: 1,

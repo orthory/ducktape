@@ -7,11 +7,11 @@ use gpui_kit::base::input::{
 };
 use gpui_kit::component::button::Button;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _, EventEmitter,
-    Focusable as _, FontWeight, HighlightStyle, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Subscription,
-    Window, div, point, px,
+    App, AppContext as _, ClipboardItem, Context, Edges, Entity, EntityInputHandler as _,
+    EventEmitter, Focusable as _, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled as _,
+    Subscription, Window, div, point, px,
 };
 use std::{ops::Range, sync::Arc};
 use ui_lang_wire as wire;

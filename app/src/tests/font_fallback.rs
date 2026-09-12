@@ -1,8 +1,8 @@
 //! The shipping platform shaper must keep bundled Latin faces and bounded fallback work.
 use crate::frame_probe::{FRAMES, Phase, headless_context};
-use gpui_kit::{FontWeight, TextRun, TextSystem, font, px};
+use gpui_kit::{FontWeight, TextRun, WindowTextSystem, font, px};
 const WEIGHTS: [FontWeight; 3] = [FontWeight::NORMAL, FontWeight::SEMIBOLD, FontWeight::BOLD];
-fn shape(system: &TextSystem, content: &str, weight: FontWeight) -> gpui_kit::ShapedLine {
+fn shape(system: &WindowTextSystem, content: &str, weight: FontWeight) -> gpui_kit::ShapedLine {
     let mut face = font("Geist");
     face.weight = weight;
     system.shape_line(
@@ -19,6 +19,7 @@ fn shape(system: &TextSystem, content: &str, weight: FontWeight) -> gpui_kit::Sh
 #[test]
 fn non_regular_weights_shape_at_the_regular_fallback_cost() {
     let cx = headless_context();
+    let shaper = WindowTextSystem::new(cx.text_system().clone());
     for content in ["🎉", "♡", "한글", "Channel"] {
         let mut costs = Vec::new();
         for weight in WEIGHTS {
@@ -26,7 +27,7 @@ fn non_regular_weights_shape_at_the_regular_fallback_cost() {
             for index in 0..FRAMES {
                 // Distinct text avoids measuring only the line-layout cache hit.
                 let text = format!("{content} {index}");
-                let shaped = phase.sample(|| shape(cx.text_system(), &text, weight));
+                let shaped = phase.sample(|| shape(&shaper, &text, weight));
                 assert!(!shaped.runs.is_empty());
                 assert!(shaped.width() > px(0.));
             }
@@ -45,8 +46,9 @@ fn non_regular_weights_shape_at_the_regular_fallback_cost() {
 #[test]
 fn latin_text_at_every_weight_is_shaped_with_geist() {
     let cx = headless_context();
+    let shaper = WindowTextSystem::new(cx.text_system().clone());
     for weight in WEIGHTS {
-        let line = shape(cx.text_system(), "Channel", weight);
+        let line = shape(&shaper, "Channel", weight);
         assert!(!line.runs.is_empty());
         for run in &line.runs {
             let face = cx
