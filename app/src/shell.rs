@@ -320,10 +320,11 @@ impl Desktop {
             });
             opened_view = Some(view.downgrade());
             let closing = view.downgrade();
-            window.on_window_should_close(cx, move |_, cx| {
+            window.on_window_should_close(cx, move |window, cx| {
                 let _ = closing.update(cx, |this, cx| {
                     this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
                 });
+                release_window_input(window, cx);
                 true
             });
             cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
@@ -357,7 +358,12 @@ impl Desktop {
                 this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
             });
         }
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                release_window_input(window, cx);
+                window.remove_window();
+            });
+        });
         self.dispatch(Message::WindowWasClosed(key), cx);
     }
 
@@ -378,8 +384,22 @@ impl Desktop {
     }
 
     fn quit(&mut self, cx: &mut Context<Self>) {
-        cx.quit();
+        let windows = self.windows.values().copied().collect::<Vec<_>>();
+        cx.defer(move |cx| {
+            for handle in windows {
+                let _ = handle.update(cx, |_, window, cx| release_window_input(window, cx));
+            }
+            cx.quit();
+        });
     }
+}
+
+fn release_window_input(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    // A platform window can outlive its GPUI window during asynchronous native
+    // teardown. Complete the blur frame first so it no longer holds an input
+    // handler (and therefore a strong entity reference) when teardown begins.
+    window.blur(cx);
+    window.draw(cx).clear(cx);
 }
 
 pub(crate) struct DesktopWindow {
@@ -1706,6 +1726,37 @@ pub(crate) fn test_window(
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn closing_a_focused_native_input_releases_its_handler(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update(gpui_kit::init);
+        let mut presenter = None;
+        let handle = cx.open_window(gpui_kit::size(gpui_kit::px(600.), gpui_kit::px(700.)), |window, cx| {
+            let mut state = Ducktape::initial_state();
+            state.hub_step = crate::HubStep::Networks;
+            let view = test_window(state, WindowKind::Onboarding, window, cx);
+            presenter = Some(view.downgrade());
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        handle.update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("remote", cx);
+            window.render_frame(cx);
+            window.input("typing-before-close", cx);
+        }).unwrap();
+        let presenter = presenter.unwrap();
+        let input = presenter.update(cx, |view, _| view.inputs["remote"].state.downgrade()).unwrap();
+        handle.update(cx, |_, window, cx| {
+            assert!(input.upgrade().unwrap().read(cx).focus_handle(cx).is_focused(window));
+            release_window_input(window, cx);
+            assert!(window.focused(cx).is_none());
+            window.remove_window();
+        }).unwrap();
+        cx.run_until_parked();
+        assert!(presenter.upgrade().is_none());
+        assert!(input.upgrade().is_none(), "native input handler cannot retain the closed window's input");
+    }
 
     #[test]
     fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers() {
