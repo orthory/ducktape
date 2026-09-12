@@ -14,12 +14,8 @@ design = { path = "../../../support/design" }
 ui-lang-wire = { workspace = true }
 iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
 serde = { version = "1", features = ["derive"] }
-ui-lang = { workspace = true }
 ui-lang-guest = { workspace = true }
 ui-lang-runtime = { workspace = true }
-
-[build-dependencies]
-ui-lang-build = { workspace = true }
 
 [features]
 host-verification = ["dep:wasmtime"]

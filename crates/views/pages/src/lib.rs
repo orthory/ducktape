@@ -20,7 +20,7 @@ pub mod markdown;
 #[path = "editor_presentation.rs"]
 pub mod presentation;
 
-ui_lang::include_app!("src/ui/app.ice");
+include!("ui/view.rs");
 
 ui_lang_guest::export_app!(
     PagesView,

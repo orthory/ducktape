@@ -1,0 +1,62 @@
+#[allow(warnings, clippy::all)]
+mod __ice_group_app_view {
+use super::*;
+impl super::PagesEditorFixture {
+pub(super) fn __view(&self) -> __IceElement<'_, __PagesEditorFixtureMessage> { let __ice_view = ::ui_lang_runtime::dev::Span::view("PagesEditorFixture", "src/ui/app.ice:69"); let __ice_palette = self.__palette(); let __ice_app_theme = Self::__app_theme(__ice_palette); let __ice_content: __IceElement<'_, __PagesEditorFixtureMessage> = {
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 69, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __PagesEditorFixtureMessage>> = ::std::vec::Vec::new(); __children.push({
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 70, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = { let __ice_node_scope = format!("{}/document", "PagesEditorFixture"); { let __editor = &(self.document); let (__document, __on_document) = __editor.document(("app:document").to_owned(), __PagesEditorFixtureMessage::__EditDocument as fn(::ui_lang_guest::EditorDocumentUpdate) -> __PagesEditorFixtureMessage); ::ui_lang_guest::wire::Node::Editor { options: ::std::boxed::Box::new(::ui_lang_guest::wire::EditorOptions { binding: ::std::option::Option::Some(::std::boxed::Box::new(crate::editor_binding::keys(self.history.clone(), self.menu.clone()).register({  move |__value| __PagesEditorFixtureMessage::Committed(__value) }, __PagesEditorFixtureMessage::__0T646f63756d656e74))), presentation: { let __presentation = crate::presentation::paint(__editor.state_view(), self.menu.clone(), self.paint_dark, self.commented.clone(), true); __presentation.validate(__editor.state_view().text).expect("invalid editor presentation"); Some(::std::boxed::Box::new(__presentation)) }, size: ::std::option::Option::None, padding: ::std::option::Option::None, line_height: ::std::option::Option::None, wrapping: ::std::option::Option::None, font: ::std::option::Option::None, style: ::ui_lang_guest::wire::InputStyle { active: ::std::default::Default::default(), hovered: ::std::option::Option::None, focused: ::std::option::Option::None, focused_hovered: ::std::option::Option::None, disabled: ::std::option::Option::None, ..::std::default::Default::default() } }), key: __ice_node_scope.clone(), placeholder: ::std::string::String::new(), document: __document, on_document: __on_document, editable: true, width: ::std::option::Option::Some((640.0) as f32), height: ::std::option::Option::None, min_height: ::std::option::Option::Some((240.0) as f32), max_height: ::std::option::Option::Some((240.0) as f32) } } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}); if (64000 > (((self.document).text()).len() as i64)) { __children.push({
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 78, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = { let __ice_node_scope = format!("{}/echo", "PagesEditorFixture"); ::ui_lang_guest::wire::Node::Text { options: ::ui_lang_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::None, tracking: 0.0f32, font: ::std::option::Option::None }, key: __ice_node_scope.clone(), size: ::std::option::Option::None, color: ::std::option::Option::None, font: ::ui_lang_guest::wire::Font { monospace: false, weight: ::ui_lang_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ((self.document).text()).to_string() } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}); } __children.push({
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 79, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = { let __ice_node_scope = format!("{}/formatting-notice", "PagesEditorFixture"); ::ui_lang_guest::wire::Node::Text { options: ::ui_lang_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::None, tracking: 0.0f32, font: ::std::option::Option::None }, key: __ice_node_scope.clone(), size: ::std::option::Option::None, color: ::std::option::Option::None, font: ::ui_lang_guest::wire::Font { monospace: false, weight: ::ui_lang_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (self.formatting_notice.to_owned()).to_string() } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}); __children.push({
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 80, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = { let __ice_node_scope = format!("{}/load-error", "PagesEditorFixture"); ::ui_lang_guest::wire::Node::Text { options: ::ui_lang_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::None, tracking: 0.0f32, font: ::std::option::Option::None }, key: __ice_node_scope.clone(), size: ::std::option::Option::None, color: ::std::option::Option::None, font: ::ui_lang_guest::wire::Font { monospace: false, weight: ::ui_lang_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (self.load_error.to_owned()).to_string() } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}); __children.push({
+#[cfg(test)]
+let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("src/ui/app.ice", 81, 1, "rendered view node");
+#[cfg(test)]
+let __ice_render_source = ::ui_lang_runtime::testing::push_render_source(__ice_render_source_location);
+let __ice_rendered: __IceElement<'_, __PagesEditorFixtureMessage> = ::ui_lang_guest::wire::Node::Button { checked: ::std::option::Option::None, expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:81", "PagesEditorFixture"), content: ::ui_lang_guest::wire::ButtonContent::Label(::std::string::String::from("Load document")), label: ::std::option::Option::None, on_press: ::std::option::Option::Some(::ui_lang_guest::slots::message(__PagesEditorFixtureMessage::Load)), width: ::std::option::Option::None, height: ::std::option::Option::None, padding: ::std::option::Option::None, style: ::ui_lang_guest::wire::ButtonStyle { preset: ::ui_lang_guest::wire::ButtonPreset::Primary, recipe: None, active: ::ui_lang_guest::wire::Face::default(), hovered: ::std::option::Option::None, pressed: ::std::option::Option::None, disabled: ::std::option::Option::None } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}); ::ui_lang_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:69", "PagesEditorFixture"), wrap: None, axis: ::ui_lang_guest::wire::Axis::Column, spacing: ::std::option::Option::Some((8.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ui_lang_guest::wire::Length::Fixed((640.0) as f32)), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
+#[cfg(test)]
+drop(__ice_render_source);
+__ice_rendered
+}; let __ice_root: __IceElement<'_, __PagesEditorFixtureMessage> = __ice_content; __ice_root }
+
+}
+}
