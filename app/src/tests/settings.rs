@@ -24,32 +24,7 @@ fn pane_arms() -> Vec<(String, String)> {
 }
 
 fn authored_items() -> syn::File {
-    let mut file = syn::parse_file(SETTINGS).unwrap();
-    let items = file
-        .items
-        .iter()
-        .flat_map(|item| match item {
-            syn::Item::Macro(item)
-                if item
-                    .mac
-                    .path
-                    .segments
-                    .last()
-                    .unwrap()
-                    .ident
-                    .to_string()
-                    .starts_with("__ice_generated_items_") =>
-            {
-                syn::parse2::<syn::File>(item.mac.tokens.clone())
-                    .unwrap()
-                    .items
-            }
-            _ => vec![item.clone()],
-        })
-        .collect::<Vec<_>>();
-    assert!(!items.is_empty(), "authored item wrappers");
-    file.items = items;
-    file
+    syn::parse_file(SETTINGS).unwrap()
 }
 
 fn pane_arms_on_stack() -> Vec<(String, String)> {
@@ -186,14 +161,14 @@ fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
 #[test]
 fn the_pane_moves_only_through_the_strip() {
     let source = rust_tokens(SETTINGS);
-    assert_eq!(source.matches("__local.settings_pane=").count(), 1);
-    assert!(source.contains("let__ice_next=picked.clone();__local.settings_pane=__ice_next"));
+    assert_eq!(source.matches("local.settings_pane=").count(), 1);
+    assert!(source.contains("local.settings_pane=picked.clone()"));
     assert!(!source.contains("emit_pick_pane"));
 }
 
 #[test]
 fn the_scrollable_is_the_screens_root() {
     let source = rust_tokens(SETTINGS);
-    assert!(source.contains("let__ice_node_scope=format!(\"{}/settings-body\""));
+    assert!(source.contains("format!(\"{}/settings-body\""));
     assert!(source.contains("Node::Scroll{on_scroll:"));
 }

@@ -190,7 +190,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     assert!(tree.contains("background"));
     let chat = rust_tokens(super::connection::CHAT);
     assert!(chat.contains("selected"));
-    assert!(chat.contains("row_hover") || chat.contains("__ice_palette"));
+    assert!(chat.contains("row_hover") || chat.contains("palette"));
 }
 #[test]
 fn every_repeated_component_mount_is_culled_or_argued() {

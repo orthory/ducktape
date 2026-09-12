@@ -55,7 +55,7 @@ fn branches_on_stack(source: &str) -> Vec<(String, String, usize)> {
 /// THE ZERO-HIT PLATE SPEAKS FOR A QUERY, AND A BOOL COULD NOT CARRY ONE —
 /// page search is enter-to-submit with no `change=` route, so a keystroke runs
 /// no handler and only `trim(draft) == query` can retire the plate (the full
-/// rationale lives on the plate arm in the view's own `pages.ice`). The query's
+/// rationale lives on the plate arm in the Pages guest). The query's
 /// lifetime is the pages view's own state now; what the app still pins is the
 /// SHAPE of the arm that reads it, on both surfaces that render a page hit.
 #[test]
@@ -144,7 +144,7 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     let source = rust_tokens(EXPLORER);
     assert!(
-        source.contains("let__ice_next=(self.query).trim().to_owned();self.sent_query=__ice_next")
+        source.contains("self.sent_query=(self.query).trim().to_owned()")
     );
     assert!(source.contains("workspace_search(") && source.contains("self.sent_query.to_owned()"));
     let condition = branches(EXPLORER)
@@ -162,7 +162,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     ] {
         assert!(condition.contains(field));
     }
-    assert!(source.contains("let__ice_next=\"\".to_owned();self.sent_query=__ice_next"));
+    assert!(source.contains("self.sent_query=\"\".to_owned()"));
 }
 
 /// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
@@ -551,7 +551,7 @@ fn check_disconnected_registers() {
     let mut requires_connection: BTreeSet<_> = methods
         .0
         .iter()
-        .filter(|(name, reading)| name.as_str() != "__view" && reading.reads)
+        .filter(|(name, reading)| name.as_str() != "view" && reading.reads)
         .map(|(name, _)| name.clone())
         .collect();
     assert!(
@@ -577,7 +577,7 @@ fn check_disconnected_registers() {
         requires_connection.extend(inherited);
     }
     assert!(
-        !requires_connection.contains("__view"),
+        !requires_connection.contains("view"),
         "a disconnected entrypoint reaches an ungated register-reading component"
     );
 }
@@ -591,24 +591,6 @@ fn check_disconnected_registers() {
 fn every_header_subtitle_is_gated_on_the_connection() {
     struct Summaries(Vec<String>);
     impl<'ast> Visit<'ast> for Summaries {
-        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-            if !item.sig.ident.to_string().starts_with("__ui_lang_check_") {
-                syn::visit::visit_item_fn(self, item);
-            }
-        }
-        fn visit_macro(&mut self, item: &'ast syn::Macro) {
-            if item
-                .path
-                .segments
-                .last()
-                .unwrap()
-                .ident
-                .to_string()
-                .starts_with("__ice_generated_items_")
-            {
-                self.visit_file(&syn::parse2(item.tokens.clone()).unwrap());
-            }
-        }
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             if let syn::Expr::Path(path) = call.func.as_ref() {
                 if path
@@ -730,7 +712,7 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     );
 
     let failure = handler_body("ConnectFailed");
-    assert!(failure.contains("self.hydration_retry_attempt=(self.hydration_retry_attempt+1)"));
+    assert!(failure.contains("self.hydration_retry_attempt=self.hydration_retry_attempt+1"));
     assert!(
         failure.contains("crate::backend::connect(") && failure.contains("self.connect_generation")
     );
@@ -779,7 +761,7 @@ fn the_clear_search_button_survives_a_zero_hit_result() {
 // moment they are written, and names them. CLAUDE.md's own rule: guard a
 // load-bearing shape with a lint, not a comment.
 //
-// Both sweeps walk the whole `.ice` view tree rather than a list of files,
+// Both sweeps walk the authored Rust view tree rather than rendered text,
 // and both carry an allowlist that must stay LIVE — an entry matching nothing
 // fails the test, so the ledger cannot rot into a blanket exemption.
 // ===========================================================================
