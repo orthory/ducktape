@@ -5103,6 +5103,37 @@ pub(crate) mod tests {
         }
     }
 
+    #[gpui_kit::test]
+    fn replacement_inputs_restore_selection_only_for_identical_values_and_fresh_handlers(cx: &mut TestAppContext) {
+        let input = |value: &str, secure, handler| wire::Node::Input {
+            options: Default::default(), key: "draft".into(), placeholder: String::new(),
+            value: value.into(), on_input: handler, on_submit: None, width: None,
+            secure, style: Box::default(),
+        };
+        let (old, mut old_window) = native_tree(input("가🙂나", false, 1), gpui::size(gpui::px(300.),gpui::px(100.)),cx);
+        native_command(&old,&mut old_window,wire::WidgetCommand::Focus {target:"draft".into()}).unwrap();
+        native_command(&old,&mut old_window,wire::WidgetCommand::Select {target:"draft".into(),start:1,end:2}).unwrap();
+        for (value,secure,restore) in [("가🙂나",false,true),("changed",false,false),("가🙂나",true,false)] {
+            let saved = old_window.update(|window,cx|old.read(cx).presentation(window,cx));
+            let root = input(value,secure,77);
+            let window = cx.open_window(gpui::size(gpui::px(300.),gpui::px(100.)),|_,_| {
+                crate::view_tree::ViewTree::new(root).with_presentation(saved)
+            });
+            let view = window.root(cx).unwrap();
+            let mut native = VisualTestContext::from_window(window.into(),cx);
+            native.update(|window,cx|window.render_frame(cx));
+            let focused: bool = wire::decode(&native_command(&view,&mut native,wire::WidgetCommand::Focused {target:"draft".into()}).unwrap()).unwrap();
+            assert_eq!(focused,restore,"restore requires exact source and masking");
+            if !restore {continue}
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = events.clone();
+            let _subscription = native.update(|_,cx|cx.subscribe(&view,move|_,event:&wire::Event,_|observed.borrow_mut().push(event.clone())));
+            native.simulate_input("X");
+            assert!(events.borrow().iter().any(|event|matches!(event,wire::Event::Input {handler:77,text} if text == "가X나")));
+            assert!(!events.borrow().iter().any(|event|matches!(event,wire::Event::Input {handler:1,..})));
+        }
+    }
+
     #[test]
     fn widget_requests_validate_scope_payload_budget_and_frame() {
         let path = staged("pages").expect("actual Pages Wasm is required");
