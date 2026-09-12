@@ -32,6 +32,9 @@ struct SensorState {
     reset: Option<wire::SurfaceValue>,
     size: Option<Size<Pixels>>,
     on_hide: Option<u32>,
+    on_show: Option<u32>,
+    on_resize: Option<u32>,
+    pending: Option<(Size<Pixels>, Task<()>)>,
 }
 
 struct EditorMount {
@@ -256,6 +259,8 @@ impl ViewTree {
             on_input,
             on_submit,
             options,
+            width,
+            style,
             ..
         } = node
         else {
@@ -332,11 +337,32 @@ impl ViewTree {
                 .state
                 .update(cx, |state, cx| state.set_masked(*secure, window, cx));
         }
-        Input::new(&field.state)
+        let input = Input::new(&field.state)
             .id(key.clone())
             .aria_label(options.label.clone())
-            .disabled(options.disabled)
-            .into_any_element()
+            .disabled(options.disabled);
+        let face = match options.disabled {
+            true => style.disabled.unwrap_or(style.active),
+            false => style.active,
+        };
+        let mut input = decoration(
+            pad(dimensions(input, *width, None), options.padding),
+            style.utility.background.or(face.background),
+            style.utility.border.or(face.border),
+        );
+        if let Some(color) = style.utility.value.or(face.value) {
+            input = input.text_color(rgba(color));
+        }
+        if let Some(size) = options.text_size {
+            input = input.text_size(px(size));
+        }
+        if let Some(height) = options.line_height {
+            input = input.line_height(relative(height));
+        }
+        if let Some(font) = &options.font {
+            input = input.font_weight(font_weight(font.weight));
+        }
+        input.into_any_element()
     }
 
     fn node(
@@ -807,6 +833,7 @@ impl ViewTree {
                 on_resize,
                 on_hide,
                 anticipate,
+                delay,
                 child,
                 ..
             } => {
@@ -814,16 +841,24 @@ impl ViewTree {
                     reset: reset.clone(),
                     size: None,
                     on_hide: *on_hide,
+                    on_show: *on_show,
+                    on_resize: *on_resize,
+                    pending: None,
                 });
                 if sensor.reset != *reset {
                     sensor.reset = reset.clone();
                     sensor.size = None;
+                    sensor.pending = None;
                 }
                 sensor.on_hide = *on_hide;
+                sensor.on_show = *on_show;
+                sensor.on_resize = *on_resize;
                 let route = key.clone();
                 let show = *on_show;
                 let resize = *on_resize;
                 let anticipate = px(anticipate.unwrap_or_default());
+                let delay =
+                    std::time::Duration::from_secs_f32(delay.unwrap_or_default().max(0.0) / 1000.0);
                 let weak = cx.entity().downgrade();
                 let measure = canvas(
                     move |bounds, window, cx| {
@@ -838,11 +873,59 @@ impl ViewTree {
                                 return;
                             };
                             if !visible {
+                                sensor.pending = None;
                                 if sensor.size.take().is_some() {
                                     if let Some(message) = sensor.on_hide {
                                         cx.emit(wire::Event::Message(message));
                                     }
                                 }
+                                return;
+                            }
+                            let unchanged = sensor.size == Some(bounds.size);
+                            if unchanged {
+                                sensor.pending = None;
+                                return;
+                            }
+                            if !delay.is_zero() {
+                                let waiting = sensor
+                                    .pending
+                                    .as_ref()
+                                    .is_some_and(|(size, _)| *size == bounds.size);
+                                if waiting {
+                                    return;
+                                }
+                                let route = route.clone();
+                                let size = bounds.size;
+                                let timer = cx.background_executor().timer(delay);
+                                let pending = cx.spawn(async move |this, cx| {
+                                    timer.await;
+                                    let _ = this.update(cx, |this, cx| {
+                                        let Some(sensor) = this.sensors.get_mut(&route) else {
+                                            return;
+                                        };
+                                        let current = sensor
+                                            .pending
+                                            .as_ref()
+                                            .is_some_and(|(pending, _)| *pending == size);
+                                        if !current {
+                                            return;
+                                        }
+                                        let handler = match sensor.size {
+                                            None => sensor.on_show,
+                                            Some(_) => sensor.on_resize,
+                                        };
+                                        sensor.size = Some(size);
+                                        sensor.pending = None;
+                                        if let Some(handler) = handler {
+                                            cx.emit(wire::Event::Size {
+                                                handler,
+                                                width: f32::from(size.width),
+                                                height: f32::from(size.height),
+                                            });
+                                        }
+                                    });
+                                });
+                                sensor.pending = Some((size, pending));
                                 return;
                             }
                             let handler = match sensor.size {
@@ -968,11 +1051,19 @@ impl ViewTree {
                     }))
                     .into_any_element()
             }
-            Node::Tooltip { key, children, .. } => {
+            Node::Tooltip {
+                key,
+                children,
+                delay_ms,
+                ..
+            } => {
                 let Some(content) = children.first() else {
                     return div().into_any_element();
                 };
-                let mut element = div().id(key.clone()).child(self.node(content, window, cx));
+                let mut element = div()
+                    .id(key.clone())
+                    .tooltip_show_delay(std::time::Duration::from_millis(*delay_ms))
+                    .child(self.node(content, window, cx));
                 if let Some(tip) = children.get(1) {
                     let tip = tip.clone();
                     element =
@@ -985,7 +1076,7 @@ impl ViewTree {
                 content,
                 x,
                 y,
-                scale,
+                scale: _,
                 shadow,
                 radius,
             } => {
@@ -1019,9 +1110,11 @@ impl ViewTree {
                         }),
                     );
                 }
-                let _ = scale;
-                element
-                    .child(self.node(content, window, cx))
+                // Authored floating rails use unit scale; their measurement is
+                // outside the translated child to avoid positional feedback.
+                div()
+                    .relative()
+                    .child(element.child(self.node(content, window, cx)))
                     .child(self.measure(key, cx))
                     .into_any_element()
             }
@@ -1108,6 +1201,7 @@ impl ViewTree {
                 background,
                 border,
                 clip,
+                under,
                 ..
             } => {
                 let mut element = decoration(
@@ -1118,10 +1212,14 @@ impl ViewTree {
                 if *clip {
                     element = element.overflow_hidden();
                 }
+                if *under == 0 {
+                    element = element.grid().grid_cols(1).grid_rows(1);
+                }
                 for (index, child) in children.iter().enumerate() {
                     let content = self.node(child, window, cx);
-                    element = match index {
-                        0 => element.child(content),
+                    element = match (*under, index) {
+                        (0, _) => element.child(div().col_start(1).row_start(1).child(content)),
+                        (base, index) if index == base as usize => element.child(content),
                         _ => element.child(div().absolute().inset_0().child(content)),
                     };
                 }
@@ -1637,6 +1735,21 @@ impl ViewTree {
         if let Some(alignment) = layout.items {
             element = align_items(element, alignment);
         }
+        if let Some(alignment) = layout.content {
+            element = match alignment {
+                wire::FlexContentAlignment::Start | wire::FlexContentAlignment::FlexStart => {
+                    element.content_start()
+                }
+                wire::FlexContentAlignment::End | wire::FlexContentAlignment::FlexEnd => {
+                    element.content_end()
+                }
+                wire::FlexContentAlignment::Center => element.content_center(),
+                wire::FlexContentAlignment::SpaceBetween => element.content_between(),
+                wire::FlexContentAlignment::SpaceAround => element.content_around(),
+                wire::FlexContentAlignment::SpaceEvenly => element.content_evenly(),
+                wire::FlexContentAlignment::Stretch => element.content_stretch(),
+            };
+        }
         let mut order: Vec<_> = children.iter().enumerate().collect();
         order.sort_by_key(|(index, _)| items.get(*index).map_or(0, |item| item.order));
         for (index, child) in order {
@@ -1649,10 +1762,36 @@ impl ViewTree {
                     wire::FlexBasis::Fixed(value) => Some(px(value).into()),
                     wire::FlexBasis::Percent(value) => Some(relative(value / 100.0).into()),
                 };
+                if let Some(alignment) = rules.align {
+                    item = match alignment {
+                        wire::FlexItemAlignment::Start => item.self_start(),
+                        wire::FlexItemAlignment::FlexStart => item.self_flex_start(),
+                        wire::FlexItemAlignment::End => item.self_end(),
+                        wire::FlexItemAlignment::FlexEnd => item.self_flex_end(),
+                        wire::FlexItemAlignment::Center => item.self_center(),
+                        wire::FlexItemAlignment::Baseline => item.self_baseline(),
+                        wire::FlexItemAlignment::Stretch => item.self_stretch(),
+                    };
+                }
+                let margin = |value| match value {
+                    wire::FlexMargin::Zero => px(0.0).into(),
+                    wire::FlexMargin::Auto => auto(),
+                    wire::FlexMargin::Fixed(value) => px(value).into(),
+                    wire::FlexMargin::Percent(value) => relative(value / 100.0).into(),
+                };
+                item = item
+                    .mt(margin(rules.margins.top))
+                    .mr(margin(rules.margins.right))
+                    .mb(margin(rules.margins.bottom))
+                    .ml(margin(rules.margins.left));
             }
             element = element.child(item.child(self.node(child, window, cx)));
         }
-        element.into_any_element()
+        let mut outer = dimensions(div(), layout.surface_width, layout.surface_height);
+        if let Some(width) = layout.surface_max_width {
+            outer = outer.max_w(px(width));
+        }
+        outer.child(element).into_any_element()
     }
 
     fn remember_image(&mut self, hash: u64, data: &wire::ImageData) {
