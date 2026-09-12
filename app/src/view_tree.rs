@@ -4099,18 +4099,14 @@ mod tests {
             clip: false,
             wrap: None,
             children: vec![
+                text("height", "17968".into(), None, Some(wire::Wrapping::None)),
                 text(
                     "hash",
                     "0123456789abcdef".repeat(4),
                     Some(wire::Length::Fill),
                     Some(wire::Wrapping::None),
                 ),
-                text(
-                    "count",
-                    "12 ops".into(),
-                    Some(wire::Length::Fixed(60.)),
-                    Some(wire::Wrapping::None),
-                ),
+                text("count", "12 ops".into(), None, Some(wire::Wrapping::None)),
             ],
         };
         let mut header = row.clone();
@@ -4161,6 +4157,7 @@ mod tests {
             let paragraph = tree.measured_bounds("paragraph").unwrap();
             let hash = tree.measured_bounds("hash").unwrap();
             let count = tree.measured_bounds("count").unwrap();
+            assert!(tree.measured_bounds("height").unwrap().right() <= hash.left());
             assert_eq!(
                 tree.measured_bounds("label").unwrap().size.width,
                 tree.measured_bounds("reference").unwrap().size.width,
