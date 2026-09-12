@@ -12,7 +12,9 @@ use std::{
 };
 
 pub(super) fn deliver(guest: &mut Guest, event: wire::Event) -> bool {
-    match event {
+    #[cfg(test)]
+    let observed = event.clone();
+    let admitted = match event {
         wire::Event::Mouse { event, captured } => mouse(guest, event, captured),
         wire::Event::Observation { event, captured } => {
             if !guest.frame.event_interest.accepts(&event) || event.validate().is_err() {
@@ -27,7 +29,29 @@ pub(super) fn deliver(guest: &mut Guest, event: wire::Event) -> bool {
             guest.pending.push(event);
             true
         }
+    };
+    #[cfg(test)]
+    if admitted {
+        RECORDED.with_borrow_mut(|events| {
+            if let Some(events) = events {
+                events.push(observed);
+            }
+        });
     }
+    admitted
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED: RefCell<Option<Vec<wire::Event>>> = const { RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn record_inputs() {
+    RECORDED.with_borrow_mut(|events| *events = Some(Vec::new()));
+}
+#[cfg(test)]
+pub(super) fn recorded_inputs() -> Vec<wire::Event> {
+    RECORDED.with_borrow_mut(|events| events.take().expect("input recording started"))
 }
 pub(super) fn mouse(guest: &mut Guest, event: wire::mouse::Event, captured: bool) -> bool {
     if !guest.frame.mouse_interest {

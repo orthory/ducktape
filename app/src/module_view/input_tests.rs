@@ -111,20 +111,17 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
             };
             guest.frame.mouse_interest = true;
         }
-        let button_bounds = native.update(|window, _| window.find(key.clone()).bounds());
+        input::record_inputs();
         click_before_frame(&mut native, key);
+        let delivered = input::recorded_inputs();
         {
-            let locked = seat.lock().unwrap();
-            let Slot::Ready(guest) = &locked.slot else {
-                unreachable!()
-            };
-            let routed = guest
-                .pending
+            // GPUI flushes dirty test windows before update returns. Observe
+            // admitted events, not a queue that the real guest already drained.
+            let routed = delivered
                 .iter()
                 .position(|event| matches!(event, wire::Event::Message(_)))
-                .unwrap_or_else(|| panic!("popup {label:?} at {button_bounds:?} queues route; pending={:?}", guest.pending));
-            let observed = guest
-                .pending
+                .unwrap_or_else(|| panic!("popup {label:?} routes: {delivered:?}"));
+            let observed = delivered
                 .iter()
                 .position(|event| {
                     matches!(
