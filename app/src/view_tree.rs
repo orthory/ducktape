@@ -2,6 +2,7 @@
 //! input state; interaction uses the same semantic events the guests consume.
 
 use gpui_kit::component::radio::Radio;
+use gpui_kit::MouseUpEvent;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
     Disableable,
