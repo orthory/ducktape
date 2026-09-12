@@ -111,6 +111,7 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
             };
             guest.frame.mouse_interest = true;
         }
+        let button_bounds = native.update(|window, _| window.find(key.clone()).bounds());
         click_before_frame(&mut native, key);
         {
             let locked = seat.lock().unwrap();
@@ -121,7 +122,7 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
                 .pending
                 .iter()
                 .position(|event| matches!(event, wire::Event::Message(_)))
-                .expect("popup queues route");
+                .unwrap_or_else(|| panic!("popup {label:?} at {button_bounds:?} queues route; pending={:?}", guest.pending));
             let observed = guest
                 .pending
                 .iter()
