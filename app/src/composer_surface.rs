@@ -398,6 +398,42 @@ impl ComposerView {
             editor.marked_text_range(window, cx).is_some()
         })
     }
+    fn native_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        let menu_open = self.menu(cx).is_some();
+        let claims = menu_open && matches!(key, "up" | "down" | "tab" | "escape") || key == "enter";
+        if claims {
+            self.key_down(
+                &KeyDownEvent {
+                    keystroke: Keystroke {
+                        key: key.into(),
+                        key_char: None,
+                        modifiers: Default::default(),
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        if matches!(key, "backspace" | "delete") {
+            let selected = expand_selection(
+                self.selection(cx),
+                &lock(&self.shared).document.mentions,
+                Some(key),
+            );
+            self.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(selected.clone(), cx)
+            });
+            self.edit_anchor = Some(selected);
+        }
+        cx.propagate();
+    }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.composing(window, cx) {
             return;
@@ -615,51 +651,30 @@ impl ComposerView {
         }
     }
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.args.blocked {
-            return;
-        }
-        let body = {
-            let slot = lock(&self.shared);
-            mention_body(&slot.document.text, &slot.document.mentions)
-                .trim()
-                .to_owned()
+        let submitted = {
+            let mut slot = lock(&self.shared);
+            let value = submit_document(
+                &mut slot.document,
+                &self.args.scope,
+                &self.args.kind,
+                self.args.blocked,
+            );
+            if value.is_some() {
+                slot.rev += 1;
+            }
+            value
         };
-        if body.is_empty() {
-            return;
+        if let Some(value) = submitted {
+            self.sync(window, cx);
+            cx.emit(value);
         }
-        if !matches!(self.args.kind.as_str(), "edit" | "thread_edit") {
-            let len = lock(&self.shared).document.text.len();
-            self.replace_selection(0..len, String::new(), Vec::new(), window, cx);
-        }
-        let prefix = if self.args.kind == "reply" {
-            "reply"
-        } else {
-            "message"
-        };
-        cx.emit(Value::Record {
-            name: "composer".into(),
-            fields: vec![
-                ("scope".into(), Value::Str(self.args.scope.clone())),
-                ("kind".into(), Value::Str(self.args.kind.clone())),
-                ("body".into(), Value::Str(body)),
-                (
-                    "id".into(),
-                    Value::Str(crate::backend::fresh_operation_id(prefix.into())),
-                ),
-            ],
-        });
     }
     fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         {
             let mut slot = lock(&self.shared);
-            let unavailable = self.args.restore_blocked
-                || slot.document.failed.is_empty()
-                || !slot.document.text.trim().is_empty();
-            if unavailable {
+            if !restore_failed(&mut slot.document, self.args.restore_blocked) {
                 return;
             }
-            let body = std::mem::take(&mut slot.document.failed);
-            restore_document(&mut slot.document, &body);
             slot.focus_pending = true;
             slot.rev += 1;
         }
@@ -685,6 +700,45 @@ impl Render for ComposerView {
             .w_full()
             .gap(px(8.))
             .capture_key_down(cx.listener(Self::key_down))
+            .capture_action(cx.listener(
+                |this, action: &gpui_kit::component::input::Enter, window, cx| {
+                    if action.shift || action.secondary {
+                        cx.propagate();
+                    } else {
+                        this.native_key("enter", window, cx);
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::MoveUp, window, cx| {
+                    this.native_key("up", window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::MoveDown, window, cx| {
+                    this.native_key("down", window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Indent, window, cx| {
+                    this.native_key("tab", window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Escape, window, cx| {
+                    this.native_key("escape", window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Backspace, window, cx| {
+                    this.native_key("backspace", window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Delete, window, cx| {
+                    this.native_key("delete", window, cx)
+                },
+            ))
             .capture_action(cx.listener(|this, _: &Copy, window, cx| {
                 this.copy(false, window, cx);
                 cx.stop_propagation();
@@ -954,6 +1008,97 @@ fn text_change(before: &str, after: &str) -> (Range<usize>, usize) {
         .map(|(c, _)| c.len_utf8())
         .sum::<usize>();
     (prefix..before.len() - suffix, after.len() - prefix - suffix)
+}
+
+fn submit_document(
+    document: &mut Document,
+    scope: &str,
+    kind: &str,
+    blocked: bool,
+) -> Option<Value> {
+    if blocked {
+        return None;
+    }
+    let body = mention_body(&document.text, &document.mentions)
+        .trim()
+        .to_owned();
+    if body.is_empty() {
+        return None;
+    }
+    if !matches!(kind, "edit" | "thread_edit") {
+        document.text.clear();
+        document.mentions.clear();
+        document.menu = MenuState::default();
+    }
+    let prefix = if kind == "reply" { "reply" } else { "message" };
+    Some(Value::Record {
+        name: "composer".into(),
+        fields: vec![
+            ("scope".into(), Value::Str(scope.into())),
+            ("kind".into(), Value::Str(kind.into())),
+            ("body".into(), Value::Str(body)),
+            (
+                "id".into(),
+                Value::Str(crate::backend::fresh_operation_id(prefix.into())),
+            ),
+        ],
+    })
+}
+fn restore_failed(document: &mut Document, blocked: bool) -> bool {
+    let unavailable = blocked || document.failed.is_empty() || !document.text.trim().is_empty();
+    if unavailable {
+        return false;
+    }
+    let body = std::mem::take(&mut document.failed);
+    restore_document(document, &body);
+    true
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    pub fn append(scope: &str, text: &str) {
+        let shared = slot(scope);
+        let mut slot = lock(&shared);
+        slot.document.text.push_str(text);
+        slot.rev += 1;
+    }
+    pub fn replace(scope: &str, text: &str) {
+        let shared = slot(scope);
+        let mut slot = lock(&shared);
+        slot.document.text = text.to_owned();
+        slot.document.mentions.clear();
+        slot.document.menu = MenuState::default();
+        slot.rev += 1;
+    }
+    pub fn submit(scope: &str, kind: &str, blocked: bool) -> Option<Value> {
+        let shared = slot(scope);
+        let mut slot = lock(&shared);
+        let value = submit_document(&mut slot.document, scope, kind, blocked);
+        slot.rev += 1;
+        value
+    }
+    pub fn restore(scope: &str, blocked: bool) {
+        let shared = slot(scope);
+        let mut slot = lock(&shared);
+        restore_failed(&mut slot.document, blocked);
+        slot.rev += 1;
+    }
+    pub fn text(scope: &str) -> String {
+        lock(&slot(scope)).document.text.clone()
+    }
+    pub fn failed(scope: &str) -> String {
+        lock(&slot(scope)).document.failed.clone()
+    }
+    pub fn roster_of(scope: &str) -> Vec<String> {
+        ROSTERS.with_borrow(|rosters| {
+            rosters
+                .by_room
+                .get(scope)
+                .map(|members| members.iter().map(|member| member.label.clone()).collect())
+                .unwrap_or_default()
+        })
+    }
 }
 
 #[cfg(test)]
