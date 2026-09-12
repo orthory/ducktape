@@ -834,15 +834,20 @@ impl Render for WireEditor {
                             }
                         })
                 {
+                    let theme = gpui_kit::component::Theme::global(cx);
+                    let colors = theme.color_tokens();
                     let mut menu_view = div()
                         .absolute()
                         .left(px(pad.left))
                         .top(row.height + px(layout.padding.top))
                         .flex()
                         .flex_col()
-                        .p(px(4.))
-                        .bg(gpui_kit::rgb(0x27272a))
-                        .rounded(px(6.));
+                        .p_1()
+                        .bg(colors.surface)
+                        .text_color(colors.surface_foreground)
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded(theme.radius_tokens().md);
                     for (item_index, item) in menu.items.iter().enumerate() {
                         let tag = item.tag.clone();
                         menu_view = menu_view.child(
@@ -874,7 +879,15 @@ impl Render for WireEditor {
             .capture_key_down(cx.listener(Self::key_down))
             .child(content);
         if let Some(error) = self.projection.as_ref().and_then(|p| p.fault.clone()) {
-            root = root.child(div().text_color(gpui_kit::rgb(0xc04040)).child(error));
+            root = root.child(
+                div()
+                    .text_color(
+                        gpui_kit::component::Theme::global(cx)
+                            .color_tokens()
+                            .destructive,
+                    )
+                    .child(error),
+            );
         }
         root
     }

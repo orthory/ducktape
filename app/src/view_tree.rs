@@ -1398,9 +1398,9 @@ impl ViewTree {
                 color,
                 ..
             } => {
-                let element = div().bg(color
-                    .map(rgba)
-                    .unwrap_or_else(|| gpui_kit::rgb(0xdad9d3).into()));
+                let element = div().bg(color.map(rgba).unwrap_or_else(|| {
+                    gpui_kit::component::Theme::global(cx).color_tokens().border
+                }));
                 match axis {
                     wire::Axis::Column => element.w(px(*thickness)).h_full().into_any_element(),
                     wire::Axis::Row => element.h(px(*thickness)).w_full().into_any_element(),
@@ -1978,9 +1978,11 @@ impl ViewTree {
                     true => ((value - min) / span).clamp(0.0, 1.0),
                     false => 0.0,
                 };
-                let fill = div().bg(bar
-                    .map(rgba)
-                    .unwrap_or_else(|| gpui_kit::rgb(0xa05a3c).into()));
+                let fill = div().bg(bar.map(rgba).unwrap_or_else(|| {
+                    gpui_kit::component::Theme::global(cx)
+                        .color_tokens()
+                        .primary
+                }));
                 match axis {
                     wire::Axis::Row => {
                         decoration(dimensions(div(), *length, *girth), *background, *border)
