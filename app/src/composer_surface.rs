@@ -260,8 +260,10 @@ pub struct ComposerView {
     _observation: Subscription,
     revision: u64,
     edit_anchor: Option<Range<usize>>,
+    ime: Option<crate::module_view::input::ImeState>,
 }
 impl EventEmitter<Value> for ComposerView {}
+impl EventEmitter<ui_lang_wire::Event> for ComposerView {}
 impl ComposerView {
     pub fn new(
         args: &[Value],
@@ -288,7 +290,26 @@ impl ComposerView {
             InputEvent::Change => this.changed(window, cx),
             InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => cx.notify(),
         });
-        let observation = cx.observe(&editor, |_, _, cx| cx.notify());
+        let observation = cx.observe_in(&editor, window, |this, editor, window, cx| {
+            let (text, marked, cursor, selection) = editor.update(cx, |editor, cx| {
+                (
+                    editor.value().to_string(),
+                    editor.marked_text_range(window, cx),
+                    editor.cursor(),
+                    editor.selected_range(),
+                )
+            });
+            for event in crate::module_view::input::ime_events(
+                &mut this.ime,
+                &text,
+                marked,
+                cursor,
+                selection,
+            ) {
+                cx.emit(event);
+            }
+            cx.notify();
+        });
         let mut this = Self {
             shared,
             args,
@@ -298,6 +319,7 @@ impl ComposerView {
             _observation: observation,
             revision: u64::MAX,
             edit_anchor: None,
+            ime: None,
         };
         this.sync(window, cx);
         Ok(this)
@@ -338,6 +360,14 @@ impl ComposerView {
             // Guest argument echoes and roster updates do not reset native
             // history, scroll or caret. Only an authoritative text change does.
             if self.editor.read(cx).value().as_ref() != text {
+                if self.ime.take().is_some() {
+                    cx.emit(ui_lang_wire::Event::Observation {
+                        event: ui_lang_wire::events::Event::InputMethod(
+                            ui_lang_wire::events::InputMethod::Closed,
+                        ),
+                        captured: false,
+                    });
+                }
                 self.editor
                     .update(cx, |editor, cx| editor.set_value(text, window, cx));
             }
