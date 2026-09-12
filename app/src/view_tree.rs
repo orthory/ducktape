@@ -842,6 +842,7 @@ impl ViewTree {
         let mut drags = std::collections::HashSet::new();
         let mut containers = std::collections::HashSet::new();
         let mut retained = std::collections::HashSet::new();
+        let mut sensors = std::collections::HashSet::new();
         let mut live_keys = std::collections::HashSet::new();
         root.for_each_mut(&mut |node| {
             if let Some(key) = node.key() {
@@ -872,8 +873,22 @@ impl ViewTree {
                         live_keys.insert(format!("{key}/@row:{}", identity.virtual_key()));
                     }
                 }
-                wire::Node::Sensor { key, .. }
-                | wire::Node::Slider { key, .. }
+                wire::Node::Sensor { key, reset, on_show, on_resize, on_hide, .. } => {
+                    sensors.insert(key.clone());
+                    if let Some(sensor) = self.sensors.get_mut(key) {
+                        if sensor.reset != *reset {
+                            sensor.reset = reset.clone();
+                            sensor.size = None;
+                            sensor.pending = None;
+                        }
+                        // Delayed measurements resolve these current-frame
+                        // routes even before the next native draw runs.
+                        sensor.on_show = *on_show;
+                        sensor.on_resize = *on_resize;
+                        sensor.on_hide = *on_hide;
+                    }
+                }
+                wire::Node::Slider { key, .. }
                 | wire::Node::Hover { key, .. }
                 | wire::Node::Surface { key, .. }
                 | wire::Node::Editor { key, .. } => {
@@ -919,15 +934,10 @@ impl ViewTree {
         self.viewers.retain(|key, _| retained.contains(key));
         self.hovered.retain(|key| retained.contains(key));
         self.surfaces.retain(|key, _| retained.contains(key));
-        self.sensors.retain(|key, sensor| {
-            let mounted = retained.contains(key);
-            if !mounted && sensor.size.is_some() {
-                if let Some(message) = sensor.on_hide {
-                    cx.emit(wire::Event::Message(message));
-                }
-            }
-            mounted
-        });
+        // on_hide observes viewport exit while mounted, not destruction.
+        // Removed nodes own old-frame IDs; emitting one now could activate
+        // an unrelated route in the replacement frame's handler table.
+        self.sensors.retain(|key, _| sensors.contains(key));
         self.root = root;
         cx.notify();
     }
@@ -3894,6 +3904,56 @@ fn append_arc_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn sensor_visibility_uses_current_routes_and_removal_does_not_replay_old_ids(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        let sensor = |y, hide| wire::Node::Pin {
+            key: "position".into(), x: 0., y,
+            width: Some(wire::Length::Fill), height: Some(wire::Length::Fill),
+            content: Box::new(wire::Node::Sensor {
+                key: "watched".into(), reset: None, on_show: None, on_resize: None,
+                on_hide: Some(hide), anticipate: None, delay: None,
+                child: Box::new(wire::Node::Space {
+                    width: Some(wire::Length::Fixed(20.)), height: Some(wire::Length::Fixed(20.)),
+                }),
+            }),
+        };
+        cx.update(gpui_kit::init);
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| ViewTree::new(sensor(0., 11)));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = native.update(|_, cx| {
+            cx.subscribe(&tree, move |_, event: &wire::Event, _| observed.borrow_mut().push(event.clone()))
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        tree.read_with(&native, |tree, _| assert!(tree.sensors["watched"].size.is_some()));
+        tree.update(&mut native, |tree, cx| {
+            tree.replace(sensor(200., 23), cx);
+            assert_eq!(tree.sensors["watched"].on_hide, Some(23), "routes refresh before native draw or delayed measurement");
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        assert_eq!(&*events.borrow(), &[wire::Event::Message(23)], "mounted viewport exit uses the new frame route");
+        tree.update(&mut native, |tree, cx| tree.replace(sensor(0., 11), cx));
+        native.update(|window, cx| window.render_frame(cx));
+        events.borrow_mut().clear();
+        tree.update(&mut native, |tree, cx| {
+            tree.replace(wire::Node::Button {
+                key: "watched".into(), content: wire::ButtonContent::Label("New action".into()),
+                label: None, checked: None, expanded: None, description: None,
+                on_press: Some(11), width: None, height: None, padding: None, style: Default::default(),
+            }, cx);
+            assert!(tree.sensors.is_empty(), "reusing a key for another widget does not retain its sensor");
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        assert!(events.borrow().is_empty(), "old hide ID 11 must not invoke the replacement action 11");
+        native.update(|window, cx| window.click("watched", cx));
+        assert_eq!(&*events.borrow(), &[wire::Event::Message(11)], "only a real new-frame click activates the replacement action");
+    }
 
     #[gpui_kit::test]
     fn editor_obeys_authored_size_and_height_limits(cx: &mut gpui_kit::TestAppContext) {
