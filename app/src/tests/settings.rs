@@ -28,7 +28,7 @@ fn authored_items() -> syn::File {
     let items = file
         .items
         .iter()
-        .filter_map(|item| match item {
+        .flat_map(|item| match item {
             syn::Item::Macro(item)
                 if item
                     .mac
@@ -40,15 +40,12 @@ fn authored_items() -> syn::File {
                     .to_string()
                     .starts_with("__ice_generated_items_") =>
             {
-                Some(
-                    syn::parse2::<syn::File>(item.mac.tokens.clone())
-                        .unwrap()
-                        .items,
-                )
+                syn::parse2::<syn::File>(item.mac.tokens.clone())
+                    .unwrap()
+                    .items
             }
-            _ => None,
+            _ => vec![item.clone()],
         })
-        .flatten()
         .collect::<Vec<_>>();
     assert!(!items.is_empty(), "authored item wrappers");
     file.items = items;

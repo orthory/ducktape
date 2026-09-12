@@ -132,7 +132,7 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
                         }
                     )
                 })
-                .expect("captured release observed");
+                .unwrap_or_else(|| panic!("captured release observed: {delivered:?}"));
             assert!(routed < observed, "widget output precedes its observation");
         }
         native.update(|window, cx| window.render_frame(cx));

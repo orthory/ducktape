@@ -1313,9 +1313,10 @@ impl ViewTree {
                 }
                 if let Some(message) = on_press {
                     let message = *message;
-                    button = button.on_click(
-                        cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))),
-                    );
+                    button = button.on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(wire::Event::Message(message));
+                        cx.stop_propagation();
+                    }));
                 }
                 dimensions(pad(button, *padding), *width, *height).into_any_element()
             }
