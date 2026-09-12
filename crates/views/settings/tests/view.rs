@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
 use settings_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::{ButtonContent, Frame, Node, Request};
+use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
+use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
 
 const SEAT: &str = "8c4fa211";
 

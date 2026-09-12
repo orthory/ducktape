@@ -7,8 +7,8 @@ use pages_view::host::{
     PageCommentThread, PageCommentThreadRow, Session, comment_post_target, sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, find, has_text, item, measure, press, texts, type_into};
-use ui_lang_guest::wire::{self, Event, Frame, Length, Node, Request};
+use ducktape_view_guest::testing::{answer, find, has_text, item, measure, press, texts, type_into};
+use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 
 /// The first editor in the tree, depth first.
 fn find_editor(node: &Node) -> Option<&Node> {

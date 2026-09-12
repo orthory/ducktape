@@ -16,9 +16,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// How far back the op feed is scanned for a settled proposal's execute
 /// height.
@@ -61,8 +61,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("governance.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -102,8 +102,8 @@ pub struct RegisterItem {
 
 /// The register now and after every governance block: read once at start,
 /// then again on each `rpc.live` hit for the governance plane.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"governance");
         stream::once(load()).chain(live.then(|_| load()))
     })
@@ -373,8 +373,8 @@ fn submit(proposal_id: String, message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

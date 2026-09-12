@@ -8,7 +8,7 @@ pub mod host;
 
 include!("ui/app.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     ChatView,
     "Chat",
     "Channels, direct messages, threads and the live huddle of this workspace.",

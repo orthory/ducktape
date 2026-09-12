@@ -9,7 +9,7 @@
 //! step. The guest keeps the only history: [`History::undo`] and
 //! [`History::redo`] are decisions too.
 //!
-//! Every name here mirrors the `ui_lang_guest` / `wire` editor API
+//! Every name here mirrors the `ducktape_view_guest` / `wire` editor API
 //! (`EditorDecision`, `EditorPatch`, `EditorCursor`, `EditorPosition`,
 //! `EditorHistoryEffect`) so wiring is a rename, not a translation. Nothing
 //! here touches iced, the wire, or the host: it compiles for wasm32 and the

@@ -17,9 +17,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// How long a membership ballot stays open, in the chain's own consensus
 /// time — the same window the desktop app opened one with.
@@ -61,8 +61,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("members.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -106,8 +106,8 @@ pub struct RosterItem {
 
 /// The roster now and after every valset block: read once at start, then
 /// again on each `rpc.live` hit for the valset plane.
-pub fn roster(connection: i64) -> iced::Subscription<RosterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn roster(connection: i64) -> ducktape_view_guest::Subscription<RosterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"valset");
         stream::once(load()).chain(live.then(|_| load()))
     })
@@ -378,8 +378,8 @@ fn submit(subject: String, target: &str, message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

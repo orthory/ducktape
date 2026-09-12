@@ -20,9 +20,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// The plane every block moves: this view re-reads the node's own facts on
 /// it, because a height, a checkpoint and a peer sample answer to no module.
@@ -74,8 +74,8 @@ pub struct SessionItem {
     pub error: String,
 }
 
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("node.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -178,8 +178,8 @@ pub struct FactsItem {
 
 /// The node's own facts now and after every block: one `/v1/status` read
 /// per block boundary, which is the cell the node publishes them from.
-pub fn facts(connection: i64) -> iced::Subscription<FactsItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn facts(connection: i64) -> ducktape_view_guest::Subscription<FactsItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_facts()).chain(every_block().then(|_| load_facts()))
     })
 }
@@ -304,8 +304,8 @@ pub struct PeersItem {
 /// The mesh sample now and after every block. EVERY SAMPLE ENCODES THE
 /// NODE'S WHOLE METRICS REGISTRY, so the `when` this subscription is held
 /// under is the budget: leaving the overview stops the encode at the source.
-pub fn peers(connection: i64) -> iced::Subscription<PeersItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn peers(connection: i64) -> ducktape_view_guest::Subscription<PeersItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_peers()).chain(every_block().then(|_| load_peers()))
     })
 }
@@ -369,8 +369,8 @@ pub struct ModulesItem {
 /// The registered set now and after every block: `/v1/status` publishes id,
 /// root and category for every module, and the modules registry (where a
 /// network runs one) adds the active code hash and any armed swap.
-pub fn modules(connection: i64) -> iced::Subscription<ModulesItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn modules(connection: i64) -> ducktape_view_guest::Subscription<ModulesItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_modules()).chain(every_block().then(|_| load_modules()))
     })
 }
@@ -472,8 +472,8 @@ const LOG_FRAMES_PER_ITEM: usize = 512;
 /// the seated key and hands over every frame verbatim — the ring's whole
 /// contents on subscribe, then each line as it is written. A frame this view
 /// cannot read leaves the timeline as it was.
-pub fn logs(connection: i64) -> iced::Subscription<LogItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn logs(connection: i64) -> ducktape_view_guest::Subscription<LogItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let asked = serde_json::json!({ "topic": LOGS_TOPIC });
         host::subscribe(
             "rpc.stream",
@@ -653,8 +653,8 @@ pub fn set_log_filter(filter: &str) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

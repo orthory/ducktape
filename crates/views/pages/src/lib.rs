@@ -22,7 +22,7 @@ pub mod presentation;
 
 include!("ui/view.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     PagesView,
     "Pages",
     "The workspace's pages: the sidebar, the document header, the tab strip and the comments rail.",

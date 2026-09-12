@@ -8,8 +8,8 @@
 use node_view::host::{Copy, Session};
 use node_view::{boot_native, tick_native};
 use serde_json::{Value, json};
-use ui_lang_guest::testing::{answer, has_text, item, press, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
+use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 
 // ---------- what the node answers ----------
 

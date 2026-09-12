@@ -15,7 +15,7 @@ pub mod host;
 
 include!("ui/app.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     FilesView,
     "Files",
     "The duckfs browser: one directory at a time, its preview, its history and its writes.",

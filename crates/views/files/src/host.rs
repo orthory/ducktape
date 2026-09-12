@@ -15,9 +15,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// The head of a text preview, in bytes — the `read` lane's own page.
 const PREVIEW_BYTES: i64 = 65_536;
@@ -94,8 +94,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("files.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -139,8 +139,8 @@ pub struct ListingItem {
 
 /// This directory now and after every files block: read once per generation,
 /// then again on each `rpc.live` hit for the files plane.
-pub fn listing(generation: i64, path: String) -> iced::Subscription<ListingItem> {
-    iced::Subscription::run_with((generation, path), |(_, path)| {
+pub fn listing(generation: i64, path: String) -> ducktape_view_guest::Subscription<ListingItem> {
+    ducktape_view_guest::Subscription::run_with((generation, path), |(_, path)| {
         let path = path.clone();
         let live = host::subscribe("rpc.live", b"files");
         stream::once(load_listing(path.clone())).chain(live.then(move |_| load_listing(path.clone())))
@@ -271,8 +271,8 @@ pub struct PreviewItem {
 
 /// The open file, read once per generation. A picture's bytes are paged into
 /// the host's picture surface (`picture.load`); anything else reads a head.
-pub fn preview(generation: i64, path: String) -> iced::Subscription<PreviewItem> {
-    iced::Subscription::run_with((generation, path), |(_, path)| {
+pub fn preview(generation: i64, path: String) -> ducktape_view_guest::Subscription<PreviewItem> {
+    ducktape_view_guest::Subscription::run_with((generation, path), |(_, path)| {
         stream::once(load_preview(path.clone()))
     })
 }
@@ -394,8 +394,8 @@ pub struct DiffItem {
 }
 
 /// One committed snapshot against the current head.
-pub fn diff(generation: i64, from: String) -> iced::Subscription<DiffItem> {
-    iced::Subscription::run_with((generation, from), |(_, from)| {
+pub fn diff(generation: i64, from: String) -> ducktape_view_guest::Subscription<DiffItem> {
+    ducktape_view_guest::Subscription::run_with((generation, from), |(_, from)| {
         stream::once(load_diff(from.clone()))
     })
 }
@@ -539,8 +539,8 @@ async fn submit_commit(
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

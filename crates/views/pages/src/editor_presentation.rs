@@ -3,7 +3,7 @@
 use crate::{editor_binding, editor_binding::MenuState, editor_view::EditorReserve, markdown};
 use iced::advanced::text::Highlighter;
 use std::collections::HashMap;
-use ui_lang_guest::{EditorStateView, wire};
+use ducktape_view_guest::{EditorStateView, wire};
 use wire::editor_presentation::{
     EditorFormat, EditorGutter, EditorHit, EditorPresentation, EditorSpan, PresentationError,
 };

@@ -10,7 +10,7 @@ pub mod host;
 
 include!("ui/app.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     ForgeView,
     "Forge",
     "This workspace's repositories: their code, pull requests and issues, with reviews and merges.",

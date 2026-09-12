@@ -19,7 +19,7 @@ pub mod editor_binding;
 pub mod editor_menu;
 pub mod fixture {
     use crate::document_ingress::DocumentSource;
-    use ui_lang_guest::wire;
+    use ducktape_view_guest::wire;
     pub fn large_source() -> DocumentSource {
         DocumentSource {
             reference: wire::encode(&crate::document_source::DocumentIdentity {
@@ -30,7 +30,7 @@ pub mod fixture {
     }
 }
 include!("ui/view.rs");
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     PagesEditorFixture,
     "Pages editor binding",
     "Pages editor transaction regression fixture",

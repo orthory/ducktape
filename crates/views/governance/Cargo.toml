@@ -15,8 +15,7 @@ crate-type = ["cdylib", "rlib"]
 test = false
 
 [dependencies]
-iced.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ui-lang-guest.workspace = true
-ui-lang-runtime.workspace = true
+ducktape-view-guest.workspace = true

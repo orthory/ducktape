@@ -6,8 +6,8 @@
 
 use explorer_view::host::{Copy, Session};
 use explorer_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, submit, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, submit, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 
 fn node_ending(frame: &Frame, suffix: &str) -> Node {
     fn find(node: &Node, suffix: &str) -> Option<Node> {
@@ -133,7 +133,7 @@ fn a_connected_view_reads_its_own_ledger() {
 
 #[test]
 fn the_ledger_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
-    use ui_lang_guest::wire::{Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
 
     let (frame, _) = connected_with_ledger();
     let width = |frame: &Frame| match node_ending(frame, "/ledger-pane") {

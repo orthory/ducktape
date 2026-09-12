@@ -20,9 +20,9 @@
 
 use std::fmt::Write as _;
 
-use iced::futures::{StreamExt, stream};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostError {
@@ -79,8 +79,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("settings.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -132,8 +132,8 @@ pub struct StandingItem {
 }
 
 /// This node's standing now and after every valset block.
-pub fn standing(connection: i64) -> iced::Subscription<StandingItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn standing(connection: i64) -> ducktape_view_guest::Subscription<StandingItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"valset");
         stream::once(load_standing()).chain(live.then(|_| load_standing()))
     })
@@ -258,8 +258,8 @@ pub struct KeysItem {
 /// The key associations of the account the seat belongs to, now and after
 /// every identity block — an op that admits or drops a key lands on that
 /// plane, so the card re-reads itself without the host saying so.
-pub fn account_keys(connection: i64, seat: String) -> iced::Subscription<KeysItem> {
-    iced::Subscription::run_with((connection, seat), |(_, seat)| {
+pub fn account_keys(connection: i64, seat: String) -> ducktape_view_guest::Subscription<KeysItem> {
+    ducktape_view_guest::Subscription::run_with((connection, seat), |(_, seat)| {
         let seat = seat.clone();
         let again = seat.clone();
         let live = host::subscribe("rpc.live", b"identity");

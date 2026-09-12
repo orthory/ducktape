@@ -5,7 +5,7 @@ mod source_registry;
 // The actual generated guest, driven through its editor transaction handlers.
 // Native editor layout/painting is owned by the runtime's separate host tests.
 use pages_editor_binding_fixture::{boot_native, restore_native, snapshot_native, tick_native};
-use ui_lang_guest::{testing, wire};
+use ducktape_view_guest::{testing, wire};
 use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
 use wire::{
     EditorCursor, EditorDecision, EditorEditKind, EditorHistoryEffect, EditorPosition,

@@ -14,10 +14,10 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 
-use iced::futures::{StreamExt, future::join_all, stream};
+use futures::{StreamExt, future::join_all, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// How many recent blocks the ledger reads. The window the screen has always
 /// shown.
@@ -55,8 +55,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("explorer.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -127,8 +127,8 @@ pub struct LedgerItem {
 /// The block window now and after every block: read once per serial, then
 /// again on each `rpc.live` hit for the `block` plane — the plane every
 /// block moves, idle fillers included.
-pub fn ledger(serial: i64) -> iced::Subscription<LedgerItem> {
-    iced::Subscription::run_with(serial, |_| {
+pub fn ledger(serial: i64) -> ducktape_view_guest::Subscription<LedgerItem> {
+    ducktape_view_guest::Subscription::run_with(serial, |_| {
         let live = host::subscribe("rpc.live", b"block");
         stream::once(read_ledger()).chain(live.then(|_| read_ledger()))
     })
@@ -388,8 +388,8 @@ impl Leg {
 
 /// The answer to one query, run once per `(query, serial)` — the serial moves
 /// on every submit, so asking the same thing twice really asks twice.
-pub fn workspace_search(query: String, serial: i64) -> iced::Subscription<SearchItem> {
-    iced::Subscription::run_with((query, serial), |key| {
+pub fn workspace_search(query: String, serial: i64) -> ducktape_view_guest::Subscription<SearchItem> {
+    ducktape_view_guest::Subscription::run_with((query, serial), |key| {
         stream::once(run_search(key.0.clone()))
     })
 }

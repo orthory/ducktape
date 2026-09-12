@@ -6,10 +6,10 @@
 
 use files_view::host::Session;
 use files_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{
+use ducktape_view_guest::testing::{
     answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
-use ui_lang_guest::wire::{Frame, Node, Request};
+use ducktape_view_guest::wire::{Frame, Node, Request};
 
 fn boot() -> Frame {
     boot_native();
@@ -139,7 +139,7 @@ fn node_ending(frame: &Frame, suffix: &str) -> Node {
 
 #[test]
 fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
-    use ui_lang_guest::wire::{Event, Length, mouse};
+    use ducktape_view_guest::wire::{Event, Length, mouse};
 
     let (frame, _) = connected_with_listing();
     let frame = with_preview(&frame, "hello");
@@ -536,7 +536,7 @@ fn button_disabled(frame: &Frame, name: &str) -> bool {
         } = node
         {
             let named = label.as_deref() == Some(name)
-                || matches!(content, ui_lang_guest::wire::ButtonContent::Label(label) if label == name);
+                || matches!(content, ducktape_view_guest::wire::ButtonContent::Label(label) if label == name);
             if named {
                 disabled = Some(on_press.is_none());
             }
@@ -558,7 +558,7 @@ fn surface_names(frame: &Frame) -> Vec<String> {
 }
 
 fn read_draft(frame: &Frame) -> (Frame, String) {
-    use ui_lang_guest::wire::editor_document::{
+    use ducktape_view_guest::wire::editor_document::{
         EditorDocumentMessage as Message, EditorTransferId, EditorTransferReceiver,
     };
     let key = keys(frame)
@@ -582,7 +582,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
         attempt: 0,
     };
     let mut receiver = EditorTransferReceiver::new(id.clone(), document.clone()).unwrap();
-    let mut events = vec![ui_lang_guest::wire::Event::EditorDocument {
+    let mut events = vec![ducktape_view_guest::wire::Event::EditorDocument {
         handler,
         message: Message::Request {
             id: id.clone(),
@@ -596,7 +596,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
                 panic!("document transfer: {message:?}");
             };
             if let Some(text) = receiver.receive(transfer).unwrap() {
-                let settled = tick_native(vec![ui_lang_guest::wire::Event::EditorDocument {
+                let settled = tick_native(vec![ducktape_view_guest::wire::Event::EditorDocument {
                     handler,
                     message: Message::Acknowledged { id },
                 }]);

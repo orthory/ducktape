@@ -5,8 +5,8 @@
 
 use governance_view::host::Session;
 use governance_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ui_lang_guest::wire::{Frame, Node, Request};
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
+use ducktape_view_guest::wire::{Frame, Node, Request};
 
 fn boot() -> Frame {
     boot_native();

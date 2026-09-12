@@ -21,9 +21,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// The planes the register follows: `runs` carries every model record and
 /// every run fact, `identity` the controllers and their names.
@@ -180,8 +180,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("agents.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -359,8 +359,8 @@ pub struct RegisterItem {
 /// The register now and after every block that moved it: read once at
 /// start, then again on each `rpc.live` hit for the `runs` or `identity`
 /// plane — the two planes an agent record is folded from.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = stream::select(
             host::subscribe("rpc.live", RUNS_PLANE),
             host::subscribe("rpc.live", IDENTITY_PLANE),
@@ -620,8 +620,8 @@ pub struct JournalItem {
 
 /// The open run's journal now, and again on every `runs` block: the facts
 /// it committed and the chips of every place it touched.
-pub fn run_journal(open_run: String, connection: i64) -> iced::Subscription<JournalItem> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn run_journal(open_run: String, connection: i64) -> ducktape_view_guest::Subscription<JournalItem> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let open_run = open_run.clone();
         let again = open_run.clone();
         let live = host::subscribe("rpc.live", RUNS_PLANE);
@@ -1470,8 +1470,8 @@ pub fn empty_live() -> LiveRun {
 /// key that asked for the run and nobody else — and hands the view every
 /// frame verbatim. Every reading below is folded HERE; the kernel carries
 /// bytes and knows nothing about a run.
-pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subscription<LiveRun> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let topic = format!("run-output:{open_run}");
         let ask = serde_json::json!({
             "topic": topic,
@@ -1730,8 +1730,8 @@ fn skills_wire(skills: &[AgentSkill]) -> serde_json::Value {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

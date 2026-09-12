@@ -6,8 +6,8 @@
 
 use chat_view::host::{Channel, PendingSend, Session};
 use chat_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, texts, type_into};
-use ui_lang_guest::wire::{Frame, Node, Request, SurfaceValue};
+use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
+use ducktape_view_guest::wire::{Frame, Node, Request, SurfaceValue};
 
 /// A native tick of this screen walks a deep tree; libtest's 2 MiB thread is
 /// at the edge of it in a debug build, so every test runs on its own roomier
@@ -351,7 +351,7 @@ fn a_search_reads_the_index_and_lands_its_hits() {
         let (frame, _) = connected_room();
         let frame = tick_native(type_into(&frame, "Search…", "  light  "));
         assert!(frame.requests.is_empty(), "typing runs no handler");
-        let frame = tick_native(ui_lang_guest::testing::submit(&frame, "Search…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
         let read = request(&frame, "rpc.view");
         let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a read decodes");
         assert_eq!(ask["target"], "chat");
@@ -422,7 +422,7 @@ fn the_newest_message_of_a_busy_room_still_reads_through_the_wire() {
             .to_string()
             .into_bytes();
         let (mut frame, _) = connected_room_reading(window);
-        ui_lang_guest::wire::sanitize(&mut frame).expect("the frame sanitizes");
+        ducktape_view_guest::wire::sanitize(&mut frame).expect("the frame sanitizes");
         let shown = texts(&frame);
         let newest = format!("m{ROWS} ");
         assert!(
@@ -454,7 +454,7 @@ fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
 #[test]
 fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
     on_a_deep_stack(|| {
-        use ui_lang_guest::wire::{Event, Length, mouse};
+        use ducktape_view_guest::wire::{Event, Length, mouse};
 
         let width = |frame: &Frame, suffix: &str| match node_ending(frame, suffix) {
             Node::Container {
@@ -555,12 +555,12 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
 }
 
 /// Every widget command a frame carries, decoded.
-fn widget_commands(frame: &Frame) -> Vec<ui_lang_guest::wire::WidgetCommand> {
+fn widget_commands(frame: &Frame) -> Vec<ducktape_view_guest::wire::WidgetCommand> {
     frame
         .requests
         .iter()
         .filter(|request| request.kind == "host.widget")
-        .map(|request| ui_lang_guest::wire::decode(&request.payload).expect("a command decodes"))
+        .map(|request| ducktape_view_guest::wire::decode(&request.payload).expect("a command decodes"))
         .collect()
 }
 
@@ -615,7 +615,7 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         assert!(
             matches!(
                 &commands[0],
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { target, key: 2 }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target, key: 2 }
                     if target.ends_with("chat/message-stream")
             ),
             "{commands:?}"
@@ -628,7 +628,7 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         assert!(
             !after.iter().any(|command| matches!(
                 command,
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { .. }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { .. }
             )),
             "the menu scrolled the stream: {after:?}"
         );
@@ -675,7 +675,7 @@ fn a_landing_on_a_reply_reveals_it_inside_the_rail() {
         assert!(
             commands.iter().any(|command| matches!(
                 command,
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { target, key: 3 }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target, key: 3 }
                     if target.ends_with("chat/thread-pane/thread-stream")
             )),
             "{commands:?}"

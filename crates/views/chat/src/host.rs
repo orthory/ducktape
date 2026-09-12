@@ -19,9 +19,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
+use ducktape_view_guest::host;
 
 /// One page of roots, replies or hits — chat's own index page size.
 const PAGE_LIMIT: usize = 64;
@@ -250,8 +250,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -469,8 +469,8 @@ pub struct RoomItem {
 
 /// The room now and after every chat block: read once per key, then again on
 /// each `rpc.live` hit for the chat plane.
-pub fn room(key: RoomKey) -> iced::Subscription<RoomItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn room(key: RoomKey) -> ducktape_view_guest::Subscription<RoomItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_room(key.clone());
@@ -684,8 +684,8 @@ pub struct ThreadItem {
 }
 
 /// The open thread now and after every chat block.
-pub fn thread(key: ThreadKey) -> iced::Subscription<ThreadItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn thread(key: ThreadKey) -> ducktape_view_guest::Subscription<ThreadItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_thread(key.clone());
@@ -782,8 +782,8 @@ pub struct SearchItem {
 }
 
 /// One workspace-wide message search, run once per query.
-pub fn search(key: SearchKey) -> iced::Subscription<SearchItem> {
-    iced::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
+pub fn search(key: SearchKey) -> ducktape_view_guest::Subscription<SearchItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
 }
 
 async fn read_search(key: SearchKey) -> SearchItem {
@@ -1392,8 +1392,8 @@ fn submit(message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;

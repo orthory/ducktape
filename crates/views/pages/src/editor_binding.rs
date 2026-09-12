@@ -4,8 +4,8 @@
 
 use crate::editor::{self, Doc, History};
 use std::{cell::RefCell, rc::Rc};
-use ui_lang_guest::wire::{self, EditorDecision, EditorHistoryEffect, EditorKeyClaim};
-use ui_lang_guest::{EditorBinding, EditorKeyRequest, EditorTransactionEvent};
+use ducktape_view_guest::wire::{self, EditorDecision, EditorHistoryEffect, EditorKeyClaim};
+use ducktape_view_guest::{EditorBinding, EditorKeyRequest, EditorTransactionEvent};
 use wire::keyboard::{Key, Modifiers, Named};
 
 /// Ordinary Ice data: retained in the app state and therefore in snapshots.
@@ -64,7 +64,7 @@ pub fn initial_menu() -> MenuState {
 /// The menu part of Pages presentation; the Markdown pass adds its spans and
 /// document affordances to this same declarative value.
 pub fn menu_paint(
-    state: ui_lang_guest::EditorStateView<'_>,
+    state: ducktape_view_guest::EditorStateView<'_>,
     menu: MenuState,
 ) -> wire::editor_presentation::EditorPresentation {
     use wire::editor_presentation::{
@@ -106,7 +106,7 @@ impl BindingState {
     fn update(
         &self,
         id: &wire::EditorTransactionId,
-        state: ui_lang_guest::EditorStateView<'_>,
+        state: ducktape_view_guest::EditorStateView<'_>,
         interaction: Vec<u8>,
     ) -> EditorUpdate {
         let reference = wire::editor_document::EditorDocumentRef {
@@ -142,7 +142,7 @@ impl BindingState {
     fn interacted(
         &mut self,
         id: &wire::EditorTransactionId,
-        state: ui_lang_guest::EditorStateView<'_>,
+        state: ducktape_view_guest::EditorStateView<'_>,
         action: &wire::editor_presentation::EditorInteraction,
     ) -> Option<EditorUpdate> {
         if self.history.reset != Some(state.reset) {
