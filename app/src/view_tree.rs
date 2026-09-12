@@ -1548,7 +1548,13 @@ impl ViewTree {
                         .disabled(on_press.is_none());
                 button = match content {
                     wire::ButtonContent::Label(text) => button.label(text.clone()),
-                    wire::ButtonContent::Child(child) => button.child(self.node(child, window, cx)),
+                    wire::ButtonContent::Child(child) => {
+                        let fit_content = matches!(height, None | Some(wire::Length::Shrink));
+                        if fit_content {
+                            button = button.h_auto();
+                        }
+                        button.child(self.node(child, window, cx))
+                    }
                 };
                 if let Some(label) = label {
                     button = button.accessibility_label(label.clone());
@@ -4095,7 +4101,7 @@ mod tests {
             spacing: Some(8.),
             padding: None,
             width: Some(wire::Length::Fill),
-            height: None,
+            height: Some(wire::Length::Fill),
             background: None,
             border: None,
             align: None,
@@ -4153,26 +4159,31 @@ mod tests {
             wrap: None,
             children: vec![paragraph, row, reference, header],
         };
-        struct ButtonTree(Entity<ViewTree>);
-        impl Render for ButtonTree {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                gpui_kit::component::button::Button::new("wrapping-parent")
-                    .w_full()
-                    .child(self.0.clone())
-            }
-        }
-        let window = cx.open_window(size(px(800.), px(500.)), |_, cx| {
-            ButtonTree(cx.new(|_| ViewTree::new(root)))
-        });
-        let tree = window
-            .root(cx)
-            .unwrap()
-            .read_with(cx, |parent, _| parent.0.clone());
+        let root = wire::Node::Button {
+            key: "wrapping-parent".into(),
+            content: wire::ButtonContent::Child(Box::new(root)),
+            label: None,
+            checked: None,
+            expanded: None,
+            description: None,
+            on_press: Some(1),
+            width: Some(wire::Length::Fill),
+            height: None,
+            padding: None,
+            style: Default::default(),
+        };
+        let window = cx.open_window(size(px(800.), px(500.)), |_, _| ViewTree::new(root));
+        let tree = window.root(cx).unwrap();
         let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
         native.update(|window, cx| window.render_frame(cx));
+        let button_bounds = native.update(|window, _| window.find("wrapping-parent").bounds());
         tree.read_with(&native, |tree, _| {
             let paragraph = tree.measured_bounds("paragraph").unwrap();
             let hash = tree.measured_bounds("hash").unwrap();
+            assert!(
+                button_bounds.bottom() >= hash.bottom(),
+                "auto-height button must show every wrapped line"
+            );
             let count = tree.measured_bounds("count").unwrap();
             assert!(tree.measured_bounds("height").unwrap().right() <= hash.left());
             assert_eq!(
