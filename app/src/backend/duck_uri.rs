@@ -8,8 +8,8 @@
 //! ```
 //!
 //! [`classify_duck_link`] is the module table: every surface that opens or
-//! embeds a link (the reader's markdown, the open plane in
-//! `handlers/chat.ice`) classifies through it and nowhere else. A malformed
+//! embeds a link (the Markdown reader or app navigation handler)
+//! classifies through it and nowhere else. A malformed
 //! or unknown ref is [`DuckKind::Unknown`] — never an error here; the caller
 //! decides what "nothing to open" looks like.
 //!
@@ -394,9 +394,7 @@ fn classify_channel(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
     }
 }
 
-/// Echo lanes: the open plane hands a classified link's field to an EXISTING
-/// navigation handler through a run continuation (`run every duck_echo_str(x)
-/// -> forge_open_repo _`), the one way an Ice handler reaches another.
+/// Hand a classified link field to an asynchronous navigation reply.
 pub async fn duck_echo_str(value: String) -> Result<String, AppError> {
     Ok(value)
 }

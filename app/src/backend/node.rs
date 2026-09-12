@@ -262,11 +262,8 @@ fn served_height(height: &serde_json::Value) -> i64 {
 
 /// What an `operations` reading the node did not publish carries.
 ///
-/// The rule is already written twice — `NodeFacts`'s consensus trio is
-/// `Option` "rather than being filled with misleading zeroes", and `state/node.ice`
-/// says an absent reading "must print `—`, never a measured `0`". The two
-/// `i64` fields beside them had no way to say it, because `0` is a legal
-/// height and a legal timestamp.
+/// An absent reading must display `—`, never a measured `0`: zero is a
+/// legal height and timestamp.
 ///
 /// NEGATIVE is that way: `height_label` already renders `< 0` as `h —`, so
 /// this reuses a contract the renderer had rather than inventing one. Naming
@@ -712,7 +709,7 @@ pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
     .map_err(app_error)
 }
 
-/// Test seam: Ice reads extern structs but cannot construct one.
+/// Construct an empty account result for app fixtures.
 pub fn account_data_none(generation: i64) -> AccountData {
     AccountData::none(generation)
 }
@@ -1168,7 +1165,7 @@ impl CeremonyStep {
     }
 }
 
-/// Test seam: Ice reads extern structs but cannot construct one.
+/// Construct an account ceremony step for app fixtures.
 pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep {
     CeremonyStep {
         phase,
