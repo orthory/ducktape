@@ -3,7 +3,7 @@
 use super::*;
 use gpui_kit::{
     self as gpui, AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, WeakEntity, Window,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, WeakEntity, Window,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -559,7 +559,7 @@ pub(crate) fn ime_events(
                 selected.end.saturating_sub(start).min(content.len()) as u32,
             );
             if content.len() > wire::MAX_STRING_BYTES {
-                return events;
+                return Vec::new();
             }
             if previous.is_none() {
                 events.push(I::Opened);
@@ -581,7 +581,7 @@ pub(crate) fn ime_events(
         }
         None => {
             let Some(old) = previous.take() else {
-                return events;
+                return Vec::new();
             };
             if let Some(content) = text.get(old.start..cursor)
                 && !content.is_empty()

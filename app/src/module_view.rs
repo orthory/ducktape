@@ -1268,7 +1268,7 @@ fn spawn_load(
                 if let Some(root) = &fresh.frame.root
                     && let Err(reason) = fresh.inputs.retain_restored_projections(&old.inputs, root)
                 {
-                    log_source(module, fresh.hash.as_ref(), "Failed", generation, reason);
+                    log_source(module, fresh.hash.as_ref(), "Failed", generation, &reason);
                     return;
                 }
                 if let Some(root) = &mut fresh.frame.root {
@@ -2436,7 +2436,7 @@ impl Guest {
                 let inherits = frame.root.is_none();
                 let mut previous = self.frame.root.take();
                 let mut accepted = true;
-                let merged = merge(&mut previous, &mut frame).and_then(|changed| {
+                let merged = merge(&mut previous, &mut frame).map_err(str::to_owned).and_then(|changed| {
                     if changed.0
                         && let Some(root) = &frame.root
                     {
@@ -2629,6 +2629,40 @@ impl NativeModuleView {
             seat.props = Some(props);
             cx.notify();
         }
+    }
+
+    /// Closing has no next paint. Deliver the final semantic observation through
+    /// one bounded guest redraw and return its intents to the surviving shell.
+    pub(crate) fn observe_final_window_event(
+        &mut self,
+        event: wire::events::Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> Vec<ModuleViewEvent> {
+        let Some(alive) = &self.alive else {
+            return Vec::new();
+        };
+        let seat = mounted(self.module);
+        let mut mounted = seat.lock().expect("module view lock");
+        if mounted.generation != self.generation {
+            return Vec::new();
+        }
+        let Mounted { slot, props, .. } = &mut *mounted;
+        let Slot::Ready(guest) = slot else {
+            return Vec::new();
+        };
+        if !Arc::ptr_eq(alive, &guest.alive) {
+            return Vec::new();
+        }
+        let accepted = input::deliver(guest, wire::Event::Observation {
+            event: wire::events::Event::Window(event),
+            captured: false,
+        });
+        if !accepted {
+            return Vec::new();
+        }
+        guest.redraw(props);
+        cx.notify();
+        std::mem::take(&mut guest.intents)
     }
 
     fn frame(
