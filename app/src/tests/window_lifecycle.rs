@@ -127,7 +127,14 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     impl<'ast> syn::visit::Visit<'ast> for Exits {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
             let selected = matches!(&arm.pat, syn::Pat::TupleStruct(pattern) if pattern.path.segments.last().is_some_and(|part| part.ident == "WindowWasClosed"));
-            if selected { self.visit_expr(&arm.body); }
+            let app_message = arm
+                .pat
+                .to_token_stream()
+                .to_string()
+                .contains("__DucktapeMessage");
+            if selected || !app_message {
+                self.visit_expr(&arm.body);
+            }
         }
         fn visit_block(&mut self, block: &'ast syn::Block) {
             for (index, statement) in block.stmts.iter().enumerate() {
@@ -167,11 +174,19 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
             syn::visit::visit_block(self, block);
         }
     }
-    let exits = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
-        let mut exits = Exits(0);
-        exits.visit_file(&syn::parse_file(include_str!("../ui/app_update.rs")).expect("native window close route"));
-        exits.0
-    }).unwrap().join().unwrap();
+    let exits = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let mut exits = Exits(0);
+            exits.visit_file(
+                &syn::parse_file(include_str!("../ui/app_update.rs"))
+                    .expect("native window close route"),
+            );
+            exits.0
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     assert!(exits > 0);
 }
 #[test]

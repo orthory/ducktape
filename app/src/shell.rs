@@ -3,6 +3,7 @@
 //! before the platform has actually opened it.
 
 use ducktape_view_guest::Task;
+use gpui_kit::prelude::FluentBuilder;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
@@ -517,7 +518,10 @@ impl DesktopWindow {
                 },
             );
         }
-        Input::new(&self.inputs[key].state).into_any_element()
+        Input::new(&self.inputs[key].state)
+            .aria_label(placeholder)
+            .rounded_none()
+            .into_any_element()
     }
 
     fn action(
@@ -531,8 +535,10 @@ impl DesktopWindow {
         let model = self.model.clone();
         gpui_kit::component::button::Button::new(key)
             .label(label)
+            .rounded_none()
             .disabled(disabled)
             .on_click(move |_, _, cx| {
+                cx.stop_propagation();
                 model.update(cx, |model, cx| model.dispatch(message.clone(), cx))
             })
     }
@@ -548,8 +554,10 @@ impl DesktopWindow {
         use gpui_kit::component::Disableable as _;
         gpui_kit::component::button::Button::new(key)
             .label(label)
+            .rounded_none()
             .disabled(disabled)
             .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
                 let message = message(this, cx);
                 this.model
                     .update(cx, |model, cx| model.dispatch(message, cx));
@@ -558,7 +566,9 @@ impl DesktopWindow {
 
     fn onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use crate::HubStep;
+        use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::*;
+        let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let state = &self.model.read(cx).state;
         let step = state.hub_step;
         let busy = state.mutation_phase != crate::MutationPhase::Idle;
@@ -698,58 +708,90 @@ impl DesktopWindow {
                 let state = &self.model.read(cx).state;
                 let networks = state.hub_networks.clone();
                 let selected = state.hub_selected.clone();
-                body = body.child("Choose a network");
+                body = body
+                    .gap_5()
+                    .child(div().flex().flex_col().gap_2()
+                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / CONNECT"))
+                        .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Your networks"))
+                        .child(div().text_color(colors.muted_foreground).child("Choose where your team works.")));
+                let empty = networks.is_empty();
+                let mut recent = div().border_1().border_color(colors.border).bg(colors.surface)
+                    .child(div().px_4().py_3().border_b_1().border_color(colors.border).flex().justify_between()
+                        .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("SAVED NETWORKS"))
+                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child(format!("{:02}", networks.len()))));
+                if empty {
+                    recent = recent.child(div().px_4().py_6().flex().flex_col().gap_2()
+                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).child("No networks yet"))
+                        .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Join a network or connect to a node below.")));
+                }
                 for network in networks {
                     let label = match (network.probed, network.live) {
                         (false, _) => format!("{} · checking", network.name),
                         (true, true) => format!("{} · block {}", network.name, network.height),
                         (true, false) => format!("{} · offline", network.name),
                     };
-                    body = body.child(
+                    let picked = network.id == selected;
+                    recent = recent.child(
                         div()
                             .flex()
                             .gap_2()
+                            .p_2()
                             .child(self.action(
                                 format!("network/{}", network.id),
                                 label,
                                 Message::PickNetwork(network.id.clone()),
                                 busy,
-                            ))
+                            ).flex_1().when(picked, |button| button.primary()))
                             .child(self.action(
                                 format!("forget/{}", network.id),
                                 "Forget",
                                 Message::ForgetNetworkSubmit(network.id),
                                 busy,
-                            )),
+                            ).ghost()),
                     );
                 }
                 let no_selection = busy || selected.is_empty();
-                body.child(self.action(
+                if !empty {
+                    recent = recent.child(div().p_3().border_t_1().border_color(colors.border).child(self.action(
                     "network-open",
                     "Open network",
                     Message::OpenNetworkSubmit,
                     no_selection,
-                ))
-                .child(self.input("remote", "Remote node address", false, window, cx))
-                .child(self.submit(
+                    ).primary().w_full().h_10()));
+                }
+                body.child(recent)
+                .child(div().flex().flex_col().gap_3()
+                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("CONNECT DIRECTLY"))
+                    .child(self.input("remote", "Remote node address", false, window, cx))
+                    .child(self.submit(
                     "remote-connect",
-                    "Connect",
-                    busy,
+                    "Connect to node",
+                    busy || self.value("remote", cx).trim().is_empty(),
                     |this, cx| Message::ConnectRemoteSubmit(this.value("remote", cx)),
                     cx,
-                ))
-                .child(self.action(
+                ).primary().w_full().h_10()))
+                .child(div().border_t_1().border_color(colors.border).pt_4().flex().flex_col().gap_2()
+                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Already have an invitation?"))
+                    .child(self.action(
                     "network-join",
                     "Join with invitation",
                     Message::GoJoin,
                     busy,
-                ))
+                ).outline().w_full().h_10()))
             }
             HubStep::Join => body
-                .child("Join a network")
-                .child(self.input("join_invite", "Invitation", true, window, cx))
-                .child(self.action("join-submit", "Join", Message::JoinNetworkSubmit, busy))
-                .child(self.action("join-back", "Back", Message::GoNetworks, busy)),
+                .gap_5()
+                .child(div().flex().flex_col().gap_2()
+                    .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / INVITATION"))
+                    .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Join your team"))
+                    .child(div().text_color(colors.muted_foreground).child("One invitation. A shared place to work.")))
+                .child(div().border_1().border_color(colors.border).bg(colors.surface).p_4().flex().flex_col().gap_3()
+                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("NETWORK INVITATION"))
+                    .child(self.input("join_invite", "Invitation", true, window, cx))
+                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Paste the invitation shared by a network member. It stays hidden on this screen.")))
+                .child(self.action("join-submit", "Join network", Message::JoinNetworkSubmit, busy || self.value("join_invite", cx).trim().is_empty()).primary().w_full().h_10())
+                .child(self.action("join-back", "Back to networks", Message::GoNetworks, busy).ghost().w_full())
+                .child(div().border_t_1().border_color(colors.border).pt_4().text_size(px(12.)).text_color(colors.muted_foreground).child("Your wallet identifies you. The invitation connects you to the right workspace.")),
             HubStep::Provisioning => {
                 for step in &self.model.read(cx).state.provision_steps {
                     body = body.child(format!("{} · {}", step.label, step.state));
@@ -828,26 +870,98 @@ impl DesktopWindow {
             .size_full()
             .flex()
             .flex_col()
-            .p_6()
-            .gap_4()
+            .bg(colors.background)
+            .text_color(colors.foreground)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .px_5()
+                    .h(px(64.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(colors.border)
                     .child(
                         div()
                             .flex_1()
-                            .text_xl()
-                            .child("Ducktape")
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(28.))
+                                    .bg(colors.foreground)
+                                    .text_color(colors.background)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("D"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("DUCKTAPE"),
+                            )
                             .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                                 window.start_window_move()
                             }),
                     )
-                    .child(self.action("launch-close", "×", Message::CloseLaunchWindow, false)),
+                    .child(
+                        self.action("launch-close", "×", Message::CloseLaunchWindow, false)
+                            .ghost()
+                            .accessibility_label("Close window")
+                            .w_8()
+                            .h_8(),
+                    ),
             )
-            .child(body)
-            .child(div().text_color(rgb(0xb42318)).child(error))
+            .child(
+                div()
+                    .id("onboarding-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_5()
+                    .child(body)
+                    .when(!error.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .mt_4()
+                                .p_3()
+                                .border_1()
+                                .border_color(colors.destructive)
+                                .text_color(colors.destructive)
+                                .text_size(px(12.))
+                                .child(error),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .h(px(40.))
+                    .px_5()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_family(design::fonts::FAMILY_MONO)
+                            .text_color(colors.muted_foreground)
+                            .child("BUILT TO WORK TOGETHER"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.muted_foreground)
+                            .child("DESKTOP"),
+                    ),
+            )
             .into_any_element()
     }
 
