@@ -1,5 +1,4 @@
 //! Compare the flattened wire paint with the existing native Markdown policy.
-use iced::advanced::text::Highlighter;
 use pages_view::{editor_binding, editor_menu, editor_view, editor_view::EditorReserve, markdown};
 use ducktape_view_guest::{Editor, wire};
 #[path = "../src/editor_presentation.rs"]
@@ -42,7 +41,7 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
                     .iter()
                     .rev()
                     .find(|(range, _)| range.contains(&byte))
-                    .map(|(_, mark)| presentation::convert(markdown::format(mark, dark)).unwrap());
+                    .map(|(_, mark)| markdown::format(mark, dark));
                 let actual = actual
                     .spans
                     .iter()

@@ -8,6 +8,8 @@
 //! text. Submission writes their ID tokens; names are only the visible label.
 //! Editing through a mention replaces the whole token.
 
+pub mod wire;
+
 use crate::backend::handle_char;
 use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
