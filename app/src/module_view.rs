@@ -1450,6 +1450,10 @@ pub(crate) mod canary {
     use std::sync::{Mutex, mpsc};
 
     pub(crate) use super::tests::connection_turn;
+    pub(crate) fn input_presentation(view: &super::NativeModuleView, key: &str, window: &gpui_kit::Window, cx: &gpui_kit::App) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
+        view.content.as_ref()?.read(cx).input_presentation(key, window, cx)
+    }
+
     pub(crate) fn frame(module: &'static str) -> Option<super::wire::Node> {
         let mounted = super::mounted(module);
         let mounted = mounted.lock().expect("module view lock");
@@ -5324,8 +5328,10 @@ pub(crate) mod tests {
         let mut measured = |width: f32| {
             let mut guest = Guest::load_from("pages", &path).unwrap();
             settle_documents(&mut guest, &props);
+            // Install the event bridge before mounting the guest, as the real
+            // NativeModuleView does. Otherwise its first Sensor::on_show is lost.
             let (view, mut native) = native_tree(
-                guest.frame.root.clone().unwrap(),
+                wire::Node::Space { width: None, height: None },
                 gpui::size(gpui::px(width), gpui::px(700.)),
                 cx,
             );

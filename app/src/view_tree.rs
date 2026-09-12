@@ -496,6 +496,12 @@ impl ViewTree {
     }
 
     #[cfg(test)]
+    pub(crate) fn input_presentation(&self, key: &str, window: &Window, cx: &App) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
+        let input = self.fields.get(key)?.state.read(cx);
+        Some((input.value().to_string(), input.cursor(), input.selected_range(), input.focus_handle(cx).is_focused(window)))
+    }
+
+    #[cfg(test)]
     pub(crate) fn scroll_offset(&self, key: &str) -> Option<Point<Pixels>> {
         self.lists
             .get(key)
