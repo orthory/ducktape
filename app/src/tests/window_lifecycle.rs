@@ -43,33 +43,33 @@ fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
 }
 #[test]
 fn leaving_settings_clears_authentication_but_reselecting_keeps_it() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.shell_tab = ShellTab::Settings;
     app.account_busy = true;
     app.account_ceremony_phase = "working".into();
     app.account_ceremony_detail = "Continue in the browser…".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
     assert!(app.account_busy);
     assert_eq!(app.account_ceremony_phase, "working");
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
     assert!(!app.account_busy);
     assert!(app.account_ceremony_phase.is_empty());
     assert!(app.account_ceremony_detail.is_empty());
 }
 #[test]
 fn reselecting_settings_without_authentication_still_refreshes() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.shell_tab = ShellTab::Settings;
     app.connected = true;
     app.settings_generation = 10;
     app.error = "old error".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
     assert_eq!(app.settings_generation, 11);
     assert!(app.error.is_empty());
 }
 #[test]
 fn closing_a_window_cancels_only_its_own_authentication() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     let launch = crate::shell::WindowKey::unique();
     let console = crate::shell::WindowKey::unique();
     let huddle = crate::shell::WindowKey::unique();
@@ -82,28 +82,28 @@ fn closing_a_window_cancels_only_its_own_authentication() {
     app.account_busy = true;
     app.account_ceremony_phase = "working".into();
 
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(huddle));
+    let _ = app.update(AppMessage::WindowWasClosed(huddle));
     assert_eq!(app.ceremony_phase, "working");
     assert!(app.account_busy);
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(launch));
+    let _ = app.update(AppMessage::WindowWasClosed(launch));
     assert!(app.ceremony_phase.is_empty());
     assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
     assert!(
         app.account_busy,
         "the console still owns its authentication"
     );
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(console));
+    let _ = app.update(AppMessage::WindowWasClosed(console));
     assert!(!app.account_busy);
     assert!(app.account_ceremony_phase.is_empty());
 }
 #[test]
 fn returning_to_the_picker_cancels_welcome_authentication() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.hub_step = crate::HubStep::Account;
     app.mutation_phase = crate::MutationPhase::Onboarding;
     app.ceremony_phase = "working".into();
     app.ceremony_detail = "Continue in the browser…".into();
-    let _ = app.__update(__DucktapeMessage::GoNetworks);
+    let _ = app.update(AppMessage::GoNetworks);
     assert!(matches!(app.hub_step, crate::HubStep::Networks));
     assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
     assert!(app.ceremony_phase.is_empty());
@@ -111,12 +111,12 @@ fn returning_to_the_picker_cancels_welcome_authentication() {
 }
 #[test]
 fn closing_a_window_exits_only_where_no_status_item_lives() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     let launch = crate::shell::WindowKey::unique();
     let console = crate::shell::WindowKey::unique();
     app.onboarding_win = Some(launch);
     app.console_win = Some(console);
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(launch));
+    let _ = app.update(AppMessage::WindowWasClosed(launch));
     assert_eq!(app.onboarding_win, None);
     assert_eq!(app.console_win, Some(console));
     let route = handler_body("WindowWasClosed");
@@ -127,11 +127,7 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     impl<'ast> syn::visit::Visit<'ast> for Exits {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
             let selected = matches!(&arm.pat, syn::Pat::TupleStruct(pattern) if pattern.path.segments.last().is_some_and(|part| part.ident == "WindowWasClosed"));
-            let app_message = arm
-                .pat
-                .to_token_stream()
-                .to_string()
-                .contains("__DucktapeMessage");
+            let app_message = arm.pat.to_token_stream().to_string().contains("AppMessage");
             if selected || !app_message {
                 self.visit_expr(&arm.body);
             }
@@ -215,11 +211,11 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
 }
 #[test]
 fn the_quit_route_is_armed_by_the_modifier_stream() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     let mods = command_chord("q").modifiers;
-    let _ = app.__update(__DucktapeMessage::ModifierStateChanged(mods));
+    let _ = app.update(AppMessage::ModifierStateChanged(mods));
     assert!(app.cmd_held);
-    let _ = app.__update(__DucktapeMessage::ModifierStateChanged(Default::default()));
+    let _ = app.update(AppMessage::ModifierStateChanged(Default::default()));
     assert!(!app.cmd_held);
     let route = handler_body("ModifierStateChanged");
     assert!(!route.contains("Task::perform"));
@@ -246,14 +242,14 @@ fn the_command_chords_are_classified_in_one_extern() {
 }
 #[test]
 fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.connected = true;
     app.shell_tab = ShellTab::Pages;
-    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
+    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
     assert!(!app.fs_dropping);
     app.shell_tab = ShellTab::Files;
     app.fs_drop_dir = "/shared/reports".into();
-    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
+    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
     assert!(app.fs_dropping);
     assert!(handler_body("FsFileDropped").contains("self.fs_drop_dir"));
 }
@@ -279,31 +275,34 @@ fn authentication_operations_always_have_replace_lanes() {
 #[test]
 fn authentication_lanes_retire_before_navigation_and_quit() {
     for (message, closes_account) in [
-        (__DucktapeMessage::TrayQuit, true),
-        (__DucktapeMessage::GoNetworks, false),
+        (AppMessage::TrayQuit, true),
+        (AppMessage::GoNetworks, false),
     ] {
-        let mut app = Ducktape::__state();
+        let mut app = Ducktape::initial_state();
         let before = (
-            app.__ice_run_lane_10_generation,
-            app.__ice_run_lane_11_generation,
-            app.__ice_run_lane_24_generation,
-            app.__ice_run_lane_25_generation,
+            app.account_qr_auth_generation,
+            app.account_desktop_auth_generation,
+            app.welcome_qr_auth_generation,
+            app.welcome_desktop_auth_generation,
         );
-        let _ = app.__update(message);
+        let _ = app.update(message);
         // GoNetworks belongs to the onboarding window. It must not cancel
         // the independently open console's account authentication lanes.
-        assert_eq!(app.__ice_run_lane_10_generation > before.0, closes_account);
-        assert_eq!(app.__ice_run_lane_11_generation > before.1, closes_account);
-        assert!(app.__ice_run_lane_24_generation > before.2);
-        assert!(app.__ice_run_lane_25_generation > before.3);
+        assert_eq!(app.account_qr_auth_generation > before.0, closes_account);
+        assert_eq!(
+            app.account_desktop_auth_generation > before.1,
+            closes_account
+        );
+        assert!(app.welcome_qr_auth_generation > before.2);
+        assert!(app.welcome_desktop_auth_generation > before.3);
     }
 }
 #[test]
 fn phone_and_desktop_account_authentication_retire_together() {
     for (name, body) in handler_bodies() {
-        if body.contains("self.__ice_run_lane_10_handle.take()") {
+        if body.contains("self.account_qr_auth_task.take()") {
             assert!(
-                body.contains("self.__ice_run_lane_11_handle.take()"),
+                body.contains("self.account_desktop_auth_task.take()"),
                 "{name}"
             );
         }
@@ -319,7 +318,7 @@ fn browser_authentication_keeps_a_visible_cancel_action() {
 }
 #[test]
 fn passkey_login_shows_its_cancellation_plate_without_an_account() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.shell_tab = ShellTab::Settings;
     app.account_exists = false;
     app.account_ceremony_phase = "working".into();

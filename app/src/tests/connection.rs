@@ -216,19 +216,19 @@ fn the_palette_says_so_when_a_search_fails() {
 /// instead of claiming a completed empty answer.
 #[test]
 fn the_palette_does_not_call_a_failed_search_an_empty_one() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
 
     // Typing is not an answer.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
+    let _ = app.update(AppMessage::PaletteChanged("zzz".into()));
     assert_eq!(app.palette_search_phase, SearchPhase::Searching);
 
     // A search that never ran is not an answer either — and it is the one a
     // bare `!searching` arm would mistake for one.
     app.palette_chat_hits = vec![stale_chat_hit()];
     app.palette_page_hits = vec![stale_page_hit()];
-    let _ = app.__update(__DucktapeMessage::PaletteSearchFailed(backend::AppError {
+    let _ = app.update(AppMessage::PaletteSearchFailed(backend::AppError {
         message: "node refused".into(),
         committed: false,
     }));
@@ -243,31 +243,27 @@ fn the_palette_does_not_call_a_failed_search_an_empty_one() {
     assert!(app.palette_page_hits.is_empty());
 
     // An empty result IS one.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
-    let _ = app.__update(__DucktapeMessage::PaletteResults(
-        backend::PaletteSearchData {
-            chat_hits: Vec::new(),
-            page_hits: Vec::new(),
-        },
-    ));
+    let _ = app.update(AppMessage::PaletteChanged("zzz".into()));
+    let _ = app.update(AppMessage::PaletteResults(backend::PaletteSearchData {
+        chat_hits: Vec::new(),
+        page_hits: Vec::new(),
+    }));
     assert_eq!(app.palette_search_phase, SearchPhase::Done);
 
     // ...and the next keystroke retires it, so the claim never outlives its
     // query.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzzz".into()));
+    let _ = app.update(AppMessage::PaletteChanged("zzzz".into()));
     assert_eq!(app.palette_search_phase, SearchPhase::Searching);
 
     // BACKSPACING TO EMPTY RUNS NO SEARCH, so nothing is coming to replace the
     // rows: `palette_changed` clears them above its early return, or the last
     // query's results sit listed under a blank field forever.
-    let _ = app.__update(__DucktapeMessage::PaletteResults(
-        backend::PaletteSearchData {
-            chat_hits: Vec::new(),
-            page_hits: vec![stale_page_hit()],
-        },
-    ));
+    let _ = app.update(AppMessage::PaletteResults(backend::PaletteSearchData {
+        chat_hits: Vec::new(),
+        page_hits: vec![stale_page_hit()],
+    }));
     assert_eq!(app.palette_page_hits.len(), 1);
-    let _ = app.__update(__DucktapeMessage::PaletteChanged(String::new()));
+    let _ = app.update(AppMessage::PaletteChanged(String::new()));
     assert!(app.palette_page_hits.is_empty());
     assert_eq!(app.palette_search_phase, SearchPhase::Idle);
 }
@@ -280,12 +276,12 @@ fn the_palette_does_not_call_a_failed_search_an_empty_one() {
 /// next block's `live_updated` overwrites the status, up to 3s on a quiet chain.
 #[test]
 fn a_single_failed_load_does_not_report_the_connection_offline() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = true;
     app.status = "Live".into();
 
-    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+    let _ = app.update(AppMessage::ChatLoadFailed(backend::HydrationError {
         generation: app.chat_generation,
         message: "the channel did not load".into(),
     }));
@@ -672,17 +668,17 @@ fn every_header_subtitle_is_gated_on_the_connection() {
 /// timeout.
 #[test]
 fn a_failed_connect_retries_instead_of_giving_up() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     let before = app.connect_generation;
 
     let fail = |generation: i64| {
-        __DucktapeMessage::ConnectFailed(backend::HydrationError {
+        AppMessage::ConnectFailed(backend::HydrationError {
             generation,
             message: "error sending request".into(),
         })
     };
-    let _ = app.__update(fail(app.connect_generation));
+    let _ = app.update(fail(app.connect_generation));
     assert_eq!(
         app.hydration_retry_attempt, 1,
         "the first failure is attempt 1"
@@ -695,8 +691,8 @@ fn a_failed_connect_retries_instead_of_giving_up() {
 
     // The counter CLIMBS — that is what feeds the backoff. A reset here would
     // retry at 1s forever against a genuinely dead endpoint.
-    let _ = app.__update(fail(app.connect_generation));
-    let _ = app.__update(fail(app.connect_generation));
+    let _ = app.update(fail(app.connect_generation));
+    let _ = app.update(fail(app.connect_generation));
     assert_eq!(app.hydration_retry_attempt, 3);
 
     // A CONNECT IS NOT GUARDED ON `hydration_generation`, AND THIS IS WHY.
@@ -707,11 +703,11 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     // the successful reply; because it SUCCEEDED no failure arm fires and
     // nothing retries, so the console sits Offline forever. Strictly worse than
     // the defect this PR fixes.
-    let (mut wired, _) = Ducktape::__boot();
+    let (mut wired, _) = Ducktape::boot();
     wired.connected_rpc = "http://127.0.0.1:38259".into();
     let connect_gen = wired.connect_generation;
     let shared_before = wired.hydration_generation;
-    let _ = wired.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = wired.update(AppMessage::ChooseChannel("general".into()));
     assert!(
         wired.hydration_generation > shared_before,
         "an ordinary channel click bumps the SHARED counter"
@@ -727,7 +723,7 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     // 10.8s apart, summing to one 16s cap.
     let stale = app.connect_generation - 1;
     let attempts = app.hydration_retry_attempt;
-    let _ = app.__update(fail(stale));
+    let _ = app.update(fail(stale));
     assert_eq!(
         app.hydration_retry_attempt, attempts,
         "an abandoned chain must not start a second retry loop"

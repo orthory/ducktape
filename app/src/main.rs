@@ -1,5 +1,6 @@
-include!("ui/app.rs");
-include!("ui/native_view.rs");
+#[path = "ui/app.rs"]
+mod app_state;
+pub(crate) use app_state::*;
 
 mod backend;
 mod call;

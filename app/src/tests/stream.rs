@@ -62,18 +62,18 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
 
 #[test]
 fn history_windows_offer_a_jump_back_to_latest() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.active_channel = "general".into();
 
     // landing on a search hit enters history mode…
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
     assert_eq!(app.chat_land_seq, 7);
 
     // …and the Jump-to-latest press — which the view emits as `choose_channel`
     // on the room it is already in — leaves it
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = app.update(AppMessage::ChooseChannel("general".into()));
     assert!(!app.history_view);
     assert_eq!(app.chat_land_seq, 0, "and the view opens back on the tail");
 
@@ -102,14 +102,14 @@ fn history_windows_offer_a_jump_back_to_latest() {
 /// reader is already at the end of. Same after a create.
 #[test]
 fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.active_channel = "general".into();
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
 
     // a resync carrying no chat news leaves the window — and its banner — alone
-    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+    let _ = app.update(AppMessage::LiveResynced(backend::LiveRefresh {
         chat_loaded: false,
         ..live_refresh(app.hydration_generation, "general")
     }));
@@ -119,7 +119,7 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     );
 
     // one that carries chat replaced it with the latest page
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
     )));
@@ -129,11 +129,11 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     );
 
     // and a create lands you in a brand-new room, which has no history at all
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
     let mut created = chat_data("brand-new");
     created.generation = app.chat_generation;
-    let _ = app.__update(__DucktapeMessage::ChannelCreated(created));
+    let _ = app.update(AppMessage::ChannelCreated(created));
     assert!(!app.history_view);
 }
 
@@ -149,12 +149,12 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
 /// means nothing else was.
 #[test]
 fn a_plane_op_refetches_only_the_plane_it_names() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
 
     let plane = |app: &mut Ducktape, module: &str| {
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        let _ = app.update(AppMessage::LiveUpdated(backend::LiveUpdate {
             kind: LiveKind::Plane,
             status: "Live".into(),
             height: 12,
@@ -232,10 +232,10 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
     let resync = |app: &Ducktape, channels: Vec<backend::ChatChannel>| {
         let mut refresh = live_refresh(app.hydration_generation, "dm-1");
         refresh.channels = channels;
-        __DucktapeMessage::LiveResynced(refresh)
+        AppMessage::LiveResynced(refresh)
     };
 
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     // The console is holding the network she left, and the node is now serving
@@ -244,7 +244,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
     app.network_chain_id = "ducktape-industries#549d70e8".into();
     app.channels = vec![room("general", 40), room("random", 3)];
 
-    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+    let _ = app.update(resync(&app, vec![room("dm-1", 6)]));
 
     let held: Vec<&str> = app.channels.iter().map(|row| row.id.as_str()).collect();
     assert_eq!(
@@ -262,7 +262,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
     // must survive it and a head a delta moved must not walk back.
     app.channels.push(room("brand-new", 1));
     app.channels[0].head_seq = 9;
-    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+    let _ = app.update(resync(&app, vec![room("dm-1", 6)]));
     assert!(
         app.channels.iter().any(|row| row.id == "brand-new"),
         "the room created mid-resync is still in the sidebar"

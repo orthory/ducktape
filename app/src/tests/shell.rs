@@ -2,10 +2,10 @@
 use super::*;
 #[test]
 fn a_pushed_status_moves_every_fact_it_carries() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
 
-    let _ = app.__update(__DucktapeMessage::NodeStatusPushed(backend::NodeFacts {
+    let _ = app.update(AppMessage::NodeStatusPushed(backend::NodeFacts {
         public_key: "node-key".into(),
         version: "0.2.0".into(),
         root_hash: "hash-new".into(),
@@ -56,9 +56,9 @@ fn a_pushed_status_moves_every_fact_it_carries() {
 
 #[test]
 fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     assert_eq!(app.shell_tab, ShellTab::Chat);
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Pages));
     assert_eq!(app.shell_tab, ShellTab::Pages);
 
     // a palette chat hit closes the palette and lands on the chat pane
@@ -66,7 +66,7 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(!app.palette_open);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 }
@@ -78,29 +78,29 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
 #[test]
 fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     // the disconnected path returns first, and must still clear.
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.error = "could not reach the node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Files));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Files));
     assert_eq!(
         app.error, "",
         "the !connected early return must still clear"
     );
 
     // the chat/pages path returns second, and must still clear.
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.error = "files: path not found".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Pages));
     assert_eq!(
         app.error, "",
         "the chat/pages early return must still clear"
     );
 
     // and the full path, which falls through to the generation bumps.
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.error = "explorer hydration failed".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Members));
     assert_eq!(app.error, "");
     assert_eq!(app.shell_tab, ShellTab::Members);
 }
@@ -121,27 +121,25 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
 
 #[test]
 fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     let in_flight = app.settings_generation;
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
-    let _ = app.__update(__DucktapeMessage::SettingsLoaded(
-        crate::backend::SettingsFacts {
-            generation: in_flight,
-            key_path: "/w/user.key".into(),
-            key_state: "encrypted".into(),
-            data_dir: "/w".into(),
-            user_key: "abcd".into(),
-        },
-    ));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Members));
+    let _ = app.update(AppMessage::SettingsLoaded(crate::backend::SettingsFacts {
+        generation: in_flight,
+        key_path: "/w/user.key".into(),
+        key_state: "encrypted".into(),
+        data_dir: "/w".into(),
+        user_key: "abcd".into(),
+    }));
     assert_eq!(
         app.settings_user_key, "abcd",
         "the move off-tab must not revoke the connect load's facts"
     );
 
     // and the tab that DOES draw them still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
     assert_ne!(
         app.settings_generation, in_flight,
         "entering Settings must issue a fresh read"
@@ -165,36 +163,36 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
 
 #[test]
 fn onboarding_capabilities_are_secret_buffers_cleared_on_navigation() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     let recovery = "duck ".repeat(24);
     let invite = "duck-capability".to_string();
 
-    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+    let _ = app.update(AppMessage::SecretTyped(
         "restore_words".into(),
         recovery.clone(),
     ));
-    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+    let _ = app.update(AppMessage::SecretTyped(
         "join_invite".into(),
         invite.clone(),
     ));
-    assert_eq!(app.__ice_secrets.text("restore_words"), recovery);
-    assert_eq!(app.__ice_secrets.text("join_invite"), invite);
+    assert_eq!(app.secrets.text("restore_words"), recovery);
+    assert_eq!(app.secrets.text("join_invite"), invite);
     let snapshot = format!("{app:?}");
     assert!(!snapshot.contains("duck-capability"));
     assert!(!snapshot.contains("duck duck"));
 
-    let _ = app.__update(__DucktapeMessage::GoNetworks);
-    assert!(app.__ice_secrets.text("restore_words").is_empty());
-    assert!(app.__ice_secrets.text("join_invite").is_empty());
+    let _ = app.update(AppMessage::GoNetworks);
+    assert!(app.secrets.text("restore_words").is_empty());
+    assert!(app.secrets.text("join_invite").is_empty());
 }
 
 #[test]
 fn ready_events_rehydrate_without_rewinding_the_tip() {
-    let (mut live, _) = Ducktape::__boot();
+    let (mut live, _) = Ducktape::boot();
     live.loading = false;
     live.block_height = 41;
     live.hydration_generation = 2;
-    let _ = live.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+    let _ = live.update(AppMessage::LiveUpdated(backend::LiveUpdate {
         kind: LiveKind::Ready,
         status: "Live".into(),
         height: -1,
@@ -220,22 +218,22 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
 
 #[test]
 fn a_tab_move_retires_the_banner_of_the_screen_it_left() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.shell_tab = ShellTab::Chat;
     app.error = "the room would not load".into();
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Node));
 
     assert_eq!(app.error, "", "a banner never rides a tab move");
     assert_eq!(app.shell_tab, ShellTab::Node);
 
     // The chat/pages return and the disconnected return each skip the
     // generation bumps below, and neither may keep a stale banner alive.
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.shell_tab = ShellTab::Pages;
     app.error = "the page would not load".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
     assert_eq!(app.error, "");
     assert_eq!(app.shell_tab, ShellTab::Chat);
 }
@@ -249,14 +247,14 @@ fn a_tab_move_retires_the_banner_of_the_screen_it_left() {
 
 #[test]
 fn a_committed_identity_op_rereads_the_account_and_frees_the_card() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.account_busy = true;
     app.account_ticket = "{}".into();
     let before = app.account_generation;
 
-    let _ = app.__update(__DucktapeMessage::AccountChanged(true));
+    let _ = app.update(AppMessage::AccountChanged(true));
 
     assert!(!app.account_busy, "the op is over");
     assert_eq!(app.account_generation, before + 1, "the account is re-read");
@@ -273,13 +271,11 @@ fn a_committed_identity_op_rereads_the_account_and_frees_the_card() {
 
 #[test]
 fn a_minted_ticket_is_shown_without_a_reread() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.account_busy = true;
     let before = app.account_generation;
 
-    let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
-        r#"{"add_key":{}}"#.into(),
-    ));
+    let _ = app.update(AppMessage::AccountTicketMinted(r#"{"add_key":{}}"#.into()));
 
     assert!(!app.account_busy);
     assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
@@ -292,7 +288,7 @@ fn a_minted_ticket_is_shown_without_a_reread() {
 
 #[test]
 fn the_explorer_is_handed_the_live_head_and_the_phase() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.shell_tab = ShellTab::Explorer;
     app.block_height = 1234;
     app.node_phase = "syncing".into();
@@ -306,7 +302,7 @@ fn the_explorer_is_handed_the_live_head_and_the_phase() {
 }
 #[test]
 fn no_seat_prints_a_checkpoint_beside_the_live_head() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.shell_tab = ShellTab::Node;
     app.node_height = 100;
     app.node_checkpoint = 90;
@@ -341,7 +337,7 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
 }
 #[test]
 fn node_operations_are_a_first_class_screen() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.shell_tab = ShellTab::Node;
     assert_eq!(app.native_view().0.module, "node");
     app.shell_tab = ShellTab::Settings;
@@ -349,11 +345,11 @@ fn node_operations_are_a_first_class_screen() {
 }
 #[test]
 fn joining_a_huddle_opens_the_call_window() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.active_channel = "general".into();
     app.active_channel_name = "General".into();
     app.huddle_now = 123;
-    let _ = app.__update(__DucktapeMessage::HuddleJoinedAck(true));
+    let _ = app.update(AppMessage::HuddleJoinedAck(true));
     assert!(app.huddle_joined);
     assert_eq!(app.huddle_channel, "general");
     assert_eq!(app.huddle_channel_name, "General");
@@ -380,7 +376,7 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
 }
 #[test]
 fn interaction_state_stays_with_the_screen_that_owns_it() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     for (tab, module) in [
         (ShellTab::Pages, "pages"),
         (ShellTab::Chat, "chat"),
@@ -409,7 +405,7 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 }
 #[test]
 fn passkey_ceremony_props_reach_settings_without_exposing_secrets() {
-    let mut app = Ducktape::__state();
+    let mut app = Ducktape::initial_state();
     app.shell_tab = ShellTab::Settings;
     app.password = "never-in-props".into();
     app.account_ceremony_phase = "working".into();

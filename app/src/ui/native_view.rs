@@ -1,9 +1,11 @@
+use super::*;
+
 impl Ducktape {
-    fn native_view(
+    pub(crate) fn native_view(
         &self,
     ) -> (
         crate::module_view::ViewSpec,
-        fn(crate::module_view::ModuleViewEvent) -> __DucktapeMessage,
+        fn(crate::module_view::ModuleViewEvent) -> AppMessage,
     ) {
         match self.shell_tab {
             ShellTab::Chat => (
@@ -40,7 +42,7 @@ impl Ducktape {
                     &self.chat_pending_sends,
                     &self.live_agents,
                 ),
-                __DucktapeMessage::ChatViewEvent,
+                AppMessage::ChatViewEvent,
             ),
             ShellTab::Pages => (
                 crate::module_view::pages_view(
@@ -50,7 +52,7 @@ impl Ducktape {
                     &self.page_route,
                     self.page_route_serial,
                 ),
-                __DucktapeMessage::PagesViewEvent,
+                AppMessage::PagesViewEvent,
             ),
             ShellTab::Forge => (
                 crate::module_view::forge_view(
@@ -64,7 +66,7 @@ impl Ducktape {
                     &self.forge_link,
                     self.forge_link_tick,
                 ),
-                __DucktapeMessage::ForgeViewEvent,
+                AppMessage::ForgeViewEvent,
             ),
             ShellTab::Agents => (
                 crate::module_view::agents_view(
@@ -74,7 +76,7 @@ impl Ducktape {
                     &self.agents_open_run,
                     self.agents_opened,
                 ),
-                __DucktapeMessage::AgentsViewEvent,
+                AppMessage::AgentsViewEvent,
             ),
             ShellTab::Files => (
                 crate::module_view::files_view(
@@ -84,7 +86,7 @@ impl Ducktape {
                     &self.fs_route,
                     self.fs_route_serial,
                 ),
-                __DucktapeMessage::FilesViewEvent,
+                AppMessage::FilesViewEvent,
             ),
             ShellTab::Explorer => (
                 crate::module_view::explorer_view(
@@ -97,7 +99,7 @@ impl Ducktape {
                         self.node_sync_target,
                     ),
                 ),
-                __DucktapeMessage::ExplorerViewEvent,
+                AppMessage::ExplorerViewEvent,
             ),
             ShellTab::Node => (
                 crate::module_view::node_view(
@@ -109,7 +111,7 @@ impl Ducktape {
                     &self.node_data_dir,
                     self.wall_now,
                 ),
-                __DucktapeMessage::NodeViewEvent,
+                AppMessage::NodeViewEvent,
             ),
             ShellTab::Members => (
                 crate::module_view::members_view(
@@ -117,7 +119,7 @@ impl Ducktape {
                     self.connected,
                     crate::backend::members_is_admin(&self.members_rows),
                 ),
-                __DucktapeMessage::MembersViewEvent,
+                AppMessage::MembersViewEvent,
             ),
             ShellTab::Governance => (
                 crate::module_view::governance_view(
@@ -125,7 +127,7 @@ impl Ducktape {
                     self.connected,
                     crate::backend::members_is_admin(&self.members_rows),
                 ),
-                __DucktapeMessage::GovernanceViewEvent,
+                AppMessage::GovernanceViewEvent,
             ),
             ShellTab::Settings => (
                 crate::module_view::settings_view(
@@ -152,7 +154,7 @@ impl Ducktape {
                     self.account_busy,
                     &self.account_ticket,
                 ),
-                __DucktapeMessage::SettingsViewEvent,
+                AppMessage::SettingsViewEvent,
             ),
         }
     }

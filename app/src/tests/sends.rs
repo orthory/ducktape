@@ -60,13 +60,13 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
 /// room's box, never posted into the one she moved to.
 #[test]
 fn a_submit_for_a_room_the_reader_has_left_goes_back_to_that_room() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     let left = backend::composer_scope("http://node", "ops");
-    let task = app.__update(__DucktapeMessage::ChatViewEvent(composer_intent(
+    let task = app.update(AppMessage::ChatViewEvent(composer_intent(
         &left, "message", "for ops",
     )));
     pump(&mut app, task);
@@ -86,7 +86,7 @@ fn a_submit_for_a_room_the_reader_has_left_goes_back_to_that_room() {
 /// the meantime.
 #[test]
 fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
@@ -115,7 +115,7 @@ fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
     // THE SECOND SEND'S RECEIPT COMES BACK FIRST. Each entry is settled by the
     // id that names it — the block it rode is in — so a receipt out of submit
     // order cannot take the other send's row with it.
-    let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
+    let _ = app.update(AppMessage::MessageSent(backend::SendReceipt {
         operation_id: second_id.clone(),
         channel_id: "general".into(),
     }));
@@ -123,7 +123,7 @@ fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert_eq!(bodies_in_flight(&app), ["first"]);
 
-    let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
+    let _ = app.update(AppMessage::MessageSent(backend::SendReceipt {
         operation_id: first_id.clone(),
         channel_id: "general".into(),
     }));
@@ -214,7 +214,7 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
 // resync landing on the room is exactly when a future refactor would reach.
 #[test]
 fn a_resync_never_eats_the_message_being_typed() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.shell_tab = ShellTab::Chat;
@@ -223,7 +223,7 @@ fn a_resync_never_eats_the_message_being_typed() {
     let composer = composer_scope(&app);
     type_into(&composer, "half a paragraph, mid-word");
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(4, "general")));
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(4, "general")));
 
     assert_eq!(
         composer_text(&composer),
@@ -242,7 +242,7 @@ fn a_resync_never_eats_the_message_being_typed() {
 // and the reconnect never reaches inside a composer to blank either.
 #[test]
 fn same_endpoint_reconnect_preserves_unsent_drafts() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.connected_rpc = "http://node-a".into();
     let composer = composer_scope(&app);
@@ -251,7 +251,7 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
     // hand-back the app's failure arms make, addressed to this document.
     composer_surface::unsent(&composer, "unsent message", false);
 
-    let _ = app.__update(__DucktapeMessage::Reconnect);
+    let _ = app.update(AppMessage::Reconnect);
 
     assert_eq!(app.connected_rpc, "http://node-a");
     assert_eq!(composer_text(&composer), "next message");
@@ -270,7 +270,7 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
 /// The rail's composer had it worse — the reconnect simply ate it.
 #[test]
 fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "private-ops".into();
@@ -279,12 +279,12 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     type_into(&ops, "the incident started at");
     type_into(&ops_rail, "half a reply");
 
-    let _ = app.__update(__DucktapeMessage::Reconnect);
+    let _ = app.update(AppMessage::Reconnect);
 
     let mut landed = workspace("general");
     landed.generation = app.connect_generation;
     landed.channels = vec![room("private-ops", 10), room("general", 20)];
-    let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
+    let _ = app.update(AppMessage::WorkspaceConnected(landed));
 
     assert_eq!(
         app.active_channel, "general",
@@ -299,7 +299,7 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     );
 
     app.mutation_phase = MutationPhase::Idle;
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    let _ = app.update(AppMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
         composer_text(&ops),
         "the incident started at",
@@ -327,18 +327,18 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
 /// room she lands in is not addressable by it at all.
 #[test]
 fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "private-ops".into();
     let ops = composer_scope(&app);
     type_into(&ops, "the incident started at");
 
-    let _ = app.__update(__DucktapeMessage::Reconnect);
+    let _ = app.update(AppMessage::Reconnect);
     let mut landed = workspace("general");
     landed.generation = app.connect_generation;
     landed.channels = vec![room("private-ops", 10), room("general", 20)];
-    let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
+    let _ = app.update(AppMessage::WorkspaceConnected(landed));
 
     // A chat-carrying resync lands on another room — the exact trip that used
     // to stash the harvest onto the app-wide plate. The rescue it still runs
@@ -346,7 +346,7 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     // and it carries the inline edit's text: nothing is being edited here, so
     // there is no body for it to hand anyone.
     let general = composer_scope(&app);
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "dm-with-alice",
     )));
@@ -391,7 +391,7 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         ("channel_archived", true, false),
         ("members_only", false, true),
     ] {
-        let (mut app, _) = Ducktape::__boot();
+        let (mut app, _) = Ducktape::boot();
         app.connected = true;
         app.loading = false;
         // Each reason is its own network: the composer documents are keyed
@@ -446,7 +446,7 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     // AND THE GATE IS NOT A BLANKET REFUSAL: seated in the same members-only
     // channel, both composers send. Without this the asserts above would pass
     // against a composer that refused everything.
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
@@ -505,7 +505,7 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
             "{name} cannot mark an instance-owned composer"
         );
     }
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.shell_tab = ShellTab::Chat;
@@ -515,7 +515,7 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
     type_into(&stream, "channel draft");
     type_into(&rail, "reply draft");
 
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("b")));
+    let _ = app.update(AppMessage::GlobalKeyPressed(command_chord("b")));
 
     assert_eq!(
         composer_text(&stream),
@@ -554,7 +554,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
         modifiers: gpui_kit::Modifiers::default(),
     };
     let escape = || plain("escape");
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.shell_tab = ShellTab::Chat;
@@ -563,25 +563,25 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     type_into(&composer, "draft");
 
     // Inert: a bare letter opens nothing.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(plain("b")));
+    let _ = app.update(AppMessage::GlobalKeyPressed(plain("b")));
     assert!(!app.palette_open);
 
     // A formatting chord is the widget's now, so the subscription leaves the
     // draft alone — and the classes the guard DOES let through still land.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("b")));
+    let _ = app.update(AppMessage::GlobalKeyPressed(command_chord("b")));
     assert_eq!(
         composer_text(&composer),
         "draft",
         "the subscription no longer marks a composer"
     );
 
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("k")));
+    let _ = app.update(AppMessage::GlobalKeyPressed(command_chord("k")));
     assert!(app.palette_open, "Cmd+K still opens the palette");
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
+    let _ = app.update(AppMessage::GlobalKeyPressed(escape()));
     assert!(!app.palette_open, "Escape still closes it");
 
     app.channel_create_open = true;
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
+    let _ = app.update(AppMessage::GlobalKeyPressed(escape()));
     assert!(
         !app.channel_create_open,
         "and the escape ladder still runs below the guard"
@@ -591,7 +591,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     // widget that holds the caret, so the app's global handler sees it and
     // names no move at all.
     app.shell_tab = ShellTab::Pages;
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("z")));
+    let _ = app.update(AppMessage::GlobalKeyPressed(command_chord("z")));
     assert!(
         app.error.is_empty(),
         "the global handler has nothing to say about a chord the view owns"
@@ -607,7 +607,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
 /// handler's task has to be pumped for the composer to hear it.
 #[test]
 fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
@@ -618,7 +618,7 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     type_into(&composer, "retry me");
     submit_composer(&mut app, &composer, ComposerKind::Message, false);
     let operation_id = app.chat_pending_sends[0].id.clone();
-    let task = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.update(AppMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
@@ -638,14 +638,14 @@ fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
 
 #[test]
 fn failed_send_preserves_the_next_and_unsent_drafts() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
     let operation_id = submit(&mut app, ComposerKind::Message, "first");
     let composer = composer_scope(&app);
     type_into(&composer, "second");
-    let task = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.update(AppMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
@@ -706,7 +706,7 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
 /// (ducktape-ui#698), and #random's composer never hears about it.
 #[test]
 fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
@@ -720,11 +720,11 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     // She switches rooms while the write is in flight, and starts a new message
     // there. `choose_channel` moves the room the view reads; the pending row
     // goes with it.
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
+    let _ = app.update(AppMessage::ChooseChannel("random".into()));
     let random = composer_scope(&app);
     type_into(&random, "different thought");
 
-    let task = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.update(AppMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
@@ -758,7 +758,7 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     // whole. `thread_seq` is what carries the reply home once the rail has
     // moved on: the room alone cannot name which of its threads let the words
     // go, and the rail itself is the view's — the app never sees it close.
-    let (mut rail, _) = Ducktape::__boot();
+    let (mut rail, _) = Ducktape::boot();
     rail.connected = true;
     rail.loading = false;
     rail.active_channel = "general".into();
@@ -769,7 +769,7 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     type_into(&rail_composer, "on it");
     submit_composer(&mut rail, &rail_composer, ComposerKind::Reply, false);
     let reply_id = rail.chat_pending_sends[0].id.clone();
-    let task = rail.__update(__DucktapeMessage::ThreadReplySendFailed(
+    let task = rail.update(AppMessage::ThreadReplySendFailed(
         backend::OptimisticMutationError {
             message: "reply rejected".into(),
             committed: false,
@@ -792,14 +792,14 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 
 #[test]
 fn committed_mutation_keeps_optimistic_state_until_refresh() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     let operation_id = submit(&mut app, ComposerKind::Message, "committed once");
     let composer = composer_scope(&app);
-    let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+    let _ = app.update(AppMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "read failed after commit".into(),
             committed: true,
@@ -836,14 +836,14 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
 
 #[test]
 fn committed_message_change_cannot_be_submitted_twice() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     app.chat_edit_seq = 7;
     app.chat_edit_rev = 2;
     app.mutation_phase = MutationPhase::MessageEdit;
 
-    let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+    let _ = app.update(AppMessage::MutationFailed(backend::AppError {
         message: "read failed after commit".into(),
         committed: true,
     }));
@@ -863,21 +863,21 @@ fn committed_message_change_cannot_be_submitted_twice() {
 /// out and no reason for anyone to guess at it.
 #[test]
 fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.loading = false;
     app.active_channel = "general".into();
     app.mutation_phase = MutationPhase::Channel;
 
-    let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+    let _ = app.update(AppMessage::MutationFailed(backend::AppError {
         message: "read failed after commit".into(),
         committed: true,
     }));
     assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 
     // a resync belonging to an abandoned chain answers for nothing
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(
         app.hydration_generation - 1,
         "general",
     )));
@@ -887,7 +887,7 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
         "a stale answer is not it"
     );
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
     )));
@@ -916,7 +916,7 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
 /// cannot carry a draft because a switch does not touch one.
 #[test]
 fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.mutation_phase = MutationPhase::Idle;
@@ -925,7 +925,7 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
     let ops = composer_scope(&app);
     type_into(&ops, "the incident started at");
 
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = app.update(AppMessage::ChooseChannel("general".into()));
     let general = composer_scope(&app);
     assert_ne!(general, ops, "a different room is a different instance");
     assert!(
@@ -935,14 +935,14 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
     );
 
     type_into(&general, "ok");
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    let _ = app.update(AppMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
         composer_text(&ops),
         "the incident started at",
         "and the sentence she was writing is waiting where she left it"
     );
 
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = app.update(AppMessage::ChooseChannel("general".into()));
     assert_eq!(composer_text(&general), "ok", "both rooms keep their own");
 
     // A SENT DRAFT DOES NOT COME BACK: the instance clears itself when it
@@ -954,8 +954,8 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
         composer_text(&general).is_empty(),
         "the send emptied the box"
     );
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = app.update(AppMessage::ChooseChannel("private-ops".into()));
+    let _ = app.update(AppMessage::ChooseChannel("general".into()));
     assert!(
         composer_text(&general).is_empty(),
         "a message she already sent must not be handed back as a draft"
@@ -972,7 +972,7 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
 /// reattributed, and gone when she went back to #private-ops for it.
 #[test]
 fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.mutation_phase = MutationPhase::Idle;
@@ -984,7 +984,7 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
     let mut created = chat_data("new-channel");
     created.generation = app.chat_generation;
     created.channels = vec![room("private-ops", 10), room("new-channel", 0)];
-    let _ = app.__update(__DucktapeMessage::ChannelCreated(created));
+    let _ = app.update(AppMessage::ChannelCreated(created));
 
     assert_eq!(
         app.active_channel, "new-channel",
@@ -997,7 +997,7 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
          room she left is armed to send here"
     );
 
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    let _ = app.update(AppMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
         composer_text(&ops),
         "the incident started at",

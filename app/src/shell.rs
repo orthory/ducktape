@@ -136,7 +136,7 @@ pub(crate) fn quit<Message: 'static>() -> Task<Message> {
     effect(Command::Quit)
 }
 
-use crate::{__DucktapeMessage as Message, Ducktape, ShellTab};
+use crate::{AppMessage as Message, Ducktape, ShellTab};
 use gpui_kit::{
     AppContext as _, AsyncApp, Context, Entity, IntoElement, ParentElement as _, Render,
     Styled as _, Window,
@@ -156,7 +156,7 @@ struct Desktop {
 impl Desktop {
     fn dispatch(&mut self, message: Message, cx: &mut Context<Self>) {
         let appearance = self.state.appearance.clone();
-        let task = self.state.__update(message);
+        let task = self.state.update(message);
         if appearance != self.state.appearance {
             self.sync_appearance(cx);
         }
@@ -212,7 +212,7 @@ impl Desktop {
     }
 
     fn subscriptions(&mut self, cx: &mut Context<Self>) {
-        let recipes = self.state.__subscription().into_recipes();
+        let recipes = self.state.subscriptions().into_recipes();
         self.streams
             .retain(|key, _| recipes.iter().any(|recipe| recipe.key == *key));
         for recipe in recipes {
@@ -490,7 +490,7 @@ impl DesktopWindow {
                 if secret_slot {
                     let text = input.read(cx).value().to_string();
                     model.update(cx, |model, cx| {
-                        model.dispatch(Message::__SecretTyped(key.into(), text), cx)
+                        model.dispatch(Message::SecretTyped(key.into(), text), cx)
                     });
                 }
                 match key {
@@ -503,7 +503,7 @@ impl DesktopWindow {
                     "channel-draft" => {
                         let text = input.read(cx).value().to_string();
                         model.update(cx, |model, cx| {
-                            model.dispatch(Message::__BindChannelDraft(text), cx)
+                            model.dispatch(Message::ChannelDraftChanged(text), cx)
                         });
                     }
                     _ => {}
@@ -1528,7 +1528,7 @@ mod close_tests {
         let handle = cx.open_window(
             gpui_kit::size(gpui_kit::px(320.), gpui_kit::px(460.)),
             |window, cx| {
-                let (state, _) = Ducktape::__boot();
+                let (state, _) = Ducktape::boot();
                 let view = test_window(state, WindowKind::Huddle, window, cx);
                 presenter = Some(view.clone());
                 gpui_kit::component::Root::new(view, window, cx)
@@ -1596,7 +1596,7 @@ pub(crate) fn run() {
         theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
         gpui_kit::component::Theme::sync_base(cx);
         let mut commands = commands();
-        let (state, initial) = Ducktape::__boot();
+        let (state, initial) = Ducktape::boot();
         let (mut tray, mut tray_events) = crate::tray::init(cx);
         tray.sync(&state);
         let desktop = cx.new(|_| Desktop {

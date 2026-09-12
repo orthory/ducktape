@@ -14,7 +14,7 @@ fn full_view_fits_the_default_test_stack() {
                 (crate::shell::WindowKind::Huddle, 320., 460.),
             ] {
                 let mut cx = crate::frame_probe::headless_context();
-                let mut app = Ducktape::__state();
+                let mut app = Ducktape::initial_state();
                 app.hub_step = HubStep::Networks;
                 let window = cx
                     .open_window(size(px(width), px(height)), |window, cx| {
@@ -132,7 +132,7 @@ fn native_sources_hold_to_the_design_system() {
         ShellTab::Governance,
         ShellTab::Settings,
     ] {
-        let mut state = Ducktape::__state();
+        let mut state = Ducktape::initial_state();
         state.shell_tab = tab;
         let (spec, _) = state.native_view();
         assert!(!spec.module.is_empty());
@@ -170,7 +170,7 @@ fn app_and_wasm_guests_do_not_resolve_the_ice_toolchain_or_iced_runtime() {
 }
 #[test]
 fn view_theme_follows_the_current_appearance_without_cache_invalidation() {
-    let mut state = Ducktape::__state();
+    let mut state = Ducktape::initial_state();
     for (appearance, dark) in [
         (Appearance::Dark, true),
         (Appearance::Light, false),

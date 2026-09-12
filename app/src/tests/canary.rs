@@ -47,7 +47,7 @@ fn parse(line: &str) -> Option<Transition> {
 
 fn capture(module: &'static str, path: &Path) -> Vec<u8> {
     let mut cx = crate::frame_probe::headless_context();
-    let mut app = super::Ducktape::__state();
+    let mut app = super::Ducktape::initial_state();
     app.connected = true;
     app.shell_tab = match module {
         "chat" => super::ShellTab::Chat,
@@ -230,7 +230,7 @@ fn canary_follows_a_live_node() {
     let mut height = workspace.height;
     let mut live = crate::backend::live_events(node.clone());
     let mut cx = crate::frame_probe::headless_context();
-    let mut app = super::Ducktape::__state();
+    let mut app = super::Ducktape::initial_state();
     app.connected = true;
     app.connected_rpc = node;
     app.shell_tab = super::ShellTab::Chat;

@@ -1,7 +1,7 @@
 //! The native menu bar mirrors session facts; choosing a row reuses the
 //! desktop's ordinary messages. macOS owns the status item and menu loop.
 
-use crate::{__DucktapeMessage as Message, Appearance, Ducktape, backend};
+use crate::{AppMessage as Message, Appearance, Ducktape, backend};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use gpui_kit::App;
 

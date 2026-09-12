@@ -3539,11 +3539,11 @@ pub(crate) mod tests {
             .expect("module views")
             .insert("governance", seat.clone());
 
-        let (mut app, _) = crate::Ducktape::__boot();
+        let (mut app, _) = crate::Ducktape::boot();
         app.connected = true;
         app.loading = false;
         let serial = app.views_live_serial;
-        let _ = app.__update(crate::__DucktapeMessage::LiveUpdated(
+        let _ = app.update(crate::AppMessage::LiveUpdated(
             crate::backend::LiveUpdate {
                 kind: crate::LiveKind::Chat,
                 status: "Live".into(),

@@ -1,5 +1,5 @@
 //! Real native shaping and scene-layout probes. Timings are reported, not gated.
-use super::{__DucktapeMessage, Ducktape, backend};
+use super::{AppMessage, Ducktape, backend};
 use gpui_kit::{AppContext, HeadlessAppContext, px, size};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
@@ -121,12 +121,12 @@ fn probe_huddle_participant(index: usize) -> backend::HuddleParticipant {
 }
 
 fn console_in_huddle() -> (Ducktape, crate::shell::WindowKey) {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.settings_user_key = "user-0".into();
     let huddle = crate::shell::WindowKey::unique();
-    let _ = app.__update(__DucktapeMessage::ChatUpdated(backend::ChatData {
+    let _ = app.update(AppMessage::ChatUpdated(backend::ChatData {
         generation: app.chat_generation,
         channels: vec![probe_channel(0)],
         active_channel: "channel-0".into(),
@@ -136,9 +136,9 @@ fn console_in_huddle() -> (Ducktape, crate::shell::WindowKey) {
         huddle_roster: (0..HUDDLE_ROWS).map(probe_huddle_participant).collect(),
         channel_members: Vec::new(),
     }));
-    let _ = app.__update(__DucktapeMessage::HuddleOpened(huddle));
+    let _ = app.update(AppMessage::HuddleOpened(huddle));
     for index in 0..HUDDLE_ROWS {
-        let _ = app.__update(__DucktapeMessage::CallEvent(super::call::CallEvent {
+        let _ = app.update(AppMessage::CallEvent(super::call::CallEvent {
             kind: "peer".into(),
             peer: format!("node-{index}"),
             muted: index % 2 == 0,

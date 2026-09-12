@@ -12,13 +12,13 @@ fn row(seq: i64) -> backend::BellItem {
 
 #[test]
 fn bell_acknowledgement_reads_only_the_admitted_watermark() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connect_generation = 7;
     app.account_number = "4".into();
     app.bell_items = vec![row(3), row(2), row(1)];
     app.bell_unread = 3;
     app.bell_marking = true;
-    let _ = app.__update(__DucktapeMessage::BellMarked(
+    let _ = app.update(AppMessage::BellMarked(
         7,
         "4".into(),
         backend::BellDelta {
@@ -31,7 +31,7 @@ fn bell_acknowledgement_reads_only_the_admitted_watermark() {
     assert_eq!(app.bell_unread, 1);
     assert!(!app.bell_items[0].read);
     assert!(app.bell_items[1].read);
-    let _ = app.__update(__DucktapeMessage::BellLoaded(
+    let _ = app.update(AppMessage::BellLoaded(
         7,
         "4".into(),
         backend::BellData {
@@ -46,7 +46,7 @@ fn bell_acknowledgement_reads_only_the_admitted_watermark() {
 
 #[test]
 fn bell_failed_read_is_visible_and_stale_accounts_cannot_finish_it() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connect_generation = 7;
     app.account_number = "4".into();
     app.bell_items = vec![row(1)];
@@ -57,11 +57,11 @@ fn bell_failed_read_is_visible_and_stale_accounts_cannot_finish_it() {
         up_to_seq: 1,
         ..Default::default()
     };
-    let _ = app.__update(__DucktapeMessage::BellMarked(6, "4".into(), delta.clone()));
-    let _ = app.__update(__DucktapeMessage::BellMarked(7, "5".into(), delta));
+    let _ = app.update(AppMessage::BellMarked(6, "4".into(), delta.clone()));
+    let _ = app.update(AppMessage::BellMarked(7, "5".into(), delta));
     assert!(app.bell_marking);
     assert_eq!(app.bell_unread, 1);
-    let _ = app.__update(__DucktapeMessage::BellMarkFailed(
+    let _ = app.update(AppMessage::BellMarkFailed(
         7,
         "4".into(),
         backend::AppError {
@@ -79,13 +79,13 @@ fn bell_failed_read_is_visible_and_stale_accounts_cannot_finish_it() {
 fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
     use futures::StreamExt as _;
     for change in ["none", "connection", "account"] {
-        let (mut app, _) = Ducktape::__boot();
+        let (mut app, _) = Ducktape::boot();
         app.connect_generation = 7;
         app.account_generation = 1;
         app.account_number = "4".into();
         app.shell_tab = ShellTab::Chat;
         app.loading = false;
-        let task = app.__update(__DucktapeMessage::BellOpenItem(
+        let task = app.update(AppMessage::BellOpenItem(
             7,
             "4".into(),
             backend::BellPresentation {
@@ -103,13 +103,13 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
         );
         match change {
             "connection" => {
-                let _ = app.__update(__DucktapeMessage::ConnectFailed(backend::HydrationError {
+                let _ = app.update(AppMessage::ConnectFailed(backend::HydrationError {
                     generation: 7,
                     message: "disconnected".into(),
                 }));
             }
             "account" => {
-                let _ = app.__update(__DucktapeMessage::AccountLoaded(backend::AccountData {
+                let _ = app.update(AppMessage::AccountLoaded(backend::AccountData {
                     generation: 1,
                     exists: true,
                     number: "5".into(),
@@ -120,7 +120,7 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
             _ => {}
         }
         for message in queued {
-            let _ = app.__update(message);
+            let _ = app.update(message);
         }
         assert_eq!(
             app.shell_tab == ShellTab::Pages,
@@ -137,7 +137,7 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{VisualTestContext, px, size};
     let _guard = crate::module_view::tests::blocking_connection_turn();
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.console_win = Some(crate::shell::WindowKey::unique());
     app.account_number = "4".into();
     app.bell_open = true;
@@ -203,7 +203,7 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     });
     view.update(&mut native, |view, cx| {
         view.test_dispatch(
-            __DucktapeMessage::BellMarked(
+            AppMessage::BellMarked(
                 0,
                 "4".into(),
                 backend::BellDelta {

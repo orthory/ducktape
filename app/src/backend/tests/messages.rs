@@ -194,7 +194,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
     // real height here. What changed is upstream — `served_height` decides that
     // a `0` on the wire was never a measurement, so no zero reaches this label
     // as a head. See `a_resyncing_replica_has_no_head_to_print_a_checkpoint_against`.
-    let (app, _) = crate::Ducktape::__boot();
+    let (app, _) = crate::Ducktape::boot();
     assert_eq!(app.node_height, -1, "an unread height is not a measured zero");
 }
 

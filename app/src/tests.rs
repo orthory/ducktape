@@ -58,7 +58,7 @@ fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
             backend::edit_scope(&app.connected_rpc, &app.active_channel, app.chat_edit_seq)
         }
     };
-    let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
+    let _ = app.update(AppMessage::ComposerSubmitted(
         kind,
         body.to_owned(),
         id.clone(),
@@ -212,15 +212,15 @@ fn submit_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, blocked:
         return;
     };
     let event = composer_surface::intent(&value).expect("native composer submit intent");
-    let task = app.__update(__DucktapeMessage::ChatViewEvent(event));
+    let task = app.update(AppMessage::ChatViewEvent(event));
     pump(app, task);
 }
 /// Drain only this task's messages. Follow-up I/O belongs to the caller's fixture.
-fn pump(app: &mut Ducktape, task: ducktape_view_guest::Task<__DucktapeMessage>) {
+fn pump(app: &mut Ducktape, task: ducktape_view_guest::Task<AppMessage>) {
     use futures::StreamExt;
     let messages: Vec<_> = futures::executor::block_on(task.into_stream().collect());
     for message in messages {
-        let _ = app.__update(message);
+        let _ = app.update(message);
     }
 }
 fn command_chord(key: &str) -> crate::shell::KeyPress {
@@ -259,7 +259,10 @@ fn rust_tokens_on_stack(source: &str) -> String {
 pub(crate) fn handler_bodies() -> Vec<(String, String)> {
     use quote::ToTokens;
     use syn::visit::Visit;
-    struct Handlers(Vec<(String, String)>);
+    struct Handlers {
+        bodies: Vec<(String, String)>,
+        methods: std::collections::BTreeMap<String, syn::Block>,
+    }
     impl<'ast> Visit<'ast> for Handlers {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
             let path = match &arm.pat {
@@ -273,10 +276,18 @@ pub(crate) fn handler_bodies() -> Vec<(String, String)> {
                     .iter()
                     .map(|part| part.ident.to_string())
                     .collect();
-                if parts.len() == 2 && parts[0] == "__DucktapeMessage" {
-                    self.0.push((
+                if parts.len() == 2 && parts[0] == "AppMessage" {
+                    assert!(arm.guard.is_none(), "message dispatch has no match guards");
+                    let syn::Expr::MethodCall(call) = arm.body.as_ref() else {
+                        panic!("each message delegates to its named handler");
+                    };
+                    let handler = self
+                        .methods
+                        .get(&call.method.to_string())
+                        .expect("the dispatched handler exists");
+                    self.bodies.push((
                         parts[1].clone(),
-                        arm.body
+                        handler
                             .to_token_stream()
                             .to_string()
                             .chars()
@@ -289,10 +300,28 @@ pub(crate) fn handler_bodies() -> Vec<(String, String)> {
         }
     }
     let source = syn::parse_file(include_str!("ui/app_update.rs")).expect("native update Rust");
-    let mut found = Handlers(Vec::new());
+    let methods = source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(&item.items),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(function) => {
+                Some((function.sig.ident.to_string(), function.block.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut found = Handlers {
+        bodies: Vec::new(),
+        methods,
+    };
     found.visit_file(&source);
-    assert!(!found.0.is_empty(), "real native handlers are present");
-    found.0
+    assert!(!found.bodies.is_empty(), "real native handlers are present");
+    found.bodies
 }
 pub(crate) fn handler_body(variant: &str) -> String {
     let mut found = handler_bodies()
