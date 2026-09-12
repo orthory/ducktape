@@ -2552,7 +2552,11 @@ fn shape(bytes: &[u8]) -> Result<(wire::Frame, display_diagnostics::FrameReports
         return Err("frame too large".to_string());
     }
     let mut frame: wire::Frame = wire::decode(bytes)?;
-    frame.requests.truncate(2 * MAX_REQUESTS_PER_TICK);
+    let requests_exceed_budget = frame.requests.len() > MAX_REQUESTS_PER_TICK;
+    let cancels_exceed_budget = frame.cancels.len() > 2 * MAX_REQUESTS_PER_TICK;
+    if requests_exceed_budget || cancels_exceed_budget {
+        return Err("frame request or cancellation budget exceeded".into());
+    }
     if frame.unchanged {
         frame.root = None;
     }
@@ -6596,6 +6600,36 @@ pub(crate) mod tests {
             "the app recovers the item's channel from the scope alone"
         );
         assert!(guest.fault.is_none());
+    }
+
+    #[test]
+    fn oversized_request_batches_are_refused_before_any_prefix_can_execute() {
+        let mut frame = wire::Frame {
+            requests: (0..MAX_REQUESTS_PER_TICK as u64)
+                .map(|id| wire::Request { id, kind: "op.submit".into(), payload: Vec::new() })
+                .collect(),
+            ..Default::default()
+        };
+        let (accepted, _) = shape(&wire::encode(&frame)).expect("exact request budget");
+        assert_eq!(accepted.requests.len(), MAX_REQUESTS_PER_TICK);
+        frame.requests.push(wire::Request {
+            id: MAX_REQUESTS_PER_TICK as u64,
+            kind: "op.submit".into(),
+            payload: Vec::new(),
+        });
+        assert_eq!(
+            shape(&wire::encode(&frame)).err().as_deref(),
+            Some("frame request or cancellation budget exceeded")
+        );
+        frame.requests.clear();
+        frame.cancels = (0..(2 * MAX_REQUESTS_PER_TICK) as u64).collect();
+        let (accepted, _) = shape(&wire::encode(&frame)).expect("exact cancellation budget");
+        assert_eq!(accepted.cancels.len(), 2 * MAX_REQUESTS_PER_TICK);
+        frame.cancels.push((2 * MAX_REQUESTS_PER_TICK) as u64);
+        assert_eq!(
+            shape(&wire::encode(&frame)).err().as_deref(),
+            Some("frame request or cancellation budget exceeded")
+        );
     }
 
     #[test]
