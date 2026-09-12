@@ -89,11 +89,12 @@ ordering arm.
 
 Prerequisites: `rustup` (the pinned toolchain and its wasm32 target install
 themselves on the first build), a C compiler, and on Linux `pkg-config`,
-`libclang-dev` and `libasound2-dev`:
+libclang, ALSA, X11/XKB and font development libraries:
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu
-xcode-select --install                                                    # macOS
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev \
+  libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
+xcode-select --install  # macOS
 ```
 
 `make` checks for them up front and prints that line when one is missing.

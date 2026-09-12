@@ -33,14 +33,17 @@ prereqs:
 	  command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
 	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
+	  for library in x11-xcb xkbcommon xkbcommon-x11 fontconfig freetype2; do \
+	    pkg-config --exists "$$library" 2>/dev/null || missing="$$missing $$library"; \
+	  done; \
 	fi; \
 	[ -z "$$missing" ] || { \
 	  echo "missing build prerequisites:$$missing" >&2; \
 	  if [ "$(UNAME_S)" = Darwin ]; then \
 	    echo "  xcode-select --install" >&2; \
 	  else \
-	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
-	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
+	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev   # Debian/Ubuntu" >&2; \
+	    echo "  On other distributions, install development packages for the missing libraries above." >&2; \
 	  fi; \
 	  echo "  rustup: https://rustup.rs" >&2; \
 	  exit 1; }

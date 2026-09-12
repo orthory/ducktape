@@ -469,9 +469,6 @@ opt-level = 2
 [profile.dev.package.lilt]
 opt-level = 2
 
-[profile.dev.package.cosmic-text]
-opt-level = 2
-
 [profile.dev.package.cryoglyph]
 opt-level = 2
 
