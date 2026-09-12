@@ -4136,7 +4136,11 @@ mod tests {
             ];
         }
         let mut reference = row.clone();
-        if let wire::Node::Linear { children, .. } = &mut reference {
+        if let wire::Node::Linear {
+            children, height, ..
+        } = &mut reference
+        {
+            *height = None;
             *children = vec![text(
                 "reference",
                 "Pages".into(),
