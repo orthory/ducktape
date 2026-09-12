@@ -287,11 +287,15 @@ impl Desktop {
             .map(std::sync::Arc::new),
             ..Default::default()
         };
+        // Native window creation can synchronously render its root. Release
+        // the model borrow before GPUI enters that renderer.
+        cx.defer(move |cx| {
         let mut opened_view = None;
+        let window_model = model.clone();
         match cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| {
                 cx.on_release(DesktopWindow::released).detach();
-                let observer = cx.observe(&model, |_, _, cx| cx.notify());
+                let observer = cx.observe(&window_model, |_, _, cx| cx.notify());
                 let activation = cx.observe_window_activation(
                     window,
                     move |this: &mut DesktopWindow, window, cx| {
@@ -300,14 +304,14 @@ impl Desktop {
                         } else {
                             Message::WindowUnfocused(key)
                         };
-                        this.model
-                            .update(cx, |model, cx| model.dispatch(message, cx));
+                        let model = this.model.clone();
+                        cx.defer(move |cx| model.update(cx, |model, cx| model.dispatch(message, cx)));
                     },
                 );
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
                 DesktopWindow {
-                    model,
+                    model: window_model,
                     kind,
                     module: None,
                     module_route: None,
@@ -332,18 +336,23 @@ impl Desktop {
             cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
         }) {
             Ok(handle) => {
-                self.windows.insert(key, handle.into());
-                if let Some(view) = opened_view {
-                    self.views.insert(key, view);
-                }
+                model.update(cx, |model, _| {
+                    model.windows.insert(key, handle.into());
+                    if let Some(view) = opened_view {
+                        model.views.insert(key, view);
+                    }
+                });
                 let _ = reply.send(key);
             }
             Err(error) => {
-                self.state.onboarding_error = format!("The window could not be opened: {error}");
                 tracing::error!(target: "ducktape::app", reason = "native_window_open_failed", %error, "window could not be opened");
-                cx.notify();
+                model.update(cx, |model, cx| {
+                    model.state.onboarding_error = format!("The window could not be opened: {error}");
+                    cx.notify();
+                });
             }
         }
+        });
     }
 
     fn close_window(&mut self, key: WindowKey, cx: &mut Context<Self>) {
