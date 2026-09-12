@@ -87,9 +87,176 @@ pub struct WireEditor {
     scroll: ScrollHandle,
     focus_line: Option<usize>,
     drag_line: Option<u32>,
+    _keystrokes: Subscription,
 }
 
 impl EventEmitter<()> for WireEditor {}
+
+#[cfg(test)]
+#[gpui_kit::test]
+fn typing_after_enter_waits_for_the_new_paragraph(cx: &mut gpui_kit::TestAppContext) {
+    enter_typing(cx, true);
+}
+
+#[cfg(test)]
+#[gpui_kit::test]
+fn native_newline_moves_focus_before_following_typing(cx: &mut gpui_kit::TestAppContext) {
+    enter_typing(cx, false);
+}
+
+#[cfg(test)]
+fn enter_typing(cx: &mut gpui_kit::TestAppContext, claim_enter: bool) {
+    use gpui_kit::test::TestWindowExt as _;
+    cx.update(gpui_kit::init);
+    let store = EditorStore::new(78);
+    let first = "Your workspace, rendered natively.";
+    let second = "WASM views keep their state while the chain keeps moving.";
+    let reference = wire::editor_document::EditorDocumentRef {
+        document: "paragraphs".into(),
+        reset: 1,
+        revision: 0,
+        text_revision: 0,
+        byte_len: first.len() as u32,
+        cursor: wire::EditorCursor {
+            position: position(first, first.len()),
+            selection: None,
+        },
+    };
+    {
+        let mut locked = store.lock();
+        locked.fields.insert(
+            "document".into(),
+            super::Field {
+                reference: reference.clone(),
+                handler: 1,
+                editable: true,
+                placeholder: String::new(),
+                options: wire::EditorOptions {
+                    binding: Some(Box::new(wire::EditorBinding {
+                        authored: true,
+                        on_request: 2,
+                        on_event: 3,
+                        claims: [
+                            claim_enter.then(|| wire::EditorKeyClaim {
+                                key: wire::keyboard::Key::Named(wire::keyboard::Named::Enter),
+                                modifiers: Default::default(),
+                                command: false,
+                            }),
+                            Some(wire::EditorKeyClaim {
+                                key: wire::keyboard::Key::Character("z".into()),
+                                modifiers: Default::default(),
+                                command: true,
+                            }),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    })),
+                    ..Default::default()
+                },
+            },
+        );
+        locked.documents.insert(
+            reference.document.clone(),
+            super::Document {
+                reference,
+                text: Some(Arc::from(first)),
+                queue: Default::default(),
+                queued_bytes: 0,
+                phase: super::Phase::Ready,
+            },
+        );
+    }
+    let window = cx.open_window(gpui_kit::size(px(800.), px(400.)), |window, cx| {
+        WireEditor::new("document".into(), store.clone(), window, cx)
+    });
+    let editor = window.root(cx).unwrap();
+    let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        editor.update(cx, |editor, cx| {
+            editor.lines[0]
+                .input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx)
+        });
+        window.render_frame(cx);
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.focused_line(window, cx), Some(0))
+        });
+        window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+    });
+    let events = store.drain();
+    let request = events.iter().find_map(|event| match event {
+        wire::Event::EditorRequest { request, .. } => Some(request.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        request.is_some(),
+        claim_enter,
+        "guest claims must precede native actions: {events:?}"
+    );
+    native.update(|window, cx| window.input(second, cx));
+    {
+        let mut locked = store.lock();
+        if let Some(request) = request {
+            locked.decide(&wire::EditorResponse {
+                id: request.id,
+                decision: wire::EditorDecision::Apply {
+                    patches: vec![wire::EditorPatch {
+                        start_byte: first.len() as u32,
+                        end_byte: first.len() as u32,
+                        replacement: "\n".into(),
+                    }],
+                    cursor: wire::EditorCursor {
+                        position: wire::EditorPosition { line: 1, column: 0 },
+                        selection: None,
+                    },
+                    history: wire::EditorHistoryEffect::Native,
+                },
+            });
+        }
+        while !locked.documents["paragraphs"].queue.is_empty() {
+            let accepted = locked.documents["paragraphs"].reference.clone();
+            locked.fields.get_mut("document").unwrap().reference = accepted;
+            locked.acknowledge();
+            locked.pump();
+            assert!(locked.fault.is_none(), "{:?}", locked.fault);
+        }
+        assert_eq!(
+            locked.documents["paragraphs"].text.as_deref(),
+            Some(format!("{first}\n{second}").as_str())
+        );
+    }
+    native.update(|window, cx| window.render_frame(cx));
+    native.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            assert_eq!(
+                editor.focused_line(window, cx),
+                Some(1),
+                "canonical split must focus its new native row"
+            )
+        });
+    });
+    editor.read_with(&native, |editor, cx| {
+        assert_eq!(&*editor.preview, format!("{first}\n{second}"));
+        assert_eq!(editor.lines[1].input.read(cx).value().as_ref(), second);
+    });
+    store.drain();
+    native.update(|window, cx| {
+        window.dispatch_keystroke(
+            Keystroke::parse(if cfg!(target_os = "macos") {
+                "cmd-z"
+            } else {
+                "ctrl-z"
+            })
+            .unwrap(),
+            cx,
+        )
+    });
+    assert!(store.drain().iter().any(|event| matches!(event, wire::Event::EditorRequest { request, .. } if matches!(&request.input, wire::EditorRequestInput::Key { key, .. } if key.key == wire::keyboard::Key::Character("z".into())))), "Undo must reach guest history, not the per-row native undo stack");
+}
 
 #[cfg(test)]
 #[gpui_kit::test]
@@ -100,28 +267,38 @@ fn readonly_cut_keeps_preview_selection_and_transaction_queue(cx: &mut gpui_kit:
         WireEditor::new("document".into(), store.clone(), window, cx)
     });
     let editor = window.root(cx).unwrap();
-    cx.update(|cx| editor.update(cx, |editor, cx| {
-        let text: Arc<str> = Arc::from("Read only 한글");
-        let cursor = wire::EditorCursor {
-            position: position(&text, text.len()),
-            selection: Some(Default::default()),
-        };
-        editor.preview = text.clone();
-        editor.cursor = cursor;
-        editor.projection = Some(Projection {
-            reference: wire::editor_document::EditorDocumentRef {
-                document: "readonly".into(), reset: 1, text_revision: 0, revision: 0,
-                cursor, byte_len: text.len() as u32,
-            },
-            text: Some(text.clone()), options: Default::default(), placeholder: String::new(),
-            editable: false, pending: false, fault: None,
-        });
-        assert!(editor.document_command(&wire::keyboard::Key::Character("c".into()), cx));
-        assert!(editor.document_command(&wire::keyboard::Key::Character("x".into()), cx));
-        assert_eq!(editor.preview, text);
-        assert_eq!(editor.cursor, cursor);
-        assert!(store.drain().is_empty());
-    }));
+    cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            let text: Arc<str> = Arc::from("Read only 한글");
+            let cursor = wire::EditorCursor {
+                position: position(&text, text.len()),
+                selection: Some(Default::default()),
+            };
+            editor.preview = text.clone();
+            editor.cursor = cursor;
+            editor.projection = Some(Projection {
+                reference: wire::editor_document::EditorDocumentRef {
+                    document: "readonly".into(),
+                    reset: 1,
+                    text_revision: 0,
+                    revision: 0,
+                    cursor,
+                    byte_len: text.len() as u32,
+                },
+                text: Some(text.clone()),
+                options: Default::default(),
+                placeholder: String::new(),
+                editable: false,
+                pending: false,
+                fault: None,
+            });
+            assert!(editor.document_command(&wire::keyboard::Key::Character("c".into()), cx));
+            assert!(editor.document_command(&wire::keyboard::Key::Character("x".into()), cx));
+            assert_eq!(editor.preview, text);
+            assert_eq!(editor.cursor, cursor);
+            assert!(store.drain().is_empty());
+        })
+    });
 }
 
 impl WireEditor {
@@ -131,6 +308,22 @@ impl WireEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let editor = cx.entity().downgrade();
+        // Native key bindings consume Enter/Tab/navigation before element key
+        // listeners. Guest claims must run at GPUI's pre-action seam.
+        let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
+            let _ = editor.update(cx, |editor, cx| {
+                editor.key_down(
+                    &KeyDownEvent {
+                        keystroke: event.keystroke.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
         let mut this = Self {
             key,
             store,
@@ -143,6 +336,7 @@ impl WireEditor {
             scroll: ScrollHandle::new(),
             focus_line: None,
             drag_line: None,
+            _keystrokes: keystrokes,
         };
         this.sync(window, cx);
         this
@@ -467,6 +661,9 @@ impl WireEditor {
             .native(&self.key, &self.preview, self.cursor, &after, next, kind);
         self.preview = Arc::from(after);
         self.cursor = next;
+        if next.position.line as usize != index {
+            self.focus_line = Some(next.position.line as usize);
+        }
         self.painted = None;
         cx.emit(());
         cx.notify();
@@ -796,9 +993,13 @@ impl Render for WireEditor {
                         .flex()
                         .gap(px(1.));
                     if gutter.plus {
-                        gutter_view =
-                            gutter_view.child(Button::new(("plus", index)).label("+").on_click(
-                                cx.listener(move |this, _, _, cx| {
+                        gutter_view = gutter_view.child(
+                            Button::new(("plus", index))
+                                .size(px(22.))
+                                .min_w(px(22.))
+                                .p_0()
+                                .label("+")
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.interaction(
                                         EditorInteraction::Gutter {
                                             line,
@@ -807,13 +1008,13 @@ impl Render for WireEditor {
                                         },
                                         cx,
                                     )
-                                }),
-                            ));
+                                })),
+                        );
                     }
                     if gutter.handle {
                         gutter_view = gutter_view.child(div()
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, _| this.drag_line = Some(line)))
-                        .child(Button::new(("block", index)).label("⋮").on_click(cx.listener(move |this, _, _, cx|
+                        .child(Button::new(("block", index)).size(px(22.)).min_w(px(22.)).p_0().label("⋮").on_click(cx.listener(move |this, _, _, cx|
                             this.interaction(EditorInteraction::Gutter { line, button: wire::editor_presentation::EditorGutterButton::Handle }, cx)))));
                     }
                     body = body.child(gutter_view);
@@ -915,7 +1116,6 @@ impl Render for WireEditor {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .capture_key_down(cx.listener(Self::key_down))
             .child(content);
         if let Some(error) = self.projection.as_ref().and_then(|p| p.fault.clone()) {
             root = root.child(
