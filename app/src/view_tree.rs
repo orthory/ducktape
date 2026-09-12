@@ -1865,6 +1865,9 @@ impl ViewTree {
                 // must not collapse inside an auto-sized measurement wrapper.
                 let (width, height) = match child.as_ref() {
                     Node::Space { width, height }
+                    | Node::Linear { width, height, .. }
+                    | Node::KeyedColumn { width, height, .. }
+                    | Node::Grid { width, height, .. }
                     | Node::Container { width, height, .. }
                     | Node::Scroll { width, height, .. }
                     | Node::Stack { width, height, .. }
@@ -4018,6 +4021,48 @@ fn append_arc_to(
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn sensor_preserves_linear_fill_bounds(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = wire::Node::Sensor {
+            key: "viewport".into(),
+            reset: None,
+            on_show: Some(1),
+            on_resize: None,
+            on_hide: None,
+            anticipate: None,
+            delay: None,
+            child: Box::new(wire::Node::Linear {
+                key: "content".into(),
+                axis: wire::Axis::Column,
+                width: Some(wire::Length::Fill),
+                height: Some(wire::Length::Fill),
+                max_width: None,
+                clip: false,
+                wrap: None,
+                spacing: None,
+                padding: None,
+                align: None,
+                background: None,
+                border: None,
+                children: vec![wire::Node::Space {
+                    width: Some(wire::Length::Fixed(20.)),
+                    height: Some(wire::Length::Fixed(5.)),
+                }],
+            }),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), |_, _| ViewTree::new(root));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        tree.read_with(&native, |tree, _| {
+            assert_eq!(
+                tree.sensors["viewport"].size,
+                Some(size(px(400.), px(300.)))
+            );
+        });
+    }
 
     #[gpui_kit::test]
     fn combo_search_reset_and_routes_use_fresh_native_state(cx: &mut gpui_kit::TestAppContext) {
