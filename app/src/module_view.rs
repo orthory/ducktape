@@ -2803,13 +2803,15 @@ pub(crate) struct NativeModuleView {
     generation: u64,
     revision: u64,
     alive: Option<Arc<()>>,
+    replies_changed: Option<gpui_kit::Task<()>>,
+    deadline: Option<(Instant, gpui_kit::Task<()>)>,
 }
 
 impl gpui_kit::EventEmitter<ModuleViewEvent> for NativeModuleView {}
 
 impl NativeModuleView {
     pub(crate) fn new(module: &'static str) -> Self {
-        Self { module, content: None, subscription: None, generation: 0, revision: 0, alive: None }
+        Self { module, content: None, subscription: None, generation: 0, revision: 0, alive: None, replies_changed: None, deadline: None }
     }
 
     pub(crate) fn set_props(&mut self, props: Vec<u8>, cx: &mut gpui_kit::Context<Self>) {
@@ -2831,8 +2833,19 @@ impl NativeModuleView {
             Slot::Ready(guest) => guest,
         };
         let again = guest.redraw(props);
-        let asynchronous_work = guest.replies.answer_owed() || !guest.clocks.is_empty();
-        if again || asynchronous_work { window.request_animation_frame(); }
+        if again { window.request_animation_frame(); }
+        let next = kernel::next_tick(&guest.clocks);
+        let deadline_changed = self.deadline.as_ref().map(|(due, _)| *due) != next;
+        if deadline_changed {
+            self.deadline = next.map(|due| {
+                let timer = cx.background_executor().timer(due.saturating_duration_since(Instant::now()));
+                let task = cx.spawn(async move |view, cx| {
+                    timer.await;
+                    let _ = view.update(cx, |_, cx| cx.notify());
+                });
+                (due, task)
+            });
+        }
         if let Some(fault) = &guest.fault { return Err(format!("This view was stopped: {fault}")); }
         let same_instance = self.generation == *generation
             && self.alive.as_ref().is_some_and(|alive| Arc::ptr_eq(alive, &guest.alive));
@@ -2845,6 +2858,15 @@ impl NativeModuleView {
                 _ => {
                     self.generation = *generation;
                     self.alive = Some(guest.alive.clone());
+                    let mut changes = guest.replies.changes();
+                    self.replies_changed = Some(cx.spawn(async move |view, cx| {
+                        while changes.changed().await.is_ok() {
+                            if view.update(cx, |_, cx| cx.notify()).is_err() { break; }
+                        }
+                    }));
+                    // An answer that landed before subscription still needs
+                    // delivery; later answers wake the entity directly.
+                    if guest.replies.answer_owed() { window.request_animation_frame(); }
                     let content = cx.new(|_| crate::view_tree::ViewTree::new(root));
                     let seat = mounted.clone();
                     let generation = *generation;

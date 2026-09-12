@@ -86,16 +86,33 @@ const MAX_STREAM_FRAME_BYTES: usize = 1 << 20;
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
-#[derive(Default)]
 pub(super) struct Replies {
     events: Mutex<Vec<wire::Event>>,
     in_flight: AtomicUsize,
     /// Told on every answer delivered: a test waits here for the node
     /// calls in flight, never on a clock.
     landed: std::sync::Condvar,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for Replies {
+    fn default() -> Self {
+        Self {
+            events: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            landed: std::sync::Condvar::new(),
+            changed: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 impl Replies {
+    /// Coalesced notifications wake each native presenter independently. The
+    /// answer remains in the queue, including when no window is presenting it.
+    pub(super) fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
     pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) {
         let mut events = self.events.lock().expect("kernel replies");
         pending.append(&mut events);
@@ -139,6 +156,7 @@ impl Replies {
         let mut events = self.events.lock().expect("kernel replies");
         events.push(wire::Event::Response { id, result, done });
         self.landed.notify_all();
+        self.changed.send_replace(());
     }
 
     /// One request off the in-flight count, under the lock a waiter holds.
@@ -146,6 +164,7 @@ impl Replies {
         let _events = self.events.lock().expect("kernel replies");
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.landed.notify_all();
+        self.changed.send_replace(());
     }
 
     fn deliver(&self, id: u64, result: Result<Vec<u8>, String>) {
@@ -164,6 +183,23 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.settled();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn reply_notifications_wake_each_presenter_and_keep_the_answer() {
+    let replies = Replies::default();
+    let mut first = replies.changes();
+    let mut second = replies.changes();
+    replies.item(7, Ok(vec![1, 2]), true);
+    futures::executor::block_on(async {
+        first.changed().await.expect("first presenter notified");
+        second.changed().await.expect("second presenter notified");
+    });
+    let mut pending = Vec::new();
+    replies.drain_into(&mut pending);
+    assert!(matches!(pending.as_slice(), [wire::Event::Response { id: 7, result: Ok(bytes), done: true }] if bytes == &[1, 2]));
+    assert!(!replies.answer_owed());
 }
 
 /// The kernel's own runtime, on its own thread: the window thread never
