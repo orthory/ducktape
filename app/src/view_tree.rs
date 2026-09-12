@@ -1678,6 +1678,7 @@ impl ViewTree {
                         );
                         let visible = viewport.intersects(&visible_bounds);
                         let _ = weak.update(cx, |this, cx| {
+                            this.bounds.insert(route.clone(), bounds);
                             let Some(sensor) = this.sensors.get_mut(&route) else {
                                 return;
                             };

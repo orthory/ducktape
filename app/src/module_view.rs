@@ -5308,6 +5308,8 @@ pub(crate) mod tests {
             native.update(|window, cx| window.click(key, cx));
             layout!();
             view.read_with(&native, |view, _| {
+                let pane = view.measured_bounds("PagesView/root/pages/pane-measure").expect("pane sensor");
+                assert_eq!(f32::from(pane.size.width), width - 240., "pane must exclude the fixed sidebar");
                 (
                     view.measured_bounds("PagesView/root/pages/document")
                         .expect("document editor"),
