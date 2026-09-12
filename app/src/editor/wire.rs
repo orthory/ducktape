@@ -2,7 +2,7 @@
 //! decision, and an accepted edit waits for the guest's observed revision.
 //! Transfer assemblers and patch validation are the wire contract's own code.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use ui_lang_wire as wire;
@@ -20,6 +20,7 @@ struct Store {
     serial: u64,
     epoch: Instant,
     fields: HashMap<String, Field>,
+    focused: HashSet<String>,
     documents: HashMap<String, Document>,
     incoming: Option<Incoming>,
     outgoing: Option<Outgoing>,
@@ -100,7 +101,7 @@ struct Projection {
 impl EditorStore {
     pub fn new(instance: u64) -> Self {
         Self(Arc::new(Mutex::new(Store { instance, serial: 0, epoch: Instant::now(),
-            fields: HashMap::new(), documents: HashMap::new(), incoming: None,
+            fields: HashMap::new(), focused: HashSet::new(), documents: HashMap::new(), incoming: None,
             outgoing: None, events: Vec::new(), fault: None })))
     }
 
@@ -146,6 +147,13 @@ impl EditorStore {
         let store = self.lock();
         store.incoming.is_some() || store.outgoing.is_some()
             || store.documents.values().any(|d| !d.queue.is_empty())
+    }
+
+    pub fn focused(&self, key: &str) -> bool { self.lock().focused.contains(key) }
+
+    fn set_focused(&self, key: &str, focused: bool) {
+        let mut store = self.lock();
+        if focused { store.focused.insert(key.to_owned()); } else { store.focused.remove(key); }
     }
 
     fn projection(&self, key: &str) -> Option<Projection> {
@@ -226,6 +234,7 @@ impl Store {
                 reference: reference.clone(), text: None, queue: VecDeque::new(), queued_bytes: 0, phase: Phase::Ready });
         }
         self.fields = fields;
+        self.focused.retain(|key| self.fields.contains_key(key));
         let stale_incoming = self.incoming.as_ref().is_some_and(|incoming|
             self.documents.get(&incoming.id.document).is_none_or(|d| d.reference.reset != incoming.id.reset));
         if stale_incoming { self.incoming = None; }
@@ -485,16 +494,19 @@ fn transaction_id(instance: u64, state: &EditorDocumentRef, sequence: u64) -> wi
 }
 
 fn offset(text: &str, position: wire::EditorPosition) -> usize {
-    let start: usize = wire::editor_lines(text).take(position.line as usize).map(|line| line.len() + 1).sum();
-    start.saturating_add(position.column as usize).min(text.len())
+    let Some(line) = wire::editor_lines(text).nth(position.line as usize) else { return text.len(); };
+    let start = line.as_ptr() as usize - text.as_ptr() as usize;
+    start + (position.column as usize).min(line.len())
 }
 
 fn position(text: &str, mut at: usize) -> wire::EditorPosition {
     at = at.min(text.len());
     while !text.is_char_boundary(at) { at -= 1; }
-    let prefix = &text[..at];
-    wire::EditorPosition { line: prefix.bytes().filter(|b| *b == b'\n').count() as u32,
-        column: prefix.rfind('\n').map_or(at, |last| at - last - 1) as u32 }
+    let (index, source) = wire::editor_lines(text).enumerate().take_while(|(_, line)| {
+        line.as_ptr() as usize - text.as_ptr() as usize <= at
+    }).last().expect("editor has at least one logical line");
+    let start = source.as_ptr() as usize - text.as_ptr() as usize;
+    wire::EditorPosition { line: index as u32, column: (at - start).min(source.len()) as u32 }
 }
 
 fn native_edit(before: &str, previous: wire::EditorCursor, after: &str, next: wire::EditorCursor,
@@ -551,252 +563,6 @@ fn native_key(text: &str, cursor: wire::EditorCursor, key: &wire::keyboard::KeyS
     Ok((vec![wire::EditorPatch { start_byte: start as u32, end_byte: end as u32, replacement: replacement.into() }], cursor))
 }
 
-use gpui_kit::*;
-use gpui_kit::base::input::{Editor, EditorState, InputEditorStyle, TextDecoration, TextDecorationCollection};
-use gpui_kit::component::button::Button;
-
-/// One retained native input per wire key. The store owns canonical text and
-/// transactions; this entity owns only GPUI selection, IME, scrolling and paint.
-pub struct WireEditor {
-    key: String,
-    store: EditorStore,
-    input: Entity<EditorState>,
-    decorations: TextDecorationCollection,
-    _observation: Subscription,
-    preview: Arc<str>,
-    cursor: wire::EditorCursor,
-    reset: Option<u64>,
-    projection: Option<Projection>,
-    painted: Option<wire::EditorOptions>,
-}
-
-impl EventEmitter<()> for WireEditor {}
-
-impl WireEditor {
-    pub fn new(key: String, store: EditorStore, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| EditorState::new(window, cx).line_number(false)
-            .smart_indent(false).soft_wrap(true).context_menu(false));
-        let decorations = input.update(cx, |input, cx| {
-            input.set_auto_close(false, window, cx);
-            input.create_decorations_collection(Vec::new(), cx)
-        });
-        let observation = cx.observe_in(&input, window, |this, _, window, cx| this.observed(window, cx));
-        let mut this = Self { key, store, input, decorations, _observation: observation,
-            preview: Arc::from(""), cursor: wire::EditorCursor::default(), reset: None, projection: None, painted: None };
-        this.sync(window, cx);
-        this
-    }
-
-    pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(projection) = self.store.projection(&self.key) else { return; };
-        let available = projection.text.is_some();
-        let editable = projection.editable && projection.fault.is_none() && available;
-        let reset = self.reset != Some(projection.reference.reset);
-        let settled = !projection.pending;
-        let text = projection.text.clone().unwrap_or_else(|| Arc::from(""));
-        let needs_install = reset || (settled && (text != self.preview || projection.reference.cursor != self.cursor));
-        if needs_install {
-            self.preview = text.clone();
-            self.cursor = projection.reference.cursor;
-            self.reset = Some(projection.reference.reset);
-            let cursor = self.cursor;
-            self.input.update(cx, |input, cx| {
-                let scroll = input.scroll_offset();
-                if input.value().as_ref() != text.as_ref() { input.set_value(text.to_string(), window, cx); }
-                set_selection(input, &text, cursor, cx);
-                if !reset { input.set_scroll_offset(scroll, cx); }
-            });
-        }
-        let paint_changed = self.painted.as_ref() != Some(&projection.options) || needs_install;
-        self.input.update(cx, |input, cx| {
-            if input.is_editable() != editable { input.set_readonly(!editable, cx); }
-        });
-        if paint_changed {
-            let options = &projection.options;
-            let prepared = options.presentation.as_ref().filter(|paint| paint.validate(&text).is_ok());
-            let decorations = prepared.map_or_else(Vec::new, |paint| paint.spans.iter().filter_map(|span| {
-                let format = paint.formats.get(span.format as usize)?;
-                let start = offset(&text, wire::EditorPosition { line: span.line, column: span.start });
-                let end = offset(&text, wire::EditorPosition { line: span.line, column: span.end });
-                Some(TextDecoration::new(start..end, HighlightStyle {
-                    color: format.color.map(color), background_color: format.background.map(color),
-                    font_weight: format.font.as_ref().map(|font| font_weight(font.weight)),
-                    font_style: format.font.as_ref().map(|font| match font.style { wire::FontStyle::Normal => gpui_kit::FontStyle::Normal,
-                        wire::FontStyle::Italic | wire::FontStyle::Oblique => gpui_kit::FontStyle::Italic }),
-                    strikethrough: format.strikethrough.map(|ink| StrikethroughStyle { thickness: px(1.), color: Some(color(ink)) }),
-                    ..Default::default()
-                }))
-            }).collect());
-            self.decorations.set(decorations, cx);
-            self.input.update(cx, |input, cx| {
-                input.set_placeholder(projection.placeholder.clone(), window, cx);
-                input.set_soft_wrap(!matches!(options.wrapping, Some(wire::Wrapping::None)), window, cx);
-                let face = &options.style.active;
-                input.set_editor_style(InputEditorStyle { foreground: face.value.map(color).unwrap_or_default(),
-                    background: face.background.map(color).unwrap_or_default(), selection: face.selection.map(color).unwrap_or_default(),
-                    muted_foreground: face.placeholder.map(color).unwrap_or_default(), ..Default::default() });
-                let padding = prepared.and_then(|p| p.padding).unwrap_or_else(|| wire::Edges::all(options.padding.unwrap_or(8.)));
-                input.set_editor_paddings(Edges { top: px(padding.top), right: px(padding.right), bottom: px(padding.bottom), left: px(padding.left) });
-            });
-            self.painted = Some(options.clone());
-        }
-        self.projection = Some(projection);
-    }
-
-    fn composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some())
-    }
-
-    fn observed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composing(window, cx) { return; }
-        let state = self.input.read(cx);
-        let text = state.value();
-        let caret = state.cursor();
-        let range = state.selected_range();
-        let cursor = wire::EditorCursor { position: position(&text, caret),
-            selection: (range.start != range.end).then(|| position(&text, if caret == range.start { range.end } else { range.start })) };
-        let changed = text.as_ref() != self.preview.as_ref() || cursor != self.cursor;
-        if !changed { return; }
-        let kind = match (text.as_ref() == self.preview.as_ref(), text.len().cmp(&self.preview.len())) {
-            (true, _) => wire::EditorEditKind::Cursor,
-            (false, std::cmp::Ordering::Less) => wire::EditorEditKind::Backspace,
-            (false, _) => wire::EditorEditKind::Insert,
-        };
-        self.store.native(&self.key, &self.preview, self.cursor, &text, cursor, kind);
-        self.preview = Arc::from(text.as_ref());
-        self.cursor = cursor;
-        cx.emit(());
-    }
-
-    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composing(window, cx) { return; }
-        let Some(projection) = &self.projection else { return; };
-        let key = key_state(&event.keystroke);
-        if let Some(menu) = projection.options.presentation.as_ref().and_then(|p| p.affordances.menu.as_ref()) {
-            let action = match key.key {
-                wire::keyboard::Key::Named(wire::keyboard::Named::ArrowUp) => Some(wire::editor_presentation::EditorInteraction::MenuSelect { index: menu.selected.saturating_sub(1) }),
-                wire::keyboard::Key::Named(wire::keyboard::Named::ArrowDown) => Some(wire::editor_presentation::EditorInteraction::MenuSelect { index: (menu.selected + 1).min(menu.items.len().saturating_sub(1) as u32) }),
-                wire::keyboard::Key::Named(wire::keyboard::Named::Enter) => menu.items.get(menu.selected as usize).map(|item| wire::editor_presentation::EditorInteraction::MenuPick { tag: item.tag.clone() }),
-                wire::keyboard::Key::Named(wire::keyboard::Named::Escape) => Some(wire::editor_presentation::EditorInteraction::MenuDismiss),
-                _ => None,
-            };
-            if let Some(action) = action { self.interaction(action, cx); cx.stop_propagation(); return; }
-        }
-        let claimed = projection.options.binding.as_ref().is_some_and(|binding|
-            binding.claims.iter().any(|claim| claim.matches(&key, cfg!(target_os = "macos"))));
-        if !claimed { return; }
-        self.store.request(&self.key, wire::EditorRequestInput::Key { key, repeat: event.is_held });
-        cx.stop_propagation();
-        cx.emit(());
-    }
-
-    fn interaction(&mut self, action: wire::editor_presentation::EditorInteraction, cx: &mut Context<Self>) {
-        self.store.request(&self.key, wire::EditorRequestInput::Interaction { action });
-        cx.emit(());
-    }
-
-    fn line_bounds(&self, line: u32, cx: &Context<Self>) -> Option<Bounds<Pixels>> {
-        let start = offset(&self.preview, wire::EditorPosition { line, column: 0 });
-        let end = self.preview[start..].chars().next().map_or(start, |ch| start + ch.len_utf8());
-        self.input.read(cx).range_to_bounds(&(start..end))
-    }
-}
-
-impl Render for WireEditor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync(window, cx);
-        let options = self.projection.as_ref().map(|p| p.options.clone()).unwrap_or_default();
-        let size = options.size.unwrap_or(14.);
-        let height = match options.line_height { Some(wire::LineHeight::Absolute(h)) => h,
-            Some(wire::LineHeight::Relative(r)) => r * size, None => size * 1.4 };
-        let mut root = div().id(SharedString::from(self.key.clone())).relative().size_full().text_size(px(size)).line_height(px(height))
-            .capture_key_down(cx.listener(Self::key_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                let Some(action) = this.projection.as_ref().and_then(|p| p.options.presentation.as_ref())
-                    .and_then(|p| p.affordances.hit(this.cursor.position)) else { return; };
-                this.interaction(action, cx);
-            }))
-            .child(Editor::new(&self.input));
-        if let Some(font) = &options.font {
-            let family = match &font.family { wire::FontFamily::Named(name) => name.as_str(), wire::FontFamily::Monospace => "monospace", _ => "Geist" };
-            root = root.font_family(SharedString::from(family.to_owned()));
-        }
-        let origin = self.input.read(cx).input_bounds().origin;
-        if let Some(paint) = &options.presentation {
-            for gutter in &paint.affordances.gutters {
-                let Some(bounds) = self.line_bounds(gutter.line, cx) else { continue; };
-                let line = gutter.line;
-                let top = bounds.origin.y - origin.y;
-                let mut actions = div().absolute().top(top).left(px(0.)).flex().gap(px(2.));
-                if gutter.plus {
-                    actions = actions.child(Button::new(("plus", line as usize)).label("+").on_click(cx.listener(move |this, _, _, cx|
-                        this.interaction(wire::editor_presentation::EditorInteraction::Gutter { line, button: wire::editor_presentation::EditorGutterButton::Plus }, cx))));
-                }
-                if gutter.handle {
-                    actions = actions.child(Button::new(("block", line as usize)).label("⋮").on_click(cx.listener(move |this, _, _, cx|
-                        this.interaction(wire::editor_presentation::EditorInteraction::Gutter { line, button: wire::editor_presentation::EditorGutterButton::Handle }, cx))));
-                }
-                root = root.child(actions);
-            }
-            for margin in &paint.affordances.margins {
-                let Some(bounds) = self.line_bounds(margin.line, cx) else { continue; };
-                let line = margin.line;
-                root = root.child(div().absolute().right(px(0.)).top(bounds.origin.y - origin.y)
-                    .child(Button::new(("comments", line as usize)).label(margin.count.to_string()).on_click(cx.listener(move |this, _, _, cx|
-                        this.interaction(wire::editor_presentation::EditorInteraction::Margin { line }, cx)))));
-            }
-            if let Some(menu) = &paint.affordances.menu {
-                let anchor = match menu.anchor { wire::editor_presentation::EditorMenuAnchor::Caret => self.input.read(cx).cursor_layout().map(|(b, _)| b),
-                    wire::editor_presentation::EditorMenuAnchor::Line(line) => self.line_bounds(line, cx) };
-                if let Some(anchor) = anchor {
-                    let mut menu_view = div().absolute().left((anchor.origin.x - origin.x).max(px(0.))).top(anchor.bottom() - origin.y)
-                        .flex().flex_col().p(px(4.)).bg(gpui_kit::rgb(0x27272a)).rounded(px(6.));
-                    for (index, item) in menu.items.iter().enumerate() {
-                        let tag = item.tag.clone();
-                        menu_view = menu_view.child(Button::new(("menu", index)).label(item.label.clone()).on_click(cx.listener(move |this, _, _, cx|
-                            this.interaction(wire::editor_presentation::EditorInteraction::MenuPick { tag: tag.clone() }, cx))));
-                    }
-                    root = root.child(menu_view);
-                }
-            }
-        }
-        if let Some(error) = self.projection.as_ref().and_then(|p| p.fault.clone()) {
-            root = root.child(div().absolute().bottom(px(0.)).left(px(0.)).text_color(gpui_kit::rgb(0xc04040)).child(error));
-        }
-        root
-    }
-}
-
-fn set_selection(input: &mut EditorState, text: &str, cursor: wire::EditorCursor, cx: &mut Context<EditorState>) {
-    let caret = offset(text, cursor.position);
-    let anchor = cursor.selection.map_or(caret, |p| offset(text, p));
-    input.set_selected_range(anchor..caret, cx);
-}
-
-fn color(ink: wire::Rgba) -> Hsla {
-    let [r, g, b, a] = ink.0;
-    gpui_kit::Rgba { r, g, b, a }.into()
-}
-
-fn font_weight(weight: wire::Weight) -> FontWeight {
-    match weight { wire::Weight::Thin => FontWeight::THIN, wire::Weight::ExtraLight => FontWeight::EXTRA_LIGHT,
-        wire::Weight::Light => FontWeight::LIGHT, wire::Weight::Normal => FontWeight::NORMAL,
-        wire::Weight::Medium => FontWeight::MEDIUM, wire::Weight::Semibold => FontWeight::SEMIBOLD,
-        wire::Weight::Bold => FontWeight::BOLD, wire::Weight::ExtraBold => FontWeight::EXTRA_BOLD, wire::Weight::Black => FontWeight::BLACK }
-}
-
-fn key_state(key: &Keystroke) -> wire::keyboard::KeyState {
-    use wire::keyboard::{Key, Named};
-    let logical = match key.key.as_str() {
-        "enter" => Key::Named(Named::Enter), "tab" => Key::Named(Named::Tab), "backspace" => Key::Named(Named::Backspace),
-        "delete" => Key::Named(Named::Delete), "escape" => Key::Named(Named::Escape),
-        "up" => Key::Named(Named::ArrowUp), "down" => Key::Named(Named::ArrowDown),
-        "left" => Key::Named(Named::ArrowLeft), "right" => Key::Named(Named::ArrowRight),
-        _ => Key::Character(key.key.clone()),
-    };
-    wire::keyboard::KeyState { key: logical.clone(), modified_key: logical,
-        physical_key: wire::keyboard::Physical::Unidentified(wire::keyboard::NativeCode::Unidentified),
-        location: wire::keyboard::Location::Standard,
-        modifiers: wire::keyboard::Modifiers { shift: key.modifiers.shift, control: key.modifiers.control,
-            alt: key.modifiers.alt, logo: key.modifiers.platform } }
-}
+#[path = "blocks.rs"]
+mod blocks;
+pub use blocks::WireEditor;
