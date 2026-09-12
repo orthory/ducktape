@@ -290,10 +290,7 @@ impl Desktop {
         let mut opened_view = None;
         match cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| {
-                cx.on_release(|this: &mut DesktopWindow, cx| {
-                    this.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
-                })
-                .detach();
+                cx.on_release(DesktopWindow::released).detach();
                 let observer = cx.observe(&model, |_, _, cx| cx.notify());
                 let activation = cx.observe_window_activation(
                     window,
@@ -419,6 +416,9 @@ struct NativeInput {
 }
 
 impl DesktopWindow {
+    fn released(&mut self, cx: &mut gpui_kit::App) {
+        self.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
+    }
     fn observe_module_window(
         &mut self,
         event: ui_lang_wire::events::Window,
@@ -1361,6 +1361,7 @@ pub(crate) fn test_window(
         pending_urls: Vec::new(),
     });
     cx.new(|cx| {
+        cx.on_release(DesktopWindow::released).detach();
         let observer = cx.observe(&model, |_, _, cx| cx.notify());
         let activation = cx.observe_window_activation(window, |_, _, _| {});
         DesktopWindow {
@@ -1378,6 +1379,74 @@ pub(crate) fn test_window(
             _observer: observer,
         }
     })
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    fn frozen_route(event: crate::module_view::ModuleViewEvent) -> Message {
+        Message::ExternalUrlFailed(crate::backend::AppError {
+            message: event.detail,
+            committed: false,
+        })
+    }
+
+    #[gpui_kit::test]
+    async fn final_observations_tick_and_route_after_the_presenter_is_released(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::module_view::tests::{
+            close_observer_fixture, close_observer_reading, queue_close_intent,
+        };
+        let _turn = crate::module_view::tests::blocking_connection_turn();
+        cx.update(gpui_kit::init);
+        let mut presenter = None;
+        let handle = cx.open_window(
+            gpui_kit::size(gpui_kit::px(320.), gpui_kit::px(460.)),
+            |window, cx| {
+                let (state, _) = Ducktape::__boot();
+                let view = test_window(state, WindowKind::Huddle, window, cx);
+                presenter = Some(view.clone());
+                gpui_kit::component::Root::new(view, window, cx)
+            },
+        );
+        let presenter = presenter.unwrap();
+        let model = presenter.update(cx, |view, cx| {
+            view.module = Some(("governance", cx.new(|_| close_observer_fixture())));
+            view.module_route = Some(frozen_route);
+            view.model.clone()
+        });
+        let baseline = close_observer_reading().0;
+        queue_close_intent("requested");
+        // The command executor owns this model borrow while requesting close.
+        // Routing inline here would re-enter it and panic.
+        model.update(cx, |_, cx| {
+            presenter.update(cx, |view, cx| {
+                view.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx);
+            });
+        });
+        assert_eq!(close_observer_reading(), (baseline + 1, 0));
+        cx.condition(&model, |model, _| model.state.error == "requested")
+            .await;
+
+        // A real guest frame replaces interest; explicitly rearm this host-only
+        // fixture before exercising the actual native presenter's release hook.
+        queue_close_intent("closed");
+        model.update(cx, |model, _| model.state.shell_tab = ShellTab::Files);
+        let weak = presenter.downgrade();
+        drop(presenter);
+        handle
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.condition(&model, |model, _| model.state.error == "closed")
+            .await;
+        assert!(
+            weak.upgrade().is_none(),
+            "the route does not retain the presenter"
+        );
+        assert_eq!(close_observer_reading(), (baseline + 2, 0));
+    }
 }
 
 pub(crate) fn run() {

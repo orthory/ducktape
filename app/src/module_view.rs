@@ -2849,6 +2849,42 @@ pub(crate) mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{self as gpui, AppContext as _, Entity, TestAppContext, VisualTestContext};
 
+    pub(crate) fn close_observer_fixture() -> NativeModuleView {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/views/governance_view.wasm");
+        assert!(path.is_file(), "close regression requires the staged governance view");
+        let mut guest = Guest::load_from("governance", &path).expect("close observer guest");
+        guest.redraw(&None);
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+        let mut view = NativeModuleView::new("governance");
+        view.generation = 1;
+        view.revision = guest.frame_rev;
+        view.alive = Some(guest.alive.clone());
+        let seat = fresh("governance");
+        let mut seat = seat.lock().unwrap();
+        seat.generation = 1;
+        seat.slot = Slot::Ready(Box::new(guest));
+        view
+    }
+
+    pub(crate) fn queue_close_intent(detail: &str) {
+        let seat = mounted("governance");
+        let mut seat = seat.lock().unwrap();
+        let Slot::Ready(guest) = &mut seat.slot else { panic!("close guest missing") };
+        // Governance does not request window events itself. Rearm this host
+        // fixture after each real WASM frame and seed an already-produced intent.
+        guest.frame.event_interest.close = true;
+        guest.intents.push(ModuleViewEvent { kind: "close-test".into(), detail: detail.into() });
+    }
+
+    pub(crate) fn close_observer_reading() -> (u64, usize) {
+        let seat = mounted("governance");
+        let seat = seat.lock().unwrap();
+        let Slot::Ready(guest) = &seat.slot else { panic!("close guest missing") };
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+        (guest.ticks, guest.pending.len())
+    }
+
     fn native_tree(
         root: wire::Node,
         size: gpui::Size<gpui::Pixels>,
