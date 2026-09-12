@@ -119,6 +119,15 @@ pub fn init(_: &mut App) -> (Tray, UnboundedReceiver<usize>) {
 }
 
 impl Tray {
+    #[cfg(test)]
+    pub(crate) fn without_status_item() -> Self {
+        Self {
+            snapshot: None,
+            #[cfg(target_os = "macos")]
+            native: None,
+        }
+    }
+
     pub fn sync(&mut self, state: &Ducktape) {
         let next = Snapshot::of(state);
         if self.snapshot.as_ref() == Some(&next) {

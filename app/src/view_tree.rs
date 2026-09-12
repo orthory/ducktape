@@ -46,6 +46,19 @@ struct SensorState {
     pending: Option<(Size<Pixels>, Task<()>)>,
 }
 
+#[derive(Clone)]
+struct VirtualRow {
+    key: String,
+    content: wire::Node,
+    gap: f32,
+}
+
+struct VirtualScroll {
+    state: ListState,
+    rows: Vec<VirtualRow>,
+    anchor: wire::ScrollAnchor,
+}
+
 struct EditorMount {
     view: Entity<crate::editor::wire::WireEditor>,
     _subscription: Subscription,
@@ -97,6 +110,7 @@ pub struct ViewTree {
     root: wire::Node,
     fields: HashMap<String, Field>,
     scrolls: HashMap<String, ScrollHandle>,
+    lists: HashMap<String, VirtualScroll>,
     scroll_positions: HashMap<String, (Point<Pixels>, Point<Pixels>)>,
     pickers: HashMap<String, Picker>,
     drags: HashMap<String, Point<Pixels>>,
@@ -117,11 +131,162 @@ pub struct ViewTree {
 impl EventEmitter<wire::Event> for ViewTree {}
 
 impl ViewTree {
+    #[allow(clippy::too_many_arguments)]
+    fn virtual_scroll(
+        &mut self,
+        key: &str,
+        rows: Vec<VirtualRow>,
+        anchor: wire::ScrollAnchor,
+        follow: bool,
+        handler: Option<u32>,
+        width: Option<wire::Length>,
+        height: Option<wire::Length>,
+        background: Option<wire::Rgba>,
+        border: Option<wire::Border>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let list = self
+            .lists
+            .entry(key.to_owned())
+            .or_insert_with(|| VirtualScroll {
+                state: ListState::new(
+                    0,
+                    if anchor == wire::ScrollAnchor::End {
+                        ListAlignment::Bottom
+                    } else {
+                        ListAlignment::Top
+                    },
+                    px(160.),
+                ),
+                rows: Vec::new(),
+                anchor,
+            });
+        let prefix = list
+            .rows
+            .iter()
+            .zip(&rows)
+            .take_while(|(old, new)| old.key == new.key)
+            .count();
+        let suffix = list.rows[prefix..]
+            .iter()
+            .rev()
+            .zip(rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old.key == new.key)
+            .count();
+        let old_end = list.rows.len() - suffix;
+        let new_end = rows.len() - suffix;
+        if prefix != old_end || prefix != new_end {
+            if list.rows.is_empty() {
+                list.state.reset_with_uniform_height(rows.len(), px(44.));
+            } else {
+                list.state.splice(prefix..old_end, new_end - prefix);
+            }
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let old = if index < prefix {
+                list.rows.get(index)
+            } else if index >= new_end {
+                list.rows.get(old_end + index - new_end)
+            } else {
+                None
+            };
+            if old.is_some_and(|old| old.content != row.content || old.gap != row.gap) {
+                list.state.remeasure_items(index..index + 1);
+            }
+        }
+        list.rows = rows;
+        list.anchor = anchor;
+        list.state.set_follow_mode(if follow {
+            FollowMode::Tail
+        } else {
+            FollowMode::Normal
+        });
+        let state = list.state.clone();
+        let weak = cx.entity().downgrade();
+        let route = key.to_owned();
+        state.set_scroll_handler(move |_, _, cx| {
+            let Some(handler) = handler else {
+                return;
+            };
+            let weak = weak.clone();
+            let route = route.clone();
+            // List invokes this callback while borrowing its layout state.
+            // Read pixel measurements after that borrow ends, on this turn.
+            cx.defer(move |cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(list) = this.lists.get(&route) else {
+                        return;
+                    };
+                    let maximum = f32::from(list.state.max_offset_for_scrollbar().y);
+                    let offset = f32::from(list.state.scroll_px_offset_for_scrollbar().y);
+                    let y = match anchor {
+                        wire::ScrollAnchor::End => maximum + offset,
+                        _ => -offset,
+                    };
+                    cx.emit(wire::Event::ScrollOffset {
+                        handler,
+                        x: 0.,
+                        y,
+                        relative_x: 0.,
+                        relative_y: y / maximum.max(1.),
+                    });
+                });
+            });
+        });
+        let weak = cx.entity().downgrade();
+        let route = key.to_owned();
+        let native = gpui_kit::list(state, move |index, window, cx| {
+            weak.update(cx, |this, cx| {
+                let Some(row) = this
+                    .lists
+                    .get(&route)
+                    .and_then(|list| list.rows.get(index))
+                    .cloned()
+                else {
+                    return div().into_any_element();
+                };
+                div()
+                    .relative()
+                    .w_full()
+                    .pb(px(row.gap))
+                    .child(this.node(&row.content, window, cx))
+                    .child(this.measure(&row.key, cx))
+                    .into_any_element()
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+        })
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .w_full()
+        .max_h_full();
+        // The native list owns scrolling, including off-screen measurements;
+        // the wire scroll remains the identity addressed by widget commands.
+        decoration(
+            dimensions(div().relative().min_h_0(), width, height),
+            background,
+            border,
+        )
+        .id(key.to_owned())
+        .child(native)
+        .child(self.measure(key, cx))
+        .into_any_element()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn measured_bounds(&self, key: &str) -> Option<Bounds<Pixels>> {
+        self.bounds.get(key).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(&self, key: &str) -> Option<Point<Pixels>> {
+        self.scrolls.get(key).map(ScrollHandle::offset)
+    }
+
     pub fn new(root: wire::Node) -> Self {
         Self {
             root,
             fields: HashMap::new(),
             scrolls: HashMap::new(),
+            lists: HashMap::new(),
             scroll_positions: HashMap::new(),
             pickers: HashMap::new(),
             drags: HashMap::new(),
@@ -328,6 +493,41 @@ impl ViewTree {
         if !self.mounted.contains(target) {
             return Ok(wire::encode(&()));
         }
+        if let Some(list) = self.lists.get(target) {
+            let maximum = list.state.max_offset_for_scrollbar().y;
+            let offset = list.state.scroll_px_offset_for_scrollbar().y;
+            let from_anchor = |value: f32| match list.anchor {
+                wire::ScrollAnchor::End => px(value) - maximum,
+                _ => -px(value),
+            };
+            match request {
+                ScrollRequest::Key(key) => {
+                    let suffix = format!("/@row:{key}");
+                    if let Some(index) = list.rows.iter().position(|row| row.key.ends_with(&suffix))
+                    {
+                        list.state.scroll_to_reveal_item(index);
+                    }
+                }
+                ScrollRequest::End => list.state.scroll_to_end(),
+                ScrollRequest::Relative(_, y) => list
+                    .state
+                    .set_offset_from_scrollbar(point(px(0.), from_anchor(y * f32::from(maximum)))),
+                ScrollRequest::Absolute(_, y) => list
+                    .state
+                    .set_offset_from_scrollbar(point(px(0.), from_anchor(y))),
+                ScrollRequest::By(_, y) => {
+                    let sign = if list.anchor == wire::ScrollAnchor::End {
+                        1.
+                    } else {
+                        -1.
+                    };
+                    list.state
+                        .set_offset_from_scrollbar(point(px(0.), offset + px(sign * y)));
+                }
+            }
+            cx.notify();
+            return Ok(wire::encode(&()));
+        }
         let Some(handle) = self.scrolls.get(target) else {
             return Ok(wire::encode(&()));
         };
@@ -477,6 +677,7 @@ impl ViewTree {
         self.bounds.retain(|key, _| live_keys.contains(key));
         self.fields.retain(|key, _| inputs.contains(key));
         self.scrolls.retain(|key, _| scrolls.contains(key));
+        self.lists.retain(|key, _| scrolls.contains(key));
         self.scroll_positions.retain(|key, _| scrolls.contains(key));
         self.pickers.retain(|key, _| pickers.contains(key));
         self.drags.retain(|key, _| drags.contains(key));
@@ -798,6 +999,22 @@ impl ViewTree {
                 border,
                 ..
             } => {
+                if *direction == wire::ScrollDirection::Vertical {
+                    if let Some(rows) = virtual_rows(content) {
+                        return self.virtual_scroll(
+                            key,
+                            rows,
+                            *anchor_y,
+                            *auto_scroll,
+                            *on_scroll,
+                            *width,
+                            *height,
+                            *background,
+                            *border,
+                            cx,
+                        );
+                    }
+                }
                 let handle = self.scrolls.entry(key.clone()).or_default().clone();
                 let element = decoration(
                     dimensions(div().relative(), *width, *height),
@@ -2324,6 +2541,147 @@ fn dimensions<T: Styled>(
         Some(wire::Length::FillPortion(_)) => element.flex_1(),
         Some(wire::Length::Shrink) | None => element,
     }
+}
+
+/// A virtual column and its surrounding vertical chrome share one native
+/// viewport. Keep the wire wrappers on each item, splitting only their outer
+/// padding, so prefix controls never become part of the message-key sequence.
+fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
+    use wire::Node;
+    match node {
+        Node::KeyedColumn {
+            key,
+            keys,
+            children,
+            virtual_row: Some(_),
+            spacing,
+            ..
+        } => {
+            let rows = children
+                .iter()
+                .enumerate()
+                .map(|(index, content)| VirtualRow {
+                    key: keys
+                        .as_ref()
+                        .and_then(|keys| keys.get(index))
+                        .map(|identity| format!("{key}/@row:{}", identity.virtual_key()))
+                        .unwrap_or_else(|| format!("{key}/@index:{index}")),
+                    content: content.clone(),
+                    gap: if index + 1 < children.len() {
+                        spacing.unwrap_or_default()
+                    } else {
+                        0.
+                    },
+                })
+                .collect();
+            Some(wrap_virtual_rows(node, rows))
+        }
+        Node::Linear {
+            axis: wire::Axis::Column,
+            children,
+            spacing,
+            ..
+        } => {
+            let mut found = false;
+            let mut rows = Vec::new();
+            for (index, child) in children.iter().enumerate() {
+                let mut part = match virtual_rows(child) {
+                    Some(rows) => {
+                        found = true;
+                        rows
+                    }
+                    None => vec![VirtualRow {
+                        key: child.key().map(str::to_owned).unwrap_or_else(|| {
+                            format!("{}/@static:{index}", node.key().unwrap_or("column"))
+                        }),
+                        content: child.clone(),
+                        gap: 0.,
+                    }],
+                };
+                if index + 1 < children.len() {
+                    if let Some(last) = part.last_mut() {
+                        last.gap += spacing.unwrap_or_default();
+                    }
+                }
+                rows.extend(part);
+            }
+            found.then(|| wrap_virtual_rows(node, rows))
+        }
+        Node::Container { content, .. } => {
+            virtual_rows(content).map(|rows| wrap_virtual_rows(node, rows))
+        }
+        _ => None,
+    }
+}
+
+fn wrap_virtual_rows(node: &wire::Node, rows: Vec<VirtualRow>) -> Vec<VirtualRow> {
+    let mut shell = node.clone();
+    match &mut shell {
+        wire::Node::Linear { children, .. } | wire::Node::KeyedColumn { children, .. } => {
+            children.clear()
+        }
+        wire::Node::Container { content, .. } => {
+            **content = wire::Node::Space {
+                width: None,
+                height: None,
+            }
+        }
+        _ => unreachable!("only vertical layout wrappers surround virtual rows"),
+    }
+    let count = rows.len();
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, mut row)| {
+            let mut wrapped = shell.clone();
+            let padding = match &mut wrapped {
+                wire::Node::Linear {
+                    children,
+                    padding,
+                    height,
+                    ..
+                } => {
+                    children.push(row.content);
+                    *height = None;
+                    padding
+                }
+                wire::Node::KeyedColumn {
+                    children,
+                    keys,
+                    virtual_row,
+                    padding,
+                    height,
+                    ..
+                } => {
+                    children.push(row.content);
+                    *keys = None;
+                    *virtual_row = None;
+                    *height = None;
+                    padding
+                }
+                wire::Node::Container {
+                    content,
+                    padding,
+                    height,
+                    ..
+                } => {
+                    **content = row.content;
+                    *height = None;
+                    padding
+                }
+                _ => unreachable!("vertical layout wrapper"),
+            };
+            if let Some(padding) = padding {
+                if index > 0 {
+                    padding.top = 0.;
+                }
+                if index + 1 < count {
+                    padding.bottom = 0.;
+                }
+            }
+            row.content = wrapped;
+            row
+        })
+        .collect()
 }
 
 fn pad<T: Styled>(element: T, padding: Option<wire::Edges>) -> T {

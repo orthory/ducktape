@@ -360,7 +360,7 @@ impl Desktop {
     }
 }
 
-struct DesktopWindow {
+pub(crate) struct DesktopWindow {
     video: Option<(
         String,
         Entity<crate::video::VideoView>,
@@ -384,6 +384,10 @@ struct NativeInput {
 }
 
 impl DesktopWindow {
+    #[cfg(test)]
+    pub(crate) fn test_state<'a>(&self, cx: &'a gpui_kit::App) -> &'a Ducktape {
+        &self.model.read(cx).state
+    }
     fn value(&self, key: &'static str, cx: &gpui_kit::App) -> String {
         self.inputs
             .get(key)
@@ -1041,6 +1045,8 @@ impl DesktopWindow {
                 let chats = state.palette_chat_hits.clone();
                 let pages = state.palette_page_hits.clone();
                 let phase = state.palette_search_phase;
+                let query = state.palette_draft.clone();
+                let empty = chats.is_empty() && pages.is_empty();
                 panel = panel.child("Search this workspace").child(self.input(
                     "palette-input",
                     "Search messages and pages",
@@ -1048,8 +1054,18 @@ impl DesktopWindow {
                     window,
                     cx,
                 ));
-                if phase == crate::SearchPhase::Searching {
-                    panel = panel.child("Searching…");
+                match phase {
+                    crate::SearchPhase::Searching => panel = panel.child("Searching…"),
+                    crate::SearchPhase::Done => {
+                        if empty {
+                            panel = panel.child("No messages or pages matched.");
+                        }
+                    }
+                    crate::SearchPhase::Idle => {
+                        if !query.trim().is_empty() {
+                            panel = panel.child("Search failed.");
+                        }
+                    }
                 }
                 for hit in chats {
                     panel = panel.child(self.action(
@@ -1243,6 +1259,39 @@ impl Render for DesktopWindow {
             ))
             .child(content)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_window(
+    state: Ducktape,
+    kind: WindowKind,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) -> Entity<DesktopWindow> {
+    let model = cx.new(|_| Desktop {
+        state,
+        tray: crate::tray::Tray::without_status_item(),
+        windows: BTreeMap::new(),
+        streams: HashMap::new(),
+        pending_focus: None,
+    });
+    cx.new(|cx| {
+        let observer = cx.observe(&model, |_, _, cx| cx.notify());
+        let activation = cx.observe_window_activation(window, |_, _, _| {});
+        DesktopWindow {
+            model,
+            kind,
+            module: None,
+            route: None,
+            inputs: HashMap::new(),
+            input_step: None,
+            qr: None,
+            video: None,
+            focus: cx.focus_handle(),
+            _activation: activation,
+            _observer: observer,
+        }
+    })
 }
 
 pub(crate) fn run() {
