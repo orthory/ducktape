@@ -96,7 +96,7 @@ pub(crate) thread_height: f64,
 #[cfg(test)]
 #[allow(dead_code)]
 impl ChatView {
-pub(crate) fn __ice_test_state_chat_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_chat_screen> { let __ice_view = |__state: &__IceChatScreenState| __IceTestState_chat_screen { message_action_focus: __state.message_action_focus.clone(),chat_pointer_y: __state.chat_pointer_y.clone(),chat_height: __state.chat_height.clone(),thread_pointer_y: __state.thread_pointer_y.clone(),thread_height: __state.thread_height.clone(), }; let __ice_stored = self.__ice_component_04368617453637265656e.get(scope).map(__ice_view); __ice_stored.or_else(|| self.__ice_test_scopes_chat_screen().iter().any(|__ice_scope| __ice_scope == scope).then(|| __ice_view(&<__IceChatScreenState>::default()))) }
+pub(crate) fn __ice_test_state_chat_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_chat_screen> { let __ice_view = |__state: &__IceChatScreenState| __IceTestState_chat_screen { message_action_focus: __state.message_action_focus.clone(),chat_pointer_y: __state.chat_pointer_y.clone(),chat_height: __state.chat_height.clone(),thread_pointer_y: __state.thread_pointer_y.clone(),thread_height: __state.thread_height.clone(), }; let __ice_stored = self.__ice_component_04368617453637265656e.get(scope).map(__ice_view); __ice_stored }
 pub(crate) fn __ice_test_message_chat_screen_chat_pointer_pressed(scope: ::std::string::String, __p0: f64, __p1: f64) -> __ChatViewMessage { __ChatViewMessage::__0C4368617453637265656eH636861745f706f696e7465725f70726573736564(scope, __p0, __p1) }
 pub(crate) fn __ice_test_message_chat_screen_chat_resized(scope: ::std::string::String, __p0: f64, __p1: f64) -> __ChatViewMessage { __ChatViewMessage::__0C4368617453637265656eH636861745f726573697a6564(scope, __p0, __p1) }
 pub(crate) fn __ice_test_message_chat_screen_thread_pointer_pressed(scope: ::std::string::String, __p0: f64, __p1: f64) -> __ChatViewMessage { __ChatViewMessage::__0C4368617453637265656eH7468726561645f706f696e7465725f70726573736564(scope, __p0, __p1) }
@@ -529,7 +529,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_4368617456696577! {
 #[allow(unused_parens)]
 impl ChatView {
-#[must_use]
 }
 }
 __ice_generated_items_4368617456696577! {

@@ -67,7 +67,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_5061676573456469746f7246697874757265! {
 #[allow(unused_parens)]
 impl PagesEditorFixture {
-#[must_use]
 }
 }
 __ice_generated_items_5061676573456469746f7246697874757265! {

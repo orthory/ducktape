@@ -105,7 +105,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_476f7665726e616e636556696577! {
 #[allow(unused_parens)]
 impl GovernanceView {
-#[must_use]
 }
 }
 __ice_generated_items_476f7665726e616e636556696577! {

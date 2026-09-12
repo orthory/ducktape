@@ -44,7 +44,7 @@ pub(crate) history_open: bool,
 #[cfg(test)]
 #[allow(dead_code)]
 impl FilesView {
-pub(crate) fn __ice_test_state_files_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_files_screen> { let __ice_view = |__state: &__IceFilesScreenState| __IceTestState_files_screen { history_open: __state.history_open.clone(), }; let __ice_stored = self.__ice_component_046696c657353637265656e.get(scope).map(__ice_view); __ice_stored.or_else(|| self.__ice_test_scopes_files_screen().iter().any(|__ice_scope| __ice_scope == scope).then(|| __ice_view(&<__IceFilesScreenState>::default()))) }
+pub(crate) fn __ice_test_state_files_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_files_screen> { let __ice_view = |__state: &__IceFilesScreenState| __IceTestState_files_screen { history_open: __state.history_open.clone(), }; let __ice_stored = self.__ice_component_046696c657353637265656e.get(scope).map(__ice_view); __ice_stored }
 pub(crate) fn __ice_test_message_files_screen_fs_toggle_history(scope: ::std::string::String) -> __FilesViewMessage { __FilesViewMessage::__0C46696c657353637265656eH66735f746f67676c655f686973746f7279(scope) }
 }
 #[allow(dead_code)]

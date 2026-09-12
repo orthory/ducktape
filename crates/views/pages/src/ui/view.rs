@@ -328,7 +328,6 @@ let _: &i64 = &_value.height;
 __ice_generated_items_506167657356696577! {
 #[allow(unused_parens)]
 impl PagesView {
-#[must_use]
 }
 }
 __ice_generated_items_506167657356696577! {

@@ -83,6 +83,10 @@ const MAX_ID_PREFIX: usize = 32;
 /// line of a run's output or the like; a frame past this is the node
 /// misbehaving, and the subscription ends rather than growing the guest.
 const MAX_STREAM_FRAME_BYTES: usize = 1 << 20;
+const MAX_IN_FLIGHT: usize = 256;
+const MAX_SUBSCRIPTIONS: usize = 256;
+const MAX_REPLY_EVENTS: usize = 1024;
+const MAX_REPLY_BYTES: usize = 32 << 20;
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
@@ -93,6 +97,7 @@ pub(super) struct Replies {
     /// calls in flight, never on a clock.
     landed: std::sync::Condvar,
     changed: tokio::sync::watch::Sender<()>,
+    fault: Mutex<Option<String>>,
 }
 
 impl Default for Replies {
@@ -102,6 +107,7 @@ impl Default for Replies {
             in_flight: AtomicUsize::new(0),
             landed: std::sync::Condvar::new(),
             changed: tokio::sync::watch::channel(()).0,
+            fault: Mutex::default(),
         }
     }
 }
@@ -113,9 +119,22 @@ impl Replies {
         self.changed.subscribe()
     }
 
-    pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) {
+    pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) -> Result<(), String> {
+        if let Some(fault) = self.fault() { return Err(fault); }
         let mut events = self.events.lock().expect("kernel replies");
         pending.append(&mut events);
+        Ok(())
+    }
+
+    pub(super) fn fault(&self) -> Option<String> {
+        self.fault.lock().expect("kernel reply fault").clone()
+    }
+
+    fn admit(self: &std::sync::Arc<Self>) -> Option<InFlight> {
+        if self.fault().is_some() { return None; }
+        self.in_flight.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+            |count| (count < MAX_IN_FLIGHT).then_some(count + 1)).ok()?;
+        Some(InFlight(self.clone()))
     }
 
     /// Whether a query or a submit is still on its way.
@@ -154,6 +173,22 @@ impl Replies {
     /// a subscription's last item and its count are not the same moment.
     fn item(&self, id: u64, result: Result<Vec<u8>, String>, done: bool) {
         let mut events = self.events.lock().expect("kernel replies");
+        if self.fault().is_some() { return; }
+        let bytes = |result: &Result<Vec<u8>, String>| match result {
+            Ok(bytes) => bytes.len(), Err(error) => error.len(),
+        };
+        let queued: usize = events.iter().map(|event| match event {
+            wire::Event::Response { result, .. } => bytes(result),
+            _ => 0,
+        }).sum();
+        let exceeds_budget = events.len() >= MAX_REPLY_EVENTS
+            || bytes(&result) > MAX_REPLY_BYTES.saturating_sub(queued);
+        if exceeds_budget {
+            *self.fault.lock().expect("kernel reply fault") = Some("view reply backlog limit exceeded; view stopped".into());
+            self.landed.notify_all();
+            self.changed.send_replace(());
+            return;
+        }
         events.push(wire::Event::Response { id, result, done });
         self.landed.notify_all();
         self.changed.send_replace(());
@@ -167,6 +202,7 @@ impl Replies {
         self.changed.send_replace(());
     }
 
+    #[cfg(test)]
     fn deliver(&self, id: u64, result: Result<Vec<u8>, String>) {
         self.item(id, result, true);
         self.settled();
@@ -197,9 +233,49 @@ fn reply_notifications_wake_each_presenter_and_keep_the_answer() {
         second.changed().await.expect("second presenter notified");
     });
     let mut pending = Vec::new();
-    replies.drain_into(&mut pending);
+    replies.drain_into(&mut pending).expect("reply budget");
     assert!(matches!(pending.as_slice(), [wire::Event::Response { id: 7, result: Ok(bytes), done: true }] if bytes == &[1, 2]));
     assert!(!replies.answer_owed());
+}
+
+#[cfg(test)]
+#[test]
+fn request_admission_is_bounded_and_drop_returns_capacity() {
+    let replies = std::sync::Arc::new(Replies::default());
+    let mut admitted: Vec<_> = (0..MAX_IN_FLIGHT)
+        .map(|_| replies.admit().expect("within budget")).collect();
+    assert!(replies.admit().is_none());
+    admitted.pop();
+    let replacement = replies.admit().expect("dropped request returns capacity");
+    drop(replacement);
+    drop(admitted);
+    assert!(!replies.any_in_flight());
+}
+
+#[cfg(test)]
+#[test]
+fn reply_overflow_stops_the_view_instead_of_losing_an_answer_silently() {
+    let replies = std::sync::Arc::new(Replies::default());
+    for id in 0..MAX_REPLY_EVENTS { replies.item(id as u64, Ok(Vec::new()), false); }
+    assert!(replies.fault().is_none());
+    replies.item(MAX_REPLY_EVENTS as u64, Ok(Vec::new()), true);
+    assert!(replies.fault().is_some());
+    assert!(replies.admit().is_none());
+    let mut pending = Vec::new();
+    assert!(replies.drain_into(&mut pending).is_err());
+    assert!(pending.is_empty());
+    assert_eq!(replies.events.lock().unwrap().len(), MAX_REPLY_EVENTS);
+}
+
+#[cfg(test)]
+#[test]
+fn queued_reply_bytes_are_bounded_across_individually_valid_items() {
+    let replies = Replies::default();
+    replies.item(1, Ok(vec![0; MAX_REPLY_BYTES]), false);
+    assert!(replies.fault().is_none());
+    replies.item(2, Ok(vec![1]), true);
+    assert!(replies.fault().is_some());
+    assert_eq!(replies.events.lock().unwrap().len(), 1);
 }
 
 /// The kernel's own runtime, on its own thread: the window thread never
@@ -250,6 +326,8 @@ pub(super) fn answer(
         ("rpc", "live") => {
             let plane = std::str::from_utf8(payload).unwrap_or_default().trim();
             let named = plane == BLOCK_PLANE || workspace_config::validate_module_id(plane).is_ok();
+            let capacity = guest.live_subscriptions.len() < MAX_SUBSCRIPTIONS;
+            if !capacity { guest.refuse(id, "too many live subscriptions".into()); return true; }
             match named {
                 true => guest.live_subscriptions.push((id, plane.to_owned())),
                 false => guest.refuse(id, "`rpc.live` names no plane".into()),
@@ -284,6 +362,8 @@ pub(super) fn answer(
         }
         ("clock", "ticks") => {
             let period = tick_period(payload);
+            let capacity = guest.clocks.len() < MAX_SUBSCRIPTIONS;
+            if !capacity { guest.refuse(id, "too many clock subscriptions".into()); return true; }
             match period {
                 Some(period) => guest.clocks.push(Clock {
                     id,
@@ -336,10 +416,14 @@ fn spawn(guest: &mut Guest, id: u64, payload: &[u8], call: Call) {
         return;
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(client, ask).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
@@ -360,10 +444,14 @@ fn spawn_host(guest: &mut Guest, id: u64, payload: &[u8], call: HostCall) {
         }
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(ask).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
@@ -385,10 +473,14 @@ fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
     };
     let bytes = payload.to_vec();
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(client, bytes).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
@@ -490,6 +582,7 @@ fn stream_ask(ask: &serde_json::Value) -> Result<(String, String), String> {
 /// Opens one node topic for a view: the socket under the seated key, then
 /// every frame it sends, until it ends.
 fn stream_open(guest: &mut Guest, id: u64, payload: &[u8]) {
+    guest.streams.retain(|(_, stream)| !stream.0.is_finished());
     let ask: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(ask) => ask,
         Err(error) => {
@@ -514,8 +607,10 @@ fn stream_open(guest: &mut Guest, id: u64, payload: &[u8]) {
         return;
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
-    let counted = InFlight(replies.clone());
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     let handle = runtime().spawn(async move {
         let _counted = counted;
         match open_topic(client.origin(), &topic, &query).await {
@@ -606,6 +701,7 @@ where
             return;
         }
         replies.item(id, Ok(frame), false);
+        if replies.fault().is_some() { return; }
     }
     replies.item(id, Ok(Vec::new()), true);
 }
@@ -1127,7 +1223,7 @@ mod tests {
 
         replies.wait_idle();
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         let items: Vec<(u64, Result<Vec<u8>, String>, bool)> = landed
             .into_iter()
             .map(|event| match event {
@@ -1194,7 +1290,7 @@ mod tests {
 
         replies.wait_idle();
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         assert_eq!(
             landed,
             vec![wire::Event::Response {
@@ -1231,7 +1327,7 @@ mod tests {
         assert!(!replies.any_in_flight(), "the count came back");
         assert!(replies.answer_owed(), "and the answer is still here");
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         assert_eq!(landed.len(), 1);
         assert!(!replies.answer_owed(), "drained, and nothing is owed");
     }
@@ -1262,7 +1358,7 @@ mod tests {
         drop(NodeStream(waiting));
         replies.wait_idle();
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         assert!(landed.is_empty(), "an abort delivers nothing: {landed:?}");
     }
 }

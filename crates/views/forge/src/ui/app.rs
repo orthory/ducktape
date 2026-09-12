@@ -375,7 +375,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_466f72676556696577! {
 #[allow(unused_parens)]
 impl ForgeView {
-#[must_use]
 }
 }
 __ice_generated_items_466f72676556696577! {

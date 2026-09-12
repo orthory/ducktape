@@ -173,7 +173,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_4e6f646556696577! {
 #[allow(unused_parens)]
 impl NodeView {
-#[must_use]
 }
 }
 __ice_generated_items_4e6f646556696577! {

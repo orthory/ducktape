@@ -129,7 +129,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_4578706c6f72657256696577! {
 #[allow(unused_parens)]
 impl ExplorerView {
-#[must_use]
 }
 }
 __ice_generated_items_4578706c6f72657256696577! {

@@ -8,7 +8,6 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 # Integration tests drive the view natively through the wire.
-test = false
 
 [dependencies]
 futures.workspace = true

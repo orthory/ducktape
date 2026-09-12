@@ -50,7 +50,7 @@ pub(crate) settings_pane: SettingsPane,
 #[cfg(test)]
 #[allow(dead_code)]
 impl SettingsView {
-pub(crate) fn __ice_test_state_settings_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_settings_screen> { let __ice_view = |__state: &__IceSettingsScreenState| __IceTestState_settings_screen { key_pw: __state.key_pw.clone(),settings_pane: __state.settings_pane.clone(), }; let __ice_stored = self.__ice_component_053657474696e677353637265656e.get(scope).map(__ice_view); __ice_stored.or_else(|| self.__ice_test_scopes_settings_screen().iter().any(|__ice_scope| __ice_scope == scope).then(|| __ice_view(&<__IceSettingsScreenState>::default()))) }
+pub(crate) fn __ice_test_state_settings_screen(&self, scope: &str) -> ::std::option::Option<__IceTestState_settings_screen> { let __ice_view = |__state: &__IceSettingsScreenState| __IceTestState_settings_screen { key_pw: __state.key_pw.clone(),settings_pane: __state.settings_pane.clone(), }; let __ice_stored = self.__ice_component_053657474696e677353637265656e.get(scope).map(__ice_view); __ice_stored }
 pub(crate) fn __ice_test_message_settings_screen_pick_pane(scope: ::std::string::String, __p0: SettingsPane) -> __SettingsViewMessage { __SettingsViewMessage::__0C53657474696e677353637265656eH7069636b5f70616e65(scope, __p0) }
 }
 #[allow(dead_code)]

@@ -228,7 +228,6 @@ let _: &::std::string::String = &_value.error;
 __ice_generated_items_4167656e747356696577! {
 #[allow(unused_parens)]
 impl AgentsView {
-#[must_use]
 }
 }
 __ice_generated_items_4167656e747356696577! {

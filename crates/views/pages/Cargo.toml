@@ -8,7 +8,6 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 # Integration tests drive the guest directly through its wire contract.
-test = false
 
 [dependencies]
 futures.workspace = true
