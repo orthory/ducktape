@@ -5262,12 +5262,9 @@ pub(crate) mod tests {
     /// the document can still spare it, and below that drops full-width onto
     /// the document's own text column, in a gap the editor holds open for it.
     ///
-    /// A float TRANSLATES a laid-out child, so `operate` reports where the card
-    /// was laid out, not where it paints. What is asserted here is therefore
-    /// the layout each placement decides — the widths the document and the card
-    /// are actually given; the float's own program is pinned in the view's
-    /// tests, and the screenshots beside each assertion are where the
-    /// translated card is read.
+    /// The native measurement canvas reports the usable content box. The
+    /// comment card's one-pixel borders are outside that box; its authored
+    /// 340-pixel outer width therefore leaves 338 pixels for the content.
     #[gpui_kit::test]
     fn pages_comments_answer_the_pane_they_open_in(cx: &mut TestAppContext) {
         let _turn = blocking_connection_turn();
@@ -5321,17 +5318,17 @@ pub(crate) mod tests {
         };
         let (beside_editor, beside_card) = measured(1500.);
         assert_eq!(f32::from(beside_editor.size.width), 704.);
-        assert_eq!(f32::from(beside_card.size.width), 340.);
+        assert_eq!(f32::from(beside_card.size.width), 338.);
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
             1060. - 340. - 32. - 62.
         );
-        assert_eq!(f32::from(squeeze_card.size.width), 340.);
+        assert_eq!(f32::from(squeeze_card.size.width), 338.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);
         let (inline_editor, inline_card) = measured(1100.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
-        assert_eq!(inline_card.size.width, inline_editor.size.width);
+        assert_eq!(inline_card.size.width + gpui::px(2.), inline_editor.size.width);
     }
 
     /// The forge view draws itself against session facts only; everything
