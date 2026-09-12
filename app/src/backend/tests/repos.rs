@@ -2,7 +2,10 @@ use super::*;
 
 #[test]
 fn highlight_ranges_hold_char_boundaries_on_real_sources() {
-    use gpui_kit::component::{Rope, highlighter::{HighlightTheme, SyntaxHighlighter}};
+    use gpui_kit::component::{
+        Rope,
+        highlighter::{HighlightTheme, SyntaxHighlighter},
+    };
     // Exercise the native syntax engine with real multibyte source text.
     let rust = include_str!("../forge.rs");
     let toml = include_str!("../../../Cargo.toml");
@@ -11,14 +14,20 @@ fn highlight_ranges_hold_char_boundaries_on_real_sources() {
         let mut highlighter = SyntaxHighlighter::new(language);
         assert!(highlighter.update(None, &Rope::from_str(source), None));
         for (range, _) in highlighter.styles(&(0..source.len()), theme.as_ref()) {
-            assert!(source.get(range).is_some(), "highlight splits a UTF-8 character");
+            assert!(
+                source.get(range).is_some(),
+                "highlight splits a UTF-8 character"
+            );
         }
     }
 }
 
 #[test]
 fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
-    use gpui_kit::component::{Rope, highlighter::{HighlightTheme, SyntaxHighlighter}};
+    use gpui_kit::component::{
+        Rope,
+        highlighter::{HighlightTheme, SyntaxHighlighter},
+    };
     assert_eq!(code_token("src/main.rs"), "rs");
     assert_eq!(code_token("a/b/query.SQL"), "sql");
     assert_eq!(code_token("Makefile"), "makefile");
@@ -31,9 +40,12 @@ fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
         let theme = HighlightTheme::default_dark();
         let mut highlighter = SyntaxHighlighter::new(token);
         highlighter.update(None, &Rope::from_str(source), None);
-        highlighter.styles(&(0..source.len()), theme.as_ref())
+        highlighter
+            .styles(&(0..source.len()), theme.as_ref())
             .into_iter()
-            .map(|(_, highlight)| format!("{:?}", highlight.color))
+            // GPUI returns one default span even without a grammar. Count
+            // actual ink overrides, not that unstyled coverage span.
+            .filter_map(|(_, highlight)| highlight.color.map(|color| format!("{color:?}")))
             .collect()
     };
     assert!(

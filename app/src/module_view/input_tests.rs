@@ -92,7 +92,7 @@ fn click_before_frame(native: &mut VisualTestContext, key: String) {
 fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();
     for (opened, label, reacted) in [
-        (&["More message actions"][..], "Add reaction", false),
+        (&["More message actions"][..], "Manage reactions", false),
         (&["Manage reactions"][..], "🦆", true),
     ] {
         let seat = seated(opened);
@@ -161,7 +161,7 @@ fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance(cx: &mut Tes
         let Slot::Ready(guest) = &mut locked.slot else {
             unreachable!()
         };
-        let message = tests::button_message(guest, "Add reaction");
+        let message = tests::button_message(guest, "Manage reactions");
         guest.pending.clear();
         guest.alive = Arc::new(());
         message
@@ -188,7 +188,7 @@ fn a_retained_control_cannot_address_a_new_frames_handler_table(cx: &mut TestApp
         let Slot::Ready(guest) = &mut locked.slot else {
             unreachable!()
         };
-        let message = tests::button_message(guest, "Add reaction");
+        let message = tests::button_message(guest, "Manage reactions");
         guest.pending.clear();
         guest.frame_rev += 1;
         message
