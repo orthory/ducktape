@@ -231,7 +231,6 @@ fn canary_follows_a_live_node() {
     app.connected = true;
     app.connected_rpc = node;
     app.shell_tab = super::ShellTab::Chat;
-    app.channel_create_open = true;
     let (spec, _) = app.native_view();
     let mut entity = None;
     let window = cx
@@ -268,7 +267,7 @@ fn canary_follows_a_live_node() {
         found.expect("live native input")
     };
     let draft = "retained-live-draft-오리";
-    let (key, _) = input("Channel name");
+    let (key, _) = input("Search messages");
     cx.update_window(window.into(), |_, window, cx| {
         window.click(key, cx);
         window.input(draft, cx);
@@ -278,7 +277,7 @@ fn canary_follows_a_live_node() {
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
     assert_eq!(
-        input("Channel name").1,
+        input("Search messages").1,
         draft,
         "native typing reaches guest state"
     );
@@ -361,7 +360,7 @@ fn canary_follows_a_live_node() {
             assert!(height > before, "chain must advance through deployment");
             assert_eq!(entity.entity_id(), identity, "native view was not replaced");
             assert_eq!(
-                input("Channel name").1,
+                input("Search messages").1,
                 draft,
                 "snapshot must preserve typed guest draft"
             );
