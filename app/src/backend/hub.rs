@@ -299,7 +299,10 @@ pub fn window_target(current: Option<crate::shell::WindowKey>) -> crate::shell::
 /// [`window_target`] gated on a bool: while `keep` holds, yields a fresh id
 /// (a no-op close); once it does not, names the window. How a branch-free
 /// fold spells "close the huddle window only if the huddle ended".
-pub fn window_target_unless(keep: bool, current: Option<crate::shell::WindowKey>) -> crate::shell::WindowKey {
+pub fn window_target_unless(
+    keep: bool,
+    current: Option<crate::shell::WindowKey>,
+) -> crate::shell::WindowKey {
     if keep {
         crate::shell::WindowKey::unique()
     } else {
@@ -506,7 +509,9 @@ async fn name_remote_keystore(rpc: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let chain_id = super::node::node_facts(&status).chain_id;
     if chain_id.is_empty() {
-        return Err("this node serves no network yet, so there is no identity to hold for it".into());
+        return Err(
+            "this node serves no network yet, so there is no identity to hold for it".into(),
+        );
     }
     note_remote_chain(rpc, &chain_id);
     Ok(())
@@ -552,9 +557,7 @@ pub fn probe_known_networks() -> futures::stream::BoxStream<'static, HubProbe> {
             height: reading.unwrap_or(-1),
         }
     });
-    futures::stream::iter(probes)
-        .buffer_unordered(8)
-        .boxed()
+    futures::stream::iter(probes).buffer_unordered(8).boxed()
 }
 
 /// One bounded status read: the height when the node answers, `None` when it
@@ -1016,7 +1019,10 @@ mod tests {
             live: false,
             height: -1,
         }];
-        assert_eq!(selected_network_name(rows.clone(), "demo#a1b2".into()), "demo");
+        assert_eq!(
+            selected_network_name(rows.clone(), "demo#a1b2".into()),
+            "demo"
+        );
         assert_eq!(selected_network_name(rows, "gone".into()), "");
     }
 
@@ -1193,14 +1199,8 @@ mod tests {
     fn tray_open_reconnects_the_console_only_when_untracked_and_connected() {
         use crate::TrayOpen;
 
-        assert!(matches!(
-            tray_open_action(false, false),
-            TrayOpen::Launch
-        ));
-        assert!(matches!(
-            tray_open_action(true, false),
-            TrayOpen::Console
-        ));
+        assert!(matches!(tray_open_action(false, false), TrayOpen::Launch));
+        assert!(matches!(tray_open_action(true, false), TrayOpen::Console));
         assert!(matches!(tray_open_action(true, true), TrayOpen::Raise));
         assert!(matches!(tray_open_action(false, true), TrayOpen::Raise));
     }

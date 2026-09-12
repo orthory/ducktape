@@ -380,7 +380,12 @@ pub struct PendingSend {
 }
 
 /// A newly admitted send, at the end of the queue.
-pub fn send_pending(mut sends: Vec<PendingSend>, id: String, body: String, thread_seq: i64) -> Vec<PendingSend> {
+pub fn send_pending(
+    mut sends: Vec<PendingSend>,
+    id: String,
+    body: String,
+    thread_seq: i64,
+) -> Vec<PendingSend> {
     sends.push(PendingSend {
         id,
         body,
