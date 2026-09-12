@@ -636,14 +636,14 @@ mod __ice_group_app_update {
                                             ::std::result::Result::Ok(value) => {
                                                 __DucktapeMessage::BellLoaded(
                                                     __ice_run_route_9_0,
-                                                    __ice_run_route_9_1,
+                                                    __ice_run_route_9_1.clone(),
                                                     value,
                                                 )
                                             }
                                             ::std::result::Result::Err(error) => {
                                                 __DucktapeMessage::BellFailed(
                                                     __ice_run_route_10_0,
-                                                    __ice_run_route_10_1,
+                                                    __ice_run_route_10_1.clone(),
                                                     error,
                                                 )
                                             }
@@ -1042,14 +1042,14 @@ mod __ice_group_app_update {
                                             ::std::result::Result::Ok(value) => {
                                                 __DucktapeMessage::BellContextLoaded(
                                                     __ice_run_route_23_0,
-                                                    __ice_run_route_23_1,
+                                                    __ice_run_route_23_1.clone(),
                                                     value,
                                                 )
                                             }
                                             ::std::result::Result::Err(error) => {
                                                 __DucktapeMessage::BellFailed(
                                                     __ice_run_route_24_0,
-                                                    __ice_run_route_24_1,
+                                                    __ice_run_route_24_1.clone(),
                                                     error,
                                                 )
                                             }
@@ -2329,7 +2329,7 @@ mod __ice_group_app_update {
                                     move |result| match result {
                                         ::std::result::Result::Ok(value) => {
                                             __DucktapeMessage::ForgeComposerEvent(
-                                                __ice_run_route_60_0,
+                                                __ice_run_route_60_0.clone(),
                                                 value,
                                             )
                                         }
@@ -2402,14 +2402,14 @@ mod __ice_group_app_update {
                                     move |result| match result {
                                         ::std::result::Result::Ok(value) => {
                                             __DucktapeMessage::ForgeNoteSent(
-                                                __ice_run_route_62_0,
+                                                __ice_run_route_62_0.clone(),
                                                 value,
                                             )
                                         }
                                         ::std::result::Result::Err(error) => {
                                             __DucktapeMessage::ForgeNoteFailed(
-                                                __ice_run_route_63_0,
-                                                __ice_run_route_63_1,
+                                                __ice_run_route_63_0.clone(),
+                                                __ice_run_route_63_1.clone(),
                                                 error,
                                             )
                                         }
@@ -2594,14 +2594,14 @@ mod __ice_group_app_update {
                                     ::std::result::Result::Ok(value) => {
                                         __DucktapeMessage::BellLoaded(
                                             __ice_run_route_67_0,
-                                            __ice_run_route_67_1,
+                                            __ice_run_route_67_1.clone(),
                                             value,
                                         )
                                     }
                                     ::std::result::Result::Err(error) => {
                                         __DucktapeMessage::BellFailed(
                                             __ice_run_route_68_0,
-                                            __ice_run_route_68_1,
+                                            __ice_run_route_68_1.clone(),
                                             error,
                                         )
                                     }
@@ -3704,14 +3704,14 @@ mod __ice_group_app_update {
                                     ::std::result::Result::Ok(value) => {
                                         __DucktapeMessage::BellLoaded(
                                             __ice_run_route_106_0,
-                                            __ice_run_route_106_1,
+                                            __ice_run_route_106_1.clone(),
                                             value,
                                         )
                                     }
                                     ::std::result::Result::Err(error) => {
                                         __DucktapeMessage::BellFailed(
                                             __ice_run_route_107_0,
-                                            __ice_run_route_107_1,
+                                            __ice_run_route_107_1.clone(),
                                             error,
                                         )
                                     }
@@ -3755,14 +3755,14 @@ mod __ice_group_app_update {
                                     ::std::result::Result::Ok(value) => {
                                         __DucktapeMessage::BellLoaded(
                                             __ice_run_route_108_0,
-                                            __ice_run_route_108_1,
+                                            __ice_run_route_108_1.clone(),
                                             value,
                                         )
                                     }
                                     ::std::result::Result::Err(error) => {
                                         __DucktapeMessage::BellFailed(
                                             __ice_run_route_109_0,
-                                            __ice_run_route_109_1,
+                                            __ice_run_route_109_1.clone(),
                                             error,
                                         )
                                     }
@@ -3816,14 +3816,14 @@ mod __ice_group_app_update {
                                     ::std::result::Result::Ok(value) => {
                                         __DucktapeMessage::BellMarked(
                                             __ice_run_route_110_0,
-                                            __ice_run_route_110_1,
+                                            __ice_run_route_110_1.clone(),
                                             value,
                                         )
                                     }
                                     ::std::result::Result::Err(error) => {
                                         __DucktapeMessage::BellMarkFailed(
                                             __ice_run_route_111_0,
-                                            __ice_run_route_111_1,
+                                            __ice_run_route_111_1.clone(),
                                             error,
                                         )
                                     }
@@ -3979,7 +3979,7 @@ mod __ice_group_app_update {
                                             ::std::result::Result::Ok(value) => {
                                                 __DucktapeMessage::OpenPageSearchHit(
                                                     value,
-                                                    __ice_run_route_113_1,
+                                                    __ice_run_route_113_1.clone(),
                                                 )
                                             }
                                             ::std::result::Result::Err(error) => {
@@ -5179,7 +5179,7 @@ mod __ice_group_app_update {
                             ({ crate::backend::duck_echo_str(link.to_owned()) }),
                             move |result| match result {
                                 ::std::result::Result::Ok(value) => {
-                                    __DucktapeMessage::CopyToClipboard(value, __ice_run_route_145_1)
+                                    __DucktapeMessage::CopyToClipboard(value, __ice_run_route_145_1.clone())
                                 }
                                 ::std::result::Result::Err(error) => {
                                     __DucktapeMessage::ExternalUrlFailed(error)
@@ -5233,7 +5233,7 @@ mod __ice_group_app_update {
                                         ::std::result::Result::Ok(value) => {
                                             __DucktapeMessage::OpenPageSearchHit(
                                                 value,
-                                                __ice_run_route_149_1,
+                                                __ice_run_route_149_1.clone(),
                                             )
                                         }
                                         ::std::result::Result::Err(error) => {
@@ -5613,7 +5613,7 @@ mod __ice_group_app_update {
                                         ::std::result::Result::Ok(value) => {
                                             __DucktapeMessage::CopyToClipboard(
                                                 value,
-                                                __ice_run_route_169_1,
+                                                __ice_run_route_169_1.clone(),
                                             )
                                         }
                                         ::std::result::Result::Err(error) => {
@@ -5662,7 +5662,7 @@ mod __ice_group_app_update {
                                         ::std::result::Result::Ok(value) => {
                                             __DucktapeMessage::ChatBeginEdit(
                                                 value,
-                                                __ice_run_route_172_1,
+                                                __ice_run_route_172_1.clone(),
                                                 __ice_run_route_172_2,
                                                 __ice_run_route_172_3,
                                             )
@@ -5735,8 +5735,8 @@ mod __ice_group_app_update {
                                             __DucktapeMessage::ComposerSubmitted(
                                                 __ice_run_route_177_0,
                                                 value,
-                                                __ice_run_route_177_2,
-                                                __ice_run_route_177_3,
+                                                __ice_run_route_177_2.clone(),
+                                                __ice_run_route_177_3.clone(),
                                             )
                                         }
                                         ::std::result::Result::Err(error) => {

@@ -81,9 +81,8 @@ fn the_mention_plate_leaves_space_before_and_after_the_token() {
             ..Default::default()
         });
     }
-    let line = cx
-        .text_system()
-        .shape_line(text.into(), px(13.5), &runs, None);
+    let shaper = gpui_kit::WindowTextSystem::new(cx.text_system().clone());
+    let line = shaper.shape_line(text.into(), px(13.5), &runs, None);
     let padding = px(1.);
     let leading = line.x_for_index(bounds[2].start) - padding - line.x_for_index(bounds[0].end);
     let trailing = line.x_for_index(bounds[4].start) - line.x_for_index(bounds[2].end) - padding;

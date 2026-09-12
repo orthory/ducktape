@@ -111,11 +111,8 @@ pub(crate) fn raise<Message: 'static>(key: WindowKey) -> Task<Message> {
     effect(Command::Raise(key))
 }
 
-pub(crate) fn drag<Message: 'static>(key: Option<WindowKey>) -> Task<Message> {
-    match key {
-        Some(key) => effect(Command::Drag(key)),
-        None => Task::none(),
-    }
+pub(crate) fn drag<Message: 'static>(key: WindowKey) -> Task<Message> {
+    effect(Command::Drag(key))
 }
 
 pub(crate) fn oldest() -> Task<Option<WindowKey>> {

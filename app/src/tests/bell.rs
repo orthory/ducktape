@@ -135,7 +135,7 @@ fn bell_controls_render_context_and_admit_read_from_the_real_button(
     cx: &mut gpui_kit::TestAppContext,
 ) {
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{AppContext as _, VisualTestContext, px, size};
+    use gpui_kit::{VisualTestContext, px, size};
     let _guard = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.console_win = Some(crate::shell::WindowKey::unique());
