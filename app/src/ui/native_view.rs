@@ -1,16 +1,159 @@
 impl Ducktape {
-fn native_view(&self) -> (crate::module_view::ViewSpec, fn(crate::module_view::ModuleViewEvent) -> __DucktapeMessage) {
-match self.shell_tab {
-ShellTab::Chat => (crate::module_view::chat_view((*self.__ice_derived_dark()), self.connected, ::std::convert::AsRef::as_ref(&(self.connected_rpc)), ::std::convert::AsRef::as_ref(&(self.network_name)), ::std::convert::AsRef::as_ref(&(self.network_chain_id)), ::std::convert::AsRef::as_ref(&(self.status)), self.block_height, ::std::convert::AsRef::as_ref(&(self.account_number)), ::std::convert::AsRef::as_ref(&(self.settings_user_key)), self.dm_peers_generation, ::std::convert::AsRef::as_ref(&(self.rooms)), ::std::convert::AsRef::as_ref(&(self.dm_rows)), self.channel_create_open, ::std::convert::AsRef::as_ref(&(self.active_channel)), ::std::convert::AsRef::as_ref(&(self.active_dm_peer)), ::std::borrow::Borrow::borrow(&(self.active_dm)), self.chat_land_seq, self.unread_boundary, self.mutation_phase.clone(), self.loading, self.huddle_joined, ::std::convert::AsRef::as_ref(&(self.huddle_channel)), ::std::convert::AsRef::as_ref(&(self.huddle_channel_name)), self.huddle_joined_at, self.huddle_now, self.call_muted, self.shift_held, self.chat_copy_chord_serial, self.chat_sent_serial, ::std::convert::AsRef::as_ref(&(self.chat_pending_sends)), ::std::convert::AsRef::as_ref(&(self.live_agents))), __DucktapeMessage::ChatViewEvent),
-ShellTab::Pages => (crate::module_view::pages_view((*self.__ice_derived_dark()), self.connected, ::std::convert::AsRef::as_ref(&(self.network_chain_id)), ::std::convert::AsRef::as_ref(&(self.page_route)), self.page_route_serial), __DucktapeMessage::PagesViewEvent),
-ShellTab::Forge => (crate::module_view::forge_view((*self.__ice_derived_dark()), self.connected, ::std::convert::AsRef::as_ref(&(self.network_name)), ::std::convert::AsRef::as_ref(&(self.account_bio)), ::std::convert::AsRef::as_ref(&(crate::backend::member_tier(::std::convert::AsRef::as_ref(&(self.members_rows))))), ::std::convert::AsRef::as_ref(&(self.network_chain_id)), ::std::convert::AsRef::as_ref(&(self.connected_rpc)), ::std::convert::AsRef::as_ref(&(self.forge_link)), self.forge_link_tick), __DucktapeMessage::ForgeViewEvent),
-ShellTab::Agents => (crate::module_view::agents_view((*self.__ice_derived_dark()), self.connected, ::std::convert::AsRef::as_ref(&(self.account_number)), ::std::convert::AsRef::as_ref(&(self.agents_open_run)), self.agents_opened), __DucktapeMessage::AgentsViewEvent),
-ShellTab::Files => (crate::module_view::files_view((*self.__ice_derived_dark()), self.connected, ::std::convert::AsRef::as_ref(&(self.network_chain_id)), ::std::convert::AsRef::as_ref(&(self.fs_route)), self.fs_route_serial), __DucktapeMessage::FilesViewEvent),
-ShellTab::Explorer => (crate::module_view::explorer_view((*self.__ice_derived_dark()), self.connected, self.block_height, ::std::convert::AsRef::as_ref(&(crate::backend::sync_label(::std::convert::AsRef::as_ref(&(self.node_phase)), self.node_sync_applied, self.node_sync_target)))), __DucktapeMessage::ExplorerViewEvent),
-ShellTab::Node => (crate::module_view::node_view((*self.__ice_derived_dark()), self.connected, crate::backend::members_is_admin(::std::convert::AsRef::as_ref(&(self.members_rows))), ::std::convert::AsRef::as_ref(&(crate::backend::member_tier(::std::convert::AsRef::as_ref(&(self.members_rows))))), ::std::convert::AsRef::as_ref(&(self.status)), ::std::convert::AsRef::as_ref(&(self.node_data_dir)), self.wall_now), __DucktapeMessage::NodeViewEvent),
-ShellTab::Members => (crate::module_view::members_view((*self.__ice_derived_dark()), self.connected, crate::backend::members_is_admin(::std::convert::AsRef::as_ref(&(self.members_rows)))), __DucktapeMessage::MembersViewEvent),
-ShellTab::Governance => (crate::module_view::governance_view((*self.__ice_derived_dark()), self.connected, crate::backend::members_is_admin(::std::convert::AsRef::as_ref(&(self.members_rows)))), __DucktapeMessage::GovernanceViewEvent),
-ShellTab::Settings => (crate::module_view::settings_view((*self.__ice_derived_dark()), self.connected, self.loading, ::std::convert::AsRef::as_ref(&(self.status)), self.mutation_phase.clone(), self.appearance.clone(), self.desktop_notifications, ::std::convert::AsRef::as_ref(&(self.password)), ::std::convert::AsRef::as_ref(&(self.settings_user_key)), ::std::convert::AsRef::as_ref(&(self.account_name)), ::std::convert::AsRef::as_ref(&(self.network_name)), ::std::convert::AsRef::as_ref(&(self.connected_rpc)), ::std::convert::AsRef::as_ref(&(self.account_ceremony_phase)), ::std::convert::AsRef::as_ref(&(self.account_ceremony_qr)), ::std::convert::AsRef::as_ref(&(self.account_ceremony_detail)), ::std::convert::AsRef::as_ref(&(self.account_ceremony_left)), ::std::convert::AsRef::as_ref(&(self.settings_key_state)), ::std::convert::AsRef::as_ref(&(self.settings_key_path)), ::std::convert::AsRef::as_ref(&(self.account_number)), self.account_exists, self.account_busy, ::std::convert::AsRef::as_ref(&(self.account_ticket))), __DucktapeMessage::SettingsViewEvent),
-}
-}
+    fn native_view(
+        &self,
+    ) -> (
+        crate::module_view::ViewSpec,
+        fn(crate::module_view::ModuleViewEvent) -> __DucktapeMessage,
+    ) {
+        match self.shell_tab {
+            ShellTab::Chat => (
+                crate::module_view::chat_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    &self.connected_rpc,
+                    &self.network_name,
+                    &self.network_chain_id,
+                    &self.status,
+                    self.block_height,
+                    &self.account_number,
+                    &self.settings_user_key,
+                    self.dm_peers_generation,
+                    &self.rooms,
+                    &self.dm_rows,
+                    self.channel_create_open,
+                    &self.active_channel,
+                    &self.active_dm_peer,
+                    &self.active_dm,
+                    self.chat_land_seq,
+                    self.unread_boundary,
+                    self.mutation_phase.clone(),
+                    self.loading,
+                    self.huddle_joined,
+                    &self.huddle_channel,
+                    &self.huddle_channel_name,
+                    self.huddle_joined_at,
+                    self.huddle_now,
+                    self.call_muted,
+                    self.shift_held,
+                    self.chat_copy_chord_serial,
+                    self.chat_sent_serial,
+                    &self.chat_pending_sends,
+                    &self.live_agents,
+                ),
+                __DucktapeMessage::ChatViewEvent,
+            ),
+            ShellTab::Pages => (
+                crate::module_view::pages_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    &self.network_chain_id,
+                    &self.page_route,
+                    self.page_route_serial,
+                ),
+                __DucktapeMessage::PagesViewEvent,
+            ),
+            ShellTab::Forge => (
+                crate::module_view::forge_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    &self.network_name,
+                    &self.account_bio,
+                    &crate::backend::member_tier(&self.members_rows),
+                    &self.network_chain_id,
+                    &self.connected_rpc,
+                    &self.forge_link,
+                    self.forge_link_tick,
+                ),
+                __DucktapeMessage::ForgeViewEvent,
+            ),
+            ShellTab::Agents => (
+                crate::module_view::agents_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    &self.account_number,
+                    &self.agents_open_run,
+                    self.agents_opened,
+                ),
+                __DucktapeMessage::AgentsViewEvent,
+            ),
+            ShellTab::Files => (
+                crate::module_view::files_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    &self.network_chain_id,
+                    &self.fs_route,
+                    self.fs_route_serial,
+                ),
+                __DucktapeMessage::FilesViewEvent,
+            ),
+            ShellTab::Explorer => (
+                crate::module_view::explorer_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    self.block_height,
+                    &crate::backend::sync_label(
+                        &self.node_phase,
+                        self.node_sync_applied,
+                        self.node_sync_target,
+                    ),
+                ),
+                __DucktapeMessage::ExplorerViewEvent,
+            ),
+            ShellTab::Node => (
+                crate::module_view::node_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    crate::backend::members_is_admin(&self.members_rows),
+                    &crate::backend::member_tier(&self.members_rows),
+                    &self.status,
+                    &self.node_data_dir,
+                    self.wall_now,
+                ),
+                __DucktapeMessage::NodeViewEvent,
+            ),
+            ShellTab::Members => (
+                crate::module_view::members_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    crate::backend::members_is_admin(&self.members_rows),
+                ),
+                __DucktapeMessage::MembersViewEvent,
+            ),
+            ShellTab::Governance => (
+                crate::module_view::governance_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    crate::backend::members_is_admin(&self.members_rows),
+                ),
+                __DucktapeMessage::GovernanceViewEvent,
+            ),
+            ShellTab::Settings => (
+                crate::module_view::settings_view(
+                    *self.__ice_derived_dark(),
+                    self.connected,
+                    self.loading,
+                    &self.status,
+                    self.mutation_phase.clone(),
+                    self.appearance.clone(),
+                    self.desktop_notifications,
+                    &self.password,
+                    &self.settings_user_key,
+                    &self.account_name,
+                    &self.network_name,
+                    &self.connected_rpc,
+                    &self.account_ceremony_phase,
+                    &self.account_ceremony_qr,
+                    &self.account_ceremony_detail,
+                    &self.account_ceremony_left,
+                    &self.settings_key_state,
+                    &self.settings_key_path,
+                    &self.account_number,
+                    self.account_exists,
+                    self.account_busy,
+                    &self.account_ticket,
+                ),
+                __DucktapeMessage::SettingsViewEvent,
+            ),
+        }
+    }
 }
