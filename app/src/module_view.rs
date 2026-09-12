@@ -1459,6 +1459,13 @@ pub(crate) mod canary {
             return None;
         };
         let mut root = guest.frame.root.clone()?;
+        root.for_each_mut(&mut |node| {
+            if let super::wire::Node::Surface { name, args, .. } = node {
+                if matches!(name.as_str(), "artifact_svg" | "artifact_image") {
+                    *node = super::surfaces::asset_node(name, args, guest);
+                }
+            }
+        });
         guest.pictures.hydrate(&mut root);
         Some(root)
     }

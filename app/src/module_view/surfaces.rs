@@ -85,7 +85,7 @@ fn markdown_args(name: &str, args: &[wire::SurfaceValue]) -> (String, String, bo
     }
 }
 
-fn asset_node(name: &str, args: &[wire::SurfaceValue], guest: &Guest) -> wire::Node {
+pub(super) fn asset_node(name: &str, args: &[wire::SurfaceValue], guest: &Guest) -> wire::Node {
     let path = surface_str(args, 0);
     let Some(bytes) = artifact_asset(&guest.assets, &path) else {
         return wire::Node::empty();
