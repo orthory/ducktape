@@ -16,6 +16,75 @@ fn runtime() -> tokio::runtime::Runtime {
         .build()
         .unwrap()
 }
+fn marker(module: &str) -> &'static str {
+    match module {
+        "files" => "+ Folder · B",
+        "pages" => "Pages · B",
+        "chat" => "CHANNELS · B",
+        _ => "CANARY B",
+    }
+}
+
+/// What a capture left behind, for the next one of the same module to be
+/// judged against.
+struct Seen {
+    state: String,
+    hash: String,
+    seal: Vec<u8>,
+}
+
+struct Transition {
+    module: String,
+    state: String,
+    hash: String,
+}
+
+/// `module=… hash=… state=… gen=… reason=…`, as `view_source` logs it.
+fn parse(line: &str) -> Option<Transition> {
+    let field = |name: &str| {
+        line.split_whitespace()
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    Some(Transition {
+        module: field("module")?,
+        state: field("state")?,
+        hash: field("hash")?,
+    })
+}
+
+fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
+    let module = &step.module;
+    let readable = module == "governance"
+        || (!shown.is_empty() && !shown.iter().any(|text| text.contains("Not connected")));
+    match step.state.as_str() {
+        "Ready" => assert!(
+            !marked,
+            "{module} shows the B marker before any swap: {shown:?}"
+        ),
+        "Swapped" => {
+            if let Some(before) = before {
+                assert_ne!(before.hash, step.hash, "{module} swapped to the same hash");
+            }
+            assert!(
+                marked || !readable,
+                "{module} swapped without its marker {:?}: {shown:?}",
+                marker(module)
+            );
+            if module == "governance" && before.is_some_and(|before| before.state == "Swapped") {
+                assert!(
+                    before.is_some_and(|before| before.seal != seal),
+                    "the governance seal did not change between B and B′"
+                );
+            }
+        }
+        "Missing" => assert!(
+            shown.is_empty(),
+            "{module} removed but still drawn: {shown:?}"
+        ),
+        _ => {}
+    }
+}
 fn capture(module: &'static str, path: &Path) -> Vec<u8> {
     let mut cx = crate::frame_probe::headless_context();
     let mut app = super::Ducktape::__state();
@@ -194,6 +263,8 @@ fn canary_follows_a_live_node() {
     let mut live = crate::backend::live_events(node);
     let mut count = 0;
     let mut log = String::new();
+    let markers = std::env::var_os("DUCKTAPE_CANARY_MARKERS").is_some();
+    let mut seen = std::collections::HashMap::new();
     loop {
         for line in transitions.try_iter() {
             log.push_str(&line);
@@ -213,7 +284,22 @@ fn canary_follows_a_live_node() {
                 continue;
             };
             count += 1;
-            capture(module, &out.join(format!("{count}-{module}-{state}")));
+            let captured = capture(module, &out.join(format!("{count}-{module}-{state}")));
+            if let Some(step) = parse(&line) {
+                let shown = texts(module);
+                let marked = shown.iter().any(|text| text.contains(marker(module)));
+                if markers {
+                    judge(&step, marked, &shown, &captured, seen.get(module));
+                }
+                seen.insert(
+                    module.to_owned(),
+                    Seen {
+                        state: step.state,
+                        hash: step.hash,
+                        seal: captured,
+                    },
+                );
+            }
             std::fs::write(out.join("view_source.log"), &log).unwrap();
             if steps > 0 && count >= steps {
                 return;
