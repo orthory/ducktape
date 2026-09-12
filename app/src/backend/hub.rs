@@ -290,12 +290,8 @@ pub fn password_problem(password: &str, confirm: &str) -> String {
 }
 
 /// The close/focus target for a window that may not be open. `Some(id)` names
-/// it; `None` yields a fresh id that names NO window, and iced drops a
-/// `window::Action::Close` for an id its manager does not hold (iced_winit
-/// `lib.rs`). That no-op IS how an ice handler — which has no if-blocks and
-/// whose window tasks are terminal — spells a conditional close. It is also
-/// the only way to reach `target=`, which demands `window-id`, not
-/// `window-id?`.
+/// it; `None` yields a fresh id that names no window. The native window
+/// manager ignores commands targeting an id it does not hold.
 pub fn window_target(current: Option<crate::shell::WindowKey>) -> crate::shell::WindowKey {
     current.unwrap_or_else(crate::shell::WindowKey::unique)
 }
@@ -349,7 +345,7 @@ pub fn huddle_summon(huddle: Option<crate::shell::WindowKey>) -> crate::WindowSu
 
 /// Does this close end the process? Only where the daemon has nowhere else to
 /// live: on a Mac it goes on in the status item with no window at all, but off
-/// macOS there is no status item (`ui-lang-runtime`'s tray is a no-op there),
+/// macOS the native tray has no status item,
 /// so a window is the only handle on the process and closing the last one
 /// must leave — a daemon nobody can reach is a leak, not a menu-bar app. The
 /// huddle window is deliberately not a survivor: a lone call window never

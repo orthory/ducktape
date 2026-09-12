@@ -1673,7 +1673,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 }
 
 /// Is the reader AT the live tail — the other end of the same offset. A NaN
-/// offset (content that fits, which iced reports as `0/0`) reads as AT THE
+/// offset (`0/0` when content fits) reads as AT THE
 /// TAIL, and NaN compares false against everything, so the band is written as
 /// the comparison plus that case.
 pub fn near_scroll_tail(relative_offset: f64) -> bool {

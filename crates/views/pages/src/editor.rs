@@ -12,10 +12,10 @@
 //! Every name here mirrors the `ducktape_view_guest` / `wire` editor API
 //! (`EditorDecision`, `EditorPatch`, `EditorCursor`, `EditorPosition`,
 //! `EditorHistoryEffect`) so wiring is a rename, not a translation. Nothing
-//! here touches iced, the wire, or the host: it compiles for wasm32 and the
+//! here depends on a renderer, the wire, or the host: it compiles for wasm32 and the
 //! native tests alike.
 //!
-//! The transforms are the app's (`app/src/pages/mod.rs`): Enter after a list
+//! The transforms preserve Markdown structure: Enter after a list
 //! item carries the marker down, on an empty item ends the list, at the end of
 //! an unmatched fence closes it; Backspace at the content edge drops the
 //! marker rather than the line above; Tab / Shift+Tab move a line one

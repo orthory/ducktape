@@ -223,9 +223,8 @@ pub fn channel_switch_facts(
 /// to the END — 1.0 is the TOP of the history in hand, which is where the next
 /// older page belongs.
 ///
-/// A NaN offset (content that fits reports `0/0`) compares false against
-/// everything, which is the answer this wants anyway — iced does not publish a
-/// viewport at all in that case, so it is a belt, not the braces.
+/// An undefined relative offset (for example `0/0` when content fits) is not
+/// a request for older history: NaN compares false here.
 pub fn near_scroll_top(relative_offset: f64) -> bool {
     relative_offset >= 0.9
 }
@@ -236,7 +235,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 /// as "now": the last row is on screen and the next arrival scrolls itself into
 /// view.
 ///
-/// A NaN offset (content that fits, which iced reports as `0/0`) must read as AT
+/// An undefined relative offset (`0/0` when content fits) must read as AT
 /// THE TAIL — a conversation too short to scroll is entirely on screen — and NaN
 /// compares false against everything, so the band is written as the comparison
 /// that must SUCCEED to be at the tail, with NaN taken by the explicit arm.

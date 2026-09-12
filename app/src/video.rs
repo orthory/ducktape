@@ -422,12 +422,9 @@ pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
     });
 }
 
-/// Open the camera, or say why. 640×480 AT ITS HIGHEST FRAME RATE — the size
-/// this module has always documented. `AbsoluteHighestFrameRate` alone meant
-/// "highest frame rate, then the HIGHEST resolution" (nokhwa-core `types.rs`),
-/// so a 720p/1080p webcam negotiated a mode whose q60 JPEG overran the mesh's
-/// ~126 KiB `MAX_FRAME_BYTES` and whose RGBA blew iced's 2 MiB upload cliff —
-/// both read as blinking. A camera that has no VGA mode, or refuses it, gets
+/// Open the camera at 640×480 and its highest frame rate, or say why.
+/// Larger frames increase decoding and upload costs and can exceed the mesh's
+/// `MAX_FRAME_BYTES` JPEG budget. A camera that has no VGA mode, or refuses it, gets
 /// the largest mode INSIDE the capture budget instead ([`open_within_budget`]):
 /// every frame is shrunk onto that budget anyway, so a bigger mode only buys
 /// a bigger decode — a 1080p JPEG per frame at the camera's top rate is a

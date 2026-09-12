@@ -189,7 +189,7 @@ revision, built with cargo and `guest-builder componentize` — the recipe is in
 Install the `ducktape` operator CLI into `~/.cargo/bin` (and the founding
 set — every module's wasm — into `~/.cargo/bin/modules` beside it, which
 `node init` composes a network's genesis from); on macOS this also builds the
-Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
+native GPUI `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
 
 ```sh
 make install

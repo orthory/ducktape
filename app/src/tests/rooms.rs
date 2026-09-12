@@ -207,8 +207,8 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 
 /// THE DM HEADER IS THE ROW'S FLEXIBLE CHILD, exactly as the channel title is.
 ///
-/// `align=center` is CROSS-axis only and iced's Row has no main-axis
-/// justification, so the header's right-hand cluster — the huddle control and
+/// Cross-axis centering does not allocate remaining row width, so the header's
+/// right-hand cluster — the huddle control and
 /// the ⋯ that is the only mouse route to Channel details — sits at the right
 /// edge only while some child takes the row's slack. The channel arm has a
 /// `box w=fill clip=true` around its title for exactly this; the DM arm mounted
