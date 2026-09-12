@@ -12,8 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::component::{
     IndexPath,
-    searchable_list::SearchableListItem,
-    select::{Select, SelectEvent, SelectState},
+    searchable_list::{SearchableListDelegate, SearchableListItem},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
 };
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext as _, Bounds, BoxShadow, Context, CursorStyle, Div,
@@ -227,11 +227,39 @@ impl SearchableListItem for Choice {
     }
 }
 
+struct PickerChoices {
+    items: SearchableVec<Choice>,
+    query: Box<dyn Fn(&str, &mut App)>,
+}
+
+impl SearchableListDelegate for PickerChoices {
+    type Item = Choice;
+    fn items_count(&self, section: usize) -> usize {
+        self.items.items_count(section)
+    }
+    fn item(&self, index: IndexPath) -> Option<&Choice> {
+        self.items.item(index)
+    }
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.items.position(value)
+    }
+    fn perform_search(&mut self, query: &str, window: &mut Window, cx: &mut App) -> Task<()> {
+        (self.query)(query, cx);
+        self.items.perform_search(query, window, cx)
+    }
+}
+
 struct Picker {
-    state: Entity<SelectState<Vec<Choice>>>,
+    state: Entity<SelectState<PickerChoices>>,
     options: Vec<String>,
     selected: Option<u32>,
     handler: u32,
+    input: Option<u32>,
+    reset: Option<(String, u64)>,
     _subscription: Subscription,
 }
 
@@ -496,9 +524,19 @@ impl ViewTree {
     }
 
     #[cfg(test)]
-    pub(crate) fn input_presentation(&self, key: &str, window: &Window, cx: &App) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
+    pub(crate) fn input_presentation(
+        &self,
+        key: &str,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
         let input = self.fields.get(key)?.state.read(cx);
-        Some((input.value().to_string(), input.cursor(), input.selected_range(), input.focus_handle(cx).is_focused(window)))
+        Some((
+            input.value().to_string(),
+            input.cursor(),
+            input.selected_range(),
+            input.focus_handle(cx).is_focused(window),
+        ))
     }
 
     #[cfg(test)]
@@ -873,7 +911,14 @@ impl ViewTree {
                         live_keys.insert(format!("{key}/@row:{}", identity.virtual_key()));
                     }
                 }
-                wire::Node::Sensor { key, reset, on_show, on_resize, on_hide, .. } => {
+                wire::Node::Sensor {
+                    key,
+                    reset,
+                    on_show,
+                    on_resize,
+                    on_hide,
+                    ..
+                } => {
                     sensors.insert(key.clone());
                     if let Some(sensor) = self.sensors.get_mut(key) {
                         if sensor.reset != *reset {
@@ -1504,30 +1549,7 @@ impl ViewTree {
                 dimensions(pad(button, *padding), *width, *height).into_any_element()
             }
             Node::Input { .. } => self.input(node, window, cx),
-            Node::PickList {
-                key,
-                options,
-                selected,
-                on_select,
-                placeholder,
-                ..
-            } => self.picker(
-                key,
-                options,
-                *selected,
-                *on_select,
-                placeholder.as_deref().unwrap_or_default(),
-                window,
-                cx,
-            ),
-            Node::ComboBox {
-                key,
-                options,
-                selected,
-                on_select,
-                placeholder,
-                ..
-            } => self.picker(key, options, *selected, *on_select, placeholder, window, cx),
+            Node::PickList { .. } | Node::ComboBox { .. } => self.picker(node, window, cx),
             Node::Toggle {
                 key,
                 kind,
@@ -2236,7 +2258,16 @@ impl ViewTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let wire::Node::Editor { key, document, width, height, min_height, max_height, .. } = node else {
+        let wire::Node::Editor {
+            key,
+            document,
+            width,
+            height,
+            min_height,
+            max_height,
+            ..
+        } = node
+        else {
             unreachable!()
         };
         let Some(store) = self.editor_store.clone() else {
@@ -2277,7 +2308,8 @@ impl ViewTree {
             div().relative(),
             Some(width.map_or(wire::Length::Fill, wire::Length::Fixed)),
             Some(height.unwrap_or(wire::Length::Fill)),
-        ).min_h(px(min_height.unwrap_or(0.)));
+        )
+        .min_h(px(min_height.unwrap_or(0.)));
         if let Some(maximum) = max_height {
             element = element.max_h(px(*maximum));
         }
@@ -2966,27 +2998,96 @@ impl ViewTree {
 
     fn picker(
         &mut self,
-        key: &str,
-        options: &[String],
-        selected: Option<u32>,
-        handler: u32,
-        placeholder: &str,
+        node: &wire::Node,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (key, options, selected, handler, placeholder, width, reset, input, menu_height) =
+            match node {
+                wire::Node::PickList {
+                    key,
+                    options,
+                    selected,
+                    on_select,
+                    placeholder,
+                    width,
+                    settings,
+                    ..
+                } => (
+                    key,
+                    options,
+                    *selected,
+                    *on_select,
+                    placeholder.as_deref().unwrap_or_default(),
+                    *width,
+                    None,
+                    None,
+                    settings.menu_height,
+                ),
+                wire::Node::ComboBox {
+                    key,
+                    state_key,
+                    options,
+                    selected,
+                    on_select,
+                    placeholder,
+                    width,
+                    reset,
+                    settings,
+                    ..
+                } => (
+                    key,
+                    options,
+                    *selected,
+                    *on_select,
+                    placeholder.as_str(),
+                    *width,
+                    Some((state_key.clone(), *reset)),
+                    settings.input,
+                    settings.menu_height,
+                ),
+                _ => unreachable!(),
+            };
+        if self
+            .pickers
+            .get(key)
+            .is_some_and(|picker| picker.reset != reset)
+        {
+            self.pickers.remove(key);
+        }
+        let weak = cx.entity().downgrade();
         let choices = || {
-            options
+            let items = options
                 .iter()
                 .enumerate()
                 .map(|(index, label)| Choice {
                     index: index as u32,
                     label: label.clone(),
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let weak = weak.clone();
+            let key = key.clone();
+            PickerChoices {
+                items: SearchableVec::new(items),
+                query: Box::new(move |query, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(handler) =
+                            this.pickers.get(&key).and_then(|picker| picker.input)
+                        {
+                            cx.emit(wire::Event::Input {
+                                handler,
+                                text: query.to_owned(),
+                            });
+                        }
+                    });
+                }),
+            }
         };
         let index = selected.map(|index| IndexPath::new(index as usize));
         if !self.pickers.contains_key(key) {
-            let state = cx.new(|cx| SelectState::new(choices(), index, window, cx));
+            let state = cx.new(|cx| {
+                SelectState::new(choices(), index, window, cx).searchable(reset.is_some())
+            });
             let route = key.to_owned();
             let subscription = cx.subscribe_in(&state, window, move |this, _, event, _, cx| {
                 let SelectEvent::Confirm(Some(index)) = event else {
@@ -3008,13 +3109,16 @@ impl ViewTree {
                     options: options.to_vec(),
                     selected,
                     handler,
+                    input,
+                    reset,
                     _subscription: subscription,
                 },
             );
         }
         let picker = self.pickers.get_mut(key).expect("picker inserted");
         picker.handler = handler;
-        if picker.options != options {
+        picker.input = input;
+        if picker.options != *options {
             picker.options = options.to_vec();
             picker
                 .state
@@ -3026,9 +3130,18 @@ impl ViewTree {
                 .state
                 .update(cx, |state, cx| state.set_selected_index(index, window, cx));
         }
-        Select::new(&picker.state)
-            .placeholder(placeholder.to_owned())
-            .into_any_element()
+        let mut select = Select::new(&picker.state)
+            .id(key.clone())
+            .placeholder(placeholder.to_owned());
+        if let Some(wire::Length::Fixed(height)) = menu_height {
+            select = select.menu_max_h(px(height));
+        }
+        dimensions(
+            div().relative().child(select).child(self.measure(key, cx)),
+            width,
+            None,
+        )
+        .into_any_element()
     }
 }
 
@@ -3904,55 +4017,170 @@ fn append_arc_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn combo_search_reset_and_routes_use_fresh_native_state(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let combo = |reset, handler| wire::Node::ComboBox {
+            key: "combo".into(),
+            state_key: "choices".into(),
+            reset,
+            options: vec!["Alpha".into(), "Beta".into()],
+            selected: None,
+            placeholder: "Choose".into(),
+            on_select: handler,
+            width: Some(wire::Length::Fixed(200.)),
+            settings: Box::new(wire::ComboOptions {
+                input: Some(44),
+                ..Default::default()
+            }),
+        };
+        let window = cx.open_window(size(px(400.), px(200.)), |_, _| ViewTree::new(combo(0, 7)));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = native.update(|_, cx| {
+            cx.subscribe(&tree, move |_, event: &wire::Event, _| {
+                observed.borrow_mut().push(event.clone())
+            })
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        let old = tree.read_with(&native, |tree, _| tree.pickers["combo"].state.clone());
+        native.update(|window, cx| window.click("combo", cx));
+        native.update(|window, cx| window.render_frame(cx));
+        native.simulate_input("Be");
+        native.run_until_parked();
+        assert!(
+            events.borrow().iter().any(
+                |event| matches!(event, wire::Event::Input { handler: 44, text } if text == "Be")
+            ),
+            "native search routes its query: {:?}",
+            events.borrow()
+        );
+        tree.update(&mut native, |tree, cx| tree.replace(combo(1, 99), cx));
+        native.update(|window, cx| window.render_frame(cx));
+        let fresh = tree.read_with(&native, |tree, _| {
+            assert_eq!(tree.measured_bounds("combo").unwrap().size.width, px(200.));
+            tree.pickers["combo"].state.clone()
+        });
+        assert_ne!(old.entity_id(), fresh.entity_id());
+        events.borrow_mut().clear();
+        old.update(&mut native, |_, cx| cx.emit(SelectEvent::Confirm(Some(0))));
+        assert!(
+            events.borrow().is_empty(),
+            "retired picker cannot emit a fresh-frame route"
+        );
+        fresh.update(&mut native, |_, cx| cx.emit(SelectEvent::Confirm(Some(1))));
+        assert!(events.borrow().iter().any(|event| matches!(
+            event,
+            wire::Event::Select {
+                handler: 99,
+                index: 1
+            }
+        )));
+    }
 
     #[gpui_kit::test]
     fn sensor_visibility_uses_current_routes_and_removal_does_not_replay_old_ids(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use gpui_kit::test::TestWindowExt as _;
-        let sensor = |y, hide| wire::Node::Pin {
-            key: "position".into(), x: 0., y,
-            width: Some(wire::Length::Fill), height: Some(wire::Length::Fill),
-            content: Box::new(wire::Node::Sensor {
-                key: "watched".into(), reset: None, on_show: None, on_resize: None,
-                on_hide: Some(hide), anticipate: None, delay: None,
-                child: Box::new(wire::Node::Space {
-                    width: Some(wire::Length::Fixed(20.)), height: Some(wire::Length::Fixed(20.)),
+        let sensor = |y, hide| wire::Node::Flex {
+            key: "host".into(),
+            layout: Default::default(),
+            background: None,
+            border: None,
+            items: Vec::new(),
+            children: vec![wire::Node::Pin {
+                key: "position".into(),
+                x: 0.,
+                y,
+                width: Some(wire::Length::Fill),
+                height: Some(wire::Length::Fill),
+                content: Box::new(wire::Node::Sensor {
+                    key: "watched".into(),
+                    reset: None,
+                    on_show: None,
+                    on_resize: None,
+                    on_hide: Some(hide),
+                    anticipate: None,
+                    delay: None,
+                    child: Box::new(wire::Node::Space {
+                        width: Some(wire::Length::Fixed(20.)),
+                        height: Some(wire::Length::Fixed(20.)),
+                    }),
                 }),
-            }),
+            }],
         };
         cx.update(gpui_kit::init);
-        let window = cx.open_window(size(px(100.), px(100.)), |_, _| ViewTree::new(sensor(0., 11)));
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| {
+            ViewTree::new(sensor(0., 11))
+        });
         let tree = window.root(cx).unwrap();
         let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let observed = events.clone();
         let _subscription = native.update(|_, cx| {
-            cx.subscribe(&tree, move |_, event: &wire::Event, _| observed.borrow_mut().push(event.clone()))
+            cx.subscribe(&tree, move |_, event: &wire::Event, _| {
+                observed.borrow_mut().push(event.clone())
+            })
         });
         native.update(|window, cx| window.render_frame(cx));
-        tree.read_with(&native, |tree, _| assert!(tree.sensors["watched"].size.is_some()));
+        tree.read_with(&native, |tree, _| {
+            assert!(tree.sensors["watched"].size.is_some())
+        });
         tree.update(&mut native, |tree, cx| {
             tree.replace(sensor(200., 23), cx);
-            assert_eq!(tree.sensors["watched"].on_hide, Some(23), "routes refresh before native draw or delayed measurement");
+            assert_eq!(
+                tree.sensors["watched"].on_hide,
+                Some(23),
+                "routes refresh before native draw or delayed measurement"
+            );
         });
         native.update(|window, cx| window.render_frame(cx));
-        assert_eq!(&*events.borrow(), &[wire::Event::Message(23)], "mounted viewport exit uses the new frame route");
+        assert_eq!(
+            &*events.borrow(),
+            &[wire::Event::Message(23)],
+            "mounted viewport exit uses the new frame route"
+        );
         tree.update(&mut native, |tree, cx| tree.replace(sensor(0., 11), cx));
         native.update(|window, cx| window.render_frame(cx));
         events.borrow_mut().clear();
         tree.update(&mut native, |tree, cx| {
-            tree.replace(wire::Node::Button {
-                key: "watched".into(), content: wire::ButtonContent::Label("New action".into()),
-                label: None, checked: None, expanded: None, description: None,
-                on_press: Some(11), width: None, height: None, padding: None, style: Default::default(),
-            }, cx);
-            assert!(tree.sensors.is_empty(), "reusing a key for another widget does not retain its sensor");
+            tree.replace(
+                wire::Node::Button {
+                    key: "watched".into(),
+                    content: wire::ButtonContent::Label("New action".into()),
+                    label: None,
+                    checked: None,
+                    expanded: None,
+                    description: None,
+                    on_press: Some(11),
+                    width: None,
+                    height: None,
+                    padding: None,
+                    style: Default::default(),
+                },
+                cx,
+            );
+            assert!(
+                tree.sensors.is_empty(),
+                "reusing a key for another widget does not retain its sensor"
+            );
         });
         native.update(|window, cx| window.render_frame(cx));
-        assert!(events.borrow().is_empty(), "old hide ID 11 must not invoke the replacement action 11");
+        assert!(
+            events.borrow().is_empty(),
+            "old hide ID 11 must not invoke the replacement action 11"
+        );
         native.update(|window, cx| window.click("watched", cx));
-        assert_eq!(&*events.borrow(), &[wire::Event::Message(11)], "only a real new-frame click activates the replacement action");
+        assert_eq!(
+            &*events.borrow(),
+            &[wire::Event::Message(11)],
+            "only a real new-frame click activates the replacement action"
+        );
     }
 
     #[gpui_kit::test]
@@ -3965,13 +4193,23 @@ mod tests {
             (None, None, None, 300.),
         ] {
             let root = wire::Node::Editor {
-                key: "document".into(), options: Box::default(), placeholder: String::new(),
+                key: "document".into(),
+                options: Box::default(),
+                placeholder: String::new(),
                 document: wire::editor_document::EditorDocumentRef {
-                    document: "sizing".into(), reset: 1, text_revision: 0, revision: 0,
-                    cursor: Default::default(), byte_len: 0,
+                    document: "sizing".into(),
+                    reset: 1,
+                    text_revision: 0,
+                    revision: 0,
+                    cursor: Default::default(),
+                    byte_len: 0,
                 },
-                on_document: 0, editable: false, width: Some(240.), height,
-                min_height: minimum, max_height: maximum,
+                on_document: 0,
+                editable: false,
+                width: Some(240.),
+                height,
+                min_height: minimum,
+                max_height: maximum,
             };
             let store = crate::editor::wire::EditorStore::new(91);
             store.replace(&root).unwrap();
@@ -3983,7 +4221,9 @@ mod tests {
             let tree = window.root(cx).unwrap();
             let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
             native.update(|window, cx| window.render_frame(cx));
-            let bounds = tree.read_with(&native, |tree, _| tree.measured_bounds("document")).unwrap();
+            let bounds = tree
+                .read_with(&native, |tree, _| tree.measured_bounds("document"))
+                .unwrap();
             assert_eq!(bounds.size, size(px(240.), px(expected)));
         }
     }
