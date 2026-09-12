@@ -6,23 +6,9 @@ publish = false
 description = "A local-first consensus workspace for people and agents"
 authors = ["Ducktape contributors"]
 
-[package.metadata.ice.bundle]
-icon = "assets/icon.svg"
-category = "public.app-category.productivity"
-# the module-owned views `make views` stages, carried into the bundle beside
-# the executable (basename kept: `views/<module>_view.wasm`), where
-# `module_view::views_dir` looks first. Relative to this manifest.
-resources = ["../target/views"]
-
-# macOS terminates the process the instant a huddle opens a device whose reason
-# the bundle does not state; these are the sentences its prompt shows. Screen
-# capture has no usage key — macOS grants it through Screen Recording instead.
-[package.metadata.ice.bundle.usage]
-camera = "Ducktape uses the camera for video in huddles."
-microphone = "Ducktape uses the microphone for voice in huddles."
-
 [dependencies]
-gpui-kit = "=0.6.1"
+gpui-kit = { version = "=0.6.1", features = ["tree-sitter-languages"] }
+unicode-segmentation = "1"
 ducktape-view-guest = { path = "../crates/views/support/guest" }
 qrcode = { version = "0.14", default-features = false }
 futures.workspace = true
@@ -108,10 +94,9 @@ x11rb = "0.13"
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
-# iced itself stays codec-less (`image-without-codecs`).
+# GPUI receives the decoded pixels.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-# The same viewer validates and measures an SVG before handing it to iced's
-# `svg` widget (resvg draws it); usvg is already in the graph under resvg.
+# The same viewer validates and measures an SVG before native rendering.
 usvg = "0.45"
 # A web picture in forge Markdown is one capped GET (`web_picture_bytes`);
 # the workspace's reqwest is already in the binary under rpc-client.
@@ -128,17 +113,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # works on every OS the app runs on.
 gethostname = "1"
 zeroize.workspace = true
-# BOTH LINUX DISPLAY SERVERS, NATIVELY. With `x11` alone a Wayland session
-# runs this app under XWayland: the compositor upscales a 1x buffer on every
-# fractionally scaled monitor (a blurred, pixelated console) and text input
-# reaches the window only through XIM, which an input method such as fcitx5
-# serves only when `XMODIFIERS` names it. `wayland` (winit's sctk backend,
-# pure Rust, libwayland dlopen'd at runtime) gives the compositor's own
-# fractional scale and the text-input-v3 protocol every Wayland input method
-# speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 # The module-owned views (`src/module_view.rs`): the wire a view's tree and
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
@@ -154,6 +128,7 @@ wasmtime.workspace = true
 # process with no bundle identifier, so `notify` reads NSBundle first and a
 # bare binary (every `cargo test`) degrades to a debug! line.
 [target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
 block2 = "0.5"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
@@ -167,11 +142,5 @@ zbus = "5"
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
-# `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
-# frame (build + layout + event walk + draw), and iced does not re-export
-# `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
-# that renderer out of the product dependency surface.
-iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

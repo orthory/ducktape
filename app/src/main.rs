@@ -7,6 +7,8 @@ mod composer_surface;
 mod editor;
 mod module_view;
 mod shell;
+mod secret;
+mod tray;
 mod view_tree;
 mod video;
 

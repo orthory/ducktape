@@ -27,10 +27,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use iced::advanced::widget::{Operation, Tree, tree};
-use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
-use iced::{Element, Event, Length, Rectangle, Size, Vector, widget, window};
-use ui_lang_runtime::view_tree::{self, Inputs, Output, Pictures, Surfaces};
+use crate::editor::wire::EditorStore;
+use gpui_kit::AppContext as _;
+use pictures::Pictures;
 use ui_lang_wire as wire;
 use wasmtime::component::{Component, Linker, TypedFunc};
 use wasmtime::{
@@ -760,92 +759,14 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
     matches!(args.get(index), Some(wire::SurfaceValue::Bool(true)))
 }
 
-/// The surfaces a module's view may leave slots for. The files view's three
-/// are the preview's readers: the picture viewer over the Files surface's
-/// store, the highlighted code reader, and the Markdown document, whose
-/// activated link goes back to the guest's own handler as a string.
-fn surfaces_of(module: &str) -> Surfaces {
-    let mut surfaces = Surfaces::default();
-    if module == "chat" {
-        surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
+fn surface_allowed(module: &str, surface: &str) -> bool {
+    match (module, surface) {
+        (_, "artifact_svg" | "artifact_image") => true,
+        ("chat", "chat_composer") => true,
+        ("forge", "forge_composer" | "picture" | "forge_markdown" | "forge_code") => true,
+        ("files", "picture" | "forge_code" | "agent_markdown") => true,
+        _ => false,
     }
-    if module == "forge" {
-        // the discussion note is the chat composer over its own scope, the
-        // item's channel — same document rule, same `composer` intent
-        surfaces.insert("forge_composer".into(), crate::composer_surface::provider());
-        surfaces.insert(
-            "picture".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(surface),
-                    wire::SurfaceValue::Str(path),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::picture(surface.clone(), path.clone())
-                    .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "forge_markdown".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(source),
-                    wire::SurfaceValue::Str(doc),
-                    wire::SurfaceValue::Bool(dark),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::forge_markdown(source.clone(), doc.clone(), *dark)
-                    .map(wire::SurfaceValue::Str)
-            }),
-        );
-        surfaces.insert(
-            "forge_code".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(source),
-                    wire::SurfaceValue::Str(path),
-                    wire::SurfaceValue::Bool(dark),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::forge_code(source.clone(), path.clone(), *dark)
-                    .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-    }
-    if module == "files" {
-        surfaces.insert(
-            "picture".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                crate::backend::picture(surface_str(args, 0), surface_str(args, 1))
-                    .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "forge_code".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                crate::backend::forge_code(
-                    surface_str(args, 0),
-                    surface_str(args, 1),
-                    surface_bool(args, 2),
-                )
-                .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "agent_markdown".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
-                    .map(wire::SurfaceValue::Str)
-            }),
-        );
-    }
-    surfaces
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -942,42 +863,7 @@ fn module_view(module: &'static str, props: Vec<u8>) -> ViewSpec {
     ViewSpec { module, props }
 }
 
-/// The mounted view as it stands — its current frame, or the notice for a
-/// slot without one — with no props pushed.
-pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
-    let mounted = mounted(module);
-    let (content, rev, generation, alive) = {
-        let mut locked = mounted.lock().expect("module view lock");
-        let generation = locked.generation;
-        match &mut locked.slot {
-            // a seat before its source event has answered: the boot and the
-            // connect hand every view over before a tab can draw, so this
-            // is a module's tab drawn before any node was ever asked
-            Slot::Loading => return notice("Loading the view…"),
-            Slot::Empty => {
-                return notice(&format!(
-                    "This network has no {module} view yet. An admin activates a {module} deployment that ships one."
-                ));
-            }
-            Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (
-                guest.render(),
-                guest.frame_rev,
-                generation,
-                guest.alive.clone(),
-            ),
-        }
-    };
-    Element::new(ModuleView {
-        mounted,
-        generation,
-        rev,
-        alive,
-        content,
-    })
-}
-
-/// The node the app is connected to, for the views that come from its
+ /// The node the app is connected to, for the views that come from its
 /// deployments. Told by `backend::connect`; every module-owned view is
 /// asked of this node, drawn or not, under a new generation, so an answer
 /// the previous node is still composing lands nowhere. Every seat keeps
@@ -1168,21 +1054,7 @@ fn connection() -> &'static Mutex<Connection> {
     CONNECTION.get_or_init(Mutex::default)
 }
 
-/// What the tab shows while the view is not there to show itself.
-fn notice(text: &str) -> Element<'static, ModuleViewEvent> {
-    widget::container(widget::text(text.to_owned()).size(13))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into()
-}
-
-/// One module's view for the life of the process: the instance once it is
-/// there, and the props the app last handed it, which it takes on its next
-/// redraw whether the instance was ready when they arrived or not.
-/// `generation` moves with every load asked for; a load answering for an
-/// earlier one is dropped, and so is what the reader did in a tree of one.
-struct Mounted {
+ struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
@@ -1407,9 +1279,9 @@ fn spawn_load(
                     log_source(module, fresh.hash.as_ref(), "Failed", generation, reason);
                     return;
                 }
-                fresh.pictures = std::mem::take(&mut old.pictures);
                 if let Some(root) = &mut fresh.frame.root {
-                    fresh.pictures.adopt(root);
+                    fresh.pictures.hydrate(root);
+                    old.pictures.adopt(root);
                     root.for_each_mut(&mut |node| match node {
                         wire::Node::Svg { bytes, .. } => *bytes = None,
                         wire::Node::Image { data, .. } | wire::Node::ImageViewer { data, .. } => {
@@ -1418,6 +1290,7 @@ fn spawn_load(
                         _ => {}
                     });
                 }
+                fresh.pictures = std::mem::take(&mut old.pictures);
                 let reason = match replacement {
                     Replacement::RecoverNeverValid => "recovered_never_valid_view",
                     Replacement::Preserve => "",
@@ -1681,10 +1554,9 @@ struct Guest {
     /// A later patch gap or trap must not erase evidence of authored state.
     ever_valid_tree: bool,
     /// The live text of every input in the tree — the host's, not the guest's.
-    inputs: Inputs,
+    inputs: EditorStore,
     /// Every picture the guest has sent, by hash: the bytes cross once.
     pictures: Pictures,
-    surfaces: Surfaces,
     /// The guest's `<module>.props` subscription, once it asked, and the
     /// props it was last given on it.
     props_subscription: Option<u64>,
@@ -1817,11 +1689,6 @@ fn compile_view(
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
-        // The faces the app loads (`font` in app.ice); a view names them and
-        // the runtime resolves the name only through this registry.
-        for family in ["Geist", "Geist Mono"] {
-            ui_lang_runtime::view_tree::register_font_family(family);
-        }
         let mut config = Config::new();
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
@@ -2079,64 +1946,7 @@ impl Guest {
     /// does not ship leaves the slot empty and says so once.
     fn deployed(&mut self, hash: [u8; 32], assets: Arc<crate::backend::view_source::Assets>) {
         self.hash = Some(hash);
-        self.assets = assets.clone();
-        let module = self.module;
-        // the paths said to be missing, once each — up to a budget, past
-        // which one line says the guest keeps asking and nothing more is
-        // kept or logged
-        let missing: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
-        let lookup = move |args: &[wire::SurfaceValue]| -> Option<Vec<u8>> {
-            let path = match args.first() {
-                Some(wire::SurfaceValue::Str(path)) => path.clone(),
-                _ => String::new(),
-            };
-            let found = artifact_asset(&assets, &path).map(<[u8]>::to_vec);
-            if found.is_none() {
-                let mut missing = missing.lock().expect("missing assets");
-                let (path, reason) = match missing.len() {
-                    n if n < MAX_MISSING_ASSETS => (path, "asset_missing"),
-                    MAX_MISSING_ASSETS => (String::new(), "asset_missing_budget"),
-                    _ => return None,
-                };
-                if missing.insert(path.clone()) {
-                    tracing::info!(
-                        target: "ducktape::app",
-                        module,
-                        hash = %crate::backend::hex_encode(&hash),
-                        state = "Ready",
-                        path,
-                        reason,
-                        "view_source"
-                    );
-                }
-            }
-            found
-        };
-        let svg = lookup.clone();
-        self.surfaces.insert(
-            "artifact_svg".into(),
-            Arc::new(
-                move |_key: &str, args: &[wire::SurfaceValue]| match svg(args) {
-                    Some(bytes) => widget::svg(widget::svg::Handle::from_memory(bytes))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into(),
-                    None => widget::Space::new().into(),
-                },
-            ),
-        );
-        self.surfaces.insert(
-            "artifact_image".into(),
-            Arc::new(
-                move |_key: &str, args: &[wire::SurfaceValue]| match lookup(args) {
-                    Some(bytes) => widget::image(widget::image::Handle::from_bytes(bytes))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into(),
-                    None => widget::Space::new().into(),
-                },
-            ),
-        );
+        self.assets = assets;
     }
 
     /// A trap or temporary missing tree cannot revoke previously accepted
@@ -2155,7 +1965,9 @@ impl Guest {
         self.fault.is_none()
             && self.pending.is_empty()
             && self.widget_commands.is_empty()
-            && self.inputs.editor_documents_status() == Ok(true)
+            && self.inputs.ready() == Ok(true)
+            && !self.inputs.pending()
+            && !self.frame.busy
             && (self.staged || self.frame.requests.is_empty())
     }
 
@@ -2223,8 +2035,7 @@ impl Guest {
             }
             if self
                 .inputs
-                .editor_documents_status()
-                .map_err(str::to_owned)?
+                .ready()?
                 && self.pending.is_empty()
             {
                 break;
@@ -2232,8 +2043,7 @@ impl Guest {
         }
         if !self
             .inputs
-            .editor_documents_status()
-            .map_err(str::to_owned)?
+            .ready()?
             || !self.pending.is_empty()
         {
             return Err(format!(
@@ -2359,9 +2169,11 @@ impl Guest {
             frame_rev: 0,
             ticks: 0,
             ever_valid_tree: false,
-            inputs: Inputs::default(),
+            inputs: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                EditorStore::new(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            },
             pictures: Pictures::default(),
-            surfaces: surfaces_of(module),
             props_subscription: None,
             props_sent: None,
             intents: Vec::new(),
@@ -2380,53 +2192,14 @@ impl Guest {
         })
     }
 
-    /// The tree as the host holds it, rendered — or the reason there is none.
-    fn render(&self) -> Element<'static, Output> {
-        if let Some(fault) = &self.fault {
-            return widget::container(
-                widget::column![
-                    widget::text("This view was stopped.").size(14),
-                    widget::text(fault.clone()).size(12),
-                ]
-                .spacing(8)
-                .align_x(iced::Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center(Length::Fill)
-            .into();
-        }
-        let root = self.frame.root.clone().unwrap_or_else(wire::Node::empty);
-        view_tree::render(&root, &self.inputs, &self.pictures, &self.surfaces)
-    }
-
-    /// What the user did to the tree, as the widgets report it: recorded
-    /// host-side (an input's text) and queued for the guest's next tick. A
-    /// host surface the guest routed (`-> handler _`) reaches that handler
-    /// with the value the surface produced; one it left unrouted is the
-    /// app's own ring, whose event was queued where the surface keeps it,
-    /// and the app is told to drain it.
-    fn deliver(&mut self, output: Output) {
-        if let Output::Surface {
-            handler: None,
-            value,
-        } = output
-        {
-            // the chat composer's submit carries its body; the other
-            // unrouted surfaces only say that something happened
-            if self.module == "chat" || self.module == "forge" {
-                self.intents.extend(crate::composer_surface::intent(&value));
-            } else {
-                // the node's log ring: the only other host surface, and it
-                // only says that something happened
-                self.intents.push(ModuleViewEvent {
-                    kind: "log_timeline".into(),
-                    detail: String::new(),
-                });
-            }
+    fn surface_event(&mut self, handler: Option<u32>, value: wire::SurfaceValue) {
+        if let Some(handler) = handler {
+            self.pending.push(wire::Event::Surface { handler, value });
             return;
         }
-        self.inputs.apply(output, &mut self.pending);
+        if matches!(self.module, "chat" | "forge") {
+            self.intents.extend(crate::composer_surface::intent(&value));
+        }
     }
 
     /// Hands the guest the props the app holds, if they moved since the
@@ -2455,6 +2228,11 @@ impl Guest {
             return false;
         }
         self.sync_props(props);
+        self.pending.extend(self.inputs.drain());
+        if let Err(error) = self.inputs.ready() {
+            self.fault = Some(error);
+            return false;
+        }
         self.replies.drain_into(&mut self.pending);
         self.pending
             .extend(kernel::ticked(&mut self.clocks, std::time::Instant::now()));
@@ -2466,7 +2244,8 @@ impl Guest {
             let quiet = self.ticks > 0
                 && !self.frame.busy
                 && self.pending.is_empty()
-                && self.inputs.editor_documents_status() != Ok(false);
+                && !self.inputs.pending()
+                && self.inputs.ready() != Ok(false);
             if quiet {
                 return false;
             }
@@ -2496,8 +2275,9 @@ impl Guest {
         }
         self.fault.is_none()
             && (self.frame.busy
+                || self.inputs.pending()
                 || !self.pending.is_empty()
-                || self.inputs.editor_documents_status() == Ok(false))
+                || self.inputs.ready() == Ok(false))
     }
 
     /// Routes one request: the props subscription is answered from what the
@@ -2605,10 +2385,10 @@ impl Guest {
     }
 
     /// Called only on the matching mounted tree after native editor work drains.
-    fn execute_widget_commands(&mut self, mut traverse: impl FnMut(&mut dyn Operation)) {
+    fn execute_widget_commands(&mut self, mut execute: impl FnMut(wire::WidgetCommand) -> Result<Vec<u8>, String>) {
         for (id, revision, command) in std::mem::take(&mut self.widget_commands) {
             let result = if revision == self.frame_rev {
-                view_tree::execute_widget_command(command, &mut traverse)
+                execute(command)
             } else {
                 Err("widget request belongs to a replaced frame".into())
             };
@@ -2660,7 +2440,7 @@ impl Guest {
                     if changed.0
                         && let Some(root) = &frame.root
                     {
-                        self.inputs.validate_editor_documents(root)?;
+                        self.inputs.validate(root)?;
                     }
                     Ok(changed)
                 });
@@ -2671,7 +2451,7 @@ impl Guest {
                         self.frame_rev += 1;
                         if let Some(root) = &mut frame.root {
                             self.ever_valid_tree = true;
-                            self.inputs.adopt(root);
+                            if let Err(error) = self.inputs.replace(root) { self.fault = Some(error); }
                             self.pictures.adopt(root);
                             // The guest remembers its tree without the
                             // picture bytes; the tree its patches build on
@@ -2705,9 +2485,8 @@ impl Guest {
                     }
                     self.frame_reports = reports;
                     self.report_display_truncation();
-                    if self.inputs.editor_frame(&frame, &mut self.pending) {
-                        self.frame_rev += 1;
-                    }
+                    if let Err(error) = self.inputs.frame(&frame) { self.fault = Some(error); }
+                    self.pending.extend(self.inputs.drain());
                 }
                 self.frame = frame;
             }
@@ -2791,11 +2570,10 @@ fn first_line(error: &wasmtime::Error) -> String {
 #[path = "module_view/display_diagnostics.rs"]
 mod display_diagnostics;
 
-#[path = "module_view/input.rs"]
-mod input;
-#[cfg(test)]
-#[path = "module_view/input_tests.rs"]
-mod input_tests;
+#[path = "module_view/pictures.rs"]
+mod pictures;
+#[path = "module_view/surfaces.rs"]
+mod surfaces;
 
 // ---------- the widget ----------
 
@@ -2811,18 +2589,21 @@ pub(crate) struct NativeModuleView {
     alive: Option<Arc<()>>,
     replies_changed: Option<gpui_kit::Task<()>>,
     deadline: Option<(Instant, gpui_kit::Task<()>)>,
+    surfaces: HashMap<String, surfaces::Surface>,
 }
 
 impl gpui_kit::EventEmitter<ModuleViewEvent> for NativeModuleView {}
 
 impl NativeModuleView {
     pub(crate) fn new(module: &'static str) -> Self {
-        Self { module, content: None, subscription: None, generation: 0, revision: 0, alive: None, replies_changed: None, deadline: None }
+        Self { module, content: None, subscription: None, generation: 0, revision: 0, alive: None, replies_changed: None, deadline: None, surfaces: HashMap::new() }
     }
 
     pub(crate) fn set_props(&mut self, props: Vec<u8>, cx: &mut gpui_kit::Context<Self>) {
-        mounted(self.module).lock().expect("module view lock").props = Some(props);
-        cx.notify();
+        let seat = mounted(self.module);
+        let mut seat = seat.lock().expect("module view lock");
+        let changed = seat.props.as_ref() != Some(&props);
+        if changed { seat.props = Some(props); cx.notify(); }
     }
 
     fn frame(&mut self, window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Self>) -> Result<(), String> {
@@ -2838,6 +2619,7 @@ impl NativeModuleView {
             Slot::Failed(reason) => return Err(reason.clone()),
             Slot::Ready(guest) => guest,
         };
+        let ticks = guest.ticks;
         let again = guest.redraw(props);
         if again { window.request_animation_frame(); }
         let next = kernel::next_tick(&guest.clocks);
@@ -2857,11 +2639,13 @@ impl NativeModuleView {
             && self.alive.as_ref().is_some_and(|alive| Arc::ptr_eq(alive, &guest.alive));
         let changed = !same_instance || self.revision != guest.frame_rev;
         if changed {
-            let root = guest.frame.root.clone().unwrap_or_else(wire::Node::empty);
+            let mut root = guest.frame.root.clone().unwrap_or_else(wire::Node::empty);
+            guest.pictures.hydrate(&mut root);
             self.revision = guest.frame_rev;
             match (&self.content, same_instance) {
                 (Some(content), true) => content.update(cx, |tree, cx| tree.replace(root, cx)),
                 _ => {
+                    self.surfaces.clear();
                     self.generation = *generation;
                     self.alive = Some(guest.alive.clone());
                     let mut changes = guest.replies.changes();
@@ -2874,6 +2658,7 @@ impl NativeModuleView {
                     // delivery; later answers wake the entity directly.
                     if guest.replies.answer_owed() { window.request_animation_frame(); }
                     let content = cx.new(|_| crate::view_tree::ViewTree::new(root));
+                    content.update(cx, |tree, cx| tree.set_editor_store(guest.inputs.clone(), cx));
                     let seat = mounted.clone();
                     let generation = *generation;
                     let alive = guest.alive.clone();
@@ -2888,6 +2673,16 @@ impl NativeModuleView {
                     }));
                     self.content = Some(content);
                 }
+            }
+            self.sync_surfaces(guest, window, cx)?;
+        }
+        if let Some(content) = &self.content {
+            if ticks != guest.ticks { content.update(cx, |_, cx| cx.notify()); }
+            let commands_ready = !guest.inputs.pending() && !guest.widget_commands.is_empty();
+            if commands_ready {
+                guest.execute_widget_commands(|command| content.update(cx,
+                    |tree, cx| tree.execute_widget_command(command, window, cx)));
+                window.request_animation_frame();
             }
         }
         for intent in std::mem::take(&mut guest.intents) { cx.emit(intent); }
@@ -2905,276 +2700,6 @@ impl gpui_kit::Render for NativeModuleView {
             },
             Err(reason) => gpui_kit::div().size_full().flex().items_center().justify_center().child(reason).into_any_element(),
         }
-    }
-}
-
-/// The tree the guest last sent, rendered with the app's own widgets and
-/// wrapped so that every redraw ticks the guest, everything the user does
-/// inside goes back as the guest's own events, and a changed tree is
-/// re-rendered in place.
-struct ModuleView {
-    mounted: Arc<Mutex<Mounted>>,
-    /// The load `content` was rendered under: what the reader does in a
-    /// tree of an earlier one is not handed to the view of a later one.
-    generation: u64,
-    /// The frame `content` was rendered from.
-    rev: u64,
-    alive: Arc<()>,
-    content: Element<'static, Output, iced::Theme, iced::Renderer>,
-}
-
-impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
-    fn tag(&self) -> tree::Tag {
-        self.content.as_widget().tag()
-    }
-
-    fn state(&self) -> tree::State {
-        self.content.as_widget().state()
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        self.content.as_widget().children()
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        self.content.as_widget().diff(tree);
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
-    }
-
-    fn size_hint(&self) -> Size<Length> {
-        self.content.as_widget().size_hint()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.content.as_widget_mut().layout(tree, renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        self.content
-            .as_widget_mut()
-            .operate(tree, layout, renderer, operation);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, ModuleViewEvent>,
-        viewport: &Rectangle,
-    ) {
-        // The tree's widgets speak `Output`; what they say is the guest's,
-        // not the app's, so it is diverted rather than mapped. Everything
-        // else the local shell collected carries over to the window's.
-        let mut outputs = Vec::new();
-        {
-            let mut local = Shell::new(&mut outputs);
-            self.content.as_widget_mut().update(
-                tree, event, layout, cursor, renderer, clipboard, &mut local, viewport,
-            );
-            if local.is_event_captured() {
-                shell.capture_event();
-            }
-            if local.is_layout_invalid() {
-                shell.invalidate_layout();
-            }
-            if local.are_widgets_invalid() {
-                shell.invalidate_widgets();
-            }
-            match local.redraw_request() {
-                window::RedrawRequest::NextFrame => shell.request_redraw(),
-                window::RedrawRequest::At(at) => shell.request_redraw_at(at),
-                window::RedrawRequest::Wait => {}
-            }
-            shell.input_method_mut().merge(local.input_method());
-        }
-        let mut mounted = self.mounted.lock().expect("module view lock");
-        let Mounted {
-            slot,
-            props,
-            generation,
-            ..
-        } = &mut *mounted;
-        let guest = match slot {
-            Slot::Ready(guest) => guest,
-            Slot::Loading => {
-                shell.request_redraw_at(window::RedrawRequest::At(
-                    iced::time::Instant::now() + LOAD_POLL,
-                ));
-                return;
-            }
-            Slot::Failed(_) | Slot::Empty => return,
-        };
-        let same_instance =
-            *generation == self.generation && Arc::ptr_eq(&guest.alive, &self.alive);
-        let outputs = if same_instance {
-            outputs
-        } else {
-            // a tree of an earlier load: its messages index nothing here
-            self.generation = *generation;
-            self.rev = 0;
-            Vec::new()
-        };
-        if !outputs.is_empty() {
-            for output in outputs {
-                guest.deliver(output);
-            }
-            shell.request_redraw();
-        }
-        if same_instance
-            && let Event::Mouse(event) = event
-            && input::mouse(
-                guest,
-                *event,
-                layout.bounds().position(),
-                shell.is_event_captured(),
-            )
-        {
-            shell.request_redraw();
-        }
-        let Event::Window(window::Event::RedrawRequested(_)) = event else {
-            return;
-        };
-        if guest.redraw(props) {
-            shell.request_redraw();
-        }
-        // a node call the kernel is running for the view lands between
-        // frames: poll for it, as the tab polls for a view still loading.
-        // An answer that landed DURING the redraw above is owed a frame
-        // too — it is sitting undrained, and nothing else is coming to
-        // fetch it.
-        if guest.replies.answer_owed() {
-            shell.request_redraw_at(window::RedrawRequest::At(
-                iced::time::Instant::now() + LOAD_POLL,
-            ));
-        }
-        // A `clock.ticks` subscription is a DEADLINE, not a poll: the shell
-        // draws the frame the view's own `every` is waiting for, and nothing
-        // burns a frame before it.
-        if let Some(due) = kernel::next_tick(&guest.clocks) {
-            shell.request_redraw_at(window::RedrawRequest::At(due));
-        }
-        let native_frame_ready = same_instance
-            && self.rev == guest.frame_rev
-            && guest.fault.is_none()
-            && !guest.staged
-            && !shell.is_layout_invalid()
-            && !shell.are_widgets_invalid()
-            && !guest.inputs.editor_transactions_pending()
-            && !guest.widget_commands.is_empty();
-        if native_frame_ready {
-            guest.execute_widget_commands(|operation| {
-                self.content
-                    .as_widget_mut()
-                    .operate(tree, layout, renderer, operation);
-                if let Some(mut overlay) = self
-                    .content
-                    .as_widget_mut()
-                    .overlay(tree, layout, renderer, viewport, Vector::ZERO)
-                    .map(overlay::Nested::new)
-                {
-                    let layout = overlay.layout(renderer, viewport.size());
-                    overlay.operate(Layout::new(&layout), renderer, operation);
-                }
-            });
-            shell.request_redraw();
-        }
-        if !guest.widget_commands.is_empty() {
-            shell.request_redraw();
-        }
-        for intent in std::mem::take(&mut guest.intents) {
-            shell.publish(intent);
-        }
-        // A new tree is re-rendered here, in place: the app's own view is
-        // rebuilt only by its own messages, and a guest's tick is not one.
-        if guest.frame_rev != self.rev {
-            self.rev = guest.frame_rev;
-            self.alive = guest.alive.clone();
-            self.content = guest.render();
-            tree.diff(self.content.as_widget());
-            shell.invalidate_layout();
-            shell.request_redraw();
-        }
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &iced::Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.content
-            .as_widget()
-            .draw(tree, renderer, theme, style, layout, cursor, viewport);
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(tree, layout, cursor, viewport, renderer)
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'b>,
-        renderer: &iced::Renderer,
-        viewport: &Rectangle,
-        translation: Vector,
-    ) -> Option<overlay::Element<'b, ModuleViewEvent, iced::Theme, iced::Renderer>> {
-        let alive = {
-            let mounted = self.mounted.lock().expect("module view lock");
-            let Slot::Ready(guest) = &mounted.slot else {
-                return None;
-            };
-            if mounted.generation != self.generation
-                || guest.frame_rev != self.rev
-                || !Arc::ptr_eq(&guest.alive, &self.alive)
-            {
-                return None;
-            }
-            guest.alive.clone()
-        };
-        self.content
-            .as_widget_mut()
-            .overlay(tree, layout, renderer, viewport, translation)
-            .map(|content| {
-                input::overlay(
-                    content,
-                    self.mounted.clone(),
-                    self.generation,
-                    alive,
-                    layout.bounds().position() + translation,
-                )
-            })
     }
 }
 

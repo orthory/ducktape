@@ -235,9 +235,9 @@ static APP_FOCUSED: AtomicBool = AtomicBool::new(false);
 /// Record the focus the window events reported: `true` when a window of this
 /// app took focus, `false` when the last focused one lost it. A task so the
 /// reducer can call it where it learns the fact; it has nothing to deliver.
-pub fn note_window_focus(focused: bool) -> iced::Task<()> {
+pub fn note_window_focus(focused: bool) -> ducktape_view_guest::Task<()> {
     APP_FOCUSED.store(focused, Ordering::Relaxed);
-    iced::Task::none()
+    ducktape_view_guest::Task::none()
 }
 
 fn app_focused() -> bool {

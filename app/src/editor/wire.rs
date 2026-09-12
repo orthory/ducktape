@@ -110,6 +110,31 @@ impl EditorStore {
     }
 
     /// Validate the complete candidate before changing the accepted projections.
+    pub fn validate(&self, root: &wire::Node) -> Result<(), String> {
+        let mut fields = HashMap::new();
+        collect(root, &mut fields)?;
+        wire::editor_document::validate_editor_document_refs(fields.values().map(|field| &field.reference))
+            .map_err(|error| format!("invalid editor references: {error:?}"))?;
+        self.lock().validate_budget(&fields)
+    }
+
+    /// A replacement may reuse immutable document bytes only when its restored
+    /// reference names exactly the same projection. The old store is untouched.
+    pub fn retain_restored_projections(&self, old: &Self, root: &wire::Node) -> Result<(), String> {
+        self.validate(root)?;
+        if old.pending() { return Err("the previous editor has pending work".into()); }
+        if !self.ready()? { return Err("replacement editor documents are incomplete".into()); }
+        let old = old.lock();
+        old.check()?;
+        let mut restored = self.lock();
+        for (id, document) in &mut restored.documents {
+            let Some(previous) = old.documents.get(id) else { continue; };
+            let identical = document.reference == previous.reference && document.text == previous.text;
+            if identical { document.text = previous.text.clone(); }
+        }
+        restored.check()
+    }
+
     pub fn replace(&self, root: &wire::Node) -> Result<(), String> {
         let mut fields = HashMap::new();
         collect(root, &mut fields)?;
@@ -145,8 +170,8 @@ impl EditorStore {
 
     pub fn pending(&self) -> bool {
         let store = self.lock();
-        store.incoming.is_some() || store.outgoing.is_some()
-            || store.documents.values().any(|d| !d.queue.is_empty())
+        store.incoming.is_some() || store.outgoing.is_some() || !store.events.is_empty()
+            || store.documents.values().any(|d| !d.queue.is_empty() || !matches!(d.phase, Phase::Ready))
     }
 
     pub fn focused(&self, key: &str) -> bool { self.lock().focused.contains(key) }
@@ -186,7 +211,7 @@ impl EditorStore {
 fn collect(node: &wire::Node, fields: &mut HashMap<String, Field>) -> Result<(), String> {
     if let wire::Node::Editor { key, document, on_document, options, placeholder, editable, .. } = node {
         let duplicate = fields.insert(key.clone(), Field { reference: document.clone(),
-            handler: *on_document, options: options.clone(), placeholder: placeholder.clone(), editable: *editable }).is_some();
+            handler: *on_document, options: (**options).clone(), placeholder: placeholder.clone(), editable: *editable }).is_some();
         if duplicate { return Err("duplicate editor projection key".into()); }
     }
     for child in node.children() { collect(child, fields)?; }

@@ -855,7 +855,7 @@ fn end_the_ceremony() {
 pub async fn restore_user_key(
     rpc: String,
     name: String,
-    words: ui_lang_runtime::Secret,
+    words: crate::secret::Secret,
     password: String,
 ) -> Result<String, AppError> {
     async {

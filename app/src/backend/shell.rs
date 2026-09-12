@@ -151,7 +151,7 @@ pub struct WorkspaceInit {
 /// ([`workspace_config::join_workspace`]) rather than an endpoint. It writes a
 /// directory, mints two keys and runs argon2-free but still blocking file work,
 /// hence `spawn_blocking`.
-pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
+pub async fn join_network(blob: crate::secret::Secret) -> Result<WorkspaceInit, AppError> {
     async {
         let blob = blob.expose().trim().to_string();
         let valid = !blob.is_empty()
