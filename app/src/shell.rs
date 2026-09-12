@@ -1248,6 +1248,19 @@ impl Render for DesktopWindow {
 pub(crate) fn run() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
+            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/Geist[wght].ttf")),
+            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf")),
+            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf")),
+        ];
+        if let Err(error) = cx.text_system().add_fonts(fonts) {
+            tracing::error!(target: "ducktape::app", reason = "font_registration_failed", %error, "bundled desktop fonts could not be registered");
+        }
+        let theme = gpui_kit::component::Theme::global_mut(cx);
+        theme.font_family = design::fonts::FAMILY_UI.into();
+        theme.mono_font_family = design::fonts::FAMILY_MONO.into();
+        theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
+        gpui_kit::component::Theme::sync_base(cx);
         let mut commands = commands();
         let (state, initial) = Ducktape::__boot();
         let (mut tray, mut tray_events) = crate::tray::init(cx);
