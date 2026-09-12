@@ -276,6 +276,17 @@ impl DesktopWindow {
                     let text = input.read(cx).value().to_string();
                     model.update(cx, |model, cx| model.dispatch(Message::__SecretTyped(key.into(), text), cx));
                 }
+                match key {
+                    "palette-input" => {
+                        let text = input.read(cx).value().to_string();
+                        model.update(cx, |model, cx| model.dispatch(Message::PaletteChanged(text), cx));
+                    }
+                    "channel-draft" => {
+                        let text = input.read(cx).value().to_string();
+                        model.update(cx, |model, cx| model.dispatch(Message::__BindChannelDraft(text), cx));
+                    }
+                    _ => {}
+                }
                 cx.notify();
             });
             self.inputs.insert(key, NativeInput { state, subscription });
@@ -439,7 +450,7 @@ impl DesktopWindow {
             .child(self.action("huddle-leave", "Leave huddle", Message::LeaveHuddleHere, false)).into_any_element()
     }
 
-    fn console(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::*;
         let (spec, route) = self.model.read(cx).state.native_view();
         let module_changed = self.module.as_ref().is_none_or(|(module, _)| *module != spec.module);
@@ -460,7 +471,90 @@ impl DesktopWindow {
                 model.update(cx, |model, cx| model.dispatch(Message::SelectShellTab(tab), cx));
             }));
         }
-        div().flex().size_full().child(tabs).child(div().flex_1().h_full().child(view)).into_any_element()
+        let state = &self.model.read(cx).state;
+        let mut modifiers = Modifiers::default();
+        if cfg!(target_os = "macos") { modifiers.platform = true; } else { modifiers.control = true; }
+        let header = div().flex().gap_2().items_center().p_2()
+            .child(state.network_name.clone()).child(state.status.clone())
+            .child(self.action("search", "Search", Message::GlobalKeyPressed(KeyPress { key: "k".into(), modifiers }), !state.connected))
+            .child(self.action("bell", format!("Notifications ({})", state.bell_unread), Message::ToggleBell, !state.connected))
+            .child(self.action("switch-network", "Switch network", Message::SwitchNetwork, false));
+        let error = state.error.clone();
+        let toast = state.toast.clone();
+        let needs_account = state.connected && !state.account_exists && !state.account_banner_dismissed;
+        let mut content = div().flex().flex_col().flex_1().h_full().child(header);
+        if needs_account {
+            content = content.child(div().flex().gap_2().p_2().child("Sign in to use your account on this network")
+                .child(self.action("account-open", "Sign in", Message::OpenAccountWelcome, false))
+                .child(self.action("account-dismiss", "Dismiss", Message::DismissAccountBanner, false)));
+        }
+        if !error.is_empty() { content = content.child(div().text_color(rgb(0xb42318)).p_2().child(error)); }
+        content = content.child(div().flex_1().min_h_0().child(view));
+        if !toast.is_empty() {
+            content = content.child(div().flex().gap_2().p_2().child(toast)
+                .child(self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)));
+        }
+        let mut root = div().relative().flex().size_full().child(tabs).child(content);
+        if let Some(overlay) = self.overlay(window, cx) { root = root.child(overlay); }
+        root.into_any_element()
+    }
+
+    fn overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        use gpui_kit::*;
+        let state = &self.model.read(cx).state;
+        let topmost = crate::backend::topmost_overlay(state.palette_open, state.bell_open, state.channel_create_open);
+        let mut panel = div().flex().flex_col().gap_2().w(px(600.0)).p_4();
+        let dismiss = match topmost.as_str() {
+            "palette" => {
+                let chats = state.palette_chat_hits.clone();
+                let pages = state.palette_page_hits.clone();
+                let phase = state.palette_search_phase;
+                panel = panel.child("Search this workspace")
+                    .child(self.input("palette-input", "Search messages and pages", false, window, cx));
+                if phase == crate::SearchPhase::Searching { panel = panel.child("Searching…"); }
+                for hit in chats {
+                    panel = panel.child(self.action(format!("search-chat/{}/{}", hit.channel_id, hit.seq), format!("{} · {}", hit.author, hit.text), Message::OpenChatSearchHit(hit.channel_id, hit.seq), false));
+                }
+                for hit in pages {
+                    panel = panel.child(self.action(format!("search-page/{}/{}", hit.page_id, hit.block_id), format!("{} · {}", hit.page_title, hit.text), Message::OpenPageSearchHit(hit.page_id, hit.block_id), false));
+                }
+                panel = panel.child(self.action("search-close", "Close", Message::ClosePalette, false));
+                Message::ClosePalette
+            }
+            "bell" => {
+                let generation = state.connect_generation;
+                let account = state.account_number.clone();
+                let items = crate::backend::bell_visible_items(state.bell_items.clone(), &account, &state.settings_user_key);
+                let presentations = state.bell_presentations.clone();
+                panel = panel.child("Notifications").child(state.bell_error.clone())
+                    .child(self.action("bell-mark-read", "Mark all read", Message::MarkBellReadSubmit, state.bell_marking));
+                for item in items {
+                    let presentation = crate::backend::bell_presentation(&item, &presentations);
+                    let unavailable = !crate::backend::bell_openable(&item, &presentations);
+                    panel = panel.child(self.action(format!("notification/{}", presentation.seq), format!("{} · {}", presentation.title, presentation.detail), Message::BellOpenItem(generation, account.clone(), presentation), unavailable));
+                }
+                panel = panel.child(self.action("bell-close", "Close", Message::CloseBell, false));
+                Message::CloseBell
+            }
+            "channel_create" => {
+                let busy = state.mutation_phase != crate::MutationPhase::Idle;
+                let members_only = state.channel_create_members_only;
+                panel = panel.child("Create a channel")
+                    .child(self.input("channel-draft", "Channel name", false, window, cx))
+                    .child(self.action("channel-private", if members_only { "Members only: on" } else { "Members only: off" }, Message::ToggleChannelCreateMembersOnly, busy))
+                    .child(self.action("channel-submit", "Create", Message::CreateChannelSubmit, busy))
+                    .child(self.action("channel-cancel", "Cancel", Message::ToggleChannelCreate, busy));
+                Message::ToggleChannelCreate
+            }
+            _ => return None,
+        };
+        let model = self.model.clone();
+        let panel = div().id("shell-modal").bg(rgb(0xfdfdfb)).text_color(rgb(0x2c2b27)).rounded_lg()
+            .max_h(relative(0.85)).overflow_y_scroll()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(panel);
+        Some(div().id("shell-scrim").absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000066))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| model.update(cx, |model, cx| model.dispatch(dismiss.clone(), cx)))
+            .child(panel).into_any_element())
     }
 }
 
@@ -468,7 +562,7 @@ impl Render for DesktopWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
         let content = match self.kind {
-            WindowKind::Console => self.console(cx),
+            WindowKind::Console => self.console(window, cx),
             WindowKind::Onboarding => self.onboarding(window, cx),
             WindowKind::Huddle => self.huddle(cx),
         };
