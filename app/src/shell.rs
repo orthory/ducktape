@@ -1545,16 +1545,18 @@ pub(crate) fn run() {
             desktop.start(initial, cx).detach();
             desktop.subscriptions(cx);
         });
-        let mut command_loop = Some(cx.spawn(async move |cx: &mut AsyncApp| {
+        let command_desktop = desktop.downgrade();
+        cx.spawn(async move |cx: &mut AsyncApp| {
             while let Some(pending) = commands.next().await {
-                let _ = desktop.update(cx, |desktop, cx| desktop.execute(pending.command, cx));
+                let _ = command_desktop.update(cx, |desktop, cx| desktop.execute(pending.command, cx));
                 let _ = pending.completed.send(());
             }
-        }));
-        // The command task owns the windowless desktop (including its tray).
-        // Cancel it before GPUI releases windows and checks entity handles.
+        }).detach();
+        // Keep the windowless desktop/tray alive until quit, without putting
+        // its strong handle in a detached future whose cancellation may lag.
+        let mut desktop = Some(desktop);
         cx.on_app_quit(move |_| {
-            drop(command_loop.take());
+            drop(desktop.take());
             async {}
         }).detach();
     });
