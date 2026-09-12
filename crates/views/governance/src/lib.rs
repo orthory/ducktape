@@ -18,7 +18,6 @@ pub(crate) enum AppTheme {
 }
 #[derive(Clone, Copy)]
 struct Palette {
-    name: &'static str,
     colors: [::ducktape_view_guest::wire::Rgba; 128],
 }
 #[allow(dead_code)]
@@ -57,7 +56,6 @@ impl GovernanceView {
         match self.active_palette.clone() {
             AppTheme::App => {
                 Palette {
-                    name: "app",
                     colors: [
                         ::ducktape_view_guest::wire::Rgba([
                             58.0 / 255.0,
@@ -832,7 +830,6 @@ impl GovernanceView {
             }
             AppTheme::AppDark => {
                 Palette {
-                    name: "app_dark",
                     colors: [
                         ::ducktape_view_guest::wire::Rgba([
                             212.0 / 255.0,
@@ -1623,13 +1620,8 @@ impl GovernanceView {
             badge_sent: false,
         }
     }
-    fn boot_task(&mut self) -> ::ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::Task::none()
-    }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
-        let mut state = Self::state();
-        let task = state.boot_task();
-        (state, task)
+        (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     #[allow(clippy::too_many_arguments)]

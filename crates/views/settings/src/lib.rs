@@ -11,7 +11,6 @@ pub(crate) enum AppTheme {
 }
 #[derive(Clone, Copy)]
 struct Palette {
-    name: &'static str,
     colors: [::ducktape_view_guest::wire::Rgba; 128],
 }
 #[derive(Default)]
@@ -37,33 +36,6 @@ impl ::std::default::Default for SettingsScreenState {
             key_pw: "".to_owned(),
             settings_pane: SettingsPane::General,
         }
-    }
-}
-#[cfg(test)]
-#[allow(non_camel_case_types, dead_code)]
-#[derive(Clone)]
-pub(crate) struct SettingsScreenReading {
-    pub(crate) key_pw: String,
-    pub(crate) settings_pane: SettingsPane,
-}
-#[cfg(test)]
-#[allow(dead_code)]
-impl SettingsView {
-    pub(crate) fn test_state_settings_screen(
-        &self,
-        scope: &str,
-    ) -> Option<SettingsScreenReading> {
-        let view = |state: &SettingsScreenState| SettingsScreenReading {
-            key_pw: state.key_pw.clone(),
-            settings_pane: state.settings_pane.clone(),
-        };
-        self.settings_screen_states.get(scope).map(view)
-    }
-    pub(crate) fn test_message_settings_screen_pick_pane(
-        scope: String,
-        p0: SettingsPane,
-    ) -> Message {
-        Message::PickSettingsPane(scope, p0)
     }
 }
 #[allow(dead_code)]
@@ -167,7 +139,6 @@ impl SettingsView {
         match self.active_palette.clone() {
             AppTheme::App => {
                 Palette {
-                    name: "app",
                     colors: [
                         ::ducktape_view_guest::wire::Rgba([
                             58.0 / 255.0,
@@ -942,7 +913,6 @@ impl SettingsView {
             }
             AppTheme::AppDark => {
                 Palette {
-                    name: "app_dark",
                     colors: [
                         ::ducktape_view_guest::wire::Rgba([
                             212.0 / 255.0,
@@ -1764,13 +1734,8 @@ impl SettingsView {
             settings_screen_initial: ::std::default::Default::default(),
         }
     }
-    fn boot_task(&mut self) -> ::ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::Task::none()
-    }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
-        let mut state = Self::state();
-        let task = state.boot_task();
-        (state, task)
+        (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     #[allow(clippy::too_many_arguments)]
