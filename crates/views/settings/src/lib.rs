@@ -3092,10 +3092,6 @@ impl SettingsView {
         picked: SettingsPane,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            ::ducktape_view_guest::invalidate_component(
-                "SettingsScreen",
-                &(scope.clone()),
-            );
             let local = self
                 .settings_screen_states
                 .entry(scope.clone())
@@ -3115,7 +3111,6 @@ impl SettingsView {
         value: String,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            ::ducktape_view_guest::invalidate_component("SettingsScreen", &(scope));
             let local = self
                 .settings_screen_states
                 .entry(scope)
