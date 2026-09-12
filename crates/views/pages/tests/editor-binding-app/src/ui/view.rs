@@ -1,6 +1,5 @@
 macro_rules! __ice_generated_items_5061676573456469746f7246697874757265 { ($($item:item)*) => { $(#[allow(warnings, clippy::all)] $item)* }; }
 __ice_generated_items_5061676573456469746f7246697874757265! {
-type __IceElement<'a, Message, Theme = ()> = <(&'a (), Message, Theme) as ::ducktape_view_guest::wire::Erase>::Node;
 pub(crate) type __IceMessage = __PagesEditorFixtureMessage;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,7 +19,6 @@ pub(crate) installed_source: ::std::vec::Vec<u8>,
 pub(crate) load_error: ::std::string::String,
 pub(crate) paint_dark: bool,
 pub(crate) commented: ::std::vec::Vec<i64>,
-pub(crate) __ice_rev: [u64; 9],
 }
 impl ::std::fmt::Debug for PagesEditorFixture { fn fmt(&self, __formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result { __formatter.write_str("PagesEditorFixture") } }
 #[derive(Clone)]
@@ -91,7 +89,6 @@ installed_source: ::std::vec![],
 load_error: "".to_owned(),
 paint_dark: false,
 commented: ::std::vec::Vec::new(),
-__ice_rev: [::ducktape_view_guest::rev::seed(); 9],
 }
 }
 fn __boot_task(&mut self) -> ::ducktape_view_guest::Task<__PagesEditorFixtureMessage> {
@@ -117,7 +114,6 @@ installed_source: installed_source,
 load_error: load_error,
 paint_dark: paint_dark,
 commented: commented,
-__ice_rev: [::ducktape_view_guest::rev::seed(); 9],
 }
 }
 pub(crate) const __SNAPSHOT_SCHEMA: &'static str = "d58bf2b798ab09bc7584235aa6d369a976f67b3396fb454eef1417f7f456836b";
