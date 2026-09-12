@@ -336,8 +336,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 
 // EVERY RUNG LEFT RIDES EVERY TAB, WHICH IS WHY NEITHER READER TAKES ONE. The
 // per-tab rungs went to the views that mount their surfaces; the palette, the
-// bell and the create modal are mounted OUTSIDE the `match tab` in
-// `components/shell.ice`, so they stay on screen across a switch and must keep
+// bell and the create modal are mounted outside the native tab content,
+// so they stay on screen across a switch and must keep
 // answering from wherever the reader lands. The two readers enumerate the SAME
 // layers in the same order, and differ on exactly one verdict.
 #[test]

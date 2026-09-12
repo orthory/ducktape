@@ -181,7 +181,7 @@ pub struct LiveUpdate {
     pub chat: Vec<ChatDelta>,
     pub bell: BellDelta,
     /// Subscription backpressure, not UI state. The next socket publication
-    /// cannot be read until the generated app message carrying this token has
+    /// cannot be read until the app message carrying this token has
     /// finished its update and all of its clones have been dropped.
     pub(crate) permit: LivePermit,
 }

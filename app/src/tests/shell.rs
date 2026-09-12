@@ -157,7 +157,7 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
 /// restating because it is what the two lines below now answer: a second OS
 /// window fell behind the console the moment anything in the console was
 /// clicked, and the console said nothing about the call at all. So the window
-/// floats (`level always-on-top`, app.ice) and the channel's LIVE pill draws
+/// uses a native popup window and the channel's LIVE pill draws
 /// whenever that channel's call is live rather than only while the window is
 /// up — the pill is the way back to a window someone has closed.
 
