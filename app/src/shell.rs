@@ -1520,16 +1520,17 @@ pub(crate) fn test_window(
 mod close_tests {
     use super::*;
 
-    #[gpui_kit::test]
-    async fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
+    #[test]
+    fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers() {
         use gpui_kit::test::TestWindowExt as _;
-        use gpui_kit::{ExternalPaths, FileDropEvent, VisualTestContext, point, px, size};
+        use gpui_kit::{ExternalPaths, FileDropEvent, InputEvent, point, px, size};
+        let runtime = crate::module_view::runtime();
+        let _runtime = runtime.enter();
         let _turn = crate::module_view::tests::blocking_connection_turn();
-        cx.update(gpui_kit::init);
+        let mut cx = crate::frame_probe::headless_context();
         let mut state = Ducktape::initial_state();
         state.connected = true;
+        state.connected_rpc = "http://127.0.0.1:0".into();
         state.shell_tab = ShellTab::Files;
         state.settings_user_key = "invalid signing key".into();
         state.fs_drop_dir = "/shared".into();
@@ -1539,49 +1540,69 @@ mod close_tests {
         );
         assert!(!expected.is_empty());
         let mut view = None;
-        let handle = cx.open_window(size(px(1120.), px(720.)), |window, cx| {
-            let presenter = test_window(state, WindowKind::Console, window, cx);
-            view = Some(presenter.clone());
-            gpui_kit::component::Root::new(presenter, window, cx)
-        });
+        let handle = cx
+            .open_window(size(px(1120.), px(720.)), |window, cx| {
+                let presenter = test_window(state, WindowKind::Console, window, cx);
+                view = Some(presenter.clone());
+                cx.new(|cx| gpui_kit::component::Root::new(presenter, window, cx))
+            })
+            .unwrap();
         let view = view.unwrap();
-        let mut native = VisualTestContext::from_window(handle.into(), cx);
-        native.update(|window, cx| window.render_frame(cx));
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
         let position = point(px(400.), px(350.));
-        native.simulate_event(FileDropEvent::Entered {
-            position,
-            paths: ExternalPaths(
-                [std::path::PathBuf::from("/local/report.txt")]
-                    .into_iter()
-                    .collect(),
-            ),
-        });
-        native.update(|window, cx| window.render_frame(cx));
-        native.simulate_event(FileDropEvent::Submit { position });
-        view.read_with(&native, |view, cx| {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position,
+                    paths: ExternalPaths(
+                        [std::path::PathBuf::from("/local/report.txt")]
+                            .into_iter()
+                            .collect(),
+                    ),
+                }
+                .to_platform_input(),
+                cx,
+            )
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx)
+        })
+        .unwrap();
+        view.read_with(&cx, |view, cx| {
             assert_eq!(view.test_state(cx).error, expected);
             assert!(
                 !view.test_state(cx).fs_dropping,
                 "write gate precedes local file I/O"
             );
         });
-        native.update(|window, cx| window.render_frame(cx));
-        native.update(|window, cx| window.click("error-dismiss", cx));
-        view.read_with(&native, |view, cx| {
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("error-dismiss", cx)
+        })
+        .unwrap();
+        view.read_with(&cx, |view, cx| {
             assert!(view.test_state(cx).error.is_empty())
         });
-        view.update(&mut native, |view, cx| {
+        view.update(&mut cx, |view, cx| {
             view.model.update(cx, |model, cx| {
                 model.state.bell_open = true;
                 model.state.bell_error = "Could not load notifications".into();
                 cx.notify();
             });
         });
-        let generation =
-            view.read_with(&native, |view, cx| view.test_state(cx).bell_load_generation);
-        native.update(|window, cx| window.render_frame(cx));
-        native.update(|window, cx| window.click("bell-retry", cx));
-        view.read_with(&native, |view, cx| {
+        let generation = view.read_with(&cx, |view, cx| view.test_state(cx).bell_load_generation);
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("bell-retry", cx)
+        })
+        .unwrap();
+        view.read_with(&cx, |view, cx| {
             assert_eq!(
                 view.test_state(cx).bell_load_generation,
                 generation.wrapping_add(1)
