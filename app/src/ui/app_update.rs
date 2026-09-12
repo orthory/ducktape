@@ -781,7 +781,7 @@ mod __ice_group_app_update {
                         },
                         {
                             // __ICE_SOURCE 186 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({
                                     crate::backend::window_target_unless(
                                         self.huddle_joined,
@@ -805,7 +805,7 @@ mod __ice_group_app_update {
                             self.console_entry = ConsoleEntry::Idle;
                             self.__ice_derived.hub_busy.take();
                             return {
-                                let (_, __task) = ::crate::shell::open(Self::__window_1());
+                                let (_, __task) = crate::shell::open(Self::__window_1());
                                 __task.map(move |value| __DucktapeMessage::ConsoleOpened(value))
                             };
                         })(),
@@ -1384,7 +1384,7 @@ mod __ice_group_app_update {
                     self.__ice_derived.has_error.take();
                     return ::ducktape_view_guest::Task::batch([{
                         // __ICE_SOURCE 413 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                        ::crate::shell::close::<__DucktapeMessage>(
+                        crate::shell::close::<__DucktapeMessage>(
                             ({
                                 crate::backend::window_target_unless(
                                     self.huddle_joined,
@@ -1839,7 +1839,7 @@ mod __ice_group_app_update {
                             if (!leaving) {
                                 return ::ducktape_view_guest::Task::none();
                             }
-                            return ::crate::shell::quit::<__DucktapeMessage>();
+                            return crate::shell::quit::<__DucktapeMessage>();
                         })(),
                         CeremonyRetirement::Account => (|| {
                             self.__ice_run_lane_10_generation =
@@ -1865,13 +1865,13 @@ mod __ice_group_app_update {
                             if (!leaving) {
                                 return ::ducktape_view_guest::Task::none();
                             }
-                            return ::crate::shell::quit::<__DucktapeMessage>();
+                            return crate::shell::quit::<__DucktapeMessage>();
                         })(),
                         CeremonyRetirement::Keep => (|| {
                             if (!leaving) {
                                 return ::ducktape_view_guest::Task::none();
                             }
-                            return ::crate::shell::quit::<__DucktapeMessage>();
+                            return crate::shell::quit::<__DucktapeMessage>();
                         })(),
                     };
                 })(),
@@ -1882,7 +1882,7 @@ mod __ice_group_app_update {
                     return match opening.clone() {
                         TrayOpen::Launch => (|| {
                             return {
-                                let (_, __task) = ::crate::shell::open(Self::__window_0());
+                                let (_, __task) = crate::shell::open(Self::__window_0());
                                 __task.map(move |value| __DucktapeMessage::OnboardingOpened(value))
                             };
                         })(),
@@ -1896,7 +1896,7 @@ mod __ice_group_app_update {
                             return ::ducktape_view_guest::Task::batch([
                                 {
                                     // __ICE_SOURCE 713 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                                    ::crate::shell::raise::<__DucktapeMessage>(
+                                    crate::shell::raise::<__DucktapeMessage>(
                                         ({
                                             crate::backend::window_target(self.console_win.clone())
                                         }),
@@ -1904,7 +1904,7 @@ mod __ice_group_app_update {
                                 },
                                 {
                                     // __ICE_SOURCE 714 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                                    ::crate::shell::raise::<__DucktapeMessage>(
+                                    crate::shell::raise::<__DucktapeMessage>(
                                         ({
                                             crate::backend::window_target(
                                                 self.onboarding_win.clone(),
@@ -1945,7 +1945,7 @@ mod __ice_group_app_update {
                     {
                         __previous.abort();
                     }
-                    return ::crate::shell::quit::<__DucktapeMessage>();
+                    return crate::shell::quit::<__DucktapeMessage>();
                 })(),
                 __DucktapeMessage::ModifierStateChanged(mods) => (|| {
                     let _ = &mods;
@@ -1954,12 +1954,12 @@ mod __ice_group_app_update {
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::DragLaunchWindow => (|| {
-                    return ::crate::shell::oldest().and_then(move |__window| {
-                        ::crate::shell::drag::<__DucktapeMessage>(__window)
+                    return crate::shell::oldest().and_then(move |__window| {
+                        crate::shell::drag::<__DucktapeMessage>(__window)
                     });
                 })(),
                 __DucktapeMessage::CloseLaunchWindow => (|| {
-                    return ::crate::shell::close::<__DucktapeMessage>(
+                    return crate::shell::close::<__DucktapeMessage>(
                         ({ crate::backend::window_target(self.onboarding_win.clone()) }),
                     );
                 })(),
@@ -2018,10 +2018,10 @@ mod __ice_group_app_update {
                             {
                                 __previous.abort();
                             }
-                            return ::crate::shell::quit::<__DucktapeMessage>();
+                            return crate::shell::quit::<__DucktapeMessage>();
                         })(),
                         CommandChord::CloseWindow => (|| {
-                            return ::crate::shell::close::<__DucktapeMessage>(
+                            return crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.focused_win.clone()) }),
                             );
                         })(),
@@ -2038,7 +2038,7 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.bell_open = true;
-                    return ::crate::shell::raise::<__DucktapeMessage>(
+                    return crate::shell::raise::<__DucktapeMessage>(
                         ({ crate::backend::window_target(self.console_win.clone()) }),
                     );
                 })(),
@@ -2049,7 +2049,7 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 789 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                            ::crate::shell::raise::<__DucktapeMessage>(
+                            crate::shell::raise::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
@@ -2067,7 +2067,7 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 797 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                            ::crate::shell::raise::<__DucktapeMessage>(
+                            crate::shell::raise::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
@@ -2085,7 +2085,7 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 805 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                            ::crate::shell::raise::<__DucktapeMessage>(
+                            crate::shell::raise::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
@@ -2103,7 +2103,7 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 813 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
-                            ::crate::shell::raise::<__DucktapeMessage>(
+                            crate::shell::raise::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
@@ -2131,7 +2131,7 @@ mod __ice_group_app_update {
                     }
                     self.toast = "Copied node key".to_owned();
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(
+                    return crate::shell::clipboard::<__DucktapeMessage>(
                         self.node_key.to_owned(),
                     );
                 })(),
@@ -2346,7 +2346,7 @@ mod __ice_group_app_update {
                                 ::std::convert::AsRef::as_ref(&("label")),
                             );
                             self.toast_age = 0;
-                            return ::crate::shell::clipboard::<__DucktapeMessage>(
+                            return crate::shell::clipboard::<__DucktapeMessage>(
                                 crate::module_view::event_text(
                                     ::std::borrow::Borrow::borrow(&(event)),
                                     ::std::convert::AsRef::as_ref(&("text")),
@@ -2857,7 +2857,7 @@ mod __ice_group_app_update {
                         ::std::convert::AsRef::as_ref(&("label")),
                     );
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(
+                    return crate::shell::clipboard::<__DucktapeMessage>(
                         crate::module_view::event_text(
                             ::std::borrow::Borrow::borrow(&(event)),
                             ::std::convert::AsRef::as_ref(&("text")),
@@ -2980,7 +2980,7 @@ mod __ice_group_app_update {
                         ::std::convert::AsRef::as_ref(&("label")),
                     );
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(
+                    return crate::shell::clipboard::<__DucktapeMessage>(
                         crate::module_view::event_text(
                             ::std::borrow::Borrow::borrow(&(event)),
                             ::std::convert::AsRef::as_ref(&("text")),
@@ -3563,7 +3563,7 @@ mod __ice_group_app_update {
                                 ::std::convert::AsRef::as_ref(&("label")),
                             );
                             self.toast_age = 0;
-                            return ::crate::shell::clipboard::<__DucktapeMessage>(
+                            return crate::shell::clipboard::<__DucktapeMessage>(
                                 crate::module_view::event_text(
                                     ::std::borrow::Borrow::borrow(&(event)),
                                     ::std::convert::AsRef::as_ref(&("text")),
@@ -3636,7 +3636,7 @@ mod __ice_group_app_update {
                     let _ = &label;
                     self.toast = label.to_owned();
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(text.to_owned());
+                    return crate::shell::clipboard::<__DucktapeMessage>(text.to_owned());
                 })(),
                 __DucktapeMessage::DismissToast => (|| {
                     self.toast = "".to_owned();
@@ -3662,7 +3662,7 @@ mod __ice_group_app_update {
                         ::std::convert::AsRef::as_ref(&("label")),
                     );
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(
+                    return crate::shell::clipboard::<__DucktapeMessage>(
                         crate::module_view::event_text(
                             ::std::borrow::Borrow::borrow(&(event)),
                             ::std::convert::AsRef::as_ref(&("text")),
@@ -4076,7 +4076,7 @@ mod __ice_group_app_update {
                     if (!self.palette_open) {
                         return ::ducktape_view_guest::Task::none();
                     }
-                    return ::crate::shell::focus::<__DucktapeMessage>(
+                    return crate::shell::focus::<__DucktapeMessage>(
                         "Ducktape/workspace-tabs/overlays/palette-input".to_owned(),
                     );
                 })(),
@@ -5005,7 +5005,7 @@ mod __ice_group_app_update {
                     self.loading = false;
                     self.error = "".to_owned();
                     self.__ice_derived.has_error.take();
-                    return ::crate::shell::close::<__DucktapeMessage>(
+                    return crate::shell::close::<__DucktapeMessage>(
                         ({
                             crate::backend::window_target_unless(
                                 self.huddle_joined,
@@ -5126,7 +5126,7 @@ mod __ice_group_app_update {
                     );
                     self.error = "".to_owned();
                     self.__ice_derived.has_error.take();
-                    return ::crate::shell::close::<__DucktapeMessage>(
+                    return crate::shell::close::<__DucktapeMessage>(
                         ({
                             crate::backend::window_target_unless(
                                 self.huddle_joined,
@@ -5768,7 +5768,7 @@ mod __ice_group_app_update {
                                 ::std::convert::AsRef::as_ref(&("label")),
                             );
                             self.toast_age = 0;
-                            return ::crate::shell::clipboard::<__DucktapeMessage>(
+                            return crate::shell::clipboard::<__DucktapeMessage>(
                                 crate::module_view::event_text(
                                     ::std::borrow::Borrow::borrow(&(event)),
                                     ::std::convert::AsRef::as_ref(&("text")),
@@ -7054,7 +7054,7 @@ mod __ice_group_app_update {
                 __DucktapeMessage::ConsoleOpened(id) => (|| {
                     let _ = &id;
                     self.console_win = ::std::option::Option::Some(id);
-                    return ::crate::shell::close::<__DucktapeMessage>(
+                    return crate::shell::close::<__DucktapeMessage>(
                         ({ crate::backend::window_target(self.onboarding_win.clone()) }),
                     );
                 })(),
@@ -7275,7 +7275,7 @@ mod __ice_group_app_update {
                     }
                     self.toast = "Invite copied".to_owned();
                     self.toast_age = 0;
-                    return ::crate::shell::clipboard::<__DucktapeMessage>(
+                    return crate::shell::clipboard::<__DucktapeMessage>(
                         self.invite_link.to_owned(),
                     );
                 })(),
@@ -7351,7 +7351,7 @@ mod __ice_group_app_update {
                     self.account_ceremony_detail = "".to_owned();
                     self.account_ceremony_left = "".to_owned();
                     return {
-                        let (_, __task) = ::crate::shell::open(Self::__window_0());
+                        let (_, __task) = crate::shell::open(Self::__window_0());
                         __task.map(move |value| __DucktapeMessage::OnboardingReopened(value))
                     };
                 })(),
@@ -7367,13 +7367,13 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 634 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6f6e626f617264696e672e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
                         {
                             // __ICE_SOURCE 635 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6f6e626f617264696e672e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.huddle_win.clone()) }),
                             )
                         },
@@ -7443,7 +7443,7 @@ mod __ice_group_app_update {
                     self.rpc = self.connected_rpc.to_owned();
                     self.hub_chain_id = self.network_chain_id.to_owned();
                     return {
-                        let (_, __task) = ::crate::shell::open(Self::__window_0());
+                        let (_, __task) = crate::shell::open(Self::__window_0());
                         __task.map(move |value| __DucktapeMessage::WelcomeReopened(value))
                     };
                 })(),
@@ -7459,13 +7459,13 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 668 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6f6e626f617264696e672e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.console_win.clone()) }),
                             )
                         },
                         {
                             // __ICE_SOURCE 669 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6f6e626f617264696e672e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.huddle_win.clone()) }),
                             )
                         },
@@ -7551,12 +7551,12 @@ mod __ice_group_app_update {
                     return match summon.clone() {
                         WindowSummon::Open => (|| {
                             return {
-                                let (_, __task) = ::crate::shell::open(Self::__window_2());
+                                let (_, __task) = crate::shell::open(Self::__window_2());
                                 __task.map(move |value| __DucktapeMessage::HuddleOpened(value))
                             };
                         })(),
                         WindowSummon::Raise => (|| {
-                            return ::crate::shell::raise::<__DucktapeMessage>(
+                            return crate::shell::raise::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.huddle_win.clone()) }),
                             );
                         })(),
@@ -7626,7 +7626,7 @@ mod __ice_group_app_update {
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 147 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f687564646c652e696365
-                            ::crate::shell::close::<__DucktapeMessage>(
+                            crate::shell::close::<__DucktapeMessage>(
                                 ({ crate::backend::window_target(self.huddle_win.clone()) }),
                             )
                         },

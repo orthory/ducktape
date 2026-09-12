@@ -316,6 +316,7 @@ impl Desktop {
                     model,
                     kind,
                     module: None,
+                    module_route: None,
                     route: None,
                     inputs: HashMap::new(),
                     input_step: None,
@@ -405,6 +406,7 @@ pub(crate) struct DesktopWindow {
     model: Entity<Desktop>,
     kind: WindowKind,
     module: Option<(&'static str, Entity<crate::module_view::NativeModuleView>)>,
+    module_route: Option<fn(crate::module_view::ModuleViewEvent) -> Message>,
     route: Option<gpui_kit::Subscription>,
     inputs: HashMap<&'static str, NativeInput>,
     input_step: Option<crate::HubStep>,
@@ -425,8 +427,17 @@ impl DesktopWindow {
         event: ui_lang_wire::events::Window,
         cx: &mut gpui_kit::App,
     ) {
-        if let Some((_, module)) = &self.module {
-            module.update(cx, |module, cx| module.observe_window(event, cx));
+        let (Some((_, module)), Some(route)) = (&self.module, self.module_route) else {
+            return;
+        };
+        let intents = module.update(cx, |module, cx| {
+            module.observe_final_window_event(event, cx)
+        });
+        // The view subscription is about to disappear with its presenter.
+        // Complete the ordinary domain route directly, without a paint tick.
+        for intent in intents {
+            self.model
+                .update(cx, |model, cx| model.dispatch(route(intent), cx));
         }
     }
     #[cfg(test)]
@@ -966,6 +977,7 @@ impl DesktopWindow {
                 model.update(cx, |model, cx| model.dispatch(route(event.clone()), cx));
             }));
             self.module = Some((spec.module, view));
+            self.module_route = Some(route);
         }
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
@@ -1142,7 +1154,7 @@ impl DesktopWindow {
                 let generation = state.connect_generation;
                 let account = state.account_number.clone();
                 let items = crate::backend::bell_visible_items(
-                    state.bell_items.clone(),
+                    &state.bell_items,
                     &account,
                     &state.settings_user_key,
                 );
@@ -1232,8 +1244,8 @@ impl DesktopWindow {
 
 impl Render for DesktopWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::InteractiveElement as _;
         use gpui_kit::component::ActiveTheme as _;
-        use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
         let content = match self.kind {
             WindowKind::Console => self.console(window, cx),
             WindowKind::Onboarding => self.onboarding(window, cx),
@@ -1337,6 +1349,7 @@ pub(crate) fn test_window(
             model,
             kind,
             module: None,
+            module_route: None,
             route: None,
             inputs: HashMap::new(),
             input_step: None,
