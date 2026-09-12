@@ -41,60 +41,23 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
         ("active_dm", &["active_dm_peer", "dm_peers"]),
     ];
 
-    // Every handler file, because a mirror's source can move in any of them.
-    macro_rules! handler_sources {
-        ($($path:literal),* $(,)?) => { [$(($path, include_str!(concat!("../", $path)))),*] };
-    }
-    let files = handler_sources![
-        "ui/handlers/chat.ice",
-        "ui/handlers/files.ice",
-        "ui/handlers/forge.ice",
-        "ui/handlers/huddle.ice",
-        "ui/handlers/lifecycle.ice",
-        "ui/handlers/node.ice",
-        "ui/handlers/onboarding.ice",
-        "ui/handlers/overlays.ice",
-        "ui/handlers/pages.ice",
-        "ui/handlers/roster.ice",
-    ];
-
-    // An ASSIGNMENT opens a statement line — prose naming a field, and a call
-    // that merely READS one, are not writes.
-    let assigns = |body: &str, field: &str| {
-        let statement = format!("{field} = ");
-        body.lines()
-            .any(|line| line.trim_start().starts_with(&statement))
-    };
-
-    let mut checked = 0usize;
-    for (path, source) in files {
-        for block in source
-            .split(
-                "
-on ",
-            )
-            .skip(1)
-        {
-            let handler = block.split('(').next().unwrap_or(block).trim();
-            let handler = handler.lines().next().unwrap_or(handler).trim();
-            for (mirror, sources) in MIRRORS {
-                let Some(moved) = sources.iter().find(|field| assigns(block, field)) else {
-                    continue;
-                };
-                checked += 1;
-                assert!(
-                    assigns(block, mirror),
-                    "{path}: `on {handler}` assigns `{moved}`, so it must also                      assign `{mirror}` — the view reads the mirror and never                      recomputes it (see state/chat.ice)"
-                );
+    let mut checked = 0;
+    for (handler, body) in handler_bodies() {
+        for (mirror, sources) in MIRRORS {
+            let moved = sources
+                .iter()
+                .any(|field| body.contains(&format!("self.{field}=")));
+            if !moved {
+                continue;
             }
+            checked += 1;
+            assert!(
+                body.contains(&format!("self.{mirror}=")),
+                "{handler} moves a source without refreshing {mirror}"
+            );
         }
     }
-    // The sweep must actually have found writers: a rename that silently
-    // stopped matching would otherwise pass with nothing checked at all.
-    assert!(
-        checked >= 20,
-        "the mirror sweep matched only {checked} writers — it has stopped seeing them"
-    );
+    assert!(checked >= 20, "the sweep must see actual assignments");
 }
 
 #[test]
@@ -117,10 +80,16 @@ fn history_windows_offer_a_jump_back_to_latest() {
     // The way back is a float over the timeline's bottom edge now, not a
     // button inside an amber band at the top of the column — and it is shown
     // for a reader who simply scrolled up, not only for a history window.
-    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(chat.contains("if !empty(messages) && (history_view || !at_live_tail)"));
-    assert!(chat.contains("button \"↓  Jump to latest\""));
-    assert!(chat.contains("-> emit(choose_channel, active_channel)"));
+    let branches = super::connection::branches(super::connection::CHAT);
+    let banner = branches
+        .iter()
+        .find(|(guard, body, _)| {
+            guard.contains("history_view")
+                && guard.contains("at_live_tail")
+                && body.contains("Jumptolatest")
+        })
+        .expect("the current-scroll-position jump control");
+    assert!(banner.0.contains("messages"));
 }
 
 /// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.

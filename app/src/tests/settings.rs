@@ -1,165 +1,122 @@
-//! SETTINGS IS A TAB STRIP OVER ONE MATCH, and this file is why it stays one.
-//! The screen was a single `grid min-cell=420.0` of eight cards: the width
-//! decided which column a group landed in, so identity, the keys that speak
-//! for it and the seat that signs with them could be three columns apart, and
-//! the identity key's seat was the last card of a scroll whose only way in
-//! was the wheel. Every group belongs to exactly one named pane now, the
-//! strip is the only way to pick one, and a new pane fails the build until it
-//! is both reachable and routed.
+//! Settings pane ownership is checked in the authored Rust tree, not a compiler spelling.
+use super::*;
+use quote::ToTokens;
+use syn::visit::Visit;
 
-// Settings ships as a module-owned view; its screen is the guest's.
-const SETTINGS: &str = include_str!("../../../crates/views/settings/src/ui/settings.ice");
-
-/// The panes, in the order the strip offers them. General first because it is
-/// the one nothing has to be true for; security last because it is the one
-/// that holds a key.
-const PANES: [&str; 4] = ["general", "network", "account", "security"];
-
-/// Every authored group, and the pane that owns it. The pairing is the whole
-/// of the redesign: a group in two panes is a group that drifted, and a group
-/// in none is a group nobody can reach.
+const SETTINGS: &str = include_str!("../../../crates/views/settings/src/lib.rs");
+const PANES: [&str; 4] = ["General", "Network", "Account", "Security"];
 const GROUPS: [(&str, &str); 6] = [
-    ("APPEARANCE", "general"),
-    ("NOTIFICATIONS", "general"),
-    ("NETWORK", "network"),
-    ("YOUR IDENTITY", "account"),
-    ("ACCOUNT KEYS", "account"),
-    ("IDENTITY KEY", "security"),
+    ("APPEARANCE", "General"),
+    ("NOTIFICATIONS", "General"),
+    ("NETWORK", "Network"),
+    ("YOURIDENTITY", "Account"),
+    ("ACCOUNTKEYS", "Account"),
+    ("IDENTITYKEY", "Security"),
 ];
 
-/// The pane each line carrying `needle` is authored under. An arm header is
-/// the only line that BEGINS `SettingsPane.` — the strip spells the same
-/// variant inside `pick_pane(…)` and `checked=(…)`, never at the margin — so
-/// walking the file top to bottom and remembering the last one seen says which
-/// arm any later line belongs to.
-fn panes_holding(needle: &str) -> Vec<String> {
-    let mut arm = String::new();
-    let mut holding = Vec::new();
-    for line in SETTINGS.lines() {
-        if let Some(name) = line.trim().strip_prefix("SettingsPane.") {
-            arm = name.to_owned();
-        }
-        if line.contains(needle) {
-            holding.push(arm.clone());
+fn pane_arms() -> Vec<(String, String)> {
+    struct Panes(Vec<(String, String)>);
+    impl<'ast> Visit<'ast> for Panes {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            if let syn::Pat::Path(path) = &arm.pat {
+                let segments: Vec<_> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|part| part.ident.to_string())
+                    .collect();
+                if segments.first().is_some_and(|name| name == "SettingsPane") {
+                    self.0.push((
+                        segments.last().unwrap().clone(),
+                        arm.body
+                            .to_token_stream()
+                            .to_string()
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect(),
+                    ));
+                }
+            }
+            syn::visit::visit_arm(self, arm);
         }
     }
-    holding
+    let mut visitor = Panes(Vec::new());
+    visitor.visit_file(&syn::parse_file(SETTINGS).unwrap());
+    visitor.0
 }
 
-/// ONE GROUP, ONE PANE. A `GroupLabel` mounted under two arms is the same
-/// heading in two places; one mounted before the dispatch is a card that
-/// paints on every pane, which is how the grid read in the first place.
 #[test]
 fn every_group_is_authored_under_exactly_one_pane() {
-    for (group, pane) in GROUPS {
-        let holding = panes_holding(&format!("\"{group}\""));
-        assert_eq!(
-            holding,
-            vec![pane.to_owned()],
-            "the {group} group is no longer the {pane} pane's alone"
-        );
+    let arms = pane_arms();
+    for (group, owner) in GROUPS {
+        let owners: Vec<_> = arms
+            .iter()
+            .filter(|(_, body)| body.contains(&format!("\"{group}\"")))
+            .map(|(pane, _)| pane.as_str())
+            .collect();
+        assert_eq!(owners, [owner], "{group} has exactly one pane");
     }
 }
 
-/// EVERY PANE IS REACHABLE AND ROUTED. A variant with an arm and no tab is a
-/// pane no reader can open; a variant with a tab and no arm fails the DSL's
-/// own exhaustiveness check, so this half only has to pin the strip.
 #[test]
 fn every_pane_has_a_tab_and_an_arm() {
+    let source = rust_tokens(SETTINGS);
+    let arms = pane_arms();
+    assert_eq!(arms.len(), PANES.len(), "one exhaustive pane dispatch");
     for pane in PANES {
-        assert!(
-            SETTINGS.contains(&format!(
-                "button #settings-{pane}-tab -> pick_pane(SettingsPane.{pane})"
-            )),
-            "the {pane} pane lost its tab, so nothing opens it"
+        assert!(source.contains(&format!("/settings-{}-tab", pane.to_lowercase())));
+        assert_eq!(arms.iter().filter(|(name, _)| name == pane).count(), 1);
+    }
+}
+
+#[test]
+fn the_enum_names_the_same_panes_in_the_same_order() {
+    let file = syn::parse_file(SETTINGS).unwrap();
+    let variants = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Enum(item) if item.ident == "SettingsPane" => Some(
+                item.variants
+                    .iter()
+                    .map(|variant| variant.ident.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("the native pane discriminant");
+    assert_eq!(variants, PANES);
+}
+
+#[test]
+fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
+    let arms = pane_arms();
+    let source = rust_tokens(SETTINGS);
+    for (group, _) in GROUPS {
+        assert_eq!(
+            source.matches(&format!("\"{group}\"")).count(),
+            1,
+            "no heading outside its pane"
         );
-        assert!(
-            SETTINGS
-                .lines()
-                .any(|line| line.trim() == format!("SettingsPane.{pane}")),
-            "the {pane} pane lost its arm"
+        assert_eq!(
+            arms.iter()
+                .filter(|(_, body)| body.contains(&format!("\"{group}\"")))
+                .count(),
+            1
         );
     }
 }
 
-/// THE ENUM IS THE STRIP. A sixth variant must fail here — and go on failing
-/// until someone gives it both a tab and an arm — rather than quietly render
-/// nothing behind a tab that is not there.
-#[test]
-fn the_enum_names_the_same_panes_in_the_same_order() {
-    let declared: Vec<String> = SETTINGS
-        .lines()
-        .skip_while(|line| line.trim() != "enum SettingsPane")
-        .skip(1)
-        .take_while(|line| line.starts_with("  ") && !line.trim().is_empty())
-        .map(|line| line.trim().to_owned())
-        .collect();
-    assert_eq!(
-        declared,
-        PANES.map(str::to_owned).to_vec(),
-        "SettingsPane and the tab strip disagree about what Settings holds"
-    );
-}
-
-/// ONE DISPATCH, NOTHING OUTSIDE IT. A second `match` — or a card hoisted
-/// above the one there is — is a group that shows on every pane, which is the
-/// flat list this replaced.
-#[test]
-fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
-    let dispatches = SETTINGS
-        .lines()
-        .filter(|line| line.trim_start().starts_with("match settings_pane"))
-        .count();
-    assert_eq!(
-        dispatches, 1,
-        "Settings branches on its pane more than once"
-    );
-    let branch = SETTINGS
-        .lines()
-        .position(|line| line.trim_start().starts_with("match settings_pane"))
-        .expect("the dispatch was just counted");
-    let strays: Vec<String> = SETTINGS
-        .lines()
-        .take(branch)
-        .enumerate()
-        .filter(|(_, line)| line.contains("GroupCard") || line.contains("GroupLabel"))
-        .map(|(number, line)| format!("{}: {}", number + 1, line.trim()))
-        .collect();
-    assert!(
-        strays.is_empty(),
-        "a settings group is authored above the dispatch, so it paints on \
-         every pane: {strays:?}"
-    );
-}
-
-/// THE PANE IS PICKED IN ONE PLACE. `pick_pane` is the screen's own handler,
-/// not an emit: the pane is chrome, so it never crosses into app state and no
-/// second route can set it.
 #[test]
 fn the_pane_moves_only_through_the_strip() {
-    let writes: Vec<String> = SETTINGS
-        .lines()
-        .filter(|line| line.trim().starts_with("settings_pane ="))
-        .map(|line| line.trim().to_owned())
-        .collect();
-    assert_eq!(
-        writes,
-        vec!["settings_pane = picked".to_owned()],
-        "something other than the strip's handler writes the pane"
-    );
-    assert!(
-        !SETTINGS.contains("emit(pick_pane"),
-        "the pane left the screen as an app event; it is chrome and stays instance state"
-    );
+    let source = rust_tokens(SETTINGS);
+    assert_eq!(source.matches("__local.settings_pane=").count(), 1);
+    assert!(source.contains("let__ice_next=picked.clone();__local.settings_pane=__ice_next"));
+    assert!(!source.contains("emit_pick_pane"));
 }
 
-/// THE SCROLL PANE IS STILL THE ROOT: the strip and the pane under it scroll
-/// as one, so a container wrapped around the scrollable is a strip that
-/// scrolls away from its own pane.
 #[test]
 fn the_scrollable_is_the_screens_root() {
-    assert!(
-        SETTINGS.contains("\n  scroll #settings-body\n"),
-        "the scrollable is no longer a top-level node of the screen"
-    );
+    let source = rust_tokens(SETTINGS);
+    assert!(source.contains("Node::Scroll{key:format!(\"{}/settings-body\""));
 }

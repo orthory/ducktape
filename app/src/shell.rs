@@ -433,6 +433,12 @@ impl DesktopWindow {
     pub(crate) fn test_state<'a>(&self, cx: &'a gpui_kit::App) -> &'a Ducktape {
         &self.model.read(cx).state
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_dispatch(&mut self, message: Message, cx: &mut Context<Self>) {
+        self.model
+            .update(cx, |model, cx| model.dispatch(message, cx));
+    }
     fn value(&self, key: &'static str, cx: &gpui_kit::App) -> String {
         self.inputs
             .get(key)
@@ -1290,7 +1296,9 @@ impl Render for DesktopWindow {
                 };
                 let copy = this.model.read(cx).state.shell_tab == ShellTab::Chat
                     && crate::backend::is_copy_chord(key.key.clone(), key.modifiers);
-                if !copy { return; }
+                if !copy {
+                    return;
+                }
                 this.model.update(cx, |model, cx| {
                     model.dispatch(Message::CopyChordPressed(key), cx)
                 });

@@ -77,7 +77,7 @@ fn bell_failed_read_is_visible_and_stale_accounts_cannot_finish_it() {
 
 #[test]
 fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
-    use iced_test::futures::futures::StreamExt as _;
+    use futures::StreamExt as _;
     for change in ["none", "connection", "account"] {
         let (mut app, _) = Ducktape::__boot();
         app.connect_generation = 7;
@@ -95,18 +95,7 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
                 ..Default::default()
             },
         ));
-        let stream =
-            iced_test::runtime::task::into_stream(task).expect("page click schedules navigation");
-        let queued = iced_test::futures::futures::executor::block_on(
-            stream
-                .filter_map(|action| async move {
-                    match action {
-                        iced_test::runtime::Action::Output(message) => Some(message),
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        let queued = futures::executor::block_on(task.into_stream().collect::<Vec<_>>());
         assert_eq!(
             queued.len(),
             1,
@@ -141,93 +130,104 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
     }
 }
 
-#[test]
-fn bell_controls_render_context_and_admit_read_from_the_real_button() {
-    use ui_lang_runtime::testing::{Config, Driver, Location, MouseButton};
+#[gpui_kit::test]
+fn bell_controls_render_context_and_admit_read_from_the_real_button(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, VisualTestContext, px, size};
     let _guard = crate::module_view::tests::blocking_connection_turn();
-    fn boot() -> (Ducktape, iced::Task<__DucktapeMessage>) {
-        let (mut app, _) = Ducktape::__boot();
-        app.console_win = Some(iced::window::Id::unique());
-        app.account_number = "4".into();
-        app.bell_open = true;
-        app.bell_unread = 1;
-        app.bell_items = vec![row(17)];
-        app.bell_presentations = vec![backend::BellPresentation {
-            seq: 17,
-            title: "Alice mentioned you".into(),
-            detail: "Please review the launch checklist.".into(),
-            target: BellTarget::Message,
-            object: "general".into(),
-            number: 42,
-            ..Default::default()
-        }];
-        (app, iced::Task::none())
-    }
-    fn update(app: &mut Ducktape, message: __DucktapeMessage) -> iced::Task<__DucktapeMessage> {
-        // Exercise the real route and admission; the backend HTTP tests own IO.
-        if let __DucktapeMessage::BellOpenItem(_, _, context) = &message {
-            assert_eq!(context.target, BellTarget::Message);
-            assert_eq!(context.object, "general");
-            assert_eq!(
-                context.number, 42,
-                "the row routes to the source message, not inbox sequence 17"
+    let (mut app, _) = Ducktape::__boot();
+    app.console_win = Some(crate::shell::WindowKey::unique());
+    app.account_number = "4".into();
+    app.bell_open = true;
+    app.bell_unread = 1;
+    app.bell_items = vec![row(17)];
+    app.bell_presentations = vec![backend::BellPresentation {
+        seq: 17,
+        title: "Alice mentioned you".into(),
+        detail: "Please review the launch checklist.".into(),
+        target: BellTarget::Message,
+        object: "general".into(),
+        number: 42,
+        ..Default::default()
+    }];
+    cx.update(gpui_kit::init);
+    let mut view = None;
+    let handle = cx.open_window(size(px(1120.), px(720.)), |window, cx| {
+        let native = crate::shell::test_window(app, crate::shell::WindowKind::Console, window, cx);
+        view = Some(native.clone());
+        gpui_kit::component::Root::new(native, window, cx)
+    });
+    let view = view.unwrap();
+    let mut native = VisualTestContext::from_window(handle.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    native.update(|window, _| {
+        let row = window.find("notification/17");
+        assert!(row.visible());
+        let label = row
+            .label()
+            .expect("the native button exposes its actual context");
+        assert!(label.contains("Alice mentioned you") && label.contains("launch checklist"));
+    });
+    let click = |native: &mut VisualTestContext, key: &str| {
+        native.update(|window, cx| {
+            let position = window.find(key.to_owned()).bounds().center();
+            window.dispatch_event(
+                gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+                    position,
+                    button: gpui_kit::MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
             );
-        }
-        let _ = app.__update(message);
-        iced::Task::none()
-    }
-    fn view(app: &Ducktape, _: iced::window::Id) -> iced::Element<'_, __DucktapeMessage> {
-        app.__view(app.console_win.expect("the test console"))
-    }
-    let location = Location::new(file!(), line!() as usize, 1, "notification controls");
-    let program = iced::daemon(boot, update, view);
-    let mut driver = Driver::new(
-        program,
-        Config::new("bell_controls").viewport(1120.0, 720.0),
-    );
-    driver.check_text("Alice mentioned you", None, false, location);
-    driver.check_text("Please review the launch checklist.", None, false, location);
-    let capture = driver.capture("notification_context", location);
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(capture.metadata_path).unwrap()).unwrap();
-    let targets = metadata["targets"]
-        .as_array()
-        .expect("captured native target tree");
-    let mark = targets
-        .iter()
-        .find_map(|target| {
-            target["id"]
-                .as_str()
-                .filter(|id| id.ends_with("/mark-bell-read"))
-        })
-        .expect("real mark-read control");
-    driver.click_with(mark, MouseButton::Left, 1, location);
-    assert!(
-        driver.state().bell_marking,
-        "the real button admits the read operation"
-    );
-    driver.dispatch(
-        __DucktapeMessage::BellMarked(
-            0,
-            "4".into(),
-            backend::BellDelta {
-                kind: "read".into(),
-                up_to_seq: 17,
-                ..Default::default()
-            },
-        ),
-        location,
-    );
-    assert_eq!(driver.state().bell_unread, 0);
-    assert!(driver.state().bell_items[0].read);
-    let row = targets
-        .iter()
-        .find_map(|target| {
-            target["id"]
-                .as_str()
-                .filter(|id| id.ends_with("/open-notification"))
-        })
-        .expect("real notification row");
-    driver.click_with(row, MouseButton::Left, 1, location);
-    assert!(!driver.state().bell_open, "the row click opens its source");
+            window.dispatch_event(
+                gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+                    position,
+                    button: gpui_kit::MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        });
+    };
+    click(&mut native, "bell-mark-read");
+    view.read_with(&native, |view, cx| {
+        assert!(
+            view.test_state(cx).bell_marking,
+            "real native button admits the read"
+        )
+    });
+    view.update(&mut native, |view, cx| {
+        view.test_dispatch(
+            __DucktapeMessage::BellMarked(
+                0,
+                "4".into(),
+                backend::BellDelta {
+                    kind: "read".into(),
+                    up_to_seq: 17,
+                    ..Default::default()
+                },
+            ),
+            cx,
+        )
+    });
+    view.read_with(&native, |view, cx| {
+        assert_eq!(view.test_state(cx).bell_unread, 0);
+        assert!(view.test_state(cx).bell_items[0].read);
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    click(&mut native, "notification/17");
+    view.read_with(&native, |view, cx| {
+        let app = view.test_state(cx);
+        assert!(!app.bell_open);
+        assert_eq!(app.active_channel, "general");
+        assert_eq!(
+            app.chat_land_seq, 42,
+            "navigate to source message, not inbox sequence 17"
+        );
+    });
 }

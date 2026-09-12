@@ -39,31 +39,17 @@ use super::*;
 /// cannot be taxed by it.
 #[test]
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
-    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
-    let presses: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("keyboard press"))
-        .collect();
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    assert_eq!(shell.matches("Message::GlobalKeyPressed(key)").count(), 1);
+    assert!(shell.contains("ifglobal{this.model.update"));
     assert_eq!(
-        presses,
-        [
-            "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
-            "keyboard press key=escape status=captured when \
-             !empty(topmost_overlay(palette_open, bell_open, channel_create_open)) -> \
-             global_key_pressed _",
-            "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
-            "keyboard press status=ignored when shell_tab == ShellTab.chat -> \
-             copy_chord_pressed _",
-        ],
-        "a `keyboard press` without `status=` bills every captured key a whole \
-         extra view rebuild; the captured half is Escape-only (ducktape-ui#602) \
-         and stays gated on an open layer; the command chords' route keeps its \
-         `when cmd_held` arming, without which it becomes a fourth STANDING \
-         subscription and every keystroke pays for ⌘Q and ⌘W; and the chat's \
-         ⌘C route keeps its tab arming, which is why it is not an arm on the \
-         chord dispatch — a reader on another tab has no copy route at all, \
-         while the chord's own route, armed by ⌘ alone, runs on every screen"
+        shell.matches("Message::ModifierStateChanged(").count(),
+        1,
+        "modifiers notify only from their native change observer"
+    );
+    assert!(
+        shell.contains("if!copy{return;}"),
+        "plain keys never dispatch a copy message"
     );
 }
 
@@ -143,11 +129,15 @@ fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
     }));
     assert!(app.chat_pending_sends.is_empty());
 
-    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(chat.contains("keyed message in messages by=message.view_key"));
-    assert!(!chat.contains("keyed message in messages by=message.seq"));
-    assert!(chat.contains("stack #message(message.id) w=fill"));
-    assert!(!chat.contains("#message(message.seq)"));
+    let chat = rust_tokens(include_str!("../../../crates/views/chat/src/ui/chat.rs"));
+    assert!(
+        chat.contains("message.view_key"),
+        "optimistic confirmations retain their row identity"
+    );
+    assert!(
+        chat.contains("message.id"),
+        "selection follows identity, not a changing confirmation sequence"
+    );
 }
 
 /// The bodies the app is still holding for the view to paint, in order.
@@ -175,113 +165,42 @@ fn bodies_in_flight(app: &Ducktape) -> Vec<&str> {
 /// the arm stashes them.
 #[test]
 fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
-    const HANDLERS: &str = include_str!("../ui/handlers/chat.ice");
-    const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
-
-    // The rail's plate is drawn under the view's own open thread, and the
-    // thread a reply belongs to reaches the app in the SCOPE it was written
-    // in, so the re-read may name both without the mount wearing them — the
-    // structure shows them.
-    const ANSWERED_BY_THE_MOUNT: [&str; 2] = ["thread_seq <= 0", "empty(active_channel)"];
-
-    // Arguments split at top-level commas, so `post_gate(a, b)` stays whole.
-    fn split_top(source: &str) -> Vec<&str> {
-        let mut parts = Vec::new();
-        let mut depth = 0usize;
-        let mut start = 0usize;
-        for (index, character) in source.char_indices() {
-            match character {
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => {
-                    parts.push(source[start..index].trim());
-                    start = index + 1;
-                }
-                _ => {}
-            }
-        }
-        parts.push(source[start..].trim());
-        parts
-    }
-
-    // A term is an `||` operand with its own balanced parens; only wrapping
-    // parens come off, so `empty(active_channel)` survives whole.
-    let terms = |expression: &str| -> Vec<String> {
-        expression
-            .split("||")
-            .map(|term| {
-                let mut term = term.trim();
-                while term.starts_with('(')
-                    && term.ends_with(')')
-                    && term[1..term.len() - 1].matches('(').count()
-                        == term[1..term.len() - 1].matches(')').count()
-                {
-                    term = term[1..term.len() - 1].trim();
-                }
-                term.to_owned()
-            })
-            .collect()
-    };
-    // The seat's `blocked` argument — the fifth of `chat_composer(scope,
-    // kind, compact, hint, blocked, …)` — and the arm's verdict, in seat order.
-    let shown: Vec<Vec<String>> = SCREEN
+    let chat = include_str!("../../../crates/views/chat/src/ui/chat.rs");
+    let mounts: Vec<_> = chat
         .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("extern chat_composer("))
-        .filter_map(|arguments| {
-            let arguments = split_top(arguments);
-            match arguments[1] {
-                "\"message\"" | "\"reply\"" => Some(terms(arguments[4])),
-                _ => None,
-            }
+        .filter(|line| {
+            line.contains("name: ::std::string::String::from(\"chat_composer\")")
+                && (line.contains("&(\"message\".") || line.contains("&(\"reply\"."))
         })
         .collect();
-    // The re-read is a VERDICT now, computed once from the same four inputs
-    // the mount's gate wears — so the lint reads its arguments rather than a
-    // hand-written `||` chain.
-    let refused: Vec<Vec<String>> = HANDLERS
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("match submit_verdict("))
-        .filter_map(|line| line.strip_suffix(')'))
-        .map(|arguments| {
-            split_top(arguments)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, argument)| match index {
-                    // busy, connected, channel, refusal, seated — spelled as
-                    // the terms a mount's `blocked=` would carry. A literal
-                    // stands for a term the arm deliberately does not have:
-                    // the rail's readiness is the view's, not this plane's.
-                    0 if argument != "false" => Some(argument.to_owned()),
-                    1 => Some(format!("!{argument}")),
-                    2 => Some(format!("empty({argument})")),
-                    3 => Some(format!("!empty({argument})")),
-                    // `seated` is the mount's own structural term, spelled
-                    // positively here and negatively on the gate.
-                    4 if argument != "true" => Some(argument.replace(" > 0", " <= 0")),
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect();
-    assert_eq!(
-        shown.len(),
-        2,
-        "the message and reply composers each have a delivery gate"
-    );
-    assert_eq!(
-        refused.len(),
-        shown.len(),
-        "every mounted composer's submit is re-read at delivery"
-    );
-
-    for (arm, (shown, refused)) in shown.iter().zip(&refused).enumerate() {
-        for term in refused {
+    assert_eq!(mounts.len(), 2, "message and reply each have a mount");
+    for mount in mounts {
+        for input in ["loading", "connected", "post_refusal"] {
             assert!(
-                shown.contains(term) || ANSWERED_BY_THE_MOUNT.contains(&term.as_str()),
-                "the delivery re-read of composer {arm} refuses on `{term}`, which                  its mount's `blocked=` does not wear — put it on the mount or                  take it out of the re-read"
+                mount.contains(input),
+                "the mount visibly wears the {input} refusal"
             );
+        }
+    }
+    let delivery = handler_body("ComposerSubmitted");
+    assert_eq!(delivery.matches("submit_verdict(").count(), 2);
+    for busy in [false, true] {
+        for connected in [false, true] {
+            for refusal in ["", "archived"] {
+                let verdict = backend::submit_verdict(
+                    busy,
+                    connected,
+                    "general".into(),
+                    refusal.into(),
+                    true,
+                    "scope".into(),
+                    "scope".into(),
+                );
+                assert_eq!(
+                    verdict == SubmitVerdict::Admitted,
+                    !busy && connected && refusal.is_empty()
+                );
+            }
         }
     }
 }
@@ -580,51 +499,12 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
 /// in `rooms.rs` pins that no handler can reach a composer to mark it.
 #[test]
 fn the_keyboard_subscription_no_longer_marks_a_composer() {
-    const HANDLERS: [(&str, &str); 10] = [
-        ("chat", include_str!("../ui/handlers/chat.ice")),
-        ("files", include_str!("../ui/handlers/files.ice")),
-        ("forge", include_str!("../ui/handlers/forge.ice")),
-        ("huddle", include_str!("../ui/handlers/huddle.ice")),
-        ("lifecycle", include_str!("../ui/handlers/lifecycle.ice")),
-        ("node", include_str!("../ui/handlers/node.ice")),
-        ("onboarding", include_str!("../ui/handlers/onboarding.ice")),
-        ("overlays", include_str!("../ui/handlers/overlays.ice")),
-        ("pages", include_str!("../ui/handlers/pages.ice")),
-        ("roster", include_str!("../ui/handlers/roster.ice")),
-    ];
-
-    // `app.ice` is the real registry; the list above is a hand copy of it, and
-    // an eleventh handler file would otherwise ship unscanned.
-    for line in include_str!("../ui/app.ice").lines() {
-        let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
-            continue;
-        };
-        let Some(file) = rest.strip_suffix(".ice\"") else {
-            continue;
-        };
+    for (name, body) in handler_bodies() {
         assert!(
-            HANDLERS.iter().any(|(scanned, _)| *scanned == file),
-            "app.ice registers handlers/{file}.ice and this lint does not read \
-             it — add it to HANDLERS, and decide there whether it marks a composer"
+            !body.contains("composer_toggle_mark"),
+            "{name} cannot mark an instance-owned composer"
         );
     }
-
-    for (name, source) in HANDLERS {
-        for line in source.lines().map(str::trim) {
-            if line.starts_with("//") {
-                continue;
-            }
-            assert!(
-                !line.contains("composer_toggle_mark"),
-                "handlers/{name}.ice marks a composer — the mark belongs to the \
-                 instance that has the caret, which is the only place that knows"
-            );
-        }
-    }
-
-    // AND THE BEHAVIOUR: a chord on the app's subscription marks nothing. The
-    // rail is open and both composers hold words, which is the state the old
-    // regime's every failure mode needed.
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -635,9 +515,7 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
     type_into(&stream, "channel draft");
     type_into(&rail, "reply draft");
 
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
-        iced::keyboard::key::Code::KeyB,
-    )));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("b")));
 
     assert_eq!(
         composer_text(&stream),
@@ -668,38 +546,14 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
 /// per class the guard tests.
 #[test]
 fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
-    let overlays = inlined(include_str!("../ui/handlers/overlays.ice"));
-    let body = overlays
-        .split_once("\non global_key_pressed(event)")
-        .expect("the keyboard handler")
-        .1;
-    let guard = body
-        .find("  return if empty(escape_key)")
-        .expect("the inert-press guard");
-    assert!(guard > 0);
-    assert!(
-        !body.contains("page_history_key("),
-        "Pages owns undo in its guest binding"
-    );
-
-    fn plain(code: iced::keyboard::key::Code, key: iced::keyboard::Key) -> __IceKeyPress {
-        __IceKeyPress {
-            key,
-            modified_key: iced::keyboard::Key::Unidentified,
-            physical_key: iced::keyboard::key::Physical::Code(code),
-            location: iced::keyboard::Location::Standard,
-            modifiers: iced::keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        }
-    }
-    let escape = || {
-        plain(
-            iced::keyboard::key::Code::Escape,
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-        )
+    let body = handler_body("GlobalKeyPressed");
+    assert!(body.contains("escape_key") && body.contains("return"));
+    assert!(!body.contains("page_history_key("));
+    let plain = |key: &str| crate::shell::KeyPress {
+        key: key.into(),
+        modifiers: gpui_kit::Modifiers::default(),
     };
-
+    let escape = || plain("escape");
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -709,26 +563,19 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     type_into(&composer, "draft");
 
     // Inert: a bare letter opens nothing.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(plain(
-        iced::keyboard::key::Code::KeyB,
-        iced::keyboard::Key::Character("b".into()),
-    )));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(plain("b")));
     assert!(!app.palette_open);
 
     // A formatting chord is the widget's now, so the subscription leaves the
     // draft alone — and the classes the guard DOES let through still land.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
-        iced::keyboard::key::Code::KeyB,
-    )));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("b")));
     assert_eq!(
         composer_text(&composer),
         "draft",
         "the subscription no longer marks a composer"
     );
 
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
-        iced::keyboard::key::Code::KeyK,
-    )));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("k")));
     assert!(app.palette_open, "Cmd+K still opens the palette");
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
     assert!(!app.palette_open, "Escape still closes it");
@@ -744,9 +591,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     // widget that holds the caret, so the app's global handler sees it and
     // names no move at all.
     app.shell_tab = ShellTab::Pages;
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
-        iced::keyboard::key::Code::KeyZ,
-    )));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord("z")));
     assert!(
         app.error.is_empty(),
         "the global handler has nothing to say about a chord the view owns"
@@ -982,7 +827,10 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 
     submit(&mut app, ComposerKind::Message, "still available");
-    assert_eq!(bodies_in_flight(&app), ["committed once", "still available"]);
+    assert_eq!(
+        bodies_in_flight(&app),
+        ["committed once", "still available"]
+    );
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 

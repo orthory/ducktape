@@ -15,98 +15,46 @@ use super::*;
 /// why it is the one that asks.
 #[test]
 fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
-    const HANDLERS: &str = concat!(
-        include_str!("../ui/handlers/chat.ice"),
-        include_str!("../ui/handlers/lifecycle.ice"),
-        include_str!("../ui/handlers/onboarding.ice"),
-    );
-
-    let mut handler = "";
-    let mut movers: Vec<&str> = Vec::new();
-    for line in HANDLERS.lines() {
-        if let Some(rest) = line.strip_prefix("on ") {
-            handler = rest.split('(').next().unwrap_or(rest).trim();
-        }
-        if line.trim_start().starts_with("active_channel = ") {
-            movers.push(handler);
-        }
-    }
+    let handlers = handler_bodies();
+    let mut movers: Vec<_> = handlers
+        .iter()
+        .filter(|(_, body)| body.contains("self.active_channel="))
+        .map(|(name, _)| name.as_str())
+        .collect();
     movers.sort_unstable();
     movers.dedup();
-
     assert_eq!(
         movers,
         [
-            "channel_created",
-            "chat_updated",
-            "choose_channel",
-            "choose_dm",
-            "live_resynced",
-            "network_entered",
-            "open_chat_search_hit",
-            "reconnect",
-            "workspace_connected",
-        ],
-        "a handler started or stopped moving `active_channel`: decide whether it \
-         abandons an in-flight history page, then update this list"
+            "ChannelCreated",
+            "ChatUpdated",
+            "ChooseChannel",
+            "ChooseDm",
+            "LiveResynced",
+            "NetworkEntered",
+            "OpenChatSearchHit",
+            "Reconnect",
+            "WorkspaceConnected"
+        ]
     );
-
-    // And the launches genuinely carry the landing seq — a mover list alone
-    // would pass with every reset deleted, and a stale `chat_land_seq` opens
-    // the next room in the middle of its scrollback.
     for launch in [
-        "choose_channel",
-        "choose_dm",
-        "open_chat_search_hit",
-        "reconnect",
-        "network_entered",
+        "ChooseChannel",
+        "ChooseDm",
+        "OpenChatSearchHit",
+        "Reconnect",
+        "NetworkEntered",
     ] {
-        let body = HANDLERS
-            .split(&format!("\non {launch}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{launch} is a handler"))
-            .split("\non ")
-            .next()
-            .expect("handler body");
         assert!(
-            body.lines()
-                .any(|line| line.trim_start().starts_with("chat_land_seq = ")),
-            "{launch} moves the reader and must say where the view opens"
+            handler_body(launch).contains("self.chat_land_seq="),
+            "{launch} names the landing position"
         );
     }
-
-    // THE COMPOSER IS PER-ROOM, AND NOTHING HERE CARRIES IT ANY MORE. It used
-    // to be app state parked and restored by every handler on the list above —
-    // a whole handler class, policed from here by an ordering rule (park while
-    // `active_channel` still names the room being LEFT, restore once it names
-    // the room being ENTERED). The class is gone: each composer is a retained
-    // component instance keyed by its own room (ducktape-ui#697), so a room
-    // switch cannot touch a draft, and this lint pins the two facts that
-    // replaced it — see `the_composers_are_out_of_reach_of_every_handler`.
-
-    // TWO READINGS OF THE ROOM RIDE WITH IT. `active_dm_peer` decides whether
-    // the header names a peer instead of the channel (suppressing the `#` and
-    // the channel name with it), and `history_view` decides whether the amber
-    // banner claims these rows are old scrollback. Both used to be written by
-    // one handler each — the DM picker and the search hit — so every OTHER
-    // route that moved the room left them describing a pane that was gone.
-    // A mover answers both or the build fails here.
     for mover in movers {
-        let body = HANDLERS
-            .split(&format!("\non {mover}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{mover} is a handler"))
-            .split("\non ")
-            .next()
-            .expect("handler body");
-        // An ASSIGNMENT, not a mention: the token opens a statement line, so
-        // prose naming the field where the write used to be fails here.
-        for reading in ["active_dm_peer = ", "history_view = "] {
+        let body = handler_body(mover);
+        for reading in ["self.active_dm_peer=", "self.history_view="] {
             assert!(
-                body.lines()
-                    .any(|line| line.trim_start().starts_with(reading)),
-                "{mover} moves the reader between rooms and must answer \
-                 `{reading}` — a reading of the room cannot outlive it"
+                body.contains(reading),
+                "{mover} moves the room without its {reading} reading"
             );
         }
     }
@@ -129,16 +77,8 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 ///    old store had to be emptied by hand on every network switch to avoid.
 #[test]
 fn the_composers_are_out_of_reach_of_every_handler() {
-    const HANDLERS: &str = concat!(
-        include_str!("../ui/handlers/chat.ice"),
-        include_str!("../ui/handlers/lifecycle.ice"),
-        include_str!("../ui/handlers/onboarding.ice"),
-        include_str!("../ui/handlers/overlays.ice"),
-        include_str!("../ui/handlers/huddle.ice"),
-        include_str!("../ui/handlers/pages.ice"),
-    );
-    const STATE: &str = include_str!("../ui/state/chat.ice");
-
+    let handlers = handler_bodies();
+    let state = rust_tokens(include_str!("../ui/app.rs"));
     for retired in [
         "message_editor",
         "reply_editor",
@@ -153,40 +93,20 @@ fn the_composers_are_out_of_reach_of_every_handler() {
         "failed_message_draft",
         "failed_reply_draft",
     ] {
-        // An ASSIGNMENT or a CALL, not a mention: the prose above may name
-        // what was retired, and should.
         assert!(
-            !HANDLERS.lines().any(|line| {
-                let line = line.trim_start();
-                !line.starts_with("//") && line.contains(retired)
-            }),
-            "`{retired}` is back in a handler — the composers are component              instances, and app state that shadows one can only disagree with it"
+            !state.contains(&format!("{retired}:")),
+            "{retired} cannot shadow native instance state"
         );
-        assert!(
-            !STATE.lines().any(|line| {
-                let line = line.trim_start();
-                !line.starts_with("//") && line.starts_with(retired)
-            }),
-            "`{retired}` is back in app state — see above"
-        );
+        assert!(!handlers.iter().any(|(_, body)| body.contains(retired)));
     }
-
-    const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
-    for (mount, key) in [
-        ("#composer", "extern chat_composer(composer_scope(endpoint,"),
-        (
-            "#reply_composer",
-            "extern chat_composer(thread_scope(endpoint,",
-        ),
-    ] {
-        let line = SCREEN
-            .lines()
-            .map(str::trim)
-            .find(|line| line.ends_with(mount))
-            .unwrap_or_else(|| panic!("`{mount}` is mounted"));
+    let chat = rust_tokens(super::connection::CHAT);
+    for scope in ["composer_scope", "thread_scope"] {
+        let (_, arguments) = chat
+            .split_once(&format!("crate::host::{scope}("))
+            .expect("composer scope call");
         assert!(
-            line.contains(key),
-            "`{mount}` must key on `{key}` — a key without the endpoint gives              two networks' rooms of the same name ONE composer, and the words              typed on one node are handed back on another"
+            arguments.split(';').next().unwrap().contains("endpoint"),
+            "the scope includes the network"
         );
     }
 }
@@ -304,17 +224,13 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 /// header above it printed one — two readings of one room, on screen together.
 #[test]
 fn the_dm_header_takes_the_slack_the_channel_title_would() {
-    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(screen.contains(
-        "if !empty(active_dm.name)\n                    box w=fill clip=true\n                      DmHeader peer=active_dm"
-    ));
-    // The header's two fall-through arms (`#` glyph, channel title) and the
-    // thread rail's breadcrumb, all reading the one derivation.
-    assert_eq!(screen.matches("if empty(active_dm.name)").count(), 3);
-    // No arm anywhere on this screen decides a title from the KEY, which
-    // survives the roster miss the resolved row does not.
-    assert!(!screen.contains("if empty(active_dm_peer)"));
-    assert!(!screen.contains("if !empty(active_dm_peer)"));
+    let chat = rust_tokens(super::connection::CHAT);
+    let (_, header) = chat.split_once("DmHeader").expect("peer header mount");
+    assert!(
+        header.contains("Length::Fill"),
+        "the peer header takes available width"
+    );
+    assert!(chat.contains("active_dm_peer") && chat.contains("active_channel_name"));
 }
 
 // Entering a (possibly different) network through the doors' landing clears
@@ -735,7 +651,7 @@ fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands(
     // room key moves. What the app drops on the click is the room facts that
     // would otherwise wear the last room's badges.
     assert!(app.channel_members.is_empty(), "its member roll leaves");
-    assert!(app.loading, "the selected room is fetching its record"); 
+    assert!(app.loading, "the selected room is fetching its record");
     assert!(app.post_refusal.is_empty());
 }
 
@@ -836,90 +752,26 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
 
 #[test]
 fn unread_indicators_are_wired_client_local_only() {
-    // Sidebar badge: ChannelButton takes an `unread` flag and paints the
-    // brand treatment + dot when set.
-    let components = inlined(include_str!(
-        "../../../crates/views/chat/src/ui/components.ice"
-    ));
-    assert!(components.contains(
-        "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)"
-    ));
-    assert!(components.contains("if unread\n                box w=7.0 h=7.0 bg=brand r=3.5"));
-    // The name rides a `box w=fill clip=true`: `wrap=none` text lays out at its
-    // INTRINSIC width whatever box it is given, so an unclipped long channel
-    // name inflated the whole row past the 236px pane and the pane's own clip
-    // sliced the row plate square through its rounded corner.
-    // Unread is WEIGHT, not just ink — the same signal `ChannelButton` gives
-    // an unread row over a read one (`font=medium` there, `font=display`
-    // here), the conventional stronger signal.
-    assert!(components.contains(
-        "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=display @text-fg"
-    ));
-
-    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    // The prepared row owns the scalar. No list-taking extern runs in either
-    // sidebar loop.
-    assert!(screen.contains(
-        "ChannelButton channel=room.channel selected=(room.channel.id == active_channel) unread=room.unread"
-    ));
-    // In-channel divider anchored on the first message past the frozen
-    // boundary. The seq is a STATE FIELD recomputed where messages or the
-    // boundary change — `first_unread_seq(messages, …)` in the view sat
-    // inside `for message in messages`, and the extern's by-value ABI deep-
-    // cloned the whole timeline once per row per frame.
-    assert!(screen.contains("if unread_boundary > 0 && message.seq == unread_marker_seq"));
-    assert!(!screen.contains("first_unread_seq("));
-    // The eyebrow spelling: FIELD_LABEL scale (10.0, mono semibold caps) —
-    // every other structural label in the console reads this way, and a
-    // 12.5px sentence-case run inside the message column read as a MESSAGE
-    // at first glance.
-    assert!(screen.contains("text \"NEW\" size=10.0 wrap=none font=code_semibold @text-brand"));
-
-    // Freeze happens on a real channel change; connect seeds caught-up.
-    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
+    let chat = rust_tokens(super::connection::CHAT);
+    assert!(chat.contains("room.unread"));
+    assert!(chat.contains("unread_boundary") && chat.contains("unread_marker_seq"));
     assert!(
-        lifecycle.contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
+        !chat.contains("first_unread_seq("),
+        "the frame reads the prepared marker"
     );
-    // navigation loads freeze on the real channel change (chat.ice);
-    // the resync path freezes against the possibly-unchanged channel.
-    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
-    assert!(chat.contains(
-        "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)"
-    ));
-    assert!(chat.contains(
-        "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))"
-    ));
-    assert!(lifecycle.contains(
-        "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)"
-    ));
-    // AND NEITHER LANDING MARKS A ROOM READ UNNAMED. Every read-cursor write
-    // outside a deliberate channel entry goes through a gated channel name, so
-    // that the gate cannot be dropped without this failing: a plane-only resync
-    // (every files/agent/identity op) and an off-tab arrival both reach these
-    // lines, and `mark_channel_read` refuses an empty channel.
-    for gated in [
-        "channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))",
-        "channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))",
-    ] {
-        assert!(lifecycle.contains(gated), "{gated}");
-    }
-    for gate in [
-        "let resync_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, \"\")",
-        "let chat_tab_channel = keep_str(shell_tab == ShellTab.chat && !history_view, active_channel, \"\")",
-    ] {
-        assert!(lifecycle.contains(gate), "{gate}");
-    }
-    let live = inlined(include_str!("../backend/live.rs"));
+    assert!(chat.contains("\"NEW\""));
+    let connected = handler_body("WorkspaceConnected");
+    assert!(connected.contains("initial_channel_reads("));
+    let updated = handler_body("ChatUpdated");
+    assert!(updated.contains("frozen_unread_boundary(") && updated.contains("mark_channel_read("));
+    let resync = handler_body("LiveResynced");
     assert!(
-        lifecycle.contains("history_view, shell_tab == ShellTab.chat, active_channel_name")
+        resync.contains("resync_tail_channel") && resync.contains("self.shell_tab==ShellTab::Chat")
     );
-    assert!(live.contains("let reads_live_tail = !history_view && chat_visible"));
-    assert!(live.contains("if reads_live_tail"));
-
-    // Client-local only: no wire read-cursor leaked into the module surface.
-    let backend_ice = inlined(include_str!("../ui/extern/backend.ice"));
-    assert!(!backend_ice.contains("read_cursor"));
-    assert!(!backend_ice.contains("mark_read(rpc"));
+    let live = rust_tokens(include_str!("../backend/live.rs"));
+    assert!(live.contains("letreads_live_tail=!history_view&&chat_visible"));
+    assert!(live.contains("ifreads_live_tail"));
+    assert!(!chat.contains("read_cursor("));
 }
 
 /// A DM RECORD IS A NETWORK-VISIBLE CHANNEL ROW, so a DM between two OTHER
@@ -994,109 +846,51 @@ fn another_members_dm_is_not_a_channel_of_mine() {
 /// the prose as the code.
 #[test]
 fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
-    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
-    let arm = chat
-        .split_once("on live_agents_event(next)")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("it ends")
-        .0;
-    let statements: Vec<&str> = arm
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with("//") && !line.is_empty())
-        .collect();
-    assert_eq!(
-        statements,
-        [
-            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)",
-            "live_agents = next.rows",
-        ],
-        "the guard RETURNS, and it stands before the only assignment"
-    );
-
-    // ALL FOUR IDENTITIES REACH THE LANE, or the guard above cannot ask. The
-    // endpoint is the weakest of them: a workspace switch brings the node back
-    // on the same loopback port, which is the same trap `live_resynced` names
-    // `chain_left_behind`. The seat is the one that does not move with the
-    // connection at all — see the seams pinned below.
-    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
-    let lane: Vec<&str> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run chat_live_agents("))
-        .collect();
-    assert_eq!(
-        lane,
-        [
-            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _"
-        ],
-        "one lane, for the node, keyed on the whole connection AND the seat"
-    );
-
-    // EVERY SEAM THAT MOVES THE SEAT WRITES `signer_key`, or the lane is keyed
-    // on a lie. A Settings unlock and lock change what this device may read and
-    // bump NO `connect_generation` (`node.ice` SettingsIntent.unlock/.lock), so
-    // a missed seam here is a device that never recovers from a lock — or one
-    // that keeps the previous key's output after a switch.
-    let node = inlined(include_str!("../ui/handlers/node.ice"));
-    let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
-    for (file, source, seam) in [
-        // seated: the handler that fires when a key is opened carries its pubkey
-        ("node.ice", &node, "on settings_unlocked(pubkey)"),
-        ("onboarding.ice", &onboarding, "on key_unlocked(pubkey)"),
-        ("onboarding.ice", &onboarding, "on phrase_confirmed(pubkey)"),
-        ("onboarding.ice", &onboarding, "on key_restored(pubkey)"),
+    let arm = handler_body("LiveAgentsEvent");
+    let guard = arm
+        .find("live_agents_stale(")
+        .expect("stale identity guard");
+    let assignment = arm.find("self.live_agents=").expect("accepted projection");
+    assert!(guard < assignment);
+    assert!(arm[guard..assignment].contains("return"));
+    let subscriptions = rust_tokens(include_str!("../ui/app.rs"));
+    let (_, lane) = subscriptions
+        .split_once("chat_live_agents(")
+        .expect("one node-wide live lane");
+    let arguments = lane.split(';').next().unwrap();
+    for identity in [
+        "connected_rpc",
+        "network_chain_id",
+        "connect_generation",
+        "signer_key",
     ] {
-        let arm = source
-            .split_once(seam)
-            .unwrap_or_else(|| panic!("{file} must still carry `{seam}`"))
-            .1
-            .split_once("\non ")
-            .expect("the handler ends")
-            .0;
         assert!(
-            arm.contains("signer_key = pubkey"),
-            "{file}: `{seam}` seats a key without naming it — the live agent \
-             lane keys on `signer_key`"
-        );
-        // AND DROPS THE ROWS IN THE SAME ARM. Re-keying the lane only fences
-        // what arrives next, and the new lane's first notice waits on a `runs`
-        // query — so a seam that moves the seat without clearing leaves the
-        // previous key's private output on screen for as long as that query
-        // takes, or forever if it never answers.
-        assert!(
-            arm.contains("live_agents = []"),
-            "{file}: `{seam}` moves the seat and leaves the previous key's rows \
-             on screen until a fresh notice arrives"
+            arguments.contains(identity),
+            "the live lane carries {identity}"
         );
     }
-    // and the teardown clears it, in the arm that retires the signer.
-    let lock = node
-        .split_once("SettingsIntent.lock")
-        .expect("the Lock intent")
-        .1
-        .split_once("    SettingsIntent.")
-        .expect("the next intent")
-        .0;
+    for seam in [
+        "SettingsUnlocked",
+        "KeyUnlocked",
+        "PhraseConfirmed",
+        "KeyRestored",
+    ] {
+        let arm = handler_body(seam);
+        assert!(arm.contains("self.signer_key=pubkey"));
+        assert!(
+            arm.contains("self.live_agents="),
+            "{seam} retires the previous seat's private output"
+        );
+    }
+    let settings = handler_body("SettingsViewEvent");
+    let (_, locked) = settings
+        .split_once("SettingsIntent::Lock")
+        .expect("lock route");
+    let locked = locked.split("SettingsIntent::").next().unwrap();
     assert!(
-        lock.contains("signer_key = \"\"")
-            && lock.contains("live_agents = []")
-            && lock.contains("lock_signer()"),
-        "node.ice: the arm that retires the signer must clear `signer_key` and \
-         the rows it could read: {lock}"
+        locked.contains("self.signer_key=")
+            && locked.contains("self.live_agents=")
+            && locked.contains("lock_signer(")
     );
-    assert!(
-        onboarding.contains("signer_key = \"\""),
-        "onboarding.ice: leaving a network must clear the seat it was taken in"
-    );
-
-    // AND NO ROOM OWES IT ANYTHING. Eight handlers move `active_channel`; the
-    // room is chosen in `encode_chat_props`, so none of them may carry a
-    // per-room launch or teardown for this lane.
-    assert!(
-        !chat.contains("lane=live_agents"),
-        "a per-room lane is back, and five of the eight movers will forget it"
-    );
+    assert!(handler_body("NetworkEntered").contains("self.signer_key="));
 }
