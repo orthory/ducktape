@@ -290,8 +290,10 @@ fn canary_follows_a_live_node() {
     let draft = "retained-live-draft-오리";
     let (key, _) = input("Search messages");
     cx.update_window(window.into(), |_, window, cx| {
-        window.click(key, cx);
+        window.click(key.clone(), cx);
         window.input(draft, cx);
+        window.press("shift-left", cx);
+        window.press("shift-left", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -302,6 +304,20 @@ fn canary_follows_a_live_node() {
         draft,
         "native typing reaches guest state"
     );
+    let mut expected_draft = draft.to_owned();
+    let mut expected_presentation = cx
+        .update_window(window.into(), |_, window, cx| {
+            crate::module_view::canary::input_presentation(entity.read(cx), &key, window, cx)
+                .expect("focused native Chat field")
+        })
+        .unwrap();
+    assert_eq!(expected_presentation.0, draft);
+    assert_eq!(expected_presentation.1, draft.len() - "오리".len());
+    assert_eq!(
+        expected_presentation.2,
+        draft.len() - "오리".len()..draft.len()
+    );
+    assert!(expected_presentation.3, "native Search field is focused");
     let mut hash = seated_hash("chat").expect("A deployed hash");
     assert!(
         !texts("chat")
@@ -309,7 +325,8 @@ fn canary_follows_a_live_node() {
             .any(|text| text.contains(marker("chat")))
     );
     let mut log = format!(
-        "phase=A height={height} native_entity={identity:?} hash={hash:?} draft_preserved=true\n"
+        "phase=A height={height} native_entity={identity:?} hash={hash:?} draft_preserved=true focus_preserved=true selection={:?}\n",
+        expected_presentation.2
     );
     std::fs::write(out.join("live-canary.log"), &log).unwrap();
     for (variant, expected_state) in [("B", "Swapped"), ("C", "Failed")] {
@@ -382,8 +399,23 @@ fn canary_follows_a_live_node() {
             assert_eq!(entity.entity_id(), identity, "native view was not replaced");
             assert_eq!(
                 input("Search messages").1,
-                draft,
+                expected_draft,
                 "snapshot must preserve typed guest draft"
+            );
+            let presentation = cx
+                .update_window(window.into(), |_, window, cx| {
+                    crate::module_view::canary::input_presentation(
+                        entity.read(cx),
+                        &key,
+                        window,
+                        cx,
+                    )
+                    .expect("retained native Chat field")
+                })
+                .unwrap();
+            assert_eq!(
+                presentation, expected_presentation,
+                "WASM replacement preserves native focus, Unicode selection, and caret"
             );
             assert!(
                 texts("chat")
@@ -396,11 +428,37 @@ fn canary_follows_a_live_node() {
                     assert_ne!(hash, expected_hash);
                     assert_eq!(seated_hash("chat"), Some(expected_hash));
                     hash = expected_hash;
+                    // Editing B proves the replacement field targets its fresh
+                    // guest handler table, not A's retired callback identities.
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.input("한글", cx);
+                        window.press("shift-left", cx);
+                        window.press("shift-left", cx);
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                    expected_draft = draft.replace("오리", "한글");
+                    assert_eq!(input("Search messages").1, expected_draft);
+                    expected_presentation.0 = expected_draft.clone();
+                    let presentation = cx
+                        .update_window(window.into(), |_, window, cx| {
+                            crate::module_view::canary::input_presentation(
+                                entity.read(cx),
+                                &key,
+                                window,
+                                cx,
+                            )
+                            .expect("B input uses fresh native handlers")
+                        })
+                        .unwrap();
+                    assert_eq!(presentation, expected_presentation);
                 }
                 "C" => assert_eq!(seated_hash("chat"), Some(hash), "failed C preserves B"),
                 _ => unreachable!(),
             }
-            log.push_str(&format!("phase={variant} height={height} native_entity={identity:?} seated_hash={hash:?} draft_preserved=true\n"));
+            log.push_str(&format!("phase={variant} height={height} native_entity={identity:?} seated_hash={hash:?} draft_preserved=true focus_preserved=true selection={:?} fresh_handler_verified=true\n", expected_presentation.2));
             std::fs::write(
                 out.join(format!("{variant}.wire")),
                 ui_lang_wire::encode(&frame("chat")),
