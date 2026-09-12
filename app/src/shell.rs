@@ -327,21 +327,9 @@ impl Desktop {
             });
             opened_view = Some(view.downgrade());
             let closing = view.downgrade();
-            let closing_model = model.clone();
             window.on_window_should_close(cx, move |_, cx| {
                 let _ = closing.update(cx, |this, cx| {
                     this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
-                });
-                let model = closing_model.clone();
-                cx.defer(move |cx| {
-                    model.update(cx, |model, cx| {
-                        let was_registered = model.windows.remove(&key).is_some();
-                        if !was_registered {
-                            return;
-                        }
-                        model.views.remove(&key);
-                        model.dispatch(Message::WindowWasClosed(key), cx);
-                    });
                 });
                 true
             });
@@ -1536,6 +1524,8 @@ pub(crate) fn run() {
         .detach();
         let weak = desktop.downgrade();
         cx.on_window_closed(move |cx, id| {
+            let weak = weak.clone();
+            cx.defer(move |cx| {
             let _ = weak.update(cx, |desktop, cx| {
                 let key = desktop
                     .windows
@@ -1547,6 +1537,7 @@ pub(crate) fn run() {
                 desktop.windows.remove(&key);
                 desktop.views.remove(&key);
                 desktop.dispatch(Message::WindowWasClosed(key), cx);
+            });
             });
         })
         .detach();
