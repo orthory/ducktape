@@ -206,6 +206,9 @@ fn the_canary_captures_every_transition_of_a_deployment() {
 }
 /// A live chain is supplied by a disposable fixture, never booted or restarted
 /// by this test. The deployment CLI changes only its Chat view artifact.
+/// B keeps A's snapshot schema and changes the visible CHANNELS marker. C
+/// keeps the manifest/ABI valid but refuses restore: invalid static metadata
+/// is rejected by node readiness and never reaches the desktop replacement.
 #[test]
 #[ignore = "needs a disposable live node, node CLI, and A/B/C view artifacts"]
 fn canary_follows_a_live_node() {
