@@ -1234,6 +1234,7 @@ impl ViewTree {
         use wire::Node;
         match node {
             Node::Text {
+                key,
                 content,
                 size,
                 color,
@@ -1244,7 +1245,7 @@ impl ViewTree {
                 ..
             } => {
                 let mut element = text_options(
-                    dimensions(div(), *width, options.height),
+                    dimensions(div().min_w_0().max_w_full(), *width, options.height),
                     *font,
                     *align_x,
                     options,
@@ -1256,6 +1257,12 @@ impl ViewTree {
                 if let Some(color) = color {
                     element = element.text_color(rgba(*color));
                 }
+                #[cfg(test)]
+                {
+                    element = element.relative().child(self.measure(key, cx));
+                }
+                #[cfg(not(test))]
+                let _ = key;
                 element.into_any_element()
             }
             Node::Space { width, height } => dimensions(div(), *width, *height).into_any_element(),
@@ -3565,7 +3572,9 @@ fn text_options(
         };
     }
     if options.wrapping == Some(wire::Wrapping::None) {
-        element = element.whitespace_nowrap();
+        // A non-wrapping label still owns only its allocated box. In a row,
+        // painting the full intrinsic line would cover the following fields.
+        element = element.whitespace_nowrap().overflow_hidden();
     }
     element
 }
@@ -4043,6 +4052,102 @@ fn append_arc_to(
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn text_respects_parent_width_and_keeps_nowrap_inside_its_box(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let text = |key: &str, content: String, width, wrapping| wire::Node::Text {
+            key: key.into(),
+            content,
+            width,
+            size: Some(14.),
+            color: None,
+            font: Default::default(),
+            align_x: None,
+            options: wire::TextOptions {
+                wrapping,
+                ..Default::default()
+            },
+        };
+        let paragraph = text(
+            "paragraph",
+            "A long description with words that must wrap within the available parent width. "
+                .repeat(8),
+            None,
+            None,
+        );
+        let row = wire::Node::Linear {
+            key: "row".into(),
+            axis: wire::Axis::Row,
+            spacing: Some(8.),
+            padding: None,
+            width: Some(wire::Length::Fill),
+            height: None,
+            background: None,
+            border: None,
+            align: None,
+            max_width: None,
+            clip: false,
+            wrap: None,
+            children: vec![
+                text(
+                    "hash",
+                    "0123456789abcdef".repeat(4),
+                    Some(wire::Length::Fill),
+                    Some(wire::Wrapping::None),
+                ),
+                text(
+                    "count",
+                    "12 ops".into(),
+                    Some(wire::Length::Fixed(60.)),
+                    Some(wire::Wrapping::None),
+                ),
+            ],
+        };
+        let root = wire::Node::Linear {
+            key: "column".into(),
+            axis: wire::Axis::Column,
+            spacing: Some(8.),
+            padding: None,
+            width: Some(wire::Length::Fill),
+            height: None,
+            background: None,
+            border: None,
+            align: None,
+            max_width: Some(620.),
+            clip: false,
+            wrap: None,
+            children: vec![paragraph, row],
+        };
+        let window = cx.open_window(size(px(800.), px(500.)), |_, _| ViewTree::new(root));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        tree.read_with(&native, |tree, _| {
+            let paragraph = tree.measured_bounds("paragraph").unwrap();
+            let hash = tree.measured_bounds("hash").unwrap();
+            let count = tree.measured_bounds("count").unwrap();
+            assert!(paragraph.size.width <= px(620.));
+            assert!(
+                paragraph.size.height > hash.size.height,
+                "default wrapping creates multiple lines"
+            );
+            assert!(hash.right() <= count.left());
+            assert!(count.right() <= px(620.));
+        });
+        let mut nowrap = text_options(
+            div(),
+            Default::default(),
+            None,
+            &wire::TextOptions {
+                wrapping: Some(wire::Wrapping::None),
+                ..Default::default()
+            },
+        );
+        assert_eq!(nowrap.style().overflow.x, Some(gpui_kit::Overflow::Hidden));
+    }
 
     #[gpui_kit::test]
     fn sensor_preserves_linear_fill_bounds(cx: &mut gpui_kit::TestAppContext) {
