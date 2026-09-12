@@ -110,8 +110,8 @@ view declares `chat_composer` as a host surface per room and per thread,
 and the app paints its rich composer there (`src/composer_surface.rs`),
 keeps every box's words for the life of the process, and hears a submit as
 the view's `composer` intent — the words themselves never cross the wire.
-The views workspace pins the same `ducktape-ui` rev as this crate; `make views`
-refuses when they differ.
+The views workspace and desktop crate pin the same `ducktape-ui` revision for
+their shared wire vocabulary.
 
 ## Release build (macOS: signed and notarized)
 
@@ -178,33 +178,16 @@ The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 
 ## Visual language
 
-The canonical shared UI uses warm ink-on-paper neutrals and a sparse
-terracotta brand role. Content stays opaque; functional chrome uses three
-translucent tiers over the native-blurred window (thin rail/sidebar, regular
-titlebar/popovers, sheet modals). Authored wire faces carry the opacity roles;
-the native renderer owns platform blur. Depth comes from surface steps and warm shadows.
+The native shell uses gpui-kit's light and dark semantic themes over an opaque
+window. Rectangular navigation and bordered sections separate the permanent
+rail, workspace header and content. Selected navigation uses the native primary
+button variant; muted surfaces and text distinguish context from actions, and
+the destructive color identifies errors. These roles follow the active theme
+rather than a separate fixed shell palette.
 
-| Token | Value | Use |
-| --- | --- | --- |
-| `bg` | `#fdfdfb` | the app canvas |
-| `surface` | `#ffffff` | cards and controls |
-| `muted_bg` | `#f6f5f2` | recessed wells and quiet regions |
-| `sidebar` | `#fbfbf9` | opaque utility bars inside content |
-| `elevated` | `#f3f2ef` | panels one notch above the canvas |
-| `row_hover` | `#f8f7f3` | ordinary row hover |
-| `fg` / `muted` | `#2c2b27` / `#6b6962` | warm ink and its secondary |
-| `primary` | `#26251f` | neutral primary actions and focus |
-| `brand` | `#a05a3c` | mentions, unread state, and action links |
-| `glass_thin` | `rgba(253,252,250,.50)` | rail and sidebar |
-| `glass_regular` | `rgba(253,252,250,.62)` | titlebar and floating chrome |
-| `glass_sheet` | `rgba(253,252,250,.86)` | modal and sheet surfaces |
-
-- Brand is sparse; danger, success, and warning colors are reserved for status.
-- Selected navigation uses neutral `#ecebe6`; brand is for mentions, unread
-  state, and action links.
-- Hover changes fill, border, and foreground only; it never changes geometry.
-- Reveal contextual row actions on hover and keep them visible while selected.
-- Authored view faces carry their light and dark colors across the WASM boundary.
+WASM views retain their authored light and dark faces across the wire boundary.
+The renderer maps their layout and presentation onto native controls; their
+module-specific styling is separate from the shell's theme tokens.
 
 ## Design system
 
@@ -215,11 +198,9 @@ layout and editor presentation through the shared wire vocabulary. The local
 - Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
   labels, and badges).
   The files are embedded from `crates/views/support/design/assets/fonts/` at build time.
-- Scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
+- Guest type scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
   body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field
   label · 9.5 navigation · 9 badge.
-- Frame: 1280×800 default, 40px titlebar, 74px permanent rail, a 236px default
-  module sidebar, flexible content, and reader-sized split panes where present.
-- Depth: cards stay paper-flat; floating bars/popovers use `0 3px 12px /.13`,
-  brand tiles/toasts use `0 6px 18px /.22`, and modal sheets use
-  `0 24px 60px /.30` with warm `#282622` ink.
+- Console frame: 1280×800 default, a 184px permanent rail and a 72px workspace
+  header. Content fills the remaining space; individual WASM views own their
+  sidebars and split panes.

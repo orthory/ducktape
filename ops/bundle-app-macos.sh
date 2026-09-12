@@ -14,7 +14,7 @@ case "$notary_count" in
   *) echo "set all three DUCKTAPE_NOTARY_* credentials or none" >&2; exit 1 ;;
 esac
 cd "$repo"
-"${CARGO:-cargo}" build --release -p ducktape-app
+"${CARGO:-cargo}" build --locked --release -p ducktape-app
 version=$(awk '/^\[workspace.package\]/{ package=1; next } /^\[/{ package=0 } package && /^version *=/{ gsub(/"/, "", $3); print $3; exit }' Cargo.toml)
 [[ -n "$version" ]] || { echo "workspace package version missing" >&2; exit 1; }
 mkdir -p "$repo/target/app-bundle"

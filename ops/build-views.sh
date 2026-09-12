@@ -30,7 +30,7 @@ done
 (("${#packages[@]}")) || { echo "no view packages selected" >&2; exit 1; }
 arguments=()
 for package in "${packages[@]}"; do arguments+=(-p "$package"); done
-"${CARGO:-cargo}" build --manifest-path crates/views/Cargo.toml --release \
+"${CARGO:-cargo}" build --locked --manifest-path crates/views/Cargo.toml --release \
   --target wasm32-unknown-unknown "${arguments[@]}"
 mkdir -p "$repo/target/views"
 for package in "${packages[@]}"; do
