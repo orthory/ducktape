@@ -1,12 +1,11 @@
-//! Module-owned views. A screen that ships as an `ice:view` component — an
-//! Ice application compiled for the `tree` target (`crates/views`) — is
+//! Module-owned views. A Rust WASM screen built from `crates/views` is
 //! loaded either from the deployed artifact of the module it belongs to
 //! (`backend::view_source`: the registry's ACTIVE code hash, fetched and
 //! verified, never a desktop substitute) or, for the desktop's own views,
 //! FROM A FILE beside the binary (`make views` stages
 //! `target/views/<module>_view.wasm`; `DUCKTAPE_VIEWS_DIR` overrides); it is
-//! ticked inside a fuel and time budget, and drawn with the runtime's tree
-//! renderer as one widget in the tab that used to hold the native screen.
+//! ticked inside a fuel and time budget, and presented through native
+//! gpui-kit controls in its tab.
 //!
 //! The boundary is the screen component's own contract. Its props go in as
 //! JSON, one item per change, on the guest's `<module>.props` subscription;
@@ -201,7 +200,7 @@ pub fn event_num(event: &ModuleViewEvent, field: &str) -> f64 {
 /// one intent that comes back is `copy` — the clipboard is an OS door.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the session's facts one by one"
+    reason = "the caller supplies each session property explicitly"
 )]
 pub fn node_view(
     dark: bool,
@@ -267,7 +266,7 @@ pub fn explorer_view(dark: bool, connected: bool, head: i64, sync_line: &str) ->
 /// passkey, unlocking and locking the seat are operations the kernel signs.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the session's facts one by one"
+    reason = "the caller supplies each session property explicitly"
 )]
 pub fn settings_view(
     dark: bool,
@@ -329,8 +328,7 @@ pub fn settings_view(
     )
 }
 
-/// Test seam: Ice reads extern structs but cannot construct one, and a scenario
-/// that presses a view's control has no view to press it in. The `kind` is the
+/// Construct an intent without mounting a view. The `kind` is the
 /// same string the guest emits, so a scenario names the act and not an enum the
 /// intent mapping could drift from.
 pub fn view_event(kind: String, detail: String) -> ModuleViewEvent {
@@ -380,7 +378,7 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
 /// `link_tick` so the same address twice still lands.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the session's facts one by one"
+    reason = "the caller supplies each session property explicitly"
 )]
 pub fn forge_view(
     dark: bool,
@@ -508,7 +506,7 @@ struct ChatProps<'a> {
 /// submit arrives as `composer`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
+    reason = "the caller supplies each screen property explicitly"
 )]
 pub fn chat_view(
     dark: bool,
@@ -1581,7 +1579,7 @@ struct Guest {
     streams: Vec<(u64, kernel::NodeStream)>,
     /// The guest's `clock.ticks` subscriptions: the period it asked for and
     /// the instant its next item is due. A module has no clock of its own,
-    /// so an Ice `every` in a view is this list — driven from the window
+    /// so periodic guest subscriptions use this list — driven from the window
     /// thread's own redraw, never from a thread that would have to wake it.
     clocks: Vec<kernel::Clock>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
@@ -2105,8 +2103,7 @@ impl Guest {
         let engine = engine();
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
-        // instances — the app, the stub adapters `cargo ice bundle` gave it,
-        // the bindings' shims — and one memory.
+        // instances — the guest and its component bindings — and one memory.
         let limits = StoreLimitsBuilder::new()
             .memory_size(MEMORY_LIMIT)
             .memories(1)
@@ -3242,7 +3239,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A MODULE HAS NO CLOCK, so an Ice `every` in a view is the kernel's:
+    /// A module has no clock, so periodic guest subscriptions use the kernel's:
     /// one item per period, on a deadline the window thread keeps. Driven
     /// through the real guest and the real redraw — the instant is the
     /// argument, so the rule is decided rather than waited for, and the
@@ -3965,7 +3962,7 @@ pub(crate) mod tests {
     /// `rpc.blocks` the kernel refuses here (no node), so the refusal is what
     /// the screen shows. A block on that plane makes it read again. What the
     /// window folds to is pinned in the view's own tests, which drive the same
-    /// compiled Ice through the wire.
+    /// compiled Rust guest through the wire.
     #[test]
     fn the_staged_explorer_view_boots_and_reads_its_window_through_the_kernel() {
         let Some(staged) = staged("explorer") else {

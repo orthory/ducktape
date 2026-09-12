@@ -140,6 +140,35 @@ fn native_sources_hold_to_the_design_system() {
     }
 }
 #[test]
+fn app_and_wasm_guests_do_not_resolve_the_ice_toolchain_or_iced_runtime() {
+    for lockfile in [
+        include_str!("../../../Cargo.lock"),
+        include_str!("../../../crates/views/Cargo.lock"),
+    ] {
+        for line in lockfile.lines() {
+            let Some(name) = line
+                .strip_prefix("name = \"")
+                .and_then(|name| name.strip_suffix('"'))
+            else {
+                continue;
+            };
+            let old_renderer = name == "iced" || name.starts_with("iced_");
+            let old_toolchain = matches!(
+                name,
+                "ui-lang-runtime"
+                    | "ui-lang-components"
+                    | "ui-lang-compiler"
+                    | "ui-lang-core"
+                    | "ui-lang-guest"
+            );
+            assert!(
+                !old_renderer && !old_toolchain,
+                "removed dependency: {name}"
+            );
+        }
+    }
+}
+#[test]
 fn every_current_row_marker_rests_on_one_selection_token() {
     let tree = rust_tokens(include_str!("../view_tree.rs"));
     assert!(tree.contains("wire::Face"));
