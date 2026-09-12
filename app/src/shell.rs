@@ -23,6 +23,12 @@ pub(crate) enum WindowKind {
     Huddle,
 }
 
+#[derive(Clone)]
+pub(crate) struct KeyPress {
+    pub(crate) key: String,
+    pub(crate) modifiers: gpui_kit::Modifiers,
+}
+
 pub(crate) enum Command {
     Open { key: WindowKey, kind: WindowKind, reply: oneshot::Sender<WindowKey> },
     Close(WindowKey),
@@ -118,6 +124,7 @@ struct Desktop {
     state: Ducktape,
     windows: BTreeMap<WindowKey, gpui_kit::AnyWindowHandle>,
     streams: HashMap<u64, gpui_kit::Task<()>>,
+    pending_focus: Option<String>,
 }
 
 impl Desktop {
@@ -183,7 +190,13 @@ impl Desktop {
         match cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| {
                 let observer = cx.observe(&model, |_, _, cx| cx.notify());
-                DesktopWindow { model, kind, module: None, route: None, inputs: HashMap::new(), input_step: None, qr: None, _observer: observer }
+                let activation = cx.observe_window_activation(window, move |this: &mut DesktopWindow, window, cx| {
+                    let message = if window.is_window_active() { Message::WindowFocused(key) } else { Message::WindowUnfocused(key) };
+                    this.model.update(cx, |model, cx| model.dispatch(message, cx));
+                });
+                let focus = cx.focus_handle();
+                focus.focus(window, cx);
+                DesktopWindow { model, kind, module: None, route: None, inputs: HashMap::new(), input_step: None, qr: None, focus, _activation: activation, _observer: observer }
             });
             cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
         }) {
@@ -220,7 +233,8 @@ impl Desktop {
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
     }
 
-    fn focus_control(&mut self, _key: String, cx: &mut Context<Self>) {
+    fn focus_control(&mut self, key: String, cx: &mut Context<Self>) {
+        self.pending_focus = Some(key);
         cx.notify();
     }
 
@@ -235,6 +249,8 @@ struct DesktopWindow {
     inputs: HashMap<&'static str, NativeInput>,
     input_step: Option<crate::HubStep>,
     qr: Option<(String, Entity<crate::view_tree::ViewTree>)>,
+    focus: gpui_kit::FocusHandle,
+    _activation: gpui_kit::Subscription,
     _observer: gpui_kit::Subscription,
 }
 
@@ -450,11 +466,50 @@ impl DesktopWindow {
 
 impl Render for DesktopWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.kind {
+        use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
+        let content = match self.kind {
             WindowKind::Console => self.console(cx),
             WindowKind::Onboarding => self.onboarding(window, cx),
             WindowKind::Huddle => self.huddle(cx),
+        };
+        let pending_focus = self.model.read(cx).pending_focus.clone();
+        if let Some(key) = pending_focus {
+            let local_key = key.rsplit('/').next().unwrap_or(&key);
+            if let Some(input) = self.inputs.get(local_key) {
+                input.state.update(cx, |state, cx| state.focus(window, cx));
+                self.model.update(cx, |model, _| model.pending_focus = None);
+            }
         }
+        gpui_kit::div().id("desktop-root").size_full().track_focus(&self.focus)
+            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let key = KeyPress { key: event.keystroke.key.clone(), modifiers: event.keystroke.modifiers };
+                let state = &this.model.read(cx).state;
+                let chord = crate::backend::command_chord(key.key.clone(), key.modifiers);
+                let palette = crate::backend::palette_key_action(key.key.clone(), key.modifiers, state.palette_open);
+                let escape = crate::backend::escape_target(key.key.clone(), state.palette_open, state.bell_open, state.channel_create_open);
+                let global = palette != "none" || !escape.is_empty();
+                this.model.update(cx, |model, cx| model.dispatch(Message::ModifierStateChanged(key.modifiers), cx));
+                match chord {
+                    crate::CommandChord::Quit | crate::CommandChord::CloseWindow => {
+                        this.model.update(cx, |model, cx| model.dispatch(Message::CommandChordPressed(key), cx));
+                        cx.stop_propagation();
+                    }
+                    crate::CommandChord::Ignored => {
+                        if global {
+                            this.model.update(cx, |model, cx| model.dispatch(Message::GlobalKeyPressed(key), cx));
+                            cx.stop_propagation();
+                        }
+                    }
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let key = KeyPress { key: event.keystroke.key.clone(), modifiers: event.keystroke.modifiers };
+                this.model.update(cx, |model, cx| model.dispatch(Message::CopyChordPressed(key), cx));
+            }))
+            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
+                this.model.update(cx, |model, cx| model.dispatch(Message::ModifierStateChanged(event.modifiers), cx));
+            }))
+            .child(content)
     }
 }
 
@@ -463,7 +518,16 @@ pub(crate) fn run() {
         gpui_kit::init(cx);
         let mut commands = commands();
         let (state, initial) = Ducktape::__boot();
-        let desktop = cx.new(|_| Desktop { state, windows: BTreeMap::new(), streams: HashMap::new() });
+        let desktop = cx.new(|_| Desktop { state, windows: BTreeMap::new(), streams: HashMap::new(), pending_focus: None });
+        let weak = desktop.downgrade();
+        cx.on_window_closed(move |cx, id| {
+            let _ = weak.update(cx, |desktop, cx| {
+                let key = desktop.windows.iter().find_map(|(key, handle)| (handle.window_id() == id).then_some(*key));
+                let Some(key) = key else { return; };
+                desktop.windows.remove(&key);
+                desktop.dispatch(Message::WindowWasClosed(key), cx);
+            });
+        }).detach();
         desktop.update(cx, |desktop, cx| { desktop.start(initial, cx).detach(); desktop.subscriptions(cx); });
         cx.spawn(async move |cx: &mut AsyncApp| {
             while let Some(pending) = commands.next().await {

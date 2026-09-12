@@ -533,7 +533,7 @@ __DucktapeMessage::WindowFocusNoted => (|| {
 })(),
 __DucktapeMessage::CommandChordPressed(event) => (|| {
 let _ = &event;
-let chord = crate::backend::command_chord(event.key.clone(), event.physical_key, event.modifiers);
+let chord = crate::backend::command_chord(event.key.clone(), event.modifiers);
 return match chord.clone() {
 CommandChord::Quit => (|| {
 self.__ice_run_lane_24_generation = self.__ice_run_lane_24_generation.wrapping_add(1); if let ::std::option::Option::Some(__previous) = self.__ice_run_lane_24_handle.take() { __previous.abort(); }
@@ -1252,7 +1252,7 @@ if true { return ::ducktape_view_guest::Task::none(); }
 __DucktapeMessage::GlobalKeyPressed(event) => (|| {
 let _ = &event;
 let escape_key = crate::backend::escape_target(event.key.clone(), self.palette_open, self.bell_open, self.channel_create_open);
-let palette_key = crate::backend::palette_key_action(event.key.clone(), event.physical_key, event.modifiers, self.palette_open);
+let palette_key = crate::backend::palette_key_action(event.key.clone(), event.modifiers, self.palette_open);
 if ((escape_key).is_empty() && (palette_key == "none")) { return ::ducktape_view_guest::Task::none(); }
 { let __ice_next = (self.bell_open && (escape_key != "bell")); if ::ui_lang_runtime::state_changed!(self.bell_open, __ice_next) { self.bell_open = __ice_next; self.__ice_rev[105] += 1; } }
 { let __ice_next = (self.channel_create_open && (escape_key != "channel_create")); if ::ui_lang_runtime::state_changed!(self.channel_create_open, __ice_next) { self.channel_create_open = __ice_next; self.__ice_rev[44] += 1; } }
@@ -1739,7 +1739,7 @@ let _ = &relative_y;
 })(),
 __DucktapeMessage::CopyChordPressed(event) => (|| {
 let _ = &event;
-if (!crate::backend::is_copy_chord(event.key.clone(), event.physical_key, event.modifiers)) { return ::ducktape_view_guest::Task::none(); }
+if (!crate::backend::is_copy_chord(event.key.clone(), event.modifiers)) { return ::ducktape_view_guest::Task::none(); }
 if (self.shell_tab != ShellTab::Chat) { return ::ducktape_view_guest::Task::none(); }
 { let __ice_next = (self.chat_copy_chord_serial + 1); if ::ui_lang_runtime::state_changed!(self.chat_copy_chord_serial, __ice_next) { self.chat_copy_chord_serial = __ice_next; self.__ice_rev[42] += 1; } }
 ::ducktape_view_guest::Task::none()
