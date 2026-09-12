@@ -347,6 +347,15 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 /// Exemptions are named with their reason, never left implicit.
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(check_disconnected_screens)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn check_disconnected_screens() {
     let native = rust_tokens(include_str!("../ui/native_view.rs"));
     for name in [
         "chat",
@@ -438,6 +447,15 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(check_disconnected_registers)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn check_disconnected_registers() {
     use std::collections::{BTreeMap, BTreeSet};
     const LISTS: &[&str] = &[
         "repos",
