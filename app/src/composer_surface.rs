@@ -9,7 +9,11 @@ use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, InputEvent, Paste, TextDecoration, TextDecorationCollection,
 };
 use gpui_kit::component::{ActiveTheme, Disableable};
-use gpui_kit::*;
+use gpui_kit::{
+    App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -807,7 +811,7 @@ impl Render for ComposerView {
                         Button::new("dismiss")
                             .label("×")
                             .ghost()
-                            .aria_label("Dismiss failed draft")
+                            .accessibility_label("Dismiss failed draft")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let mut slot = lock(&this.shared);
                                 slot.document.failed.clear();
@@ -828,6 +832,7 @@ impl Render for ComposerView {
             .bg(cx.theme().background);
         if let Some(menu) = self.menu(cx) {
             let mut choices = div()
+                .id("mention-choices")
                 .flex()
                 .flex_col()
                 .w_full()
@@ -865,7 +870,7 @@ impl Render for ComposerView {
                 Button::new(kind)
                     .label(label)
                     .ghost()
-                    .aria_label(aria)
+                    .accessibility_label(aria)
                     .disabled(self.args.blocked)
                     .on_click(cx.listener(move |this, _, window, cx| this.mark(kind, window, cx))),
             );

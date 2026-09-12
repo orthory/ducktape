@@ -36,7 +36,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gpui_kit::*;
+use gpui_kit::{
+    Context, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, Window, div, img,
+    px,
+};
 use media_service::call_wire::{CapturedFrame, PeerFrame};
 
 /// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
@@ -780,37 +783,37 @@ pub(crate) fn capture_thread(
 /// Native video surfaces read the latest decoded frame at the window's vsync.
 /// Empty stores park redraws; the call roster update mounts/re-arms the surface.
 pub struct VideoView {
-    source: VideoSource,
+    source: VideoDisplay,
 }
-enum VideoSource {
+enum VideoDisplay {
     Tiles(String),
     Stage(String),
 }
 
 pub fn call_video_tiles(staged: &str) -> VideoView {
     VideoView {
-        source: VideoSource::Tiles(staged.to_owned()),
+        source: VideoDisplay::Tiles(staged.to_owned()),
     }
 }
 pub fn call_video_stage(peer: &str) -> VideoView {
     VideoView {
-        source: VideoSource::Stage(peer.to_owned()),
+        source: VideoDisplay::Stage(peer.to_owned()),
     }
 }
 impl VideoView {
     pub fn replace_tiles(&mut self, staged: String, cx: &mut Context<Self>) {
-        self.source = VideoSource::Tiles(staged);
+        self.source = VideoDisplay::Tiles(staged);
         cx.notify();
     }
     pub fn replace_stage(&mut self, peer: String, cx: &mut Context<Self>) {
-        self.source = VideoSource::Stage(peer);
+        self.source = VideoDisplay::Stage(peer);
         cx.notify();
     }
 }
 impl Render for VideoView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match &self.source {
-            VideoSource::Stage(peer) => {
+            VideoDisplay::Stage(peer) => {
                 let Some((_, _, handle)) = stage_frame(peer) else {
                     return div().into_any_element();
                 };
@@ -822,7 +825,7 @@ impl Render for VideoView {
                     .rounded(px(8.))
                     .into_any_element()
             }
-            VideoSource::Tiles(staged) => {
+            VideoDisplay::Tiles(staged) => {
                 let tiles = tiles_snapshot(staged);
                 if !tiles.is_empty() {
                     window.request_animation_frame();

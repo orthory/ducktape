@@ -1,6 +1,9 @@
 use super::*;
 use gpui_kit::base::text::{TextView, TextViewState};
-use gpui_kit::*;
+use gpui_kit::{
+    App, AppContext, ClickEvent, Context, Entity, EventEmitter, ImageCache, ImageCacheError,
+    IntoElement, MouseButton, ParentElement, Render, RenderImage, Resource, Styled, Window, div,
+};
 
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 

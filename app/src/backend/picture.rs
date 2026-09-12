@@ -3,7 +3,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gpui_kit::*;
+use gpui_kit::{
+    AnyElement, Context, Image, ImageFormat, ImageSource, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, div,
+    img, point, px, relative,
+};
 
 /// Source-byte ceiling: a file past it is shown as "too large", never
 /// decoded. ponytail: 16 MiB holds every screenshot and most photos; raise
@@ -315,7 +320,7 @@ impl Render for PictureView {
             .max_h(px(MAX_VIEWER_HEIGHT))
             .overflow_hidden()
             .children(content)
-            .on_scroll_wheel(cx.listener(|this, event, _, cx| {
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 let delta = match event.delta {
                     ScrollDelta::Pixels(delta) => f32::from(delta.y),
                     ScrollDelta::Lines(delta) => delta.y,
@@ -326,9 +331,9 @@ impl Render for PictureView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event, _, _| this.drag = Some(event.position)),
+                cx.listener(|this, event: &MouseDownEvent, _, _| this.drag = Some(event.position)),
             )
-            .on_mouse_move(cx.listener(|this, event, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let Some(previous) = this.drag else {
                     return;
                 };
