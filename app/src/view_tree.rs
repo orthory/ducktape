@@ -3129,9 +3129,31 @@ impl ViewTree {
         }
         if picker.selected != selected {
             picker.selected = selected;
-            picker
-                .state
-                .update(cx, |state, cx| state.set_selected_index(index, window, cx));
+            let state = picker.state.downgrade();
+            let route = key.clone();
+            // A wire index identifies a value in the full option set, not a
+            // row in the filtered menu. Native value projection clears search
+            // synchronously, so run it after releasing this render borrow.
+            window.defer(cx, move |window, cx| {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let current = weak
+                    .read_with(cx, |tree, _| {
+                        tree.pickers.get(&route).is_some_and(|picker| {
+                            picker.state.entity_id() == state.entity_id()
+                                && picker.selected == selected
+                        })
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    return;
+                }
+                state.update(cx, |state, cx| match selected {
+                    Some(value) => state.set_selected_value(&value, window, cx),
+                    None => state.set_selected_index(None, window, cx),
+                });
+            });
         }
         let mut select = Select::new(&picker.state)
             .id(key.clone())
@@ -4104,8 +4126,37 @@ mod tests {
             "native search routes its query: {:?}",
             events.borrow()
         );
-        tree.update(&mut native, |tree, cx| tree.replace(combo(1, 99), cx));
+        let mut authoritative = combo(0, 7);
+        if let wire::Node::ComboBox { selected, .. } = &mut authoritative {
+            *selected = Some(0);
+        }
+        tree.update(&mut native, |tree, cx| tree.replace(authoritative, cx));
         native.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            old.read_with(&native, |state, _| state.selected_value().copied()),
+            Some(0),
+            "authoritative Alpha is not filtered menu row zero (Beta)"
+        );
+        assert!(
+            events.borrow().iter().any(|event| matches!(event,
+            wire::Event::Input { handler: 44, text } if text.is_empty())),
+            "native authoritative projection clears its search query"
+        );
+        native.update(|window, cx| {
+            let mut pending = combo(0, 7);
+            if let wire::Node::ComboBox { selected, .. } = &mut pending {
+                *selected = Some(1);
+            }
+            tree.update(cx, |tree, cx| tree.replace(pending, cx));
+            window.render_frame(cx);
+            tree.update(cx, |tree, cx| tree.replace(combo(1, 99), cx));
+            window.render_frame(cx);
+        });
+        assert_eq!(
+            old.read_with(&native, |state, _| state.selected_value().copied()),
+            Some(0),
+            "a deferred projection cannot mutate a retired native picker"
+        );
         let fresh = tree.read_with(&native, |tree, _| {
             assert_eq!(tree.measured_bounds("combo").unwrap().size.width, px(200.));
             tree.pickers["combo"].state.clone()
