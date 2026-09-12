@@ -1208,7 +1208,12 @@ impl DesktopWindow {
             );
         }
         if !error.is_empty() {
-            content = content.child(div().text_color(rgb(0xb42318)).p_2().child(error));
+            content = content.child(
+                div().flex().items_center().gap_2().p_2()
+                    .text_color(cx.theme().danger)
+                    .child(div().flex_1().child(error))
+                    .child(self.action("error-dismiss", "Dismiss", Message::DismissError, false)),
+            );
         }
         content = content.child(div().flex_1().min_h_0().child(view));
         if !toast.is_empty() {
@@ -1309,6 +1314,9 @@ impl DesktopWindow {
                         Message::MarkBellReadSubmit,
                         state.bell_marking,
                     ));
+                if !state.bell_error.is_empty() {
+                    panel = panel.child(self.action("bell-retry", "Retry", Message::ReloadBell, false));
+                }
                 for item in items {
                     let presentation = crate::backend::bell_presentation(&item, &presentations);
                     let unavailable = !crate::backend::bell_openable(&item, &presentations);
@@ -1406,6 +1414,26 @@ impl Render for DesktopWindow {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .track_focus(&self.focus)
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                if this.kind != WindowKind::Console {
+                    return;
+                }
+                // The existing Files reducer owns the write gate and permits
+                // one upload at a time. Native paths never reach the WASM view.
+                for path in paths.paths() {
+                    let Some(path) = path.to_str() else {
+                        this.model.update(cx, |model, cx| model.dispatch(
+                            Message::FsDropFailed(crate::backend::AppError {
+                                message: "This file path cannot be represented as UTF-8.".into(),
+                                committed: false,
+                            }), cx));
+                        continue;
+                    };
+                    this.model.update(cx, |model, cx| {
+                        model.dispatch(Message::FsFileDropped(path.to_owned()), cx)
+                    });
+                }
+            }))
             .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 let key = KeyPress {
                     key: event.keystroke.key.clone(),
@@ -1507,6 +1535,61 @@ pub(crate) fn test_window(
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    async fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{FileDropEvent, ExternalPaths, VisualTestContext, point, px, size};
+        let _turn = crate::module_view::tests::blocking_connection_turn();
+        cx.update(gpui_kit::init);
+        let mut state = Ducktape::initial_state();
+        state.connected = true;
+        state.shell_tab = ShellTab::Files;
+        state.settings_user_key = "invalid signing key".into();
+        state.fs_drop_dir = "/shared".into();
+        let expected = crate::backend::files_write_gate(
+            state.fs_drop_dir.clone(), state.settings_user_key.clone(),
+        );
+        assert!(!expected.is_empty());
+        let mut view = None;
+        let handle = cx.open_window(size(px(1120.), px(720.)), |window, cx| {
+            let presenter = test_window(state, WindowKind::Console, window, cx);
+            view = Some(presenter.clone());
+            gpui_kit::component::Root::new(presenter, window, cx)
+        });
+        let view = view.unwrap();
+        let mut native = VisualTestContext::from_window(handle.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        let position = point(px(400.), px(350.));
+        native.simulate_event(FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths([std::path::PathBuf::from("/local/report.txt")].into_iter().collect()),
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        native.simulate_event(FileDropEvent::Submit { position });
+        view.read_with(&native, |view, cx| {
+            assert_eq!(view.test_state(cx).error, expected);
+            assert!(!view.test_state(cx).fs_dropping, "write gate precedes local file I/O");
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        native.update(|window, cx| window.click("error-dismiss", cx));
+        view.read_with(&native, |view, cx| assert!(view.test_state(cx).error.is_empty()));
+        view.update(&mut native, |view, cx| {
+            view.model.update(cx, |model, cx| {
+                model.state.bell_open = true;
+                model.state.bell_error = "Could not load notifications".into();
+                cx.notify();
+            });
+        });
+        let generation = view.read_with(&native, |view, cx| view.test_state(cx).bell_load_generation);
+        native.update(|window, cx| window.render_frame(cx));
+        native.update(|window, cx| window.click("bell-retry", cx));
+        view.read_with(&native, |view, cx| {
+            assert_eq!(view.test_state(cx).bell_load_generation, generation.wrapping_add(1));
+        });
+    }
 
     fn frozen_route(event: crate::module_view::ModuleViewEvent) -> Message {
         Message::ExternalUrlFailed(crate::backend::AppError {
@@ -1679,6 +1762,13 @@ pub(crate) fn run() {
 pub(crate) fn seconds() -> impl futures::Stream<Item = ()> {
     futures::stream::unfold((), |()| async {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        Some(((), ()))
+    })
+}
+
+pub(crate) fn toast_ticks() -> impl futures::Stream<Item = ()> {
+    futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         Some(((), ()))
     })
 }
