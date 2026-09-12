@@ -1,8 +1,8 @@
 //! The existing Pages Markdown policy copied into a bounded wire presentation.
 //! The guest computes styles and hit ranges; the host alone lays out and paints.
 use crate::{editor_binding, editor_binding::MenuState, editor_view::EditorReserve, markdown};
-use std::collections::HashMap;
 use ducktape_view_guest::{EditorStateView, wire};
+use std::collections::HashMap;
 use wire::editor_presentation::{
     EditorGutter, EditorHit, EditorPresentation, EditorSpan, PresentationError,
 };

@@ -55,3 +55,47 @@ impl Pictures {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vector(hash: u64, bytes: Option<Vec<u8>>) -> wire::Node {
+        wire::Node::Svg {
+            key: format!("picture-{hash}"), hash, bytes,
+            inherit_button_ink: false, label: None, color: None, hover: None,
+            fit: None, rotation: None, opacity: None, width: None, height: None,
+        }
+    }
+
+    #[test]
+    fn hidden_pictures_survive_remount_and_the_first_hash_value_wins() {
+        let mut pictures = Pictures::default();
+        pictures.adopt(&mut vector(7, Some(b"first".to_vec())));
+        pictures.adopt(&mut wire::Node::empty());
+        pictures.adopt(&mut vector(7, Some(b"conflicting".to_vec())));
+        let mut remounted = vector(7, None);
+        pictures.hydrate(&mut remounted);
+        assert!(matches!(remounted, wire::Node::Svg { bytes: Some(bytes), .. } if bytes == b"first"));
+    }
+
+    #[test]
+    fn lifetime_budget_refuses_new_bytes_without_evicting_known_hashes() {
+        let mut pictures = Pictures::default();
+        pictures.vector.insert(1, vec![0; MAX_PICTURE_BYTES]);
+        pictures.adopt(&mut vector(2, Some(vec![1])));
+        assert!(pictures.vector.contains_key(&1));
+        assert!(!pictures.vector.contains_key(&2));
+        assert_eq!(pictures.vector.values().map(Vec::len).sum::<usize>(), MAX_PICTURE_BYTES);
+    }
+
+    #[test]
+    fn entry_budget_also_bounds_empty_pictures() {
+        let mut pictures = Pictures::default();
+        for hash in 0..MAX_PICTURES as u64 {
+            pictures.adopt(&mut vector(hash, Some(Vec::new())));
+        }
+        pictures.adopt(&mut vector(MAX_PICTURES as u64, Some(Vec::new())));
+        assert_eq!(pictures.vector.len(), MAX_PICTURES);
+    }
+}

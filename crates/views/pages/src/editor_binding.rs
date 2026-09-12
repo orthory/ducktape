@@ -3,9 +3,9 @@
 //! consumers; this adapter does not replace them with a plain editor.
 
 use crate::editor::{self, Doc, History};
-use std::{cell::RefCell, rc::Rc};
 use ducktape_view_guest::wire::{self, EditorDecision, EditorHistoryEffect, EditorKeyClaim};
 use ducktape_view_guest::{EditorBinding, EditorKeyRequest, EditorTransactionEvent};
+use std::{cell::RefCell, rc::Rc};
 use wire::keyboard::{Key, Modifiers, Named};
 
 /// Ordinary Ice data: retained in the app state and therefore in snapshots.
@@ -168,8 +168,9 @@ impl BindingState {
             }
             wire::editor_presentation::EditorInteraction::LinePress { tag: 2, position } => {
                 if let Some(line) = wire::editor_lines(state.text).nth(position.line as usize) {
-                    navigation.link = crate::inline::document_link_at(line, position.column as usize)
-                        .unwrap_or_default();
+                    navigation.link =
+                        crate::inline::document_link_at(line, position.column as usize)
+                            .unwrap_or_default();
                 }
             }
             _ => {}

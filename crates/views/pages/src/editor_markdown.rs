@@ -17,9 +17,11 @@
 //! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.65, quote 14/1.6, code 12/1.6,
 //! callout 13/1.6), so a saved document reads at exactly the size it was typed.
 
-use ducktape_view_guest::wire::{self, Edges as Padding, Rgba as Color, NamedFont as Font, FontStyle, Weight, LineHeight};
-use std::ops::Range;
 use ducktape_view_guest::wire::editor_presentation::EditorFormat as Format;
+use ducktape_view_guest::wire::{
+    self, Edges as Padding, FontStyle, LineHeight, NamedFont as Font, Rgba as Color, Weight,
+};
+use std::ops::Range;
 const TRANSPARENT: Color = Color([0.0; 4]);
 
 use super::inline::{Inline, document_marks};
@@ -236,7 +238,6 @@ pub struct DocumentHighlighter {
 }
 
 impl DocumentHighlighter {
-
     pub fn new(caret: &Caret) -> Self {
         Self {
             current_line: 0,
@@ -459,7 +460,9 @@ struct Ink {
     tick_mark: Color,
 }
 
-const fn rgb8(r: u8, g: u8, b: u8) -> Color { wash(r, g, b, 1.0) }
+const fn rgb8(r: u8, g: u8, b: u8) -> Color {
+    wash(r, g, b, 1.0)
+}
 
 const fn wash(r: u8, g: u8, b: u8, a: f32) -> Color {
     Color([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a])
@@ -510,17 +513,27 @@ fn ink(dark: bool) -> &'static Ink {
 }
 
 fn body_font(weight: Weight, style: FontStyle) -> Font {
-    Font { family: wire::FontFamily::Named(design::fonts::FAMILY_UI.into()), weight,
-        stretch: wire::FontStretch::Normal, style }
+    Font {
+        family: wire::FontFamily::Named(design::fonts::FAMILY_UI.into()),
+        weight,
+        stretch: wire::FontStretch::Normal,
+        style,
+    }
 }
 
 fn code_font() -> Font {
-    Font { family: wire::FontFamily::Named(design::fonts::FAMILY_MONO.into()),
-        ..body_font(Weight::Normal, FontStyle::Normal) }
+    Font {
+        family: wire::FontFamily::Named(design::fonts::FAMILY_MONO.into()),
+        ..body_font(Weight::Normal, FontStyle::Normal)
+    }
 }
 
 fn border(color: Color, width: f32, radius: f32) -> wire::Border {
-    wire::Border { color: Some(color), width: Some(width), radius: Some([radius; 4]) }
+    wire::Border {
+        color: Some(color),
+        width: Some(width),
+        radius: Some([radius; 4]),
+    }
 }
 
 fn tick_advance(checked: bool) -> f32 {
@@ -700,7 +713,11 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             })),
             line_background: Some(ink.code_plate),
             line_border: Some(border(ink.code_line, 1.0, 10.0)),
-            line_padding: Padding { left: CODE_PLATE_PAD, right: CODE_PLATE_PAD, ..Padding::default() },
+            line_padding: Padding {
+                left: CODE_PLATE_PAD,
+                right: CODE_PLATE_PAD,
+                ..Padding::default()
+            },
             ..Format::default()
         },
         Mark::CodeBody => Format {
@@ -710,7 +727,11 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             line_height: Some(LineHeight::Absolute(CODE_SIZE * CODE_LINE_HEIGHT)),
             line_background: Some(ink.code_plate),
             line_border: Some(border(ink.code_line, 1.0, 10.0)),
-            line_padding: Padding { left: CODE_PLATE_PAD, right: CODE_PLATE_PAD, ..Padding::default() },
+            line_padding: Padding {
+                left: CODE_PLATE_PAD,
+                right: CODE_PLATE_PAD,
+                ..Padding::default()
+            },
             ..Format::default()
         },
     }
@@ -751,19 +772,20 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         let step = usize::from(level).saturating_sub(1).min(2);
         let size = HEADING_SIZE[step];
         format.size = Some(size);
-        format.line_height = Some(LineHeight::Absolute(
-            size * HEADING_LINE_HEIGHT[step],
-        ));
+        format.line_height = Some(LineHeight::Absolute(size * HEADING_LINE_HEIGHT[step]));
         return format;
     }
     if style.callout {
         format.size = Some(CALLOUT_SIZE);
-        format.line_height = Some(LineHeight::Absolute(
-            CALLOUT_SIZE * CALLOUT_LINE_HEIGHT,
-        ));
+        format.line_height = Some(LineHeight::Absolute(CALLOUT_SIZE * CALLOUT_LINE_HEIGHT));
         format.line_background = Some(ink.callout_plate);
         format.line_border = Some(border(ink.callout_line, 1.0, 11.0));
-        format.line_padding = Padding { top: 9.0, bottom: 9.0, left: 14.0, right: 14.0 };
+        format.line_padding = Padding {
+            top: 9.0,
+            bottom: 9.0,
+            left: 14.0,
+            right: 14.0,
+        };
         return format;
     }
     if style.quote {
@@ -1098,7 +1120,13 @@ mod plate_probe {
         );
 
         let (code, _) = highlight("let x = 1;", true, false, false);
-        assert_eq!({ let pad = format(&code[0].1, false).line_padding; pad.top + pad.bottom }, 0.0);
+        assert_eq!(
+            {
+                let pad = format(&code[0].1, false).line_padding;
+                pad.top + pad.bottom
+            },
+            0.0
+        );
 
         let (callout, _) = highlight("!> note", false, false, false);
         for (_, mark) in &callout {
