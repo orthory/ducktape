@@ -1545,13 +1545,18 @@ pub(crate) fn run() {
             desktop.start(initial, cx).detach();
             desktop.subscriptions(cx);
         });
-        cx.spawn(async move |cx: &mut AsyncApp| {
+        let mut command_loop = Some(cx.spawn(async move |cx: &mut AsyncApp| {
             while let Some(pending) = commands.next().await {
                 let _ = desktop.update(cx, |desktop, cx| desktop.execute(pending.command, cx));
                 let _ = pending.completed.send(());
             }
-        })
-        .detach();
+        }));
+        // The command task owns the windowless desktop (including its tray).
+        // Cancel it before GPUI releases windows and checks entity handles.
+        cx.on_app_quit(move |_| {
+            drop(command_loop.take());
+            async {}
+        }).detach();
     });
 }
 
