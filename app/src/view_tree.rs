@@ -18,6 +18,131 @@ use gpui_kit::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use ui_lang_wire as wire;
+use unicode_segmentation::UnicodeSegmentation;
+
+struct RichSelection {
+    handle: gpui_kit::base::TextSelectionHandle,
+    _refresh: Subscription,
+}
+
+// Layout and hit-testing stay native. One participant receives every span's
+// measured glyph run so copying concatenates source text, never visual padding.
+struct RichParagraph {
+    id: ElementId,
+    content: AnyElement,
+    layouts: Vec<(SharedString, TextLayout)>,
+    handle: gpui_kit::base::TextSelectionHandle,
+    selections: std::rc::Rc<std::cell::RefCell<Vec<Option<std::ops::Range<usize>>>>>,
+}
+
+impl IntoElement for RichParagraph {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for RichParagraph {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.content.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.content.prepaint(window, cx);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        self.handle.register(
+            gpui_kit::base::TextSelectionRegistration::new(hitbox, bounds).with_text_bounds(
+                self.layouts
+                    .iter()
+                    .map(|(_, layout)| layout.bounds())
+                    .collect(),
+            ),
+            window,
+            cx,
+        );
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let runs = self
+            .layouts
+            .iter()
+            .enumerate()
+            .map(|(index, (text, layout))| {
+                gpui_kit::base::TextSelectionRun::new(text.clone(), layout.clone(), layout.bounds())
+                    .with_document_order(index as u64)
+            })
+            .collect::<Vec<_>>();
+        let projection = self.handle.update_runs(&runs, cx);
+        *self.selections.borrow_mut() = projection.ranges().to_vec();
+        self.content.paint(window, cx);
+    }
+}
+
+fn paint_rich_selection(
+    layout: &TextLayout,
+    range: &std::ops::Range<usize>,
+    window: &mut Window,
+    cx: &App,
+) {
+    let (Some(start), Some(end)) = (
+        layout.position_for_index(range.start),
+        layout.position_for_index(range.end),
+    ) else {
+        return;
+    };
+    let height = layout.line_height();
+    if height <= px(0.) {
+        return;
+    }
+    let color = gpui_kit::base::Theme::global(cx).tokens.colors.selection;
+    let mut y = start.y;
+    while y <= end.y {
+        let left = if y == start.y {
+            start.x
+        } else {
+            layout.bounds().left()
+        };
+        let right = if y == end.y {
+            end.x
+        } else {
+            layout.bounds().right()
+        };
+        window.paint_quad(fill(
+            Bounds::from_corners(point(left, y), point(right, y + height)),
+            color,
+        ));
+        y += height;
+    }
+}
 
 struct RangeControl {
     state: Entity<SliderState>,
@@ -111,6 +236,7 @@ struct Field {
 pub struct ViewTree {
     root: wire::Node,
     fields: HashMap<String, Field>,
+    rich_selections: HashMap<String, RichSelection>,
     scrolls: HashMap<String, ScrollHandle>,
     lists: HashMap<String, VirtualScroll>,
     scroll_positions: HashMap<String, (Point<Pixels>, Point<Pixels>)>,
@@ -290,6 +416,7 @@ impl ViewTree {
         Self {
             root,
             fields: HashMap::new(),
+            rich_selections: HashMap::new(),
             scrolls: HashMap::new(),
             lists: HashMap::new(),
             scroll_positions: HashMap::new(),
@@ -681,6 +808,8 @@ impl ViewTree {
         });
         self.bounds.retain(|key, _| live_keys.contains(key));
         self.fields.retain(|key, _| inputs.contains(key));
+        self.rich_selections
+            .retain(|key, _| live_keys.contains(key));
         self.scrolls.retain(|key, _| scrolls.contains(key));
         self.lists.retain(|key, _| scrolls.contains(key));
         self.scroll_positions.retain(|key, _| scrolls.contains(key));
@@ -2124,7 +2253,7 @@ impl ViewTree {
     fn rich_text(
         &mut self,
         node: &wire::Node,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let wire::Node::RichText {
@@ -2141,69 +2270,134 @@ impl ViewTree {
         else {
             unreachable!()
         };
-        let mut text = String::new();
-        let mut highlights = Vec::new();
-        let mut ranges = Vec::new();
-        let mut links = Vec::new();
-        for span in spans {
-            let start = text.len();
-            text.push_str(&span.content);
-            let range = start..text.len();
-            let mut style = HighlightStyle::default();
-            style.color = span.color.map(rgba);
-            style.background_color = span.background.map(rgba);
-            if let Some(font) = &span.font {
-                style.font_weight = Some(font_weight(font.weight));
+        let canonical = spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let selection = self.rich_selections.entry(key.clone()).or_insert_with(|| {
+            let handle = gpui_kit::base::TextSelectionHandle::new(canonical.clone(), cx);
+            let refresh = handle.refresh_window_on_change(window, cx);
+            RichSelection {
+                handle,
+                _refresh: refresh,
             }
-            if span.underline {
-                style.underline = Some(UnderlineStyle {
-                    thickness: px(1.0),
-                    color: span.color.map(rgba),
-                    wavy: false,
-                });
-            }
-            if span.strikethrough {
-                style.strikethrough = Some(StrikethroughStyle {
-                    thickness: px(1.0),
-                    color: span.color.map(rgba),
-                });
-            }
-            highlights.push((range.clone(), style));
-            if let Some(link) = &span.link {
-                ranges.push(range);
-                links.push(link.clone());
-            }
-        }
-        let styled = StyledText::new(text).with_highlights(highlights);
-        let mut interactive = InteractiveText::new(key.clone(), styled);
-        if let Some(handler) = on_link {
-            let handler = *handler;
-            let weak = cx.entity().downgrade();
-            interactive = interactive.on_click(ranges, move |index, _, cx| {
-                let Some(link) = links.get(index) else {
-                    return;
-                };
-                let _ = weak.update(cx, |_, cx| {
-                    cx.emit(wire::Event::Input {
-                        handler,
-                        text: link.clone(),
-                    })
-                });
-            });
-        }
-        let mut element = text_options(
-            dimensions(div(), *width, options.height),
+        });
+        selection.handle.set_fallback_copy_text(canonical, cx);
+        let handle = selection.handle.clone();
+        let mut content = text_options(
+            dimensions(
+                div().flex().flex_row().items_baseline(),
+                *width,
+                options.height,
+            ),
             *font,
             *align_x,
             options,
         );
+        if options.wrapping != Some(wire::Wrapping::None) {
+            content = content.flex_wrap();
+        }
+        content = horizontal_align(content, *align_x);
         if let Some(size) = size {
-            element = element.text_size(px(*size));
+            content = content.text_size(px(*size));
         }
         if let Some(color) = color {
-            element = element.text_color(rgba(*color));
+            content = content.text_color(rgba(*color));
         }
-        element.child(interactive).into_any_element()
+        let mut layouts = Vec::new();
+        let selections = std::rc::Rc::new(std::cell::RefCell::new(Vec::<
+            Option<std::ops::Range<usize>>,
+        >::new()));
+        for (span_index, span) in spans.iter().enumerate() {
+            // Native flex wraps at Unicode word boundaries; padding is paint
+            // geometry only, while every copied fragment retains source bytes.
+            let fragments = span.content.split_word_bounds().collect::<Vec<_>>();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let mut run_options = options.clone();
+                run_options.font = span.font.clone().or_else(|| options.font.clone());
+                run_options.line_height = span.line_height.or(options.line_height);
+                let mut paint = text_options(
+                    div().flex_shrink_0().max_w_full(),
+                    *font,
+                    None,
+                    &run_options,
+                );
+                if let Some(size) = span.size {
+                    paint = paint.text_size(px(size));
+                }
+                if let Some(color) = span.color {
+                    paint = paint.text_color(rgba(color));
+                }
+                let mut padding = span.padding.unwrap_or_default();
+                if index > 0 {
+                    padding.left = 0.;
+                }
+                if index + 1 < fragments.len() {
+                    padding.right = 0.;
+                }
+                paint = decoration(pad(paint, Some(padding)), span.background, span.border);
+                let mut style = HighlightStyle::default();
+                if span.underline {
+                    style.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: span.color.map(rgba),
+                        wavy: false,
+                    });
+                }
+                if span.strikethrough {
+                    style.strikethrough = Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: span.color.map(rgba),
+                    });
+                }
+                let text: SharedString = (*fragment).to_owned().into();
+                let styled =
+                    StyledText::new(text.clone()).with_highlights([(0..text.len(), style)]);
+                let layout = styled.layout().clone();
+                let run_index = layouts.len();
+                layouts.push((text, layout.clone()));
+                let ranges = selections.clone();
+                let selection = canvas(
+                    |_, _, _| (),
+                    move |_, (), window, cx| {
+                        if let Some(Some(range)) = ranges.borrow().get(run_index) {
+                            paint_rich_selection(&layout, range, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full();
+                let id = format!("{key}-span-{span_index}-{index}");
+                let mut painted = paint.id(id).child(selection).child(styled);
+                if let (Some(handler), Some(link)) = (on_link, &span.link) {
+                    let handler = *handler;
+                    let link = link.clone();
+                    painted = painted
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(wire::Event::Input {
+                                handler,
+                                text: link.clone(),
+                            });
+                        }));
+                }
+                let newline = fragment.contains('\n');
+                if newline {
+                    // Explicit source line breaks remain real measured text, not
+                    // injected spaces in the selection/copy representation.
+                    painted = painted.w_full().h(px(0.));
+                }
+                content = content.child(painted);
+            }
+        }
+        RichParagraph {
+            id: key.clone().into(),
+            content: content.into_any_element(),
+            layouts,
+            handle,
+            selections,
+        }
+        .into_any_element()
     }
 
     fn flex(
@@ -2646,6 +2840,9 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
             spacing,
             ..
         } => {
+            if !children.iter().any(has_virtual_column) {
+                return None;
+            }
             let mut found = false;
             let mut rows = Vec::new();
             for (index, child) in children.iter().enumerate() {
@@ -2675,6 +2872,22 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
             virtual_rows(content).map(|rows| wrap_virtual_rows(node, rows))
         }
         _ => None,
+    }
+}
+
+fn has_virtual_column(node: &wire::Node) -> bool {
+    match node {
+        wire::Node::KeyedColumn {
+            virtual_row: Some(_),
+            ..
+        } => true,
+        wire::Node::Linear {
+            axis: wire::Axis::Column,
+            children,
+            ..
+        } => children.iter().any(has_virtual_column),
+        wire::Node::Container { content, .. } => has_virtual_column(content),
+        _ => false,
     }
 }
 
