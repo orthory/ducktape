@@ -1421,8 +1421,40 @@ impl ViewTree {
                 let press = *on_press;
                 let release = *on_release;
                 let drag = *on_drag;
+                let view = cx.entity().downgrade();
+                let capture = canvas(|_, _, _| (), move |_, _, window, _| {
+                    let moving = view.clone();
+                    let move_key = move_key.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != gpui_kit::DispatchPhase::Capture { return; }
+                        let _ = moving.update(cx, |this, cx| {
+                            let Some(previous) = this.drags.get_mut(&move_key) else { return; };
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                this.drags.remove(&move_key);
+                                return;
+                            }
+                            let delta = event.position - *previous;
+                            *previous = event.position;
+                            if let Some(handler) = drag {
+                                cx.emit(wire::Event::Drag { handler, dx: f32::from(delta.x) as f64, dy: f32::from(delta.y) as f64 });
+                            }
+                        });
+                    });
+                    let releasing = view.clone();
+                    let release_key = release_key.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase != gpui_kit::DispatchPhase::Capture || event.button != MouseButton::Left { return; }
+                        let _ = releasing.update(cx, |this, cx| {
+                            let was_dragging = this.drags.remove(&release_key).is_some();
+                            if was_dragging {
+                                if let Some(message) = release { cx.emit(wire::Event::Message(message)); }
+                            }
+                        });
+                    });
+                }).absolute().inset_0();
                 div()
                     .id(key.clone())
+                    .relative()
                     .cursor(native_cursor(*cursor))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1433,36 +1465,8 @@ impl ViewTree {
                             }
                         }),
                     )
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                        let Some(previous) = this.drags.get_mut(&move_key) else {
-                            return;
-                        };
-                        if event.pressed_button != Some(MouseButton::Left) {
-                            this.drags.remove(&move_key);
-                            return;
-                        }
-                        let delta = event.position - *previous;
-                        *previous = event.position;
-                        if let Some(handler) = drag {
-                            cx.emit(wire::Event::Drag {
-                                handler,
-                                dx: f32::from(delta.x) as f64,
-                                dy: f32::from(delta.y) as f64,
-                            });
-                        }
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            let was_dragging = this.drags.remove(&release_key).is_some();
-                            if was_dragging {
-                                if let Some(message) = release {
-                                    cx.emit(wire::Event::Message(message));
-                                }
-                            }
-                        }),
-                    )
                     .child(self.node(content, window, cx))
+                    .child(capture)
                     .into_any_element()
             }
             Node::Responsive {
