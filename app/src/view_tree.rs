@@ -14,7 +14,16 @@ use gpui_kit::component::{
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
 };
-use gpui_kit::*;
+use gpui_kit::{
+    AnyElement, AnyView, App, AppContext as _, Bounds, BoxShadow, Context, CursorStyle, Div,
+    Element, ElementId, Entity, EventEmitter, Focusable as _, FontWeight, GlobalElementId,
+    HighlightStyle, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement as _, IntoElement,
+    LayoutId, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    StrikethroughStyle, Styled, StyledImage as _, StyledText, Subscription, TextLayout,
+    UnderlineStyle, Window, auto, canvas, div, fill, img, point, px, relative, rgb, size, svg,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use ui_lang_wire as wire;
@@ -2108,18 +2117,19 @@ impl ViewTree {
         if let Some(handler) = on_move {
             let handler = *handler;
             let route = key.clone();
-            element = element.on_mouse_move(cx.listener(move |this, event, _, cx| {
-                let origin = this
-                    .bounds
-                    .get(&route)
-                    .map_or(Point::default(), |bounds| bounds.origin);
-                let local = event.position - origin;
-                cx.emit(wire::Event::Pointer {
-                    handler,
-                    x: f32::from(local.x),
-                    y: f32::from(local.y),
-                });
-            }));
+            element =
+                element.on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    let origin = this
+                        .bounds
+                        .get(&route)
+                        .map_or(Point::default(), |bounds| bounds.origin);
+                    let local = event.position - origin;
+                    cx.emit(wire::Event::Pointer {
+                        handler,
+                        x: f32::from(local.x),
+                        y: f32::from(local.y),
+                    });
+                }));
         }
         if let Some(handler) = on_press_at {
             let handler = *handler;
@@ -2624,23 +2634,24 @@ impl ViewTree {
         let (minimum, maximum) = options.scale_bounds.unwrap_or((0.25, 10.0));
         let step = options.scale_step.unwrap_or(0.1);
         let wheel_key = key.clone();
-        element = element.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-            let delta = match event.delta {
-                ScrollDelta::Pixels(delta) => f32::from(delta.y),
-                ScrollDelta::Lines(delta) => delta.y,
-            };
-            let Some(viewer) = this.viewers.get_mut(&wheel_key) else {
-                return;
-            };
-            viewer.scale =
-                (viewer.scale * (1.0 + step).powf(delta.signum())).clamp(minimum, maximum);
-            cx.stop_propagation();
-            cx.notify();
-        }));
+        element =
+            element.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                let delta = match event.delta {
+                    ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                    ScrollDelta::Lines(delta) => delta.y,
+                };
+                let Some(viewer) = this.viewers.get_mut(&wheel_key) else {
+                    return;
+                };
+                viewer.scale =
+                    (viewer.scale * (1.0 + step).powf(delta.signum())).clamp(minimum, maximum);
+                cx.stop_propagation();
+                cx.notify();
+            }));
         let down_key = key.clone();
         element = element.on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, event, _, cx| {
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 if let Some(viewer) = this.viewers.get_mut(&down_key) {
                     viewer.drag = Some(event.position);
                 }
@@ -2648,7 +2659,7 @@ impl ViewTree {
             }),
         );
         let move_key = key.clone();
-        element = element.on_mouse_move(cx.listener(move |this, event, _, cx| {
+        element = element.on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
             let Some(viewer) = this.viewers.get_mut(&move_key) else {
                 return;
             };
