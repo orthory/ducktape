@@ -303,6 +303,7 @@ impl Desktop {
                 );
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
+                let keystrokes = DesktopWindow::intercept_global_keys(window, cx);
                 DesktopWindow {
                     model: window_model,
                     kind,
@@ -316,6 +317,7 @@ impl Desktop {
                     focus,
                     _activation: activation,
                     _observer: observer,
+                    _keystrokes: keystrokes,
                 }
             });
             opened_view = Some(view.downgrade());
@@ -419,6 +421,7 @@ pub(crate) struct DesktopWindow {
     focus: gpui_kit::FocusHandle,
     _activation: gpui_kit::Subscription,
     _observer: gpui_kit::Subscription,
+    _keystrokes: gpui_kit::Subscription,
 }
 
 struct NativeInput {
@@ -427,6 +430,49 @@ struct NativeInput {
 }
 
 impl DesktopWindow {
+    fn intercept_global_keys(
+        window: &gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Subscription {
+        let window_id = window.window_handle().window_id();
+        let view = cx.entity().downgrade();
+        // Native input actions resolve before element key listeners. Only the
+        // owning window's shell commands precede them; ordinary keys stay native.
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle().window_id() != window_id {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                view.global_key(KeyPress {
+                    key: event.keystroke.key.clone(),
+                    modifiers: event.keystroke.modifiers,
+                }, cx);
+            });
+        })
+    }
+
+    fn global_key(&mut self, key: KeyPress, cx: &mut Context<Self>) {
+        let state = &self.model.read(cx).state;
+        let chord = crate::backend::command_chord(key.key.clone(), key.modifiers);
+        let palette = crate::backend::palette_key_action(
+            key.key.clone(), key.modifiers, state.palette_open,
+        );
+        let escape = crate::backend::escape_target(
+            key.key.clone(), state.palette_open, state.bell_open, state.channel_create_open,
+        );
+        let global = palette != "none" || !escape.is_empty();
+        let message = match chord {
+            crate::CommandChord::Quit | crate::CommandChord::CloseWindow =>
+                Message::CommandChordPressed(key),
+            crate::CommandChord::Ignored => {
+                if !global { return; }
+                Message::GlobalKeyPressed(key)
+            }
+        };
+        self.model.update(cx, |model, cx| model.dispatch(message, cx));
+        cx.stop_propagation();
+    }
+
     fn released(&mut self, cx: &mut gpui_kit::App) {
         self.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
     }
@@ -1625,42 +1671,6 @@ impl Render for DesktopWindow {
                     });
                 }
             }))
-            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
-                let key = KeyPress {
-                    key: event.keystroke.key.clone(),
-                    modifiers: event.keystroke.modifiers,
-                };
-                let state = &this.model.read(cx).state;
-                let chord = crate::backend::command_chord(key.key.clone(), key.modifiers);
-                let palette = crate::backend::palette_key_action(
-                    key.key.clone(),
-                    key.modifiers,
-                    state.palette_open,
-                );
-                let escape = crate::backend::escape_target(
-                    key.key.clone(),
-                    state.palette_open,
-                    state.bell_open,
-                    state.channel_create_open,
-                );
-                let global = palette != "none" || !escape.is_empty();
-                match chord {
-                    crate::CommandChord::Quit | crate::CommandChord::CloseWindow => {
-                        this.model.update(cx, |model, cx| {
-                            model.dispatch(Message::CommandChordPressed(key), cx)
-                        });
-                        cx.stop_propagation();
-                    }
-                    crate::CommandChord::Ignored => {
-                        if global {
-                            this.model.update(cx, |model, cx| {
-                                model.dispatch(Message::GlobalKeyPressed(key), cx)
-                            });
-                            cx.stop_propagation();
-                        }
-                    }
-                }
-            }))
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 let key = KeyPress {
                     key: event.keystroke.key.clone(),
@@ -1706,6 +1716,7 @@ pub(crate) fn test_window(
         cx.on_release(DesktopWindow::released).detach();
         let observer = cx.observe(&model, |_, _, cx| cx.notify());
         let activation = cx.observe_window_activation(window, |_, _, _| {});
+        let keystrokes = DesktopWindow::intercept_global_keys(window, cx);
         DesktopWindow {
             model,
             kind,
@@ -1719,6 +1730,7 @@ pub(crate) fn test_window(
             focus: cx.focus_handle(),
             _activation: activation,
             _observer: observer,
+            _keystrokes: keystrokes,
         }
     })
 }
@@ -1726,6 +1738,52 @@ pub(crate) fn test_window(
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn shell_commands_precede_focused_input_actions_in_only_their_window(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update(gpui_kit::init);
+        let mut views = Vec::new();
+        let mut windows = Vec::new();
+        for _ in 0..2 {
+            let handle = cx.open_window(gpui_kit::size(gpui_kit::px(600.), gpui_kit::px(700.)), |window, cx| {
+                let mut state = Ducktape::initial_state();
+                state.hub_step = crate::HubStep::Networks;
+                state.connected = true;
+                let view = test_window(state, WindowKind::Onboarding, window, cx);
+                views.push(view.clone());
+                gpui_kit::component::Root::new(view, window, cx)
+            });
+            windows.push(gpui_kit::AnyWindowHandle::from(handle));
+        }
+        let view = &views[0];
+        windows[0].update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            let input = view.read(cx).inputs["remote"].state.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            window.render_frame(cx);
+            window.input("keep these words", cx);
+            let command = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+            window.press(&format!("{command}-k"), cx);
+            assert!(view.read(cx).model.read(cx).state.palette_open);
+            view.read(cx).model.clone().update(cx, |model, _| model.state.bell_open = true);
+            window.press("escape", cx);
+            assert!(!view.read(cx).model.read(cx).state.palette_open);
+            assert!(view.read(cx).model.read(cx).state.bell_open, "only the top shell overlay closes");
+            window.press("escape", cx);
+            assert!(!view.read(cx).model.read(cx).state.bell_open);
+            window.press(&format!("{command}-w"), cx);
+            assert_eq!(input.read(cx).value(), "keep these words", "Close is not native delete-word");
+            window.press(&format!("{command}-a"), cx);
+            assert_eq!(input.read(cx).selected_range(), 0.."keep these words".len(), "ordinary native shortcuts remain available");
+            let before = view.read(cx).model.read(cx).state.account_qr_auth_generation;
+            let other_before = views[1].read(cx).model.read(cx).state.account_qr_auth_generation;
+            window.press(&format!("{command}-q"), cx);
+            assert_eq!(view.read(cx).model.read(cx).state.account_qr_auth_generation, before + 1);
+            assert_eq!(views[1].read(cx).model.read(cx).state.account_qr_auth_generation, other_before,
+                "global interceptor must not route another native window's command");
+        }).unwrap();
+    }
 
     #[gpui_kit::test]
     fn closing_a_focused_native_input_releases_its_handler(cx: &mut gpui_kit::TestAppContext) {
