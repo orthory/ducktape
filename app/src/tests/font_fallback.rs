@@ -19,10 +19,12 @@ fn shape(system: &WindowTextSystem, content: &str, weight: FontWeight) -> gpui_k
 #[test]
 fn non_regular_weights_shape_at_the_regular_fallback_cost() {
     let cx = headless_context();
-    let shaper = WindowTextSystem::new(cx.text_system().clone());
     for content in ["🎉", "♡", "한글", "Channel"] {
         let mut costs = Vec::new();
         for weight in WEIGHTS {
+            // Fallback font ids can coincide across weights. Independent
+            // layout caches prevent heavier weights measuring regular's hits.
+            let shaper = WindowTextSystem::new(cx.text_system().clone());
             let mut phase = Phase::new("native fallback shaping");
             for index in 0..FRAMES {
                 // Distinct text avoids measuring only the line-layout cache hit.

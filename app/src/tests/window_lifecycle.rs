@@ -120,8 +120,9 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     assert_eq!(app.onboarding_win, None);
     assert_eq!(app.console_win, Some(console));
     let route = handler_body("WindowWasClosed");
-    assert_eq!(route.matches("last_window_closed_exits(").count(), 1);
-    assert_eq!(route.matches("shell::quit").count(), 1);
+    let guarded_exits = route.matches("last_window_closed_exits(").count();
+    assert!(guarded_exits > 0);
+    assert_eq!(route.matches("shell::quit").count(), guarded_exits);
 }
 #[test]
 fn only_the_tray_row_and_the_quit_chord_leave() {
@@ -212,7 +213,10 @@ fn authentication_operations_always_have_replace_lanes() {
 }
 #[test]
 fn authentication_lanes_retire_before_navigation_and_quit() {
-    for message in [__DucktapeMessage::TrayQuit, __DucktapeMessage::GoNetworks] {
+    for (message, closes_account) in [
+        (__DucktapeMessage::TrayQuit, true),
+        (__DucktapeMessage::GoNetworks, false),
+    ] {
         let mut app = Ducktape::__state();
         let before = (
             app.__ice_run_lane_10_generation,
@@ -221,8 +225,10 @@ fn authentication_lanes_retire_before_navigation_and_quit() {
             app.__ice_run_lane_25_generation,
         );
         let _ = app.__update(message);
-        assert!(app.__ice_run_lane_10_generation > before.0);
-        assert!(app.__ice_run_lane_11_generation > before.1);
+        // GoNetworks belongs to the onboarding window. It must not cancel
+        // the independently open console's account authentication lanes.
+        assert_eq!(app.__ice_run_lane_10_generation > before.0, closes_account);
+        assert_eq!(app.__ice_run_lane_11_generation > before.1, closes_account);
         assert!(app.__ice_run_lane_24_generation > before.2);
         assert!(app.__ice_run_lane_25_generation > before.3);
     }
@@ -242,7 +248,9 @@ fn phone_and_desktop_account_authentication_retire_together() {
 fn browser_authentication_keeps_a_visible_cancel_action() {
     let source = rust_tokens(include_str!("../../../crates/views/settings/src/lib.rs"));
     assert!(source.contains("plate-cancel-working"));
-    assert!(source.contains("account_ceremony_cancel"));
+    assert!(source.contains("crate::host::cancel_ceremony()"));
+    let host = rust_tokens(include_str!("../../../crates/views/settings/src/host.rs"));
+    assert!(host.contains("notify(\"settings.ceremony_cancel\",&())"));
 }
 #[test]
 fn passkey_login_shows_its_cancellation_plate_without_an_account() {

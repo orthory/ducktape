@@ -188,6 +188,7 @@ struct VirtualRow {
     key: String,
     content: wire::Node,
     gap: f32,
+    estimated_height: f32,
 }
 
 struct VirtualScroll {
@@ -317,7 +318,11 @@ impl ViewTree {
         let new_end = rows.len() - suffix;
         if prefix != old_end || prefix != new_end {
             if list.rows.is_empty() {
-                list.state.reset_with_uniform_height(rows.len(), px(44.));
+                let estimate = rows
+                    .first()
+                    .map_or(44., |row| row.estimated_height + row.gap);
+                list.state
+                    .reset_with_uniform_height(rows.len(), px(estimate));
             } else {
                 list.state.splice(prefix..old_end, new_end - prefix);
             }
@@ -395,9 +400,13 @@ impl ViewTree {
             })
             .unwrap_or_else(|_| div().into_any_element())
         })
-        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .with_sizing_behavior(if height.is_some() {
+            ListSizingBehavior::Auto
+        } else {
+            ListSizingBehavior::Infer
+        })
         .w_full()
-        .max_h_full();
+        .h_full();
         // The native list owns scrolling, including off-screen measurements;
         // the wire scroll remains the identity addressed by widget commands.
         decoration(
@@ -1116,6 +1125,7 @@ impl ViewTree {
                 element.into_any_element()
             }
             Node::Container {
+                key,
                 content,
                 width,
                 height,
@@ -1136,7 +1146,10 @@ impl ViewTree {
                 };
                 let mut element = shadows(
                     decoration(
-                        pad(dimensions(div().flex(), *width, *height), *padding),
+                        pad(
+                            dimensions(div().relative().flex(), *width, *height),
+                            *padding,
+                        ),
                         color,
                         *border,
                     ),
@@ -1155,6 +1168,7 @@ impl ViewTree {
                 }
                 element
                     .child(self.node(content, window, cx))
+                    .child(self.measure(key, cx))
                     .into_any_element()
             }
             Node::Scroll {
@@ -2027,7 +2041,12 @@ impl ViewTree {
         }
         let editor = self.editors.get(key).expect("editor inserted");
         editor.view.update(cx, |editor, cx| editor.sync(window, cx));
-        editor.view.clone().into_any_element()
+        let view = editor.view.clone();
+        div()
+            .relative()
+            .child(view)
+            .child(self.measure(key, cx))
+            .into_any_element()
     }
 
     fn measure(&self, key: &str, cx: &Context<Self>) -> impl IntoElement + use<> {
@@ -2848,7 +2867,7 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
             key,
             keys,
             children,
-            virtual_row: Some(_),
+            virtual_row: Some(estimated_height),
             spacing,
             ..
         } => {
@@ -2862,6 +2881,7 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
                         .map(|identity| format!("{key}/@row:{}", identity.virtual_key()))
                         .unwrap_or_else(|| format!("{key}/@index:{index}")),
                     content: content.clone(),
+                    estimated_height: *estimated_height,
                     gap: if index + 1 < children.len() {
                         spacing.unwrap_or_default()
                     } else {
@@ -2894,6 +2914,7 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
                         }),
                         content: child.clone(),
                         gap: 0.,
+                        estimated_height: 44.,
                     }],
                 };
                 if index + 1 < children.len() {
