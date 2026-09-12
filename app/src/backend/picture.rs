@@ -7,8 +7,7 @@ use gpui_kit::StyledImage;
 use gpui_kit::{
     AnyElement, Context, Image, ImageFormat, ImageSource, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
-    RenderImage, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, div,
-    img, point, px, relative,
+    RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Window, div, img, point, px, relative,
 };
 
 /// Source-byte ceiling: a file past it is shown as "too large", never

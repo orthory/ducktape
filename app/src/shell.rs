@@ -3,11 +3,12 @@
 //! before the platform has actually opened it.
 
 use ducktape_view_guest::Task;
-use gpui_kit::prelude::FluentBuilder;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
 };
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::FluentBuilder;
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -44,8 +45,6 @@ pub(crate) enum Command {
     },
     Close(WindowKey),
     Raise(WindowKey),
-    Drag(WindowKey),
-    Oldest(oneshot::Sender<Option<WindowKey>>),
     Clipboard(String),
     Focus(String),
     Quit,
@@ -110,18 +109,6 @@ pub(crate) fn close<Message: 'static>(key: WindowKey) -> Task<Message> {
 
 pub(crate) fn raise<Message: 'static>(key: WindowKey) -> Task<Message> {
     effect(Command::Raise(key))
-}
-
-pub(crate) fn drag<Message: 'static>(key: WindowKey) -> Task<Message> {
-    effect(Command::Drag(key))
-}
-
-pub(crate) fn oldest() -> Task<Option<WindowKey>> {
-    Task::future(async {
-        let (reply, receive) = oneshot::channel();
-        send(Command::Oldest(reply)).await;
-        receive.await.unwrap_or_default()
-    })
 }
 
 pub(crate) fn clipboard<Message: 'static>(text: String) -> Task<Message> {
@@ -230,8 +217,6 @@ impl Desktop {
             Command::Open { key, kind, reply } => self.open_window(key, kind, reply, cx),
             Command::Close(key) => self.close_window(key, cx),
             Command::Raise(key) => self.raise_window(key, cx),
-            Command::Drag(key) => self.drag_window(key, cx),
-            Command::Oldest(reply) => self.oldest_window(reply),
             Command::Clipboard(text) => self.write_clipboard(text, cx),
             Command::Focus(key) => self.focus_control(key, cx),
             Command::Quit => self.quit(cx),
@@ -374,17 +359,6 @@ impl Desktop {
             return;
         };
         let _ = handle.update(cx, |_, window, _| window.activate_window());
-    }
-
-    fn drag_window(&mut self, key: WindowKey, cx: &mut Context<Self>) {
-        let Some(handle) = self.windows.get(&key) else {
-            return;
-        };
-        let _ = handle.update(cx, |_, window, _| window.start_window_move());
-    }
-
-    fn oldest_window(&self, reply: oneshot::Sender<Option<WindowKey>>) {
-        let _ = reply.send(self.windows.keys().next().copied());
     }
 
     fn write_clipboard(&self, text: String, cx: &mut Context<Self>) {
@@ -1209,7 +1183,11 @@ impl DesktopWindow {
         }
         if !error.is_empty() {
             content = content.child(
-                div().flex().items_center().gap_2().p_2()
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
                     .text_color(cx.theme().danger)
                     .child(div().flex_1().child(error))
                     .child(self.action("error-dismiss", "Dismiss", Message::DismissError, false)),
@@ -1315,7 +1293,8 @@ impl DesktopWindow {
                         state.bell_marking,
                     ));
                 if !state.bell_error.is_empty() {
-                    panel = panel.child(self.action("bell-retry", "Retry", Message::ReloadBell, false));
+                    panel =
+                        panel.child(self.action("bell-retry", "Retry", Message::ReloadBell, false));
                 }
                 for item in items {
                     let presentation = crate::backend::bell_presentation(&item, &presentations);
@@ -1422,11 +1401,16 @@ impl Render for DesktopWindow {
                 // one upload at a time. Native paths never reach the WASM view.
                 for path in paths.paths() {
                     let Some(path) = path.to_str() else {
-                        this.model.update(cx, |model, cx| model.dispatch(
-                            Message::FsDropFailed(crate::backend::AppError {
-                                message: "This file path cannot be represented as UTF-8.".into(),
-                                committed: false,
-                            }), cx));
+                        this.model.update(cx, |model, cx| {
+                            model.dispatch(
+                                Message::FsDropFailed(crate::backend::AppError {
+                                    message: "This file path cannot be represented as UTF-8."
+                                        .into(),
+                                    committed: false,
+                                }),
+                                cx,
+                            )
+                        });
                         continue;
                     };
                     this.model.update(cx, |model, cx| {
@@ -1541,7 +1525,7 @@ mod close_tests {
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use gpui_kit::test::TestWindowExt as _;
-        use gpui_kit::{FileDropEvent, ExternalPaths, VisualTestContext, point, px, size};
+        use gpui_kit::{ExternalPaths, FileDropEvent, VisualTestContext, point, px, size};
         let _turn = crate::module_view::tests::blocking_connection_turn();
         cx.update(gpui_kit::init);
         let mut state = Ducktape::initial_state();
@@ -1550,7 +1534,8 @@ mod close_tests {
         state.settings_user_key = "invalid signing key".into();
         state.fs_drop_dir = "/shared".into();
         let expected = crate::backend::files_write_gate(
-            state.fs_drop_dir.clone(), state.settings_user_key.clone(),
+            state.fs_drop_dir.clone(),
+            state.settings_user_key.clone(),
         );
         assert!(!expected.is_empty());
         let mut view = None;
@@ -1565,17 +1550,26 @@ mod close_tests {
         let position = point(px(400.), px(350.));
         native.simulate_event(FileDropEvent::Entered {
             position,
-            paths: ExternalPaths([std::path::PathBuf::from("/local/report.txt")].into_iter().collect()),
+            paths: ExternalPaths(
+                [std::path::PathBuf::from("/local/report.txt")]
+                    .into_iter()
+                    .collect(),
+            ),
         });
         native.update(|window, cx| window.render_frame(cx));
         native.simulate_event(FileDropEvent::Submit { position });
         view.read_with(&native, |view, cx| {
             assert_eq!(view.test_state(cx).error, expected);
-            assert!(!view.test_state(cx).fs_dropping, "write gate precedes local file I/O");
+            assert!(
+                !view.test_state(cx).fs_dropping,
+                "write gate precedes local file I/O"
+            );
         });
         native.update(|window, cx| window.render_frame(cx));
         native.update(|window, cx| window.click("error-dismiss", cx));
-        view.read_with(&native, |view, cx| assert!(view.test_state(cx).error.is_empty()));
+        view.read_with(&native, |view, cx| {
+            assert!(view.test_state(cx).error.is_empty())
+        });
         view.update(&mut native, |view, cx| {
             view.model.update(cx, |model, cx| {
                 model.state.bell_open = true;
@@ -1583,11 +1577,15 @@ mod close_tests {
                 cx.notify();
             });
         });
-        let generation = view.read_with(&native, |view, cx| view.test_state(cx).bell_load_generation);
+        let generation =
+            view.read_with(&native, |view, cx| view.test_state(cx).bell_load_generation);
         native.update(|window, cx| window.render_frame(cx));
         native.update(|window, cx| window.click("bell-retry", cx));
         view.read_with(&native, |view, cx| {
-            assert_eq!(view.test_state(cx).bell_load_generation, generation.wrapping_add(1));
+            assert_eq!(
+                view.test_state(cx).bell_load_generation,
+                generation.wrapping_add(1)
+            );
         });
     }
 

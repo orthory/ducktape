@@ -24,9 +24,9 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
-    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, author_display,
-    chat_message, handle_char, mark_message_groups, short_label,
+    CHAT_HOT_WINDOW_LIMIT, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReader,
+    MentionCandidates, NameDirectory, author_display, chat_message, mark_message_groups,
+    short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.

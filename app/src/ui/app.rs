@@ -545,7 +545,6 @@ pub(crate) enum AppMessage {
     TrayOpen,
     TrayQuit,
     ModifierStateChanged(gpui_kit::Modifiers),
-    DragLaunchWindow,
     CloseLaunchWindow,
     WindowFocused(crate::shell::WindowKey),
     WindowUnfocused(crate::shell::WindowKey),
@@ -711,7 +710,6 @@ pub(crate) enum AppMessage {
     WelcomeNameChanged(String),
     ChannelDraftChanged(String),
     PaletteDraftChanged(String),
-    Noop,
 }
 impl ::std::fmt::Debug for AppMessage {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -998,6 +996,11 @@ impl Ducktape {
             subscriptions
                 .push(Subscription::run(crate::shell::seconds).map(|()| AppMessage::WallTick));
         }
+        let toast_visible = !self.toast.is_empty();
+        if toast_visible {
+            subscriptions
+                .push(Subscription::run(crate::shell::toast_ticks).map(|()| AppMessage::ToastTick));
+        }
         Subscription::batch(subscriptions)
     }
     pub(crate) fn boot() -> (Self, Task<AppMessage>) {
@@ -1146,7 +1149,7 @@ impl Ducktape {
         let mut state = Self::initial_state();
 
         state.connected = true;
-        state.console_win = Some(({ crate::backend::window_target(None) }));
+        state.console_win = Some({ crate::backend::window_target(None) });
         state.connected_rpc = "http://127.0.0.1:1".to_owned();
         state.network_name = "demo".to_owned();
         state.bell_unread = 3;

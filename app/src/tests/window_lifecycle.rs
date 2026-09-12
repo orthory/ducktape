@@ -125,13 +125,6 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     use syn::visit::Visit as _;
     struct Exits(usize);
     impl<'ast> syn::visit::Visit<'ast> for Exits {
-        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            let selected = matches!(&arm.pat, syn::Pat::TupleStruct(pattern) if pattern.path.segments.last().is_some_and(|part| part.ident == "WindowWasClosed"));
-            let app_message = arm.pat.to_token_stream().to_string().contains("AppMessage");
-            if selected || !app_message {
-                self.visit_expr(&arm.body);
-            }
-        }
         fn visit_block(&mut self, block: &'ast syn::Block) {
             for (index, statement) in block.stmts.iter().enumerate() {
                 let syn::Stmt::Expr(syn::Expr::Return(returned), _) = statement else {
@@ -164,7 +157,7 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
                     .to_token_stream()
                     .to_string()
                     .replace(' ', "");
-                assert_eq!(refusal, "{return::ducktape_view_guest::Task::none();}");
+                assert_eq!(refusal, "{returnTask::none();}");
                 self.0 += 1;
             }
             syn::visit::visit_block(self, block);
@@ -174,10 +167,24 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
             let mut exits = Exits(0);
-            exits.visit_file(
-                &syn::parse_file(include_str!("../ui/app_update.rs"))
-                    .expect("native window close route"),
-            );
+            let source = syn::parse_file(include_str!("../ui/app_update.rs"))
+                .expect("native window close route");
+            let handler = source
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::Item::Impl(item) => Some(&item.items),
+                    _ => None,
+                })
+                .flatten()
+                .find_map(|item| match item {
+                    syn::ImplItem::Fn(function) if function.sig.ident == "on_window_was_closed" => {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .expect("named window-close handler");
+            exits.visit_block(&handler.block);
             exits.0
         })
         .unwrap()

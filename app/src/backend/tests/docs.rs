@@ -18,7 +18,6 @@ fn an_unnamed_principal_gets_a_bare_plate() {
     assert_eq!(initial_of("quackbot"), "Q");
 }
 
-
 /// A PAGE HIT NAMES ITS PAGE, AND SAYS EACH THING ONCE. The index's hit row
 /// carries a `page_id` and no title, so nothing downstream could name the page
 /// a match came from: the Explorer set BOTH its row title and its snippet to
@@ -105,9 +104,10 @@ fn a_page_search_hit_names_the_page_it_came_from() {
         PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
     );
+    let panel = crate::tests::rust_tokens(PANEL);
     assert!(
-        PANEL.lines().any(|line| line.contains("Node::Text") && line.contains(".page_title"))
-            && !PANEL.lines().any(|line| line.contains("Node::Text") && line.contains("content:") && line.contains(".block_id")),
+        panel.contains("content:hit.page_title.to_owned()")
+            && !panel.contains("content:hit.block_id"),
         "the pages search panel names the page instead of printing a raw block id"
     );
 }

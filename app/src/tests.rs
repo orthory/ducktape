@@ -177,27 +177,6 @@ fn room(id: &str, head: i64) -> backend::ChatChannel {
     }
 }
 
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-fn code_of(line: &str) -> &str {
-    line.split("//").next().unwrap_or_default()
-}
-
-fn calls(code: &str, name: &str) -> bool {
-    let mut rest = code;
-    while let Some(at) = rest.find(name) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + name.len()..].chars().next();
-        let bounded = !before.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if bounded && after == Some('(') {
-            return true;
-        }
-        rest = &rest[at + name.len()..];
-    }
-    false
-}
 fn type_into(scope: &str, text: &str) {
     composer::append(scope, text);
 }
@@ -278,7 +257,14 @@ pub(crate) fn handler_bodies() -> Vec<(String, String)> {
                     .collect();
                 if parts.len() == 2 && parts[0] == "AppMessage" {
                     assert!(arm.guard.is_none(), "message dispatch has no match guards");
-                    let syn::Expr::MethodCall(call) = arm.body.as_ref() else {
+                    let expression = match arm.body.as_ref() {
+                        syn::Expr::Block(block) => match block.block.stmts.as_slice() {
+                            [syn::Stmt::Expr(expression, None)] => expression,
+                            _ => panic!("a dispatch arm contains only its handler call"),
+                        },
+                        expression => expression,
+                    };
+                    let syn::Expr::MethodCall(call) = expression else {
                         panic!("each message delegates to its named handler");
                     };
                     let handler = self
@@ -332,7 +318,4 @@ pub(crate) fn handler_body(variant: &str) -> String {
         .unwrap_or_else(|| panic!("missing native handler {variant}"));
     assert!(found.next().is_none(), "one handler per message variant");
     body
-}
-fn inlined(source: &str) -> String {
-    source.split_whitespace().collect::<Vec<_>>().join(" ")
 }

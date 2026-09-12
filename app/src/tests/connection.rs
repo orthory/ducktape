@@ -143,9 +143,7 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
 #[test]
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     let source = rust_tokens(EXPLORER);
-    assert!(
-        source.contains("self.sent_query=(self.query).trim().to_owned()")
-    );
+    assert!(source.contains("self.sent_query=(self.query).trim().to_owned()"));
     assert!(source.contains("workspace_search(") && source.contains("self.sent_query.to_owned()"));
     let condition = branches(EXPLORER)
         .into_iter()

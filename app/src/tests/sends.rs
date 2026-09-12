@@ -165,14 +165,45 @@ fn bodies_in_flight(app: &Ducktape) -> Vec<&str> {
 /// the arm stashes them.
 #[test]
 fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
-    let chat = include_str!("../../../crates/views/chat/src/ui/chat.rs");
-    let mounts: Vec<_> = chat
-        .lines()
-        .filter(|line| {
-            line.contains("name: ::std::string::String::from(\"chat_composer\")")
-                && (line.contains("&(\"message\".") || line.contains("&(\"reply\"."))
+    let mounts = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            use quote::ToTokens;
+            use syn::visit::Visit;
+            struct Mounts(Vec<String>);
+            impl<'ast> Visit<'ast> for Mounts {
+                fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+                    let surface = node
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|part| part.ident == "Surface");
+                    if surface {
+                        let field = |name: &str| {
+                            node.fields.iter().find(|field| {
+                            matches!(&field.member, syn::Member::Named(member) if member == name)
+                        }).map(|field| field.expr.to_token_stream().to_string()).unwrap_or_default()
+                        };
+                        let name = field("name");
+                        let args = field("args");
+                        let composer = name.contains("\"chat_composer\"");
+                        let send_kind = args.contains("\"message\"") || args.contains("\"reply\"");
+                        if composer && send_kind {
+                            self.0.push(args);
+                        }
+                    }
+                    syn::visit::visit_expr_struct(self, node);
+                }
+            }
+            let source =
+                syn::parse_file(include_str!("../../../crates/views/chat/src/ui/chat.rs")).unwrap();
+            let mut mounts = Mounts(Vec::new());
+            mounts.visit_file(&source);
+            mounts.0
         })
-        .collect();
+        .unwrap()
+        .join()
+        .unwrap();
     assert_eq!(mounts.len(), 2, "message and reply each have a mount");
     for mount in mounts {
         for input in ["loading", "connected", "post_refusal"] {
