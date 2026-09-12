@@ -50,6 +50,10 @@ fn open(cx: &mut TestAppContext) -> (Entity<NativeModuleView>, VisualTestContext
     (view, native)
 }
 fn button(seat: &Arc<Mutex<Mounted>>, label: &str) -> String {
+    fn shows(node: &wire::Node, label: &str) -> bool {
+        matches!(node, wire::Node::Text { content, .. } if content == label)
+            || node.children().iter().any(|child| shows(child, label))
+    }
     let locked = seat.lock().unwrap();
     let Slot::Ready(guest) = &locked.slot else {
         panic!("live guest")
@@ -63,7 +67,7 @@ fn button(seat: &Arc<Mutex<Mounted>>, label: &str) -> String {
             on_press: Some(_),
             ..
         } = node
-            && matches!(child.as_ref(), wire::Node::Text { content, .. } if content == label)
+            && shows(child, label)
         {
             visible_label = Some(key.clone());
         }
