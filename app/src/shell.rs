@@ -1086,7 +1086,9 @@ impl DesktopWindow {
     }
 
     fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::{Selectable as _, button::ButtonVariants as _};
         use gpui_kit::*;
+        let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let (spec, route) = self.model.read(cx).state.native_view();
         let module_changed = self
             .module
@@ -1103,8 +1105,8 @@ impl DesktopWindow {
         }
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
-        let mut tabs = div().flex().flex_col().gap_1().w(px(132.0)).p_2();
-        for (tab, label) in [
+        let selected_tab = self.model.read(cx).state.shell_tab;
+        let navigation = [
             (ShellTab::Chat, "Chat"),
             (ShellTab::Pages, "Pages"),
             (ShellTab::Forge, "Forge"),
@@ -1115,16 +1117,85 @@ impl DesktopWindow {
             (ShellTab::Members, "Members"),
             (ShellTab::Governance, "Governance"),
             (ShellTab::Settings, "Settings"),
-        ] {
-            let model = self.model.clone();
+        ];
+        let title = navigation
+            .iter()
+            .find(|(tab, _)| *tab == selected_tab)
+            .map(|(_, label)| *label)
+            .expect("native navigation covers every shell tab");
+        let mut tabs = div()
+            .id("workspace-rail")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(184.))
+            .h_full()
+            .flex_shrink_0()
+            .px_3()
+            .py_4()
+            .bg(colors.muted)
+            .border_r_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .h_10()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .mb_4()
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(colors.foreground)
+                            .text_color(colors.background)
+                            .font_weight(FontWeight::BOLD)
+                            .child("D"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("DUCKTAPE"),
+                    ),
+            );
+        for (tab, label) in navigation {
+            let section = match tab {
+                ShellTab::Chat => Some("WORKSPACE"),
+                ShellTab::Explorer => Some("NETWORK"),
+                ShellTab::Settings => Some("PREFERENCES"),
+                _ => None,
+            };
+            if tab == ShellTab::Settings {
+                tabs = tabs.child(div().flex_1().min_h_4());
+            }
+            if let Some(section) = section {
+                tabs = tabs.child(
+                    div()
+                        .px_3()
+                        .pt_3()
+                        .pb_2()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .font_family(design::fonts::FAMILY_MONO)
+                        .text_color(colors.muted_foreground)
+                        .child(section),
+                );
+            }
+            let selected = tab == selected_tab;
             tabs = tabs.child(
-                gpui_kit::component::button::Button::new(label)
-                    .label(label)
-                    .on_click(move |_, _, cx| {
-                        model.update(cx, |model, cx| {
-                            model.dispatch(Message::SelectShellTab(tab), cx)
-                        });
-                    }),
+                self.action(label, label, Message::SelectShellTab(tab), false)
+                    .ghost()
+                    .selected(selected)
+                    .w_full()
+                    .h_9()
+                    .px_3()
+                    .justify_start()
+                    .when(selected, |button| button.primary()),
             );
         }
         let state = &self.model.read(cx).state;
@@ -1135,57 +1206,132 @@ impl DesktopWindow {
             modifiers.control = true;
         }
         let header = div()
+            .id("workspace-header")
             .flex()
-            .gap_2()
+            .gap_3()
             .items_center()
-            .p_2()
-            .child(state.network_name.clone())
-            .child(state.status.clone())
-            .child(self.action(
-                "search",
-                "Search",
-                Message::GlobalKeyPressed(KeyPress {
-                    key: "k".into(),
-                    modifiers,
-                }),
-                !state.connected,
-            ))
-            .child(self.action(
-                "bell",
-                format!("Notifications ({})", state.bell_unread),
-                Message::ToggleBell,
-                !state.connected,
-            ))
-            .child(self.action(
-                "switch-network",
-                "Switch network",
-                Message::SwitchNetwork,
-                false,
-            ));
+            .h(px(72.))
+            .flex_shrink_0()
+            .px_5()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.background)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(colors.muted_foreground)
+                            .child(state.network_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .font_family(design::fonts::FAMILY_MONO)
+                    .text_color(colors.muted_foreground)
+                    .child(state.status.clone()),
+            )
+            .child(
+                self.action(
+                    "search",
+                    "Search",
+                    Message::GlobalKeyPressed(KeyPress {
+                        key: "k".into(),
+                        modifiers,
+                    }),
+                    !state.connected,
+                )
+                .outline()
+                .h_8()
+                .px_3(),
+            )
+            .child(
+                self.action(
+                    "bell",
+                    format!("Notifications ({})", state.bell_unread),
+                    Message::ToggleBell,
+                    !state.connected,
+                )
+                .outline()
+                .h_8()
+                .px_3(),
+            )
+            .child(
+                self.action(
+                    "switch-network",
+                    "Switch network",
+                    Message::SwitchNetwork,
+                    false,
+                )
+                .ghost()
+                .h_8()
+                .px_3(),
+            );
         let error = state.error.clone();
         let toast = state.toast.clone();
         let needs_account =
             state.connected && !state.account_exists && !state.account_banner_dismissed;
-        let mut content = div().flex().flex_col().flex_1().h_full().child(header);
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .overflow_hidden()
+            .bg(colors.background)
+            .child(header);
         if needs_account {
             content = content.child(
                 div()
                     .flex()
-                    .gap_2()
-                    .p_2()
-                    .child("Sign in to use your account on this network")
-                    .child(self.action(
-                        "account-open",
-                        "Sign in",
-                        Message::OpenAccountWelcome,
-                        false,
-                    ))
-                    .child(self.action(
-                        "account-dismiss",
-                        "Dismiss",
-                        Message::DismissAccountBanner,
-                        false,
-                    )),
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .bg(colors.muted)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(colors.muted_foreground)
+                            .child("Sign in to use your account on this network"),
+                    )
+                    .child(
+                        self.action(
+                            "account-open",
+                            "Sign in",
+                            Message::OpenAccountWelcome,
+                            false,
+                        )
+                        .primary()
+                        .h_8(),
+                    )
+                    .child(
+                        self.action(
+                            "account-dismiss",
+                            "Dismiss",
+                            Message::DismissAccountBanner,
+                            false,
+                        )
+                        .ghost()
+                        .h_8(),
+                    ),
             );
         }
         if !error.is_empty() {
@@ -1194,25 +1340,59 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .p_2()
-                    .text_color(cx.theme().danger)
-                    .child(div().flex_1().child(error))
-                    .child(self.action("error-dismiss", "Dismiss", Message::DismissError, false)),
+                    .px_5()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .text_color(colors.destructive)
+                    .child(div().flex_1().text_size(px(12.)).child(error))
+                    .child(
+                        self.action("error-dismiss", "Dismiss", Message::DismissError, false)
+                            .ghost()
+                            .h_8(),
+                    ),
             );
         }
-        content = content.child(div().flex_1().min_h_0().child(view));
+        content = content.child(
+            div()
+                .id("workspace-content")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .overflow_hidden()
+                .child(view),
+        );
         if !toast.is_empty() {
-            content = content.child(div().flex().gap_2().p_2().child(toast).child(self.action(
-                "toast-dismiss",
-                "Dismiss",
-                Message::DismissToast,
-                false,
-            )));
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .bg(colors.muted)
+                    .child(div().flex_1().text_size(px(12.)).child(toast))
+                    .child(
+                        self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
+                            .ghost()
+                            .h_8(),
+                    ),
+            );
         }
         let mut root = div()
             .relative()
             .flex()
             .size_full()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
             .child(tabs)
             .child(content);
         if let Some(overlay) = self.overlay(window, cx) {
