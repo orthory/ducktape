@@ -1,10 +1,13 @@
 #[allow(warnings, clippy::all)]
 mod __ice_group_app_update {
-use super::*;
-impl super::ChatView {
-#[allow(clippy::assign_op_pattern)]
-pub(super) fn __update(&mut self, message: __ChatViewMessage) -> ::ducktape_view_guest::Task<__ChatViewMessage> {
-match message {
+    use super::*;
+    impl super::ChatView {
+        #[allow(clippy::assign_op_pattern)]
+        pub(super) fn __update(
+            &mut self,
+            message: __ChatViewMessage,
+        ) -> ::ducktape_view_guest::Task<__ChatViewMessage> {
+            match message {
 __ChatViewMessage::SidebarResized(dx, _dy) => (|| {
 
 let _ = &dx;
@@ -720,41 +723,40 @@ __ChatViewMessage::__0C4368617453637265656eH636861745f706f696e7465725f7072657373
 
 let _ = &_x;
 let _ = &y;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 5],});
-{ let __ice_next = y; if ::ducktape_view_guest::state_changed!(__local.chat_pointer_y, __ice_next) { __local.chat_pointer_y = __ice_next; __local.__ice_rev[1] += 1; } }
+::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
+__local.chat_pointer_y = y;
 ::ducktape_view_guest::Task::none()
 })(),
 __ChatViewMessage::__0C4368617453637265656eH636861745f726573697a6564(__scope, _width, height) => (|| {
 
 let _ = &_width;
 let _ = &height;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 5],});
-{ let __ice_next = height; if ::ducktape_view_guest::state_changed!(__local.chat_height, __ice_next) { __local.chat_height = __ice_next; __local.__ice_rev[2] += 1; } }
+::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
+__local.chat_height = height;
 ::ducktape_view_guest::Task::none()
 })(),
 __ChatViewMessage::__0C4368617453637265656eH7468726561645f706f696e7465725f70726573736564(__scope, _x, y) => (|| {
 
 let _ = &_x;
 let _ = &y;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 5],});
-{ let __ice_next = y; if ::ducktape_view_guest::state_changed!(__local.thread_pointer_y, __ice_next) { __local.thread_pointer_y = __ice_next; __local.__ice_rev[3] += 1; } }
+::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
+__local.thread_pointer_y = y;
 ::ducktape_view_guest::Task::none()
 })(),
 __ChatViewMessage::__0C4368617453637265656eH7468726561645f726573697a6564(__scope, _width, height) => (|| {
 
 let _ = &_width;
 let _ = &height;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 5],});
-{ let __ice_next = height; if ::ducktape_view_guest::state_changed!(__local.thread_height, __ice_next) { __local.thread_height = __ice_next; __local.__ice_rev[4] += 1; } }
+::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
+__local.thread_height = height;
 ::ducktape_view_guest::Task::none()
 })(),
-__ChatViewMessage::__0C4368617453637265656eB6d6573736167655f616374696f6e5f666f637573(__scope, value) => { ::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope)); let __local = self.__ice_component_04368617453637265656e.entry(__scope).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 5],}); { let __ice_next = value; if ::ducktape_view_guest::state_changed!(__local.message_action_focus, __ice_next) { __local.message_action_focus = __ice_next; __local.__ice_rev[0] += 1; } } ::ducktape_view_guest::Task::none() },
+__ChatViewMessage::__0C4368617453637265656eB6d6573736167655f616374696f6e5f666f637573(__scope, value) => { ::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope)); let __local = self.__ice_component_04368617453637265656e.entry(__scope).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),}); __local.message_action_focus = value; ::ducktape_view_guest::Task::none() },
 __ChatViewMessage::__BindSearchDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.search_draft, __ice_next) { self.search_draft = __ice_next; self.__ice_rev[79] += 1; } } ::ducktape_view_guest::Task::none() }
 __ChatViewMessage::__BindChannelNameDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.channel_name_draft, __ice_next) { self.channel_name_draft = __ice_next; self.__ice_rev[81] += 1; } } ::ducktape_view_guest::Task::none() }
 __ChatViewMessage::__BindMemberKeyDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.member_key_draft, __ice_next) { self.member_key_draft = __ice_next; self.__ice_rev[82] += 1; } } ::ducktape_view_guest::Task::none() }
 __ChatViewMessage::__ExternNoop => ::ducktape_view_guest::Task::none(),
 }
-}
-
-}
+        }
+    }
 }

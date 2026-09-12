@@ -1,10 +1,13 @@
 #[allow(warnings, clippy::all)]
 mod __ice_group_app_update {
-use super::*;
-impl super::FilesView {
-#[allow(clippy::assign_op_pattern)]
-pub(super) fn __update(&mut self, message: __FilesViewMessage) -> ::ducktape_view_guest::Task<__FilesViewMessage> {
-match message {
+    use super::*;
+    impl super::FilesView {
+        #[allow(clippy::assign_op_pattern)]
+        pub(super) fn __update(
+            &mut self,
+            message: __FilesViewMessage,
+        ) -> ::ducktape_view_guest::Task<__FilesViewMessage> {
+            match message {
 __FilesViewMessage::TreeResized(dx, _dy) => (|| {
 
 let _ = &dx;
@@ -289,8 +292,8 @@ let _ = &url;
 })(),
 __FilesViewMessage::__0C46696c657353637265656eH66735f746f67676c655f686973746f7279(__scope) => (|| {
 
-::ducktape_view_guest::invalidate_component("FilesScreen", &(__scope.clone())); let __local = self.__ice_component_046696c657353637265656e.entry(__scope.clone()).or_insert_with(|| __IceFilesScreenState {history_open: self.__ice_component_046696c657353637265656e_initial.history_open.clone(),__ice_rev: [::ducktape_view_guest::rev::seed(); 1],});
-{ let __ice_next = (!__local.history_open); if ::ducktape_view_guest::state_changed!(__local.history_open, __ice_next) { __local.history_open = __ice_next; __local.__ice_rev[0] += 1; } }
+::ducktape_view_guest::invalidate_component("FilesScreen", &(__scope.clone())); let __local = self.__ice_component_046696c657353637265656e.entry(__scope.clone()).or_insert_with(|| __IceFilesScreenState {history_open: self.__ice_component_046696c657353637265656e_initial.history_open.clone(),});
+__local.history_open = (!__local.history_open);
 ::ducktape_view_guest::Task::none()
 })(),
 __FilesViewMessage::__BindNewName(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.new_name, __ice_next) { self.new_name = __ice_next; self.__ice_rev[30] += 1; } } ::ducktape_view_guest::Task::none() }
@@ -298,7 +301,6 @@ __FilesViewMessage::__0T6472616674(__transaction) => { let __route = __transacti
 __FilesViewMessage::__EditDraft(__document) => { __document.apply(&mut self.draft); self.__ice_rev[31] += 1; ::ducktape_view_guest::Task::none() }
 __FilesViewMessage::__ExternNoop => ::ducktape_view_guest::Task::none(),
 }
-}
-
-}
+        }
+    }
 }
