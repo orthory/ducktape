@@ -1,7 +1,6 @@
 # Ducktape desktop
 
-Native Chat + Pages client, with its UI declared in
-`src/ui/app.ice` through [Ice](https://github.com/byeongsu-hong/ducktape-ui-lang).
+Native GPUI desktop shell with dynamically loaded, Rust-authored WASM views.
 
 ```bash
 cargo build -p node-bin
@@ -28,15 +27,14 @@ the home.
 ## Module-owned views
 
 The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
-Pages and Forge tabs are not native: each is an Ice application under `crates/views`
+Pages and Forge tabs keep their state and behavior in WASM views under `crates/views`
 (`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`,
-`pages`, `forge`) compiled
-for the `tree` target and wrapped as an `ice:view` component that the app
+`pages`, `forge`). Rust cdylibs compile to `wasm32-unknown-unknown`; wasm-tools wraps their embedded WIT exports as components that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
 `target/views/<module>_view.wasm`, where a built binary looks for it
-(`DUCKTAPE_VIEWS_DIR` overrides; the bundle's `resources` metadata carries the
-directory into `Ducktape.app` beside the executable, and the Linux
+(`DUCKTAPE_VIEWS_DIR` overrides; the native packaging script carries the
+directory into `Ducktape.app` as resources linked beside the executable, and the Linux
 `make install-app` copies it beside the binary); `make dev` and `make app` run
 it first. A tab whose view is not
 staged says so in its place.
@@ -101,16 +99,16 @@ refuses when they differ.
 ## Release build (macOS: signed and notarized)
 
 `make app` builds `Ducktape.app` and `Ducktape-<version>-<arch>.dmg` under
-`target/ice-bundle/` and signs both **ad-hoc**, which runs on the machine that
+`target/app-bundle/` and signs both **ad-hoc**, which runs on the machine that
 built it and nowhere else — Gatekeeper refuses an ad-hoc bundle that arrived
 over the network. A bundle that leaves this Mac is signed with a Developer ID
-identity and notarized by Apple. `cargo-ice bundle` does both itself, off four
+identity and notarized by Apple. `ops/bundle-app-macos.sh` does both itself, off four
 environment variables; `make app` inherits the environment, so exporting them
 is the whole configuration.
 
 1. **The signing identity.** A "Developer ID Application" certificate from the
    Apple Developer Program, in the login keychain. The exact string is what
-   `ICE_CODESIGN_IDENTITY` takes:
+   `DUCKTAPE_CODESIGN_IDENTITY` takes:
 
    ```sh
    security find-identity -v -p codesigning   # "Developer ID Application: … (TEAMID)"
@@ -129,26 +127,26 @@ is the whole configuration.
 3. **Build.**
 
    ```sh
-   export ICE_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
-   export ICE_NOTARY_KEY="$HOME/.appstoreconnect/AuthKey_XXXXXXXXXX.p8"
-   export ICE_NOTARY_KEY_ID=XXXXXXXXXX
-   export ICE_NOTARY_ISSUER=00000000-0000-0000-0000-000000000000
-   make app-release          # refuses if ICE_CODESIGN_IDENTITY is unset
+   export DUCKTAPE_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
+   export DUCKTAPE_NOTARY_KEY="$HOME/.appstoreconnect/AuthKey_XXXXXXXXXX.p8"
+   export DUCKTAPE_NOTARY_KEY_ID=XXXXXXXXXX
+   export DUCKTAPE_NOTARY_ISSUER=00000000-0000-0000-0000-000000000000
+   make app-release          # refuses if DUCKTAPE_CODESIGN_IDENTITY is unset
    ```
 
-   The three `ICE_NOTARY_*` go together: all three set adds `xcrun notarytool
+   The three `DUCKTAPE_NOTARY_*` go together: all three set adds `xcrun notarytool
    submit --wait` on the DMG followed by `xcrun stapler staple`, so the ticket
    travels inside the image and a first launch with no network still passes.
-   Set without `ICE_CODESIGN_IDENTITY`, cargo-ice refuses before the upload
+   Set without `DUCKTAPE_CODESIGN_IDENTITY`, the packaging script refuses before the upload
    rather than after Apple's wait. Set none and the build prints the identity
    it used and says what to export to notarize.
 
 4. **Verify** — on the built artifacts, before shipping them:
 
    ```sh
-   spctl -a -vv target/ice-bundle/Ducktape.app      # accepted, source=Notarized Developer ID
-   xcrun stapler validate target/ice-bundle/Ducktape-*.dmg
-   codesign -dv --verbose=4 target/ice-bundle/Ducktape.app   # Authority + TeamIdentifier
+   spctl -a -vv target/app-bundle/Ducktape.app      # accepted, source=Notarized Developer ID
+   xcrun stapler validate target/app-bundle/Ducktape-*.dmg
+   codesign -dv --verbose=4 target/app-bundle/Ducktape.app   # Authority + TeamIdentifier
    ```
 
 `ops/macos-preflight.sh` reports both halves — the Developer ID identities in
@@ -166,8 +164,8 @@ The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 The canonical shared UI uses warm ink-on-paper neutrals and a sparse
 terracotta brand role. Content stays opaque; functional chrome uses three
 translucent tiers over the native-blurred window (thin rail/sidebar, regular
-titlebar/popovers, sheet modals). Ice owns the opacity roles while blur remains
-renderer-owned. Depth comes from surface steps and warm shadows.
+titlebar/popovers, sheet modals). Authored wire faces carry the opacity roles;
+the native renderer owns platform blur. Depth comes from surface steps and warm shadows.
 
 | Token | Value | Use |
 | --- | --- | --- |
@@ -189,15 +187,13 @@ renderer-owned. Depth comes from surface steps and warm shadows.
   state, and action links.
 - Hover changes fill, border, and foreground only; it never changes geometry.
 - Reveal contextual row actions on hover and keep them visible while selected.
-- Ice theme tokens are compile-time constants, so the app ships the shared
-  default light palette.
+- Authored view faces carry their light and dark colors across the WASM boundary.
 
 ## Design system
 
-Shared color, shape, recipes, and components come from the pinned
-`ducktape-ui` source vendored under `src/ui/ducktape-ui/`. The local `design`
-crate owns only application font assets and the product type scale; drift
-guards hold the Ice sources to both authorities.
+The native shell uses GPUI components. WASM views describe their own faces,
+layout and editor presentation through the shared wire vocabulary. The local
+`design` crate owns application font assets and the product type scale.
 
 - Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
   labels, and badges).
