@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use gpui_kit::StyledImage;
 use gpui_kit::{
     AnyElement, Context, Image, ImageFormat, ImageSource, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,

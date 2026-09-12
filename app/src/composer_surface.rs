@@ -4,6 +4,7 @@
 //! scrolling and text history; this module owns mention identities and sends.
 
 use crate::backend::{ChatMember, MentionCandidates, names_at, names_generation, room_scope};
+use gpui_kit::EntityInputHandler;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, InputEvent, Paste, TextDecoration, TextDecorationCollection,

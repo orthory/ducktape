@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use gpui_kit::StyledImage;
 use gpui_kit::{
     Context, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, Window, div, img,
     px,
