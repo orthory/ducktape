@@ -142,6 +142,10 @@ struct Desktop {
 
 impl Desktop {
     fn dispatch(&mut self, message: Message, cx: &mut Context<Self>) {
+        // Native callbacks run on GPUI's thread, not a Tokio worker. Reducers
+        // may construct effects which spawn immediately, before their first poll.
+        let runtime = crate::module_view::runtime();
+        let _runtime = runtime.enter();
         let appearance = self.state.appearance.clone();
         let task = self.state.update(message);
         if appearance != self.state.appearance {
@@ -199,6 +203,9 @@ impl Desktop {
     }
 
     fn subscriptions(&mut self, cx: &mut Context<Self>) {
+        // Boot also enters here without dispatch; stream constructors may spawn.
+        let runtime = crate::module_view::runtime();
+        let _runtime = runtime.enter();
         let recipes = self.state.subscriptions().into_recipes();
         self.streams
             .retain(|key, _| recipes.iter().any(|recipe| recipe.key == *key));
@@ -1524,8 +1531,7 @@ mod close_tests {
     fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers() {
         use gpui_kit::test::TestWindowExt as _;
         use gpui_kit::{ExternalPaths, FileDropEvent, InputEvent, point, px, size};
-        let runtime = crate::module_view::runtime();
-        let _runtime = runtime.enter();
+        assert!(tokio::runtime::Handle::try_current().is_err());
         let _turn = crate::module_view::tests::blocking_connection_turn();
         let mut cx = crate::frame_probe::headless_context();
         let mut state = Ducktape::initial_state();
