@@ -15,6 +15,38 @@ const GROUPS: [(&str, &str); 6] = [
 ];
 
 fn pane_arms() -> Vec<(String, String)> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(pane_arms_on_stack)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn authored_items() -> syn::File {
+    let file = syn::parse_file(SETTINGS).unwrap();
+    file.items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Macro(item)
+                if item
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .unwrap()
+                    .ident
+                    .to_string()
+                    .starts_with("__ice_generated_items_") =>
+            {
+                Some(syn::parse2(item.mac.tokens.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .expect("authored item wrapper")
+}
+
+fn pane_arms_on_stack() -> Vec<(String, String)> {
     struct Panes(Vec<(String, String)>);
     impl<'ast> Visit<'ast> for Panes {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
@@ -41,7 +73,37 @@ fn pane_arms() -> Vec<(String, String)> {
         }
     }
     let mut visitor = Panes(Vec::new());
-    visitor.visit_file(&syn::parse_file(SETTINGS).unwrap());
+    let file = authored_items();
+    visitor.visit_file(&file);
+    struct Methods(Vec<(String, String)>);
+    impl<'ast> Visit<'ast> for Methods {
+        fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+            self.0.push((
+                method.sig.ident.to_string(),
+                method
+                    .block
+                    .to_token_stream()
+                    .to_string()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect(),
+            ));
+        }
+    }
+    let mut methods = Methods(Vec::new());
+    methods.visit_file(&file);
+    for (_, body) in &mut visitor.0 {
+        let mut pending = vec![body.clone()];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(caller) = pending.pop() {
+            for (name, callee) in &methods.0 {
+                if caller.contains(&format!(".{name}(")) && visited.insert(name.clone()) {
+                    body.push_str(callee);
+                    pending.push(callee.clone());
+                }
+            }
+        }
+    }
     visitor.0
 }
 
@@ -71,20 +133,28 @@ fn every_pane_has_a_tab_and_an_arm() {
 
 #[test]
 fn the_enum_names_the_same_panes_in_the_same_order() {
-    let file = syn::parse_file(SETTINGS).unwrap();
-    let variants = file
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Enum(item) if item.ident == "SettingsPane" => Some(
-                item.variants
-                    .iter()
-                    .map(|variant| variant.ident.to_string())
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
+    let variants = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let file = authored_items();
+            let variants = file
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    syn::Item::Enum(item) if item.ident == "SettingsPane" => Some(
+                        item.variants
+                            .iter()
+                            .map(|variant| variant.ident.to_string())
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .expect("the native pane discriminant");
+            variants
         })
-        .expect("the native pane discriminant");
+        .unwrap()
+        .join()
+        .unwrap();
     assert_eq!(variants, PANES);
 }
 

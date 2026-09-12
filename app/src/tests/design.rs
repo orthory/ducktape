@@ -75,7 +75,7 @@ fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
 }
 #[test]
 fn message_action_toolbar_stays_compact_and_accessible() {
-    let chat = rust_tokens(include_str!("../../../crates/views/chat/src/lib.rs"));
+    let chat = rust_tokens(super::connection::CHAT);
     assert!(chat.contains("wire::Node::Hover"));
     assert!(chat.contains("27.0"));
     assert!(chat.contains("25.0"));
@@ -142,7 +142,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     let tree = rust_tokens(include_str!("../view_tree.rs"));
     assert!(tree.contains("wire::Face"));
     assert!(tree.contains("background"));
-    let chat = rust_tokens(include_str!("../../../crates/views/chat/src/lib.rs"));
+    let chat = rust_tokens(super::connection::CHAT);
     assert!(chat.contains("selected"));
     assert!(chat.contains("row_hover") || chat.contains("__ice_palette"));
 }

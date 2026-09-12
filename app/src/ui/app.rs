@@ -1440,8 +1440,8 @@ mod state_tests {
         let __actual = (state.live_agents).is_empty();
         assert!(__actual);
     }
-    #[test]
-    fn a_chat_address_opened_from_another_tab_lands_on_the_chat_tab() {
+    #[tokio::test]
+    async fn a_chat_address_opened_from_another_tab_lands_on_the_chat_tab() {
         let (mut state, _) = Ducktape::__preset_12();
         let __message = __DucktapeMessage::SelectShellTab(ShellTab::Agents);
         dispatch(&mut state, __message);

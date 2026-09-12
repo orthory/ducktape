@@ -854,10 +854,11 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
     assert!(guard < assignment);
     assert!(arm[guard..assignment].contains("return"));
     let subscriptions = rust_tokens(include_str!("../ui/app.rs"));
-    let (_, lane) = subscriptions
+    let (prefix, lane) = subscriptions
         .split_once("chat_live_agents(")
         .expect("one node-wide live lane");
-    let arguments = lane.split(';').next().unwrap();
+    let arguments = prefix.rsplit_once("Subscription::run_with(").unwrap().1;
+    assert!(lane.starts_with("data.0.clone(),data.1.clone(),data.2,data.3.clone()"));
     for identity in [
         "connected_rpc",
         "network_chain_id",

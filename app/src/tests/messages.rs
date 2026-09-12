@@ -32,7 +32,7 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
 #[test]
 fn the_message_line_is_one_rich_text_paragraph() {
     for source in [
-        include_str!("../../../crates/views/chat/src/ui/kit.rs"),
+        include_str!("../../../crates/views/chat/src/ui/chat.rs"),
         include_str!("../../../crates/views/forge/src/ui/kit.rs"),
     ] {
         let source = rust_tokens(source);
@@ -98,7 +98,7 @@ fn the_mention_plate_leaves_space_before_and_after_the_token() {
 
 #[test]
 fn the_edited_marker_reaches_every_row_it_annotates() {
-    let components = include_str!("../../../crates/views/chat/src/ui/components.rs");
+    let components = super::connection::CHAT;
     let branches = super::connection::branches(components);
     let continuations: Vec<_> = branches
         .iter()

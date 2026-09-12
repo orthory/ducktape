@@ -131,7 +131,7 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
 }
 
 #[gpui_kit::test]
-fn bell_controls_render_context_and_admit_read_from_the_real_button(
+async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     cx: &mut gpui_kit::TestAppContext,
 ) {
     use gpui_kit::test::TestWindowExt as _;
@@ -221,6 +221,10 @@ fn bell_controls_render_context_and_admit_read_from_the_real_button(
     });
     native.update(|window, cx| window.render_frame(cx));
     click(&mut native, "notification/17");
+    cx.condition(&view, |view, cx| {
+        view.test_state(cx).active_channel == "general"
+    })
+    .await;
     view.read_with(&native, |view, cx| {
         let app = view.test_state(cx);
         assert!(!app.bell_open);

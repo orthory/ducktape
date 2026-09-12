@@ -430,12 +430,14 @@ impl DesktopWindow {
         let intents = module.update(cx, |module, cx| {
             module.observe_final_window_event(event, cx)
         });
-        // The view subscription is about to disappear with its presenter.
-        // Complete the ordinary domain route directly, without a paint tick.
-        for intent in intents {
-            self.model
-                .update(cx, |model, cx| model.dispatch(route(intent), cx));
-        }
+        // Closing can run inside a model update. Keep the model and frozen
+        // route alive until that borrow ends, independent of the presenter.
+        let model = self.model.clone();
+        cx.defer(move |cx| {
+            for intent in intents {
+                model.update(cx, |model, cx| model.dispatch(route(intent), cx));
+            }
+        });
     }
     #[cfg(test)]
     pub(crate) fn test_state<'a>(&self, cx: &'a gpui_kit::App) -> &'a Ducktape {

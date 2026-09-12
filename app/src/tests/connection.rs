@@ -7,6 +7,19 @@ const PAGES: &str = include_str!("../../../crates/views/pages/src/ui/pages.rs");
 const EXPLORER: &str = include_str!("../../../crates/views/explorer/src/lib.rs");
 
 pub(super) fn branches(source: &str) -> Vec<(String, String, usize)> {
+    // Deep authored widget trees exceed the test harness's small thread stack.
+    // Bound only this syntax walk, not the application or the whole suite.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || branches_on_stack(source))
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+}
+
+fn branches_on_stack(source: &str) -> Vec<(String, String, usize)> {
     struct Branches {
         depth: usize,
         rows: Vec<(String, String, usize)>,
@@ -64,7 +77,11 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
             "{field} participates in the plate guard"
         );
     }
-    assert!(plate.contains("Nopagesmatched"));
+    assert!(plate.contains("EmptyPlate@"));
+    assert!(
+        rust_tokens(include_str!("../../../crates/views/pages/src/ui/kit.rs"))
+            .contains("Nopagesmatched")
+    );
     assert!(
         plate.contains("Background::Color"),
         "the plate paints a background over the document"
@@ -104,7 +121,7 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
             *at == depth
                 && condition.contains("page_search_hits")
                 && !condition.contains("search_answer_stands")
-                && body.contains("Node::Button")
+                && body.contains("PageSearchResult@")
         })
         .map(|(index, _)| index)
         .expect("result sibling");
@@ -343,7 +360,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
         "node",
     ] {
         assert!(
-            native.contains(&format!("\"{name}\"")),
+            native.contains(&format!("::{name}_view(")),
             "{name} stays a dynamically loaded module view"
         );
     }
@@ -567,7 +584,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             .match_indices("_summary(")
             .map(|(at, _)| (at, &source[at..]))
         {
-            let arguments = tail.split(')').next().unwrap();
+            let arguments = tail.split(';').next().unwrap();
             assert!(
                 arguments.contains("connected"),
                 "summary must distinguish no answer from measured zero"
