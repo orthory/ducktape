@@ -963,7 +963,7 @@ mod tests {
         assert_eq!(tick.color, Some(LIGHT.tick_mark));
         assert_eq!(
             tick.background.expect("a filled box"),
-            LIGHT.tick_fill.into()
+            LIGHT.tick_fill
         );
         assert!(tick.strikethrough.is_none());
         let Mark::Body(style) = marks[4].1 else {

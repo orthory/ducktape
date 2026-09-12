@@ -159,7 +159,7 @@ impl<A: App> Driver<A> {
                 observation @ (wire::Event::Observation { .. } | wire::Event::Mouse { .. } | wire::Event::Keyboard { .. }) => {
                     let valid = match &observation {
                         wire::Event::Observation { event, .. } => event.validate().is_ok(),
-                        wire::Event::Mouse { event, .. } => event.clone().sanitize().is_some(),
+                        wire::Event::Mouse { event, .. } => event.sanitize().is_some(),
                         wire::Event::Keyboard { .. } => true,
                         _ => unreachable!(),
                     };
