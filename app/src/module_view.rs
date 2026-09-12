@@ -4263,7 +4263,7 @@ pub(crate) mod tests {
 
         for surface in ["picture", "forge_markdown", "forge_code", "forge_composer"] {
             assert!(
-                surfaces_of("forge").contains_key(surface),
+                surface_allowed("forge", surface),
                 "the host paints the {surface} slot the view leaves"
             );
         }
@@ -4499,8 +4499,8 @@ pub(crate) mod tests {
         let component = std::fs::read(staged).expect("the staged view");
         let a = deployment(&component, "a.svg");
         let client = fake_node(FakeDeployment::serving("governance", &a)).await;
-        // a tab drawn before any node: a seat, with nothing on its way
-        drop(drawn("files"));
+        // A presenter asks for a seat before any node: nothing starts loading.
+        drop(mounted("files"));
         {
             let seat = mounted("files");
             let locked = seat.lock().expect("module view lock");
