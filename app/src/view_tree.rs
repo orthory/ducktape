@@ -1757,8 +1757,17 @@ impl ViewTree {
                 )
                 .absolute()
                 .inset_0();
-                div()
-                    .relative()
+                // A sensor is layout-transparent. In particular, a fill spacer
+                // must not collapse inside an auto-sized measurement wrapper.
+                let (width, height) = match child.as_ref() {
+                    Node::Space { width, height }
+                    | Node::Container { width, height, .. }
+                    | Node::Scroll { width, height, .. }
+                    | Node::Stack { width, height, .. }
+                    | Node::Responsive { width, height, .. } => (*width, *height),
+                    _ => (None, None),
+                };
+                dimensions(div().relative(), width, height)
                     .child(self.node(child, window, cx))
                     .child(measure)
                     .into_any_element()
