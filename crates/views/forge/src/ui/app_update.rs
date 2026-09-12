@@ -1,428 +1,617 @@
-#[allow(warnings, clippy::all)]
-mod __ice_group_app_update {
 use super::*;
 impl super::ForgeView {
-#[allow(clippy::assign_op_pattern)]
-pub(super) fn __update(&mut self, message: __ForgeViewMessage) -> ::ducktape_view_guest::Task<__ForgeViewMessage> {
-match message {
-__ForgeViewMessage::SessionArrived(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-if (!(item.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-let next = item.next.clone();
-{ let __ice_next = crate::host::connection_serial_after(self.connected, next.connected, self.connection_serial); if ::ducktape_view_guest::state_changed!(self.connection_serial, __ice_next) { self.connection_serial = __ice_next; self.__ice_rev[8] += 1; } }
-{ let __ice_next = next.connected; if ::ducktape_view_guest::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[1] += 1; } }
-{ let __ice_next = next.dark; if ::ducktape_view_guest::state_changed!(self.dark, __ice_next) { self.dark = __ice_next; self.__ice_rev[2] += 1; } }
-{ let __ice_next = next.org.to_owned(); if ::ducktape_view_guest::state_changed!(self.org, __ice_next) { self.org = __ice_next; self.__ice_rev[3] += 1; } }
-{ let __ice_next = next.about.to_owned(); if ::ducktape_view_guest::state_changed!(self.about, __ice_next) { self.about = __ice_next; self.__ice_rev[4] += 1; } }
-{ let __ice_next = next.tier.to_owned(); if ::ducktape_view_guest::state_changed!(self.tier, __ice_next) { self.tier = __ice_next; self.__ice_rev[5] += 1; } }
-{ let __ice_next = next.network_chain_id.to_owned(); if ::ducktape_view_guest::state_changed!(self.network_chain_id, __ice_next) { self.network_chain_id = __ice_next; self.__ice_rev[6] += 1; } }
-{ let __ice_next = next.connected_rpc.to_owned(); if ::ducktape_view_guest::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[7] += 1; } }
-let routed = (next.link_tick != self.link_tick);
-{ let __ice_next = next.link_tick; if ::ducktape_view_guest::state_changed!(self.link_tick, __ice_next) { self.link_tick = __ice_next; self.__ice_rev[9] += 1; } }
-return match crate::host::appearance_of(next.dark) {
-Appearance::Light => (|| {
-{ let __ice_next = AppTheme::App; if ::ducktape_view_guest::state_changed!(self.active_palette, __ice_next) { self.active_palette = __ice_next; self.__ice_rev[0] += 1; } }
-return (::ducktape_view_guest::Task::done(crate::host::routed_link(routed, ::std::convert::AsRef::as_ref(&(next.link))))).map(|value| __ForgeViewMessage::ForgeLandLink(value));
-})(),
-Appearance::Dark => (|| {
-{ let __ice_next = AppTheme::AppDark; if ::ducktape_view_guest::state_changed!(self.active_palette, __ice_next) { self.active_palette = __ice_next; self.__ice_rev[0] += 1; } }
-return (::ducktape_view_guest::Task::done(crate::host::routed_link(routed, ::std::convert::AsRef::as_ref(&(next.link))))).map(|value| __ForgeViewMessage::ForgeLandLink(value));
-})(),
-};
-})(),
-__ForgeViewMessage::ForgeLandLink(url) => (|| {
-
-let _ = &url;
-if (url).is_empty() { return ::ducktape_view_guest::Task::none(); }
-let link = crate::host::forge_link(::std::convert::AsRef::as_ref(&(url)));
-if (link.repo).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = link.number; if ::ducktape_view_guest::state_changed!(self.focus_number, __ice_next) { self.focus_number = __ice_next; self.__ice_rev[45] += 1; } }
-{ let __ice_next = link.seq; if ::ducktape_view_guest::state_changed!(self.focus_seq, __ice_next) { self.focus_seq = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = link.path.to_owned(); if ::ducktape_view_guest::state_changed!(self.focus_path, __ice_next) { self.focus_path = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = link.rev.to_owned(); if ::ducktape_view_guest::state_changed!(self.focus_rev, __ice_next) { self.focus_rev = __ice_next; self.__ice_rev[70] += 1; } }
-return (::ducktape_view_guest::Task::done(link.repo.to_owned())).map(|value| __ForgeViewMessage::ForgeOpenRepo(value));
-})(),
-__ForgeViewMessage::ReposArrived(next) => (|| {
-
-let _ = &next;
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.repos.clone(); if ::ducktape_view_guest::state_changed!(self.repos, __ice_next) { self.repos = __ice_next; self.__ice_rev[10] += 1; } }
-{ let __ice_next = "ready".to_owned(); if ::ducktape_view_guest::state_changed!(self.list_phase, __ice_next) { self.list_phase = __ice_next; self.__ice_rev[11] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::RepoArrived(next) => (|| {
-
-let _ = &next;
-if (next.repo != self.open_repo) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.branches.clone(); if ::ducktape_view_guest::state_changed!(self.branches, __ice_next) { self.branches = __ice_next; self.__ice_rev[14] += 1; } }
-{ let __ice_next = next.items.clone(); if ::ducktape_view_guest::state_changed!(self.items, __ice_next) { self.items = __ice_next; self.__ice_rev[15] += 1; } }
-{ let __ice_next = "ready".to_owned(); if ::ducktape_view_guest::state_changed!(self.repo_phase, __ice_next) { self.repo_phase = __ice_next; self.__ice_rev[13] += 1; } }
-let parked = ((self.focus_number > 0) || (!(self.focus_path).is_empty()));
-if (!parked) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::keep_focus(self.focus_rev.to_owned(), ::std::convert::AsRef::as_ref(&(self.tree_rev))); if ::ducktape_view_guest::state_changed!(self.tree_rev, __ice_next) { self.tree_rev = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = crate::host::keep_focus(crate::host::forge_parent(::std::convert::AsRef::as_ref(&(self.focus_path))), ::std::convert::AsRef::as_ref(&(self.tree_path))); if ::ducktape_view_guest::state_changed!(self.tree_path, __ice_next) { self.tree_path = __ice_next; self.__ice_rev[52] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.focus_rev, __ice_next) { self.focus_rev = __ice_next; self.__ice_rev[70] += 1; } }
-if (self.focus_number <= 0) { return ::ducktape_view_guest::Task::none(); }
-let number = self.focus_number;
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.focus_number, __ice_next) { self.focus_number = __ice_next; self.__ice_rev[45] += 1; } }
-return (::ducktape_view_guest::Task::done(number)).map(|value| __ForgeViewMessage::ForgeOpenItem(value));
-})(),
-__ForgeViewMessage::ItemArrived(next) => (|| {
-
-let _ = &next;
-if ((next.repo != self.open_repo) || (next.number != self.forge_item_number)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-let branch_moved = crate::host::forge_branch_moved(::std::convert::AsRef::as_ref(&(next.source_oid)), ::std::convert::AsRef::as_ref(&(self.forge_item_source_oid)));
-{ let __ice_next = crate::host::staged_comment_drop_note((branch_moved && (!(self.staged_comments).is_empty()))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-self.staged_comments = crate::host::keep_staged(branch_moved, ::std::mem::take(&mut self.staged_comments)); self.__ice_rev[50] += 1;
-{ let __ice_next = crate::host::keep_draft(branch_moved, ::std::convert::AsRef::as_ref(&(self.comment_draft))); if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = crate::host::keep_draft(branch_moved, ::std::convert::AsRef::as_ref(&(self.comment_path))); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = crate::host::keep_draft(branch_moved, ::std::convert::AsRef::as_ref(&(self.comment_line))); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = crate::host::keep_draft(branch_moved, ::std::convert::AsRef::as_ref(&(self.comment_side))); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-{ let __ice_next = "ready".to_owned(); if ::ducktape_view_guest::state_changed!(self.item_phase, __ice_next) { self.item_phase = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = next.kind.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_kind, __ice_next) { self.forge_item_kind = __ice_next; self.__ice_rev[19] += 1; } }
-{ let __ice_next = crate::host::kind_tab(::std::convert::AsRef::as_ref(&(next.kind))); if ::ducktape_view_guest::state_changed!(self.tab, __ice_next) { self.tab = __ice_next; self.__ice_rev[16] += 1; } }
-{ let __ice_next = next.title.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_title, __ice_next) { self.forge_item_title = __ice_next; self.__ice_rev[20] += 1; } }
-{ let __ice_next = next.state.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_state, __ice_next) { self.forge_item_state = __ice_next; self.__ice_rev[21] += 1; } }
-{ let __ice_next = next.author.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_author, __ice_next) { self.forge_item_author = __ice_next; self.__ice_rev[22] += 1; } }
-{ let __ice_next = next.branches.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_branches, __ice_next) { self.forge_item_branches = __ice_next; self.__ice_rev[23] += 1; } }
-{ let __ice_next = next.body.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_body, __ice_next) { self.forge_item_body = __ice_next; self.__ice_rev[24] += 1; } }
-{ let __ice_next = next.blocks.clone(); if ::ducktape_view_guest::state_changed!(self.forge_item_blocks, __ice_next) { self.forge_item_blocks = __ice_next; self.__ice_rev[25] += 1; } }
-{ let __ice_next = next.channel_id.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_channel, __ice_next) { self.forge_item_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = next.source_branch.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_source_branch, __ice_next) { self.forge_item_source_branch = __ice_next; self.__ice_rev[32] += 1; } }
-{ let __ice_next = next.source_oid.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_source_oid, __ice_next) { self.forge_item_source_oid = __ice_next; self.__ice_rev[33] += 1; } }
-{ let __ice_next = next.target_oid.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_target_oid, __ice_next) { self.forge_item_target_oid = __ice_next; self.__ice_rev[34] += 1; } }
-{ let __ice_next = next.merge_oid.to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_merge_oid, __ice_next) { self.forge_item_merge_oid = __ice_next; self.__ice_rev[31] += 1; } }
-{ let __ice_next = next.diff_rows.clone(); if ::ducktape_view_guest::state_changed!(self.diff_rows, __ice_next) { self.diff_rows = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = next.diff_truncated; if ::ducktape_view_guest::state_changed!(self.forge_item_diff_truncated, __ice_next) { self.forge_item_diff_truncated = __ice_next; self.__ice_rev[30] += 1; } }
-{ let __ice_next = next.files_changed; if ::ducktape_view_guest::state_changed!(self.forge_item_files_changed, __ice_next) { self.forge_item_files_changed = __ice_next; self.__ice_rev[26] += 1; } }
-{ let __ice_next = next.additions; if ::ducktape_view_guest::state_changed!(self.forge_item_additions, __ice_next) { self.forge_item_additions = __ice_next; self.__ice_rev[27] += 1; } }
-{ let __ice_next = next.deletions; if ::ducktape_view_guest::state_changed!(self.forge_item_deletions, __ice_next) { self.forge_item_deletions = __ice_next; self.__ice_rev[28] += 1; } }
-{ let __ice_next = next.reviews.clone(); if ::ducktape_view_guest::state_changed!(self.forge_item_reviews, __ice_next) { self.forge_item_reviews = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = next.approvals; if ::ducktape_view_guest::state_changed!(self.forge_item_approvals, __ice_next) { self.forge_item_approvals = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = next.change_requests; if ::ducktape_view_guest::state_changed!(self.forge_item_change_requests, __ice_next) { self.forge_item_change_requests = __ice_next; self.__ice_rev[38] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::DiscussionArrived(next) => (|| {
-
-let _ = &next;
-if (next.channel_id != self.forge_item_channel) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.messages.clone(); if ::ducktape_view_guest::state_changed!(self.discussion, __ice_next) { self.discussion = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = next.clipped; if ::ducktape_view_guest::state_changed!(self.discussion_clipped, __ice_next) { self.discussion_clipped = __ice_next; self.__ice_rev[40] += 1; } }
-{ let __ice_next = ({ crate::host::seat_roster(::std::convert::AsRef::as_ref(&(crate::host::composer_scope(::std::convert::AsRef::as_ref(&(self.connected_rpc)), ::std::convert::AsRef::as_ref(&(self.forge_item_channel))))), ::std::convert::AsRef::as_ref(&(next.members))) }); if ::ducktape_view_guest::state_changed!(self.roster_set, __ice_next) { self.roster_set = __ice_next; self.__ice_rev[42] += 1; } }
-if (self.focus_seq == 0) { return ::ducktape_view_guest::Task::none(); }
-let landed = self.focus_seq;
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.focus_seq, __ice_next) { self.focus_seq = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = crate::host::note_at_seq(::std::convert::AsRef::as_ref(&(next.messages)), landed); if ::ducktape_view_guest::state_changed!(self.linked_note, __ice_next) { self.linked_note = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = (self.landed_tick + 1); if ::ducktape_view_guest::state_changed!(self.landed_tick, __ice_next) { self.landed_tick = __ice_next; self.__ice_rev[44] += 1; } }
-return ::ducktape_view_guest::widget::perform::<__ForgeViewMessage>(::ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target: ::std::string::String::from("ForgeView/forge/item-detail"), key: ::ducktape_view_guest::wire::ListKey::from(landed).virtual_key() });
-})(),
-__ForgeViewMessage::TreeArrived(next) => (|| {
-
-let _ = &next;
-if ((next.repo != self.open_repo) || (next.path != self.tree_path)) { return ::ducktape_view_guest::Task::none(); }
-if ((!(self.tree_rev).is_empty()) && (next.rev != self.tree_rev)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-{ let __ice_next = crate::host::phase_of(::std::convert::AsRef::as_ref(&(next.error))); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.rev.to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_rev, __ice_next) { self.tree_rev = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = next.born; if ::ducktape_view_guest::state_changed!(self.tree_born, __ice_next) { self.tree_born = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = next.entries.clone(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = next.truncated; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-if (self.focus_path).is_empty() { return ::ducktape_view_guest::Task::none(); }
-let path = self.focus_path.to_owned();
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.focus_path, __ice_next) { self.focus_path = __ice_next; self.__ice_rev[69] += 1; } }
-return (::ducktape_view_guest::Task::done(path.to_owned())).map(|value| __ForgeViewMessage::ForgeOpenFile(value));
-})(),
-__ForgeViewMessage::BlobArrived(next) => (|| {
-
-let _ = &next;
-if ((next.repo != self.open_repo) || (next.path != self.file_path)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.note.to_owned(); if ::ducktape_view_guest::state_changed!(self.file_note, __ice_next) { self.file_note = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = crate::host::phase_of(::std::convert::AsRef::as_ref(&(next.error))); if ::ducktape_view_guest::state_changed!(self.file_phase, __ice_next) { self.file_phase = __ice_next; self.__ice_rev[66] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = next.text.to_owned(); if ::ducktape_view_guest::state_changed!(self.file_text, __ice_next) { self.file_text = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = next.binary; if ::ducktape_view_guest::state_changed!(self.file_binary, __ice_next) { self.file_binary = __ice_next; self.__ice_rev[60] += 1; } }
-{ let __ice_next = next.truncated; if ::ducktape_view_guest::state_changed!(self.file_truncated, __ice_next) { self.file_truncated = __ice_next; self.__ice_rev[61] += 1; } }
-{ let __ice_next = next.picture; if ::ducktape_view_guest::state_changed!(self.file_picture, __ice_next) { self.file_picture = __ice_next; self.__ice_rev[62] += 1; } }
-{ let __ice_next = next.width; if ::ducktape_view_guest::state_changed!(self.file_width, __ice_next) { self.file_width = __ice_next; self.__ice_rev[63] += 1; } }
-{ let __ice_next = next.height; if ::ducktape_view_guest::state_changed!(self.file_height, __ice_next) { self.file_height = __ice_next; self.__ice_rev[64] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ActDone(next) => (|| {
-
-let _ = &next;
-{ let __ice_next = next.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-return match crate::host::act_of(::std::convert::AsRef::as_ref(&(next.kind))) {
-Act::Review => (|| {
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.review_busy, __ice_next) { self.review_busy = __ice_next; self.__ice_rev[49] += 1; } }
-if (!(next.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "comment".to_owned(); if ::ducktape_view_guest::state_changed!(self.review_verdict, __ice_next) { self.review_verdict = __ice_next; self.__ice_rev[48] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.staged_comments, __ice_next) { self.staged_comments = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.review_draft, __ice_next) { self.review_draft = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-Act::Merge => (|| {
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.merge_busy, __ice_next) { self.merge_busy = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = next.conflicts.clone(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-};
-})(),
-__ForgeViewMessage::ForgeOpenRepo(name) => (|| {
-
-let _ = &name;
-if (!self.connected) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = name.to_owned(); if ::ducktape_view_guest::state_changed!(self.open_repo, __ice_next) { self.open_repo = __ice_next; self.__ice_rev[12] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.repo_phase, __ice_next) { self.repo_phase = __ice_next; self.__ice_rev[13] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.branches, __ice_next) { self.branches = __ice_next; self.__ice_rev[14] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.items, __ice_next) { self.items = __ice_next; self.__ice_rev[15] += 1; } }
-{ let __ice_next = "code".to_owned(); if ::ducktape_view_guest::state_changed!(self.tab, __ice_next) { self.tab = __ice_next; self.__ice_rev[16] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_pick, __ice_next) { self.tree_pick = __ice_next; self.__ice_rev[51] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.forge_item_number, __ice_next) { self.forge_item_number = __ice_next; self.__ice_rev[17] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.item_phase, __ice_next) { self.item_phase = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_channel, __ice_next) { self.forge_item_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.linked_note, __ice_next) { self.linked_note = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.diff_rows, __ice_next) { self.diff_rows = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.discussion, __ice_next) { self.discussion = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.discussion_clipped, __ice_next) { self.discussion_clipped = __ice_next; self.__ice_rev[40] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.staged_comments, __ice_next) { self.staged_comments = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_path, __ice_next) { self.tree_path = __ice_next; self.__ice_rev[52] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_rev, __ice_next) { self.tree_rev = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_born, __ice_next) { self.tree_born = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_path, __ice_next) { self.file_path = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_text, __ice_next) { self.file_text = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_note, __ice_next) { self.file_note = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_phase, __ice_next) { self.file_phase = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_dir, __ice_next) { self.opened_dir = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_rev, __ice_next) { self.opened_rev = __ice_next; self.__ice_rev[68] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCloseRepo => (|| {
-
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.open_repo, __ice_next) { self.open_repo = __ice_next; self.__ice_rev[12] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.repo_phase, __ice_next) { self.repo_phase = __ice_next; self.__ice_rev[13] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.branches, __ice_next) { self.branches = __ice_next; self.__ice_rev[14] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.items, __ice_next) { self.items = __ice_next; self.__ice_rev[15] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_pick, __ice_next) { self.tree_pick = __ice_next; self.__ice_rev[51] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.forge_item_number, __ice_next) { self.forge_item_number = __ice_next; self.__ice_rev[17] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.item_phase, __ice_next) { self.item_phase = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_channel, __ice_next) { self.forge_item_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.linked_note, __ice_next) { self.linked_note = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.focus_seq, __ice_next) { self.focus_seq = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.diff_rows, __ice_next) { self.diff_rows = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.discussion, __ice_next) { self.discussion = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.discussion_clipped, __ice_next) { self.discussion_clipped = __ice_next; self.__ice_rev[40] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.staged_comments, __ice_next) { self.staged_comments = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_path, __ice_next) { self.tree_path = __ice_next; self.__ice_rev[52] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_rev, __ice_next) { self.tree_rev = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_born, __ice_next) { self.tree_born = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_path, __ice_next) { self.file_path = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_text, __ice_next) { self.file_text = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_note, __ice_next) { self.file_note = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_phase, __ice_next) { self.file_phase = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_dir, __ice_next) { self.opened_dir = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_rev, __ice_next) { self.opened_rev = __ice_next; self.__ice_rev[68] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgePickBranch(name) => (|| {
-
-let _ = &name;
-if ((!self.connected) || (self.open_repo).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-let head = crate::host::forge_branch_head(::std::convert::AsRef::as_ref(&(self.branches)), ::std::convert::AsRef::as_ref(&(name)));
-if (head).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = name.to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_pick, __ice_next) { self.tree_pick = __ice_next; self.__ice_rev[51] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_path, __ice_next) { self.tree_path = __ice_next; self.__ice_rev[52] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-{ let __ice_next = head.to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_rev, __ice_next) { self.tree_rev = __ice_next; self.__ice_rev[53] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeOpenDir(path) => (|| {
-
-let _ = &path;
-if ((!self.connected) || (self.open_repo).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = path.to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_path, __ice_next) { self.tree_path = __ice_next; self.__ice_rev[52] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.tree_entries, __ice_next) { self.tree_entries = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.tree_truncated, __ice_next) { self.tree_truncated = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.tree_phase, __ice_next) { self.tree_phase = __ice_next; self.__ice_rev[57] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeOpenFile(path) => (|| {
-
-let _ = &path;
-if ((!self.connected) || (self.open_repo).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = self.tree_path.to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_dir, __ice_next) { self.opened_dir = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = self.tree_rev.to_owned(); if ::ducktape_view_guest::state_changed!(self.opened_rev, __ice_next) { self.opened_rev = __ice_next; self.__ice_rev[68] += 1; } }
-{ let __ice_next = path.to_owned(); if ::ducktape_view_guest::state_changed!(self.file_path, __ice_next) { self.file_path = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_text, __ice_next) { self.file_text = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.file_binary, __ice_next) { self.file_binary = __ice_next; self.__ice_rev[60] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.file_truncated, __ice_next) { self.file_truncated = __ice_next; self.__ice_rev[61] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.file_picture, __ice_next) { self.file_picture = __ice_next; self.__ice_rev[62] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_note, __ice_next) { self.file_note = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.file_phase, __ice_next) { self.file_phase = __ice_next; self.__ice_rev[66] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeOpenItem(number) => (|| {
-
-let _ = &number;
-if ((!self.connected) || (self.open_repo).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = number; if ::ducktape_view_guest::state_changed!(self.forge_item_number, __ice_next) { self.forge_item_number = __ice_next; self.__ice_rev[17] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.linked_note, __ice_next) { self.linked_note = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[76] += 1; } }
-{ let __ice_next = "loading".to_owned(); if ::ducktape_view_guest::state_changed!(self.item_phase, __ice_next) { self.item_phase = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_channel, __ice_next) { self.forge_item_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = "comment".to_owned(); if ::ducktape_view_guest::state_changed!(self.review_verdict, __ice_next) { self.review_verdict = __ice_next; self.__ice_rev[48] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.staged_comments, __ice_next) { self.staged_comments = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.review_draft, __ice_next) { self.review_draft = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.diff_rows, __ice_next) { self.diff_rows = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.discussion, __ice_next) { self.discussion = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.discussion_clipped, __ice_next) { self.discussion_clipped = __ice_next; self.__ice_rev[40] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCloseItem => (|| {
-
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.forge_item_number, __ice_next) { self.forge_item_number = __ice_next; self.__ice_rev[17] += 1; } }
-{ let __ice_next = "idle".to_owned(); if ::ducktape_view_guest::state_changed!(self.item_phase, __ice_next) { self.item_phase = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.forge_item_channel, __ice_next) { self.forge_item_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.linked_note, __ice_next) { self.linked_note = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.focus_seq, __ice_next) { self.focus_seq = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.diff_rows, __ice_next) { self.diff_rows = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.discussion, __ice_next) { self.discussion = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.discussion_clipped, __ice_next) { self.discussion_clipped = __ice_next; self.__ice_rev[40] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.staged_comments, __ice_next) { self.staged_comments = __ice_next; self.__ice_rev[50] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::SelectForgeTab(next) => (|| {
-
-let _ = &next;
-{ let __ice_next = next.to_owned(); if ::ducktape_view_guest::state_changed!(self.tab, __ice_next) { self.tab = __ice_next; self.__ice_rev[16] += 1; } }
-if (self.forge_item_number <= 0) { return ::ducktape_view_guest::Task::none(); }
-return (::ducktape_view_guest::Task::done(true)).map(|value| { let _ = &value; __ForgeViewMessage::ForgeCloseItem });
-})(),
-__ForgeViewMessage::ForgeReviewPick(verdict) => (|| {
-
-let _ = &verdict;
-{ let __ice_next = verdict.to_owned(); if ::ducktape_view_guest::state_changed!(self.review_verdict, __ice_next) { self.review_verdict = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeReviewSubmit(body) => (|| {
-
-let _ = &body;
-if ((self.review_busy || (!self.connected)) || (self.forge_item_source_oid).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-if ((body).is_empty() && (self.staged_comments).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.review_busy, __ice_next) { self.review_busy = __ice_next; self.__ice_rev[49] += 1; } }
-{ let __ice_next = ({ crate::host::review_submit(self.open_repo.to_owned(), self.forge_item_number, self.review_verdict.to_owned(), body.to_owned(), self.forge_item_source_oid.to_owned(), self.staged_comments.clone()) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[77] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeMergeSubmit => (|| {
-
-if ((((!self.connected) || self.merge_busy) || (self.open_repo).is_empty()) || (self.forge_item_number <= 0)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.merge_busy, __ice_next) { self.merge_busy = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.merge_conflicts, __ice_next) { self.merge_conflicts = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = ({ crate::host::merge(self.open_repo.to_owned(), self.forge_item_number, self.forge_item_source_branch.to_owned(), self.forge_item_source_oid.to_owned(), self.forge_item_target_oid.to_owned()) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[77] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCommentOpen(path, line, side) => (|| {
-
-let _ = &path;
-let _ = &line;
-let _ = &side;
-if (path).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = path.to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = line.to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = side.to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCommentCancel => (|| {
-
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCommentStage(body) => (|| {
-
-let _ = &body;
-if (((self.comment_path).is_empty() || (body).is_empty()) || crate::host::forge_comment_cap_reached(::std::convert::AsRef::as_ref(&(self.staged_comments)))) { return ::ducktape_view_guest::Task::none(); }
-self.staged_comments = crate::host::stage_forge_comment(::std::mem::take(&mut self.staged_comments), self.comment_path.to_owned(), self.comment_line.to_owned(), self.comment_side.to_owned(), body.to_owned()); self.__ice_rev[50] += 1;
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_path, __ice_next) { self.comment_path = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_line, __ice_next) { self.comment_line = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_side, __ice_next) { self.comment_side = __ice_next; self.__ice_rev[75] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ForgeCommentDrop(anchor) => (|| {
-
-let _ = &anchor;
-self.staged_comments = crate::host::drop_forge_comment(::std::mem::take(&mut self.staged_comments), ::std::convert::AsRef::as_ref(&(anchor))); self.__ice_rev[50] += 1;
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::OpenMessageLink(url) => (|| {
-
-let _ = &url;
-{ let __ice_next = ({ crate::host::open_link(::std::convert::AsRef::as_ref(&(url))) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[77] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::CopyToClipboard(text, label) => (|| {
-
-let _ = &text;
-let _ = &label;
-{ let __ice_next = ({ crate::host::copy(::std::convert::AsRef::as_ref(&(text)), ::std::convert::AsRef::as_ref(&(label))) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[77] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::TreeResized(dx, _dy) => (|| {
-
-let _ = &dx;
-let _ = &_dy;
-{ let __ice_next = crate::host::tree_width_after_delta(self.tree_width, dx, self.viewport_width); if ::ducktape_view_guest::state_changed!(self.tree_width, __ice_next) { self.tree_width = __ice_next; self.__ice_rev[79] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::ViewportChanged(width, _height) => (|| {
-
-let _ = &width;
-let _ = &_height;
-{ let __ice_next = width; if ::ducktape_view_guest::state_changed!(self.viewport_width, __ice_next) { self.viewport_width = __ice_next; self.__ice_rev[78] += 1; } }
-{ let __ice_next = crate::host::tree_width_after_delta(self.tree_width, 0.0, width); if ::ducktape_view_guest::state_changed!(self.tree_width, __ice_next) { self.tree_width = __ice_next; self.__ice_rev[79] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ForgeViewMessage::__BindCommentDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.comment_draft, __ice_next) { self.comment_draft = __ice_next; self.__ice_rev[72] += 1; } } ::ducktape_view_guest::Task::none() }
-__ForgeViewMessage::__BindReviewDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.review_draft, __ice_next) { self.review_draft = __ice_next; self.__ice_rev[71] += 1; } } ::ducktape_view_guest::Task::none() }
-__ForgeViewMessage::__ExternNoop => ::ducktape_view_guest::Task::none(),
-}
-}
-
-}
+    pub(crate) fn update(&mut self, message: Message) -> ducktape_view_guest::Task<Message> {
+        match message {
+            Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::ForgeLandLink(url) => self.on_forge_land_link(url),
+            Message::ReposArrived(next) => self.on_repos_arrived(next),
+            Message::RepoArrived(next) => self.on_repo_arrived(next),
+            Message::ItemArrived(next) => self.on_item_arrived(next),
+            Message::DiscussionArrived(next) => self.on_discussion_arrived(next),
+            Message::TreeArrived(next) => self.on_tree_arrived(next),
+            Message::BlobArrived(next) => self.on_blob_arrived(next),
+            Message::ActDone(next) => self.on_act_done(next),
+            Message::ForgeOpenRepo(name) => self.on_forge_open_repo(name),
+            Message::ForgeCloseRepo => self.on_forge_close_repo(),
+            Message::ForgePickBranch(name) => self.on_forge_pick_branch(name),
+            Message::ForgeOpenDir(path) => self.on_forge_open_dir(path),
+            Message::ForgeOpenFile(path) => self.on_forge_open_file(path),
+            Message::ForgeOpenItem(number) => self.on_forge_open_item(number),
+            Message::ForgeCloseItem => self.on_forge_close_item(),
+            Message::SelectForgeTab(next) => self.on_select_forge_tab(next),
+            Message::ForgeReviewPick(verdict) => self.on_forge_review_pick(verdict),
+            Message::ForgeReviewSubmit(body) => self.on_forge_review_submit(body),
+            Message::ForgeMergeSubmit => self.on_forge_merge_submit(),
+            Message::ForgeCommentOpen(path, line, side) => {
+                self.on_forge_comment_open(path, line, side)
+            }
+            Message::ForgeCommentCancel => self.on_forge_comment_cancel(),
+            Message::ForgeCommentStage(body) => self.on_forge_comment_stage(body),
+            Message::ForgeCommentDrop(anchor) => self.on_forge_comment_drop(anchor),
+            Message::OpenMessageLink(url) => self.on_open_message_link(url),
+            Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
+            Message::TreeResized(dx, _dy) => self.on_tree_resized(dx, _dy),
+            Message::ViewportChanged(width, _height) => self.on_viewport_changed(width, _height),
+            Message::CommentDraftChanged(value) => self.on_comment_draft_changed(value),
+            Message::ReviewDraftChanged(value) => self.on_review_draft_changed(value),
+            Message::Ignore => self.on_ignore(),
+        }
+    }
+    fn on_session_arrived(
+        &mut self,
+        item: crate::host::SessionItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = item.error.to_owned();
+        if !(item.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let next = item.next.clone();
+        self.connection_serial = crate::host::connection_serial_after(
+            self.connected,
+            next.connected,
+            self.connection_serial,
+        );
+        self.connected = next.connected;
+        self.dark = next.dark;
+        self.org = next.org.to_owned();
+        self.about = next.about.to_owned();
+        self.tier = next.tier.to_owned();
+        self.network_chain_id = next.network_chain_id.to_owned();
+        self.connected_rpc = next.connected_rpc.to_owned();
+        let routed = next.link_tick != self.link_tick;
+        self.link_tick = next.link_tick;
+        return match crate::host::appearance_of(next.dark) {
+            Appearance::Light => (|| {
+                self.active_palette = AppTheme::App;
+                return (::ducktape_view_guest::Task::done(crate::host::routed_link(
+                    routed,
+                    ::std::convert::AsRef::as_ref(&(next.link)),
+                )))
+                .map(|value| Message::ForgeLandLink(value));
+            })(),
+            Appearance::Dark => (|| {
+                self.active_palette = AppTheme::AppDark;
+                return (::ducktape_view_guest::Task::done(crate::host::routed_link(
+                    routed,
+                    ::std::convert::AsRef::as_ref(&(next.link)),
+                )))
+                .map(|value| Message::ForgeLandLink(value));
+            })(),
+        };
+    }
+    fn on_forge_land_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
+        if (url).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let link = crate::host::forge_link(::std::convert::AsRef::as_ref(&(url)));
+        if (link.repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.focus_number = link.number;
+        self.focus_seq = link.seq;
+        self.focus_path = link.path.to_owned();
+        self.focus_rev = link.rev.to_owned();
+        return (::ducktape_view_guest::Task::done(link.repo.to_owned()))
+            .map(|value| Message::ForgeOpenRepo(value));
+    }
+    fn on_repos_arrived(
+        &mut self,
+        next: crate::host::RepoListItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = next.error.to_owned();
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.repos = next.repos.clone();
+        self.list_phase = "ready".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_repo_arrived(
+        &mut self,
+        next: crate::host::RepoItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if next.repo != self.open_repo {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = next.error.to_owned();
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.branches = next.branches.clone();
+        self.items = next.items.clone();
+        self.repo_phase = "ready".to_owned();
+        let parked = (self.focus_number > 0) || (!(self.focus_path).is_empty());
+        if !parked {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.tree_rev = crate::host::keep_focus(
+            self.focus_rev.to_owned(),
+            ::std::convert::AsRef::as_ref(&(self.tree_rev)),
+        );
+        self.tree_path = crate::host::keep_focus(
+            crate::host::forge_parent(::std::convert::AsRef::as_ref(&(self.focus_path))),
+            ::std::convert::AsRef::as_ref(&(self.tree_path)),
+        );
+        self.tree_entries = Vec::new();
+        self.tree_truncated = false;
+        self.tree_phase = "loading".to_owned();
+        self.focus_rev = "".to_owned();
+        if self.focus_number <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let number = self.focus_number;
+        self.focus_number = 0;
+        return (::ducktape_view_guest::Task::done(number))
+            .map(|value| Message::ForgeOpenItem(value));
+    }
+    fn on_item_arrived(
+        &mut self,
+        next: crate::host::ItemItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (next.repo != self.open_repo) || (next.number != self.forge_item_number) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = next.error.to_owned();
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let branch_moved = crate::host::forge_branch_moved(
+            ::std::convert::AsRef::as_ref(&(next.source_oid)),
+            ::std::convert::AsRef::as_ref(&(self.forge_item_source_oid)),
+        );
+        self.host_error = crate::host::staged_comment_drop_note(
+            branch_moved && (!(self.staged_comments).is_empty()),
+        );
+        self.staged_comments =
+            crate::host::keep_staged(branch_moved, ::std::mem::take(&mut self.staged_comments));
+        self.comment_draft = crate::host::keep_draft(
+            branch_moved,
+            ::std::convert::AsRef::as_ref(&(self.comment_draft)),
+        );
+        self.comment_path = crate::host::keep_draft(
+            branch_moved,
+            ::std::convert::AsRef::as_ref(&(self.comment_path)),
+        );
+        self.comment_line = crate::host::keep_draft(
+            branch_moved,
+            ::std::convert::AsRef::as_ref(&(self.comment_line)),
+        );
+        self.comment_side = crate::host::keep_draft(
+            branch_moved,
+            ::std::convert::AsRef::as_ref(&(self.comment_side)),
+        );
+        self.item_phase = "ready".to_owned();
+        self.forge_item_kind = next.kind.to_owned();
+        self.tab = crate::host::kind_tab(::std::convert::AsRef::as_ref(&(next.kind)));
+        self.forge_item_title = next.title.to_owned();
+        self.forge_item_state = next.state.to_owned();
+        self.forge_item_author = next.author.to_owned();
+        self.forge_item_branches = next.branches.to_owned();
+        self.forge_item_body = next.body.to_owned();
+        self.forge_item_blocks = next.blocks.clone();
+        self.forge_item_channel = next.channel_id.to_owned();
+        self.forge_item_source_branch = next.source_branch.to_owned();
+        self.forge_item_source_oid = next.source_oid.to_owned();
+        self.forge_item_target_oid = next.target_oid.to_owned();
+        self.forge_item_merge_oid = next.merge_oid.to_owned();
+        self.diff_rows = next.diff_rows.clone();
+        self.forge_item_diff_truncated = next.diff_truncated;
+        self.forge_item_files_changed = next.files_changed;
+        self.forge_item_additions = next.additions;
+        self.forge_item_deletions = next.deletions;
+        self.forge_item_reviews = next.reviews.clone();
+        self.forge_item_approvals = next.approvals;
+        self.forge_item_change_requests = next.change_requests;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_discussion_arrived(
+        &mut self,
+        next: crate::host::DiscussionItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if next.channel_id != self.forge_item_channel {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = next.error.to_owned();
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.discussion = next.messages.clone();
+        self.discussion_clipped = next.clipped;
+        self.roster_set = crate::host::seat_roster(
+            ::std::convert::AsRef::as_ref(
+                &(crate::host::composer_scope(
+                    ::std::convert::AsRef::as_ref(&(self.connected_rpc)),
+                    ::std::convert::AsRef::as_ref(&(self.forge_item_channel)),
+                )),
+            ),
+            ::std::convert::AsRef::as_ref(&(next.members)),
+        );
+        if self.focus_seq == 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let landed = self.focus_seq;
+        self.focus_seq = 0;
+        self.linked_note =
+            crate::host::note_at_seq(::std::convert::AsRef::as_ref(&(next.messages)), landed);
+        self.landed_tick = self.landed_tick + 1;
+        return ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
+                target: String::from("ForgeView/forge/item-detail"),
+                key: ::ducktape_view_guest::wire::ListKey::from(landed).virtual_key(),
+            },
+        );
+    }
+    fn on_tree_arrived(
+        &mut self,
+        next: crate::host::TreeItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (next.repo != self.open_repo) || (next.path != self.tree_path) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        if (!(self.tree_rev).is_empty()) && (next.rev != self.tree_rev) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = next.error.to_owned();
+        self.tree_phase = crate::host::phase_of(::std::convert::AsRef::as_ref(&(next.error)));
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.tree_rev = next.rev.to_owned();
+        self.tree_born = next.born;
+        self.tree_entries = next.entries.clone();
+        self.tree_truncated = next.truncated;
+        if (self.focus_path).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let path = self.focus_path.to_owned();
+        self.focus_path = "".to_owned();
+        return (::ducktape_view_guest::Task::done(path.to_owned()))
+            .map(|value| Message::ForgeOpenFile(value));
+    }
+    fn on_blob_arrived(
+        &mut self,
+        next: crate::host::BlobItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (next.repo != self.open_repo) || (next.path != self.file_path) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.file_note = next.note.to_owned();
+        self.file_phase = crate::host::phase_of(::std::convert::AsRef::as_ref(&(next.error)));
+        if !(next.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        {
+            let next = next.text.to_owned();
+            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
+                self.file_text = next;
+                self.file_text_revision += 1;
+            }
+        }
+        self.file_binary = next.binary;
+        self.file_truncated = next.truncated;
+        self.file_picture = next.picture;
+        self.file_width = next.width;
+        self.file_height = next.height;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_act_done(&mut self, next: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
+        self.host_error = next.error.to_owned();
+        return match crate::host::act_of(::std::convert::AsRef::as_ref(&(next.kind))) {
+            Act::Review => (|| {
+                self.review_busy = false;
+                if !(next.error).is_empty() {
+                    return ::ducktape_view_guest::Task::none();
+                }
+                self.review_verdict = "comment".to_owned();
+                self.staged_comments = Vec::new();
+                self.review_draft = "".to_owned();
+                self.comment_draft = "".to_owned();
+                self.comment_path = "".to_owned();
+                self.comment_line = "".to_owned();
+                self.comment_side = "".to_owned();
+                ::ducktape_view_guest::Task::none()
+            })(),
+            Act::Merge => {
+                self.merge_busy = false;
+                self.merge_conflicts = next.conflicts.clone();
+                ::ducktape_view_guest::Task::none()
+            }
+        };
+    }
+    fn on_forge_open_repo(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.open_repo = name.to_owned();
+        self.host_error = "".to_owned();
+        self.repo_phase = "loading".to_owned();
+        self.branches = Vec::new();
+        self.items = Vec::new();
+        self.tab = "code".to_owned();
+        self.tree_pick = "".to_owned();
+        self.forge_item_number = 0;
+        self.item_phase = "idle".to_owned();
+        self.forge_item_channel = "".to_owned();
+        self.linked_note = Vec::new();
+        self.diff_rows = Vec::new();
+        self.discussion = Vec::new();
+        self.discussion_clipped = false;
+        self.merge_conflicts = Vec::new();
+        self.staged_comments = Vec::new();
+        self.tree_path = "".to_owned();
+        self.tree_rev = "".to_owned();
+        self.tree_entries = Vec::new();
+        self.tree_born = false;
+        self.tree_truncated = false;
+        self.tree_phase = "loading".to_owned();
+        self.file_path = "".to_owned();
+        {
+            let next = "".to_owned();
+            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
+                self.file_text = next;
+                self.file_text_revision += 1;
+            }
+        }
+        self.file_note = "".to_owned();
+        self.file_phase = "idle".to_owned();
+        self.opened_dir = "".to_owned();
+        self.opened_rev = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_close_repo(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.open_repo = "".to_owned();
+        self.repo_phase = "idle".to_owned();
+        self.branches = Vec::new();
+        self.items = Vec::new();
+        self.tree_pick = "".to_owned();
+        self.forge_item_number = 0;
+        self.item_phase = "idle".to_owned();
+        self.forge_item_channel = "".to_owned();
+        self.linked_note = Vec::new();
+        self.focus_seq = 0;
+        self.diff_rows = Vec::new();
+        self.discussion = Vec::new();
+        self.discussion_clipped = false;
+        self.merge_conflicts = Vec::new();
+        self.staged_comments = Vec::new();
+        self.tree_path = "".to_owned();
+        self.tree_rev = "".to_owned();
+        self.tree_entries = Vec::new();
+        self.tree_born = false;
+        self.tree_truncated = false;
+        self.tree_phase = "loading".to_owned();
+        self.file_path = "".to_owned();
+        {
+            let next = "".to_owned();
+            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
+                self.file_text = next;
+                self.file_text_revision += 1;
+            }
+        }
+        self.file_note = "".to_owned();
+        self.file_phase = "idle".to_owned();
+        self.opened_dir = "".to_owned();
+        self.opened_rev = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_pick_branch(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
+        if (!self.connected) || (self.open_repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let head = crate::host::forge_branch_head(
+            ::std::convert::AsRef::as_ref(&(self.branches)),
+            ::std::convert::AsRef::as_ref(&(name)),
+        );
+        if (head).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.tree_pick = name.to_owned();
+        self.tree_path = "".to_owned();
+        self.tree_entries = Vec::new();
+        self.tree_truncated = false;
+        self.tree_phase = "loading".to_owned();
+        self.tree_rev = head.to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_open_dir(&mut self, path: String) -> ducktape_view_guest::Task<Message> {
+        if (!self.connected) || (self.open_repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.tree_path = path.to_owned();
+        self.tree_entries = Vec::new();
+        self.tree_truncated = false;
+        self.tree_phase = "loading".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_open_file(&mut self, path: String) -> ducktape_view_guest::Task<Message> {
+        if (!self.connected) || (self.open_repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.opened_dir = self.tree_path.to_owned();
+        self.opened_rev = self.tree_rev.to_owned();
+        self.file_path = path.to_owned();
+        {
+            let next = "".to_owned();
+            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
+                self.file_text = next;
+                self.file_text_revision += 1;
+            }
+        }
+        self.file_binary = false;
+        self.file_truncated = false;
+        self.file_picture = false;
+        self.file_note = "".to_owned();
+        self.file_phase = "loading".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_open_item(&mut self, number: i64) -> ducktape_view_guest::Task<Message> {
+        if (!self.connected) || (self.open_repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.forge_item_number = number;
+        self.linked_note = Vec::new();
+        self.host_error = "".to_owned();
+        self.item_phase = "loading".to_owned();
+        self.forge_item_channel = "".to_owned();
+        self.review_verdict = "comment".to_owned();
+        self.staged_comments = Vec::new();
+        self.review_draft = "".to_owned();
+        self.comment_draft = "".to_owned();
+        self.comment_path = "".to_owned();
+        self.comment_line = "".to_owned();
+        self.comment_side = "".to_owned();
+        self.merge_conflicts = Vec::new();
+        self.diff_rows = Vec::new();
+        self.discussion = Vec::new();
+        self.discussion_clipped = false;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_close_item(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.forge_item_number = 0;
+        self.item_phase = "idle".to_owned();
+        self.forge_item_channel = "".to_owned();
+        self.linked_note = Vec::new();
+        self.focus_seq = 0;
+        self.diff_rows = Vec::new();
+        self.discussion = Vec::new();
+        self.discussion_clipped = false;
+        self.merge_conflicts = Vec::new();
+        self.staged_comments = Vec::new();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_select_forge_tab(&mut self, next: String) -> ducktape_view_guest::Task<Message> {
+        self.tab = next.to_owned();
+        if self.forge_item_number <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        return (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem);
+    }
+    fn on_forge_review_pick(&mut self, verdict: String) -> ducktape_view_guest::Task<Message> {
+        self.review_verdict = verdict.to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_review_submit(&mut self, body: String) -> ducktape_view_guest::Task<Message> {
+        if (self.review_busy || (!self.connected)) || (self.forge_item_source_oid).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        if (body).is_empty() && (self.staged_comments).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.review_busy = true;
+        self.sent = crate::host::review_submit(
+            self.open_repo.to_owned(),
+            self.forge_item_number,
+            self.review_verdict.to_owned(),
+            body.to_owned(),
+            self.forge_item_source_oid.to_owned(),
+            self.staged_comments.clone(),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_merge_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (((!self.connected) || self.merge_busy) || (self.open_repo).is_empty())
+            || (self.forge_item_number <= 0)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.merge_busy = true;
+        self.merge_conflicts = Vec::new();
+        self.sent = crate::host::merge(
+            self.open_repo.to_owned(),
+            self.forge_item_number,
+            self.forge_item_source_branch.to_owned(),
+            self.forge_item_source_oid.to_owned(),
+            self.forge_item_target_oid.to_owned(),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_comment_open(
+        &mut self,
+        path: String,
+        line: String,
+        side: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (path).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.comment_path = path.to_owned();
+        self.comment_line = line.to_owned();
+        self.comment_side = side.to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_comment_cancel(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.comment_path = "".to_owned();
+        self.comment_line = "".to_owned();
+        self.comment_side = "".to_owned();
+        self.comment_draft = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_comment_stage(&mut self, body: String) -> ducktape_view_guest::Task<Message> {
+        if ((self.comment_path).is_empty() || (body).is_empty())
+            || crate::host::forge_comment_cap_reached(::std::convert::AsRef::as_ref(
+                &(self.staged_comments),
+            ))
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.staged_comments = crate::host::stage_forge_comment(
+            ::std::mem::take(&mut self.staged_comments),
+            self.comment_path.to_owned(),
+            self.comment_line.to_owned(),
+            self.comment_side.to_owned(),
+            body.to_owned(),
+        );
+        self.comment_path = "".to_owned();
+        self.comment_line = "".to_owned();
+        self.comment_side = "".to_owned();
+        self.comment_draft = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_forge_comment_drop(&mut self, anchor: String) -> ducktape_view_guest::Task<Message> {
+        self.staged_comments = crate::host::drop_forge_comment(
+            ::std::mem::take(&mut self.staged_comments),
+            ::std::convert::AsRef::as_ref(&(anchor)),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::open_link(::std::convert::AsRef::as_ref(&(url)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_copy_to_clipboard(
+        &mut self,
+        text: String,
+        label: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::copy(
+            ::std::convert::AsRef::as_ref(&(text)),
+            ::std::convert::AsRef::as_ref(&(label)),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_tree_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
+        self.tree_width =
+            crate::host::tree_width_after_delta(self.tree_width, dx, self.viewport_width);
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_viewport_changed(
+        &mut self,
+        width: f64,
+        _height: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.viewport_width = width;
+        self.tree_width = crate::host::tree_width_after_delta(self.tree_width, 0.0, width);
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_comment_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.comment_draft = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_review_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.review_draft = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_ignore(&mut self) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::Task::none()
+    }
 }

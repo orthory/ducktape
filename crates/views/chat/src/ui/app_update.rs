@@ -1,762 +1,1472 @@
-#[allow(warnings, clippy::all)]
-mod __ice_group_app_update {
-    use super::*;
-    impl super::ChatView {
-        #[allow(clippy::assign_op_pattern)]
-        pub(super) fn __update(
-            &mut self,
-            message: __ChatViewMessage,
-        ) -> ::ducktape_view_guest::Task<__ChatViewMessage> {
-            match message {
-__ChatViewMessage::SidebarResized(dx, _dy) => (|| {
-
-let _ = &dx;
-let _ = &_dy;
-{ let __ice_next = crate::host::sidebar_width_after_delta(self.sidebar_width, dx, self.chat_viewport_width); if ::ducktape_view_guest::state_changed!(self.sidebar_width, __ice_next) { self.sidebar_width = __ice_next; self.__ice_rev[76] += 1; } }
-{ let __ice_next = crate::host::details_width_after_delta(self.details_width, 0.0, self.chat_viewport_width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.details_width, __ice_next) { self.details_width = __ice_next; self.__ice_rev[77] += 1; } }
-{ let __ice_next = crate::host::thread_width_after_delta(self.thread_width, 0.0, self.chat_viewport_width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.thread_width, __ice_next) { self.thread_width = __ice_next; self.__ice_rev[78] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::DetailsResized(dx, _dy) => (|| {
-
-let _ = &dx;
-let _ = &_dy;
-{ let __ice_next = crate::host::details_width_after_delta(self.details_width, (-dx), self.chat_viewport_width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.details_width, __ice_next) { self.details_width = __ice_next; self.__ice_rev[77] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ThreadResized(dx, _dy) => (|| {
-
-let _ = &dx;
-let _ = &_dy;
-{ let __ice_next = crate::host::thread_width_after_delta(self.thread_width, (-dx), self.chat_viewport_width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.thread_width, __ice_next) { self.thread_width = __ice_next; self.__ice_rev[78] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ChatViewportChanged(width, _height) => (|| {
-
-let _ = &width;
-let _ = &_height;
-{ let __ice_next = width; if ::ducktape_view_guest::state_changed!(self.chat_viewport_width, __ice_next) { self.chat_viewport_width = __ice_next; self.__ice_rev[75] += 1; } }
-{ let __ice_next = crate::host::sidebar_width_after_delta(self.sidebar_width, 0.0, width); if ::ducktape_view_guest::state_changed!(self.sidebar_width, __ice_next) { self.sidebar_width = __ice_next; self.__ice_rev[76] += 1; } }
-{ let __ice_next = crate::host::details_width_after_delta(self.details_width, 0.0, width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.details_width, __ice_next) { self.details_width = __ice_next; self.__ice_rev[77] += 1; } }
-{ let __ice_next = crate::host::thread_width_after_delta(self.thread_width, 0.0, width, self.sidebar_width); if ::ducktape_view_guest::state_changed!(self.thread_width, __ice_next) { self.thread_width = __ice_next; self.__ice_rev[78] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::SessionArrived(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if (!(item.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-let next = item.next.clone();
-let sent_now = (next.sent_serial != self.sent_serial);
-let chord_now = (next.copy_chord_serial != self.copy_chord_serial);
-let moved_room = ((next.active_channel != self.active_channel) || (next.land_seq != self.land_seq));
-{ let __ice_next = next.sent_serial; if ::ducktape_view_guest::state_changed!(self.sent_serial, __ice_next) { self.sent_serial = __ice_next; self.__ice_rev[25] += 1; } }
-{ let __ice_next = next.copy_chord_serial; if ::ducktape_view_guest::state_changed!(self.copy_chord_serial, __ice_next) { self.copy_chord_serial = __ice_next; self.__ice_rev[24] += 1; } }
-{ let __ice_next = crate::host::connection_serial_after(self.connected, next.connected, self.connection_serial); if ::ducktape_view_guest::state_changed!(self.connection_serial, __ice_next) { self.connection_serial = __ice_next; self.__ice_rev[31] += 1; } }
-{ let __ice_next = next.connected; if ::ducktape_view_guest::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[6] += 1; } }
-{ let __ice_next = next.endpoint.to_owned(); if ::ducktape_view_guest::state_changed!(self.endpoint, __ice_next) { self.endpoint = __ice_next; self.__ice_rev[1] += 1; } }
-{ let __ice_next = next.network_name.to_owned(); if ::ducktape_view_guest::state_changed!(self.network_name, __ice_next) { self.network_name = __ice_next; self.__ice_rev[2] += 1; } }
-{ let __ice_next = next.network_chain_id.to_owned(); if ::ducktape_view_guest::state_changed!(self.network_chain_id, __ice_next) { self.network_chain_id = __ice_next; self.__ice_rev[3] += 1; } }
-{ let __ice_next = next.status.to_owned(); if ::ducktape_view_guest::state_changed!(self.status, __ice_next) { self.status = __ice_next; self.__ice_rev[4] += 1; } }
-{ let __ice_next = next.block_height; if ::ducktape_view_guest::state_changed!(self.block_height, __ice_next) { self.block_height = __ice_next; self.__ice_rev[5] += 1; } }
-{ let __ice_next = next.me.to_owned(); if ::ducktape_view_guest::state_changed!(self.me, __ice_next) { self.me = __ice_next; self.__ice_rev[27] += 1; } }
-{ let __ice_next = next.me_key.to_owned(); if ::ducktape_view_guest::state_changed!(self.me_key, __ice_next) { self.me_key = __ice_next; self.__ice_rev[28] += 1; } }
-{ let __ice_next = ({ crate::host::seat_reader(::std::convert::AsRef::as_ref(&(next.me)), ::std::convert::AsRef::as_ref(&(next.me_key))) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-{ let __ice_next = next.names_serial; if ::ducktape_view_guest::state_changed!(self.names_serial, __ice_next) { self.names_serial = __ice_next; self.__ice_rev[29] += 1; } }
-{ let __ice_next = next.rooms.clone(); if ::ducktape_view_guest::state_changed!(self.rooms, __ice_next) { self.rooms = __ice_next; self.__ice_rev[9] += 1; } }
-{ let __ice_next = next.dm_rows.clone(); if ::ducktape_view_guest::state_changed!(self.dm_rows, __ice_next) { self.dm_rows = __ice_next; self.__ice_rev[10] += 1; } }
-{ let __ice_next = next.channel_create_open; if ::ducktape_view_guest::state_changed!(self.channel_create_open, __ice_next) { self.channel_create_open = __ice_next; self.__ice_rev[11] += 1; } }
-{ let __ice_next = next.active_channel.to_owned(); if ::ducktape_view_guest::state_changed!(self.active_channel, __ice_next) { self.active_channel = __ice_next; self.__ice_rev[12] += 1; } }
-{ let __ice_next = next.active_dm_peer.to_owned(); if ::ducktape_view_guest::state_changed!(self.active_dm_peer, __ice_next) { self.active_dm_peer = __ice_next; self.__ice_rev[13] += 1; } }
-{ let __ice_next = next.active_dm.clone(); if ::ducktape_view_guest::state_changed!(self.active_dm, __ice_next) { self.active_dm = __ice_next; self.__ice_rev[14] += 1; } }
-{ let __ice_next = next.land_seq; if ::ducktape_view_guest::state_changed!(self.land_seq, __ice_next) { self.land_seq = __ice_next; self.__ice_rev[30] += 1; } }
-{ let __ice_next = next.unread_boundary; if ::ducktape_view_guest::state_changed!(self.unread_boundary, __ice_next) { self.unread_boundary = __ice_next; self.__ice_rev[21] += 1; } }
-{ let __ice_next = next.loading; if ::ducktape_view_guest::state_changed!(self.session_loading, __ice_next) { self.session_loading = __ice_next; self.__ice_rev[7] += 1; } }
-{ let __ice_next = next.busy; if ::ducktape_view_guest::state_changed!(self.session_busy, __ice_next) { self.session_busy = __ice_next; self.__ice_rev[8] += 1; } }
-{ let __ice_next = self.session_busy; if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-{ let __ice_next = next.huddle_joined; if ::ducktape_view_guest::state_changed!(self.huddle_joined, __ice_next) { self.huddle_joined = __ice_next; self.__ice_rev[15] += 1; } }
-{ let __ice_next = next.huddle_channel.to_owned(); if ::ducktape_view_guest::state_changed!(self.huddle_channel, __ice_next) { self.huddle_channel = __ice_next; self.__ice_rev[16] += 1; } }
-{ let __ice_next = next.huddle_channel_name.to_owned(); if ::ducktape_view_guest::state_changed!(self.huddle_channel_name, __ice_next) { self.huddle_channel_name = __ice_next; self.__ice_rev[17] += 1; } }
-{ let __ice_next = next.huddle_joined_at; if ::ducktape_view_guest::state_changed!(self.huddle_joined_at, __ice_next) { self.huddle_joined_at = __ice_next; self.__ice_rev[18] += 1; } }
-{ let __ice_next = next.huddle_now; if ::ducktape_view_guest::state_changed!(self.huddle_now, __ice_next) { self.huddle_now = __ice_next; self.__ice_rev[19] += 1; } }
-{ let __ice_next = next.call_muted; if ::ducktape_view_guest::state_changed!(self.call_muted, __ice_next) { self.call_muted = __ice_next; self.__ice_rev[20] += 1; } }
-{ let __ice_next = next.shift_held; if ::ducktape_view_guest::state_changed!(self.shift_held, __ice_next) { self.shift_held = __ice_next; self.__ice_rev[23] += 1; } }
-{ let __ice_next = next.pending_sends.clone(); if ::ducktape_view_guest::state_changed!(self.pending_sends, __ice_next) { self.pending_sends = __ice_next; self.__ice_rev[26] += 1; } }
-{ let __ice_next = next.live_agents.clone(); if ::ducktape_view_guest::state_changed!(self.live_agents, __ice_next) { self.live_agents = __ice_next; self.__ice_rev[22] += 1; } }
-{ let __ice_next = (self.session_loading || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel))); if ::ducktape_view_guest::state_changed!(self.loading, __ice_next) { self.loading = __ice_next; self.__ice_rev[44] += 1; } }
-return ::ducktape_view_guest::Task::batch([
-{ // __ICE_SOURCE 357 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-(::ducktape_view_guest::Task::done(moved_room)).map(|value| __ChatViewMessage::SessionSettled(value))
-},
-{ // __ICE_SOURCE 362 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-(::ducktape_view_guest::Task::done(sent_now)).map(|value| __ChatViewMessage::SnapStream(value))
-},
-{ // __ICE_SOURCE 365 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-(::ducktape_view_guest::Task::done(chord_now)).map(|value| __ChatViewMessage::CopyChord(value))
-},
-{ // __ICE_SOURCE 368 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-(::ducktape_view_guest::Task::done(next.dark)).map(|value| __ChatViewMessage::ToneChanged(value))
-},
-]);
-})(),
-__ChatViewMessage::ToneChanged(dark) => (|| {
-
-let _ = &dark;
-return match crate::host::tone_of(dark) {
-Tone::Light => (|| {
-{ let __ice_next = AppTheme::App; if ::ducktape_view_guest::state_changed!(self.active_palette, __ice_next) { self.active_palette = __ice_next; self.__ice_rev[0] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-Tone::Dark => (|| {
-{ let __ice_next = AppTheme::AppDark; if ::ducktape_view_guest::state_changed!(self.active_palette, __ice_next) { self.active_palette = __ice_next; self.__ice_rev[0] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-};
-})(),
-__ChatViewMessage::SessionSettled(moved_room) => (|| {
-
-let _ = &moved_room;
-return match crate::host::room_move(moved_room) {
-RoomMove::Stayed => (|| {
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(self.room_messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), 0, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::first_unread_seq(::std::convert::AsRef::as_ref(&(self.messages)), self.unread_boundary); if ::ducktape_view_guest::state_changed!(self.unread_marker_seq, __ice_next) { self.unread_marker_seq = __ice_next; self.__ice_rev[64] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.live_agents))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = crate::host::room_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.land_seq, self.history_pages); if ::ducktape_view_guest::state_changed!(self.room_key, __ice_next) { self.room_key = __ice_next; self.__ice_rev[34] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.active_thread_seq, self.thread_target_seq, self.thread_pages); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-RoomMove::Moved => (|| {
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.history_pages, __ice_next) { self.history_pages = __ice_next; self.__ice_rev[33] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.active_thread_seq, __ice_next) { self.active_thread_seq = __ice_next; self.__ice_rev[49] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_target_seq, __ice_next) { self.thread_target_seq = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_pages, __ice_next) { self.thread_pages = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_has_more, __ice_next) { self.thread_has_more = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_next_reply_seq, __ice_next) { self.thread_next_reply_seq = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_anchor_seq, __ice_next) { self.copy_anchor_seq = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_head_seq, __ice_next) { self.copy_head_seq = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = CopySurface::Nowhere; if ::ducktape_view_guest::state_changed!(self.copy_surface, __ice_next) { self.copy_surface = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.channel_settings_open, __ice_next) { self.channel_settings_open = __ice_next; self.__ice_rev[68] += 1; } }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.at_live_tail, __ice_next) { self.at_live_tail = __ice_next; self.__ice_rev[62] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.room_messages, __ice_next) { self.room_messages = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(::std::vec::Vec::new())), ::std::convert::AsRef::as_ref(&(::std::vec::Vec::new()))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.unread_marker_seq, __ice_next) { self.unread_marker_seq = __ice_next; self.__ice_rev[64] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.channel_members, __ice_next) { self.channel_members = __ice_next; self.__ice_rev[38] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.post_refusal, __ice_next) { self.post_refusal = __ice_next; self.__ice_rev[42] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.has_older_history, __ice_next) { self.has_older_history = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = crate::host::room_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.land_seq, 0); if ::ducktape_view_guest::state_changed!(self.room_key, __ice_next) { self.room_key = __ice_next; self.__ice_rev[34] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), 0, 0, 0); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-};
-})(),
-__ChatViewMessage::SnapStream(moved) => (|| {
-
-let _ = &moved;
-if (!moved) { return ::ducktape_view_guest::Task::none(); }
-return ::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Snap { target: ::std::string::String::from("ChatView/chat/message-stream"), x: (0.0) as f32, y: (0.0) as f32 });
-})(),
-__ChatViewMessage::RevealStream(target_key) => (|| {
-
-let _ = &target_key;
-if (target_key <= 0) { return ::ducktape_view_guest::Task::none(); }
-return ::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target: ::std::string::String::from("ChatView/chat/message-stream"), key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key() });
-})(),
-__ChatViewMessage::RevealThread(target_key) => (|| {
-
-let _ = &target_key;
-if (target_key <= 0) { return ::ducktape_view_guest::Task::none(); }
-return ::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target: ::std::string::String::from("ChatView/chat/thread-pane/thread-stream"), key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key() });
-})(),
-__ChatViewMessage::RoomArrived(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.history_loading, __ice_next) { self.history_loading = __ice_next; self.__ice_rev[63] += 1; } }
-if (item.channel != self.active_channel) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = item.channel.to_owned(); if ::ducktape_view_guest::state_changed!(self.room_channel, __ice_next) { self.room_channel = __ice_next; self.__ice_rev[35] += 1; } }
-{ let __ice_next = self.session_loading; if ::ducktape_view_guest::state_changed!(self.loading, __ice_next) { self.loading = __ice_next; self.__ice_rev[44] += 1; } }
-if (!(item.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = item.name.to_owned(); if ::ducktape_view_guest::state_changed!(self.active_channel_name, __ice_next) { self.active_channel_name = __ice_next; self.__ice_rev[39] += 1; } }
-{ let __ice_next = item.archived; if ::ducktape_view_guest::state_changed!(self.active_channel_archived, __ice_next) { self.active_channel_archived = __ice_next; self.__ice_rev[40] += 1; } }
-{ let __ice_next = item.members_only; if ::ducktape_view_guest::state_changed!(self.active_channel_members_only, __ice_next) { self.active_channel_members_only = __ice_next; self.__ice_rev[41] += 1; } }
-{ let __ice_next = item.members.clone(); if ::ducktape_view_guest::state_changed!(self.channel_members, __ice_next) { self.channel_members = __ice_next; self.__ice_rev[38] += 1; } }
-{ let __ice_next = crate::host::post_gate(item.archived, item.members_only, ::std::convert::AsRef::as_ref(&(item.members)), ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.post_refusal, __ice_next) { self.post_refusal = __ice_next; self.__ice_rev[42] += 1; } }
-{ let __ice_next = item.messages.clone(); if ::ducktape_view_guest::state_changed!(self.room_messages, __ice_next) { self.room_messages = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(self.room_messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), 0, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::first_unread_seq(::std::convert::AsRef::as_ref(&(self.messages)), self.unread_boundary); if ::ducktape_view_guest::state_changed!(self.unread_marker_seq, __ice_next) { self.unread_marker_seq = __ice_next; self.__ice_rev[64] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.live_agents))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = item.has_older; if ::ducktape_view_guest::state_changed!(self.has_older_history, __ice_next) { self.has_older_history = __ice_next; self.__ice_rev[43] += 1; } }
-{ let __ice_next = ((self.land_seq > 0) || (self.history_pages > 0)); if ::ducktape_view_guest::state_changed!(self.history_view, __ice_next) { self.history_view = __ice_next; self.__ice_rev[61] += 1; } }
-{ let __ice_next = crate::host::message_target_key(::std::convert::AsRef::as_ref(&(self.messages)), self.land_seq, (self.land_seq > 0)); if ::ducktape_view_guest::state_changed!(self.stream_reveal_key, __ice_next) { self.stream_reveal_key = __ice_next; self.__ice_rev[52] += 1; } }
-return match crate::host::landing_thread(item.thread_root) {
-LandingThread::Absent => (|| {
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.active_thread_seq, self.thread_target_seq, self.thread_pages); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-return (::ducktape_view_guest::Task::done(self.stream_reveal_key)).map(|value| __ChatViewMessage::RevealStream(value));
-})(),
-LandingThread::Seated => (|| {
-{ let __ice_next = item.thread_root; if ::ducktape_view_guest::state_changed!(self.active_thread_seq, __ice_next) { self.active_thread_seq = __ice_next; self.__ice_rev[49] += 1; } }
-{ let __ice_next = self.land_seq; if ::ducktape_view_guest::state_changed!(self.thread_target_seq, __ice_next) { self.thread_target_seq = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_pages, __ice_next) { self.thread_pages = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), item.thread_root, self.land_seq, 0); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-return (::ducktape_view_guest::Task::done(self.stream_reveal_key)).map(|value| __ChatViewMessage::RevealStream(value));
-})(),
-};
-})(),
-__ChatViewMessage::ThreadArrived(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-if (item.root_seq != self.active_thread_seq) { return ::ducktape_view_guest::Task::none(); }
-if (!(item.error).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(item.messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), self.active_thread_seq, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = item.target_seq; if ::ducktape_view_guest::state_changed!(self.thread_target_seq, __ice_next) { self.thread_target_seq = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = item.has_more; if ::ducktape_view_guest::state_changed!(self.thread_has_more, __ice_next) { self.thread_has_more = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = item.next_reply_seq; if ::ducktape_view_guest::state_changed!(self.thread_next_reply_seq, __ice_next) { self.thread_next_reply_seq = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = crate::host::message_target_key(::std::convert::AsRef::as_ref(&(self.thread_messages)), item.target_seq, (item.target_seq > 0)); if ::ducktape_view_guest::state_changed!(self.thread_reveal_key, __ice_next) { self.thread_reveal_key = __ice_next; self.__ice_rev[51] += 1; } }
-return (::ducktape_view_guest::Task::done(self.thread_reveal_key)).map(|value| __ChatViewMessage::RevealThread(value));
-})(),
-__ChatViewMessage::SearchArrived(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if ((item.query).is_empty() || (item.query != self.search_query)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = item.hits.clone(); if ::ducktape_view_guest::state_changed!(self.search_hits, __ice_next) { self.search_hits = __ice_next; self.__ice_rev[60] += 1; } }
-return match crate::host::search_outcome((item.error).is_empty()) {
-SearchOutcome::Answered => (|| {
-{ let __ice_next = SearchPhase::Done; if ::ducktape_view_guest::state_changed!(self.search_phase, __ice_next) { self.search_phase = __ice_next; self.__ice_rev[58] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-SearchOutcome::Refused => (|| {
-{ let __ice_next = SearchPhase::Idle; if ::ducktape_view_guest::state_changed!(self.search_phase, __ice_next) { self.search_phase = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.search_query, __ice_next) { self.search_query = __ice_next; self.__ice_rev[59] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-};
-})(),
-__ChatViewMessage::ActDone(item) => (|| {
-
-let _ = &item;
-{ let __ice_next = self.session_busy; if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-{ let __ice_next = item.error.to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.member_key_draft, __ice_next) { self.member_key_draft = __ice_next; self.__ice_rev[82] += 1; } }
-{ let __ice_next = (self.room_serial + 1); if ::ducktape_view_guest::state_changed!(self.room_serial, __ice_next) { self.room_serial = __ice_next; self.__ice_rev[32] += 1; } }
-{ let __ice_next = crate::host::room_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.land_seq, self.history_pages); if ::ducktape_view_guest::state_changed!(self.room_key, __ice_next) { self.room_key = __ice_next; self.__ice_rev[34] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.active_thread_seq, self.thread_target_seq, self.thread_pages); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::SearchChatSubmit => (|| {
-
-if ((self.search_draft).trim().to_owned()).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = SearchPhase::Searching; if ::ducktape_view_guest::state_changed!(self.search_phase, __ice_next) { self.search_phase = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.search_hits, __ice_next) { self.search_hits = __ice_next; self.__ice_rev[60] += 1; } }
-{ let __ice_next = (self.search_draft).trim().to_owned(); if ::ducktape_view_guest::state_changed!(self.search_query, __ice_next) { self.search_query = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = crate::host::search_key(self.connection_serial, self.names_serial, ::std::convert::AsRef::as_ref(&(self.search_query))); if ::ducktape_view_guest::state_changed!(self.search_key, __ice_next) { self.search_key = __ice_next; self.__ice_rev[57] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ClearChatSearch => (|| {
-
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.search_draft, __ice_next) { self.search_draft = __ice_next; self.__ice_rev[79] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.search_query, __ice_next) { self.search_query = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.search_hits, __ice_next) { self.search_hits = __ice_next; self.__ice_rev[60] += 1; } }
-{ let __ice_next = SearchPhase::Idle; if ::ducktape_view_guest::state_changed!(self.search_phase, __ice_next) { self.search_phase = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = crate::host::search_key(self.connection_serial, self.names_serial, ::std::convert::AsRef::as_ref(&(""))); if ::ducktape_view_guest::state_changed!(self.search_key, __ice_next) { self.search_key = __ice_next; self.__ice_rev[57] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenChatSearchHit(channel_id, _root_seq, target_seq) => (|| {
-
-let _ = &channel_id;
-let _ = &_root_seq;
-let _ = &target_seq;
-{ let __ice_next = SearchPhase::Idle; if ::ducktape_view_guest::state_changed!(self.search_phase, __ice_next) { self.search_phase = __ice_next; self.__ice_rev[58] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.search_hits, __ice_next) { self.search_hits = __ice_next; self.__ice_rev[60] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.search_query, __ice_next) { self.search_query = __ice_next; self.__ice_rev[59] += 1; } }
-{ let __ice_next = crate::host::send_open_hit(::std::convert::AsRef::as_ref(&(channel_id)), target_seq); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ToggleChannelCreate => (|| {
-
-{ let __ice_next = crate::host::send_toggle_create(); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ChooseChannel(id) => (|| {
-
-let _ = &id;
-{ let __ice_next = crate::host::send_choose_channel(::std::convert::AsRef::as_ref(&(id))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ChooseDm(peer_key) => (|| {
-
-let _ = &peer_key;
-{ let __ice_next = crate::host::send_choose_dm(::std::convert::AsRef::as_ref(&(peer_key))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ToggleChannelSettings => (|| {
-
-if (self.active_channel).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = self.active_channel_name.to_owned(); if ::ducktape_view_guest::state_changed!(self.channel_name_draft, __ice_next) { self.channel_name_draft = __ice_next; self.__ice_rev[81] += 1; } }
-{ let __ice_next = (!self.channel_settings_open); if ::ducktape_view_guest::state_changed!(self.channel_settings_open, __ice_next) { self.channel_settings_open = __ice_next; self.__ice_rev[68] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ShowHuddle => (|| {
-
-{ let __ice_next = crate::host::send_show_huddle(); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::LeaveHuddleHere => (|| {
-
-{ let __ice_next = crate::host::send_leave_huddle(); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::JoinHuddleSubmit => (|| {
-
-{ let __ice_next = crate::host::send_join_huddle(); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenMessageLink(url) => (|| {
-
-let _ = &url;
-{ let __ice_next = crate::host::send_open_link(::std::convert::AsRef::as_ref(&(url))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CopyToClipboard(text, label) => (|| {
-
-let _ = &text;
-let _ = &label;
-{ let __ice_next = crate::host::send_copy(::std::convert::AsRef::as_ref(&(text)), ::std::convert::AsRef::as_ref(&(label))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CopyMessageLink(link) => (|| {
-
-let _ = &link;
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-if (link).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::send_copy_link(::std::convert::AsRef::as_ref(&(link))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CancelRun(run_id) => (|| {
-
-let _ = &run_id;
-{ let __ice_next = crate::host::send_cancel_run(::std::convert::AsRef::as_ref(&(run_id))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenRun(dispatch_id) => (|| {
-
-let _ = &dispatch_id;
-{ let __ice_next = crate::host::send_open_run(::std::convert::AsRef::as_ref(&(dispatch_id))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ChatScrolled(absolute_x, absolute_y, relative_x, relative_y) => (|| {
-
-let _ = &absolute_x;
-let _ = &absolute_y;
-let _ = &relative_x;
-let _ = &relative_y;
-{ let __ice_next = crate::host::near_scroll_tail(relative_y); if ::ducktape_view_guest::state_changed!(self.at_live_tail, __ice_next) { self.at_live_tail = __ice_next; self.__ice_rev[62] += 1; } }
-{ let __ice_next = crate::host::send_scrolled(absolute_x, absolute_y, relative_x, relative_y); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-if ((((((!crate::host::near_scroll_top(relative_y)) || self.history_loading) || self.loading) || self.busy) || (self.active_channel).is_empty()) || (!self.has_older_history)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.history_loading, __ice_next) { self.history_loading = __ice_next; self.__ice_rev[63] += 1; } }
-{ let __ice_next = (self.history_pages + 1); if ::ducktape_view_guest::state_changed!(self.history_pages, __ice_next) { self.history_pages = __ice_next; self.__ice_rev[33] += 1; } }
-{ let __ice_next = crate::host::room_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.land_seq, self.history_pages); if ::ducktape_view_guest::state_changed!(self.room_key, __ice_next) { self.room_key = __ice_next; self.__ice_rev[34] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::LoadMoreHistory => (|| {
-
-if (((((self.history_loading || self.loading) || self.busy) || (self.active_channel).is_empty()) || (self.messages).is_empty()) || (!self.has_older_history)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.history_loading, __ice_next) { self.history_loading = __ice_next; self.__ice_rev[63] += 1; } }
-{ let __ice_next = (self.history_pages + 1); if ::ducktape_view_guest::state_changed!(self.history_pages, __ice_next) { self.history_pages = __ice_next; self.__ice_rev[33] += 1; } }
-{ let __ice_next = crate::host::room_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.land_seq, self.history_pages); if ::ducktape_view_guest::state_changed!(self.room_key, __ice_next) { self.room_key = __ice_next; self.__ice_rev[34] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenMessageActions(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::More; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 635 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/message-action-focus") })
-}).chain({ // __ICE_SOURCE 636 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::OpenMessageReactions(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::reaction_refusal(self.active_channel_archived, ::std::convert::AsRef::as_ref(&(self.host_error))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if self.active_channel_archived { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Reactions; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 651 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/message-reaction-focus") })
-}).chain({ // __ICE_SOURCE 652 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::BeginMessageEdit(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-let seed = crate::host::edit_body_of(::std::convert::AsRef::as_ref(&(self.messages)), seq, rev);
-if (seed).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::send_begin_edit(::std::convert::AsRef::as_ref(&(crate::host::edit_scope(::std::convert::AsRef::as_ref(&(self.endpoint)), ::std::convert::AsRef::as_ref(&(self.active_channel)), seq))), ::std::convert::AsRef::as_ref(&(seed)), seq, rev); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Editing; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ArmMessageDelete(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Delete; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 675 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/message-delete-focus") })
-}).chain({ // __ICE_SOURCE 676 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::ClearMessageSelection => (|| {
-
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenThreadMessageActions(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::More; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 691 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/thread-pane/thread-action-focus") })
-}).chain({ // __ICE_SOURCE 692 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::OpenThreadMessageReactions(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::reaction_refusal(self.active_channel_archived, ::std::convert::AsRef::as_ref(&(self.host_error))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if self.active_channel_archived { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Reactions; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 703 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/thread-pane/thread-reaction-focus") })
-}).chain({ // __ICE_SOURCE 704 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::BeginThreadMessageEdit(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-let seed = crate::host::edit_body_of(::std::convert::AsRef::as_ref(&(self.thread_messages)), seq, rev);
-if (seed).is_empty() { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::send_begin_edit(::std::convert::AsRef::as_ref(&(crate::host::edit_scope(::std::convert::AsRef::as_ref(&(self.endpoint)), ::std::convert::AsRef::as_ref(&(self.active_channel)), seq))), ::std::convert::AsRef::as_ref(&(seed)), seq, rev); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Editing; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ArmThreadMessageDelete(seq, body, rev) => (|| {
-
-let _ = &seq;
-let _ = &body;
-let _ = &rev;
-if (seq <= 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = rev; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Delete; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = body.to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-return ::ducktape_view_guest::Task::none().chain({ // __ICE_SOURCE 723 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::Focus { target: ::std::string::String::from("ChatView/chat/thread-pane/thread-delete-focus") })
-}).chain({ // __ICE_SOURCE 724 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6372617465732f76696577732f636861742f7372632f75692f6170702e696365
-::ducktape_view_guest::widget::perform::<__ChatViewMessage>(::ducktape_view_guest::wire::WidgetCommand::FocusNext)
-});
-})(),
-__ChatViewMessage::ClearThreadMessageSelection => (|| {
-
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::OpenThreadFor(seq) => (|| {
-
-let _ = &seq;
-if ((seq <= 0) || (self.active_channel).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.channel_settings_open, __ice_next) { self.channel_settings_open = __ice_next; self.__ice_rev[68] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_seq, __ice_next) { self.selected_message_seq = __ice_next; self.__ice_rev[65] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.selected_message_rev, __ice_next) { self.selected_message_rev = __ice_next; self.__ice_rev[66] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.message_action, __ice_next) { self.message_action = __ice_next; self.__ice_rev[67] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.message_edit_draft, __ice_next) { self.message_edit_draft = __ice_next; self.__ice_rev[80] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_anchor_seq, __ice_next) { self.copy_anchor_seq = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_head_seq, __ice_next) { self.copy_head_seq = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = CopySurface::Nowhere; if ::ducktape_view_guest::state_changed!(self.copy_surface, __ice_next) { self.copy_surface = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_has_more, __ice_next) { self.thread_has_more = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_next_reply_seq, __ice_next) { self.thread_next_reply_seq = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_pages, __ice_next) { self.thread_pages = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = seq; if ::ducktape_view_guest::state_changed!(self.active_thread_seq, __ice_next) { self.active_thread_seq = __ice_next; self.__ice_rev[49] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_target_seq, __ice_next) { self.thread_target_seq = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), seq, 0, 0); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CloseThread => (|| {
-
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.active_thread_seq, __ice_next) { self.active_thread_seq = __ice_next; self.__ice_rev[49] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_target_seq, __ice_next) { self.thread_target_seq = __ice_next; self.__ice_rev[50] += 1; } }
-{ let __ice_next = ::std::vec::Vec::new(); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_pages, __ice_next) { self.thread_pages = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_has_more, __ice_next) { self.thread_has_more = __ice_next; self.__ice_rev[54] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_next_reply_seq, __ice_next) { self.thread_next_reply_seq = __ice_next; self.__ice_rev[55] += 1; } }
-{ let __ice_next = false; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_seq, __ice_next) { self.thread_selected_seq = __ice_next; self.__ice_rev[69] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.thread_selected_rev, __ice_next) { self.thread_selected_rev = __ice_next; self.__ice_rev[70] += 1; } }
-{ let __ice_next = MessageAction::Toolbar; if ::ducktape_view_guest::state_changed!(self.thread_message_action, __ice_next) { self.thread_message_action = __ice_next; self.__ice_rev[71] += 1; } }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.thread_edit_draft, __ice_next) { self.thread_edit_draft = __ice_next; self.__ice_rev[83] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_anchor_seq, __ice_next) { self.copy_anchor_seq = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_head_seq, __ice_next) { self.copy_head_seq = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = CopySurface::Nowhere; if ::ducktape_view_guest::state_changed!(self.copy_surface, __ice_next) { self.copy_surface = __ice_next; self.__ice_rev[74] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), 0, 0, 0); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::LoadMoreThread => (|| {
-
-if (((self.thread_loading || self.busy) || (self.active_thread_seq <= 0)) || (!self.thread_has_more)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = true; if ::ducktape_view_guest::state_changed!(self.thread_loading, __ice_next) { self.thread_loading = __ice_next; self.__ice_rev[56] += 1; } }
-{ let __ice_next = (self.thread_pages + 1); if ::ducktape_view_guest::state_changed!(self.thread_pages, __ice_next) { self.thread_pages = __ice_next; self.__ice_rev[47] += 1; } }
-{ let __ice_next = crate::host::thread_key((self.connection_serial + self.room_serial), self.names_serial, ::std::convert::AsRef::as_ref(&(self.active_channel)), self.active_thread_seq, self.thread_target_seq, self.thread_pages); if ::ducktape_view_guest::state_changed!(self.thread_key, __ice_next) { self.thread_key = __ice_next; self.__ice_rev[48] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::AddReactionSubmit(emoji) => (|| {
-
-let _ = &emoji;
-if ((self.active_channel).is_empty() || (self.selected_message_seq <= 0)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::reaction_refusal(self.active_channel_archived, ::std::convert::AsRef::as_ref(&(self.host_error))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if self.active_channel_archived { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.room_messages)), self.selected_message_seq, ::std::convert::AsRef::as_ref(&(emoji)), true); if ::ducktape_view_guest::state_changed!(self.room_messages, __ice_next) { self.room_messages = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(self.room_messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), 0, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.live_agents))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.thread_messages)), self.selected_message_seq, ::std::convert::AsRef::as_ref(&(emoji)), true); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = ({ crate::host::write_reaction(::std::convert::AsRef::as_ref(&(self.active_channel)), self.selected_message_seq, ::std::convert::AsRef::as_ref(&(emoji)), true) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::AddReactionAt(seq, emoji) => (|| {
-
-let _ = &seq;
-let _ = &emoji;
-if ((self.active_channel).is_empty() || (seq <= 0)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::reaction_refusal(self.active_channel_archived, ::std::convert::AsRef::as_ref(&(self.host_error))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if self.active_channel_archived { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.room_messages)), seq, ::std::convert::AsRef::as_ref(&(emoji)), true); if ::ducktape_view_guest::state_changed!(self.room_messages, __ice_next) { self.room_messages = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(self.room_messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), 0, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.live_agents))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.thread_messages)), seq, ::std::convert::AsRef::as_ref(&(emoji)), true); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = ({ crate::host::write_reaction(::std::convert::AsRef::as_ref(&(self.active_channel)), seq, ::std::convert::AsRef::as_ref(&(emoji)), true) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::RemoveReactionAt(seq, emoji) => (|| {
-
-let _ = &seq;
-let _ = &emoji;
-if ((self.active_channel).is_empty() || (seq <= 0)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::reaction_refusal(self.active_channel_archived, ::std::convert::AsRef::as_ref(&(self.host_error))); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-if self.active_channel_archived { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.room_messages)), seq, ::std::convert::AsRef::as_ref(&(emoji)), false); if ::ducktape_view_guest::state_changed!(self.room_messages, __ice_next) { self.room_messages = __ice_next; self.__ice_rev[36] += 1; } }
-{ let __ice_next = crate::host::with_pending(::std::convert::AsRef::as_ref(&(self.room_messages)), ::std::convert::AsRef::as_ref(&(self.pending_sends)), 0, ::std::convert::AsRef::as_ref(&(self.me))); if ::ducktape_view_guest::state_changed!(self.messages, __ice_next) { self.messages = __ice_next; self.__ice_rev[37] += 1; } }
-{ let __ice_next = crate::host::timeline_of(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.live_agents))); if ::ducktape_view_guest::state_changed!(self.timeline, __ice_next) { self.timeline = __ice_next; self.__ice_rev[46] += 1; } }
-{ let __ice_next = crate::host::reaction_applied(::std::convert::AsRef::as_ref(&(self.thread_messages)), seq, ::std::convert::AsRef::as_ref(&(emoji)), false); if ::ducktape_view_guest::state_changed!(self.thread_messages, __ice_next) { self.thread_messages = __ice_next; self.__ice_rev[53] += 1; } }
-{ let __ice_next = ({ crate::host::write_reaction(::std::convert::AsRef::as_ref(&(self.active_channel)), seq, ::std::convert::AsRef::as_ref(&(emoji)), false) }); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::DeleteMessageSubmit => (|| {
-
-if (((self.busy || (self.active_channel).is_empty()) || (self.selected_message_seq <= 0)) || (self.message_action != MessageAction::Delete)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_delete(::std::convert::AsRef::as_ref(&(self.active_channel)), self.selected_message_seq) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::DeleteThreadMessageSubmit => (|| {
-
-if (((self.busy || (self.active_channel).is_empty()) || (self.thread_selected_seq <= 0)) || (self.thread_message_action != MessageAction::Delete)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_delete(::std::convert::AsRef::as_ref(&(self.active_channel)), self.thread_selected_seq) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::RenameChannelSubmit => (|| {
-
-if ((self.busy || (self.active_channel).is_empty()) || ((self.channel_name_draft).trim().to_owned()).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_rename(::std::convert::AsRef::as_ref(&(self.active_channel)), ::std::convert::AsRef::as_ref(&((self.channel_name_draft).trim().to_owned()))) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ArchiveChannelSubmit => (|| {
-
-if ((self.busy || (self.active_channel).is_empty()) || self.active_channel_archived) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_archived(::std::convert::AsRef::as_ref(&(self.active_channel)), true) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::UnarchiveChannelSubmit => (|| {
-
-if ((self.busy || (self.active_channel).is_empty()) || (!self.active_channel_archived)) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_archived(::std::convert::AsRef::as_ref(&(self.active_channel)), false) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::AddChannelMemberSubmit => (|| {
-
-if ((self.busy || (self.active_channel).is_empty()) || ((self.member_key_draft).trim().to_owned()).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_membership(::std::convert::AsRef::as_ref(&(self.active_channel)), ::std::convert::AsRef::as_ref(&((self.member_key_draft).trim().to_owned())), true) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::RemoveChannelMemberSubmit(key) => (|| {
-
-let _ = &key;
-if ((self.busy || (self.active_channel).is_empty()) || (key).is_empty()) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = "".to_owned(); if ::ducktape_view_guest::state_changed!(self.host_error, __ice_next) { self.host_error = __ice_next; self.__ice_rev[84] += 1; } }
-{ let __ice_next = ({ crate::host::write_membership(::std::convert::AsRef::as_ref(&(self.active_channel)), ::std::convert::AsRef::as_ref(&(key)), false) }); if ::ducktape_view_guest::state_changed!(self.busy, __ice_next) { self.busy = __ice_next; self.__ice_rev[45] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::PressMessage(seq, surface) => (|| {
-
-let _ = &seq;
-let _ = &surface;
-if (!self.shift_held) { return ::ducktape_view_guest::Task::none(); }
-let range = crate::host::copy_range_after_press(self.copy_anchor_seq, self.copy_surface.clone(), seq, surface.clone());
-{ let __ice_next = range.anchor; if ::ducktape_view_guest::state_changed!(self.copy_anchor_seq, __ice_next) { self.copy_anchor_seq = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = range.head; if ::ducktape_view_guest::state_changed!(self.copy_head_seq, __ice_next) { self.copy_head_seq = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = crate::host::copy_surface_of(::std::convert::AsRef::as_ref(&(range.surface))); if ::ducktape_view_guest::state_changed!(self.copy_surface, __ice_next) { self.copy_surface = __ice_next; self.__ice_rev[74] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::ClearCopyRange => (|| {
-
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_anchor_seq, __ice_next) { self.copy_anchor_seq = __ice_next; self.__ice_rev[72] += 1; } }
-{ let __ice_next = 0; if ::ducktape_view_guest::state_changed!(self.copy_head_seq, __ice_next) { self.copy_head_seq = __ice_next; self.__ice_rev[73] += 1; } }
-{ let __ice_next = CopySurface::Nowhere; if ::ducktape_view_guest::state_changed!(self.copy_surface, __ice_next) { self.copy_surface = __ice_next; self.__ice_rev[74] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CopySelectedMessages => (|| {
-
-let rows = crate::host::copy_range_rows(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.thread_messages)), self.copy_surface.clone());
-let count = crate::host::copy_range_count(::std::convert::AsRef::as_ref(&(rows)), self.copy_anchor_seq, self.copy_head_seq);
-if (count == 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::send_copy(::std::convert::AsRef::as_ref(&(crate::host::copy_range_text(::std::convert::AsRef::as_ref(&(rows)), self.copy_anchor_seq, self.copy_head_seq))), ::std::convert::AsRef::as_ref(&(crate::host::copy_range_label(count)))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::CopyChord(fired) => (|| {
-
-let _ = &fired;
-if (!fired) { return ::ducktape_view_guest::Task::none(); }
-let rows = crate::host::copy_range_rows(::std::convert::AsRef::as_ref(&(self.messages)), ::std::convert::AsRef::as_ref(&(self.thread_messages)), self.copy_surface.clone());
-let count = crate::host::copy_range_count(::std::convert::AsRef::as_ref(&(rows)), self.copy_anchor_seq, self.copy_head_seq);
-if (count == 0) { return ::ducktape_view_guest::Task::none(); }
-{ let __ice_next = crate::host::send_copy(::std::convert::AsRef::as_ref(&(crate::host::copy_range_text(::std::convert::AsRef::as_ref(&(rows)), self.copy_anchor_seq, self.copy_head_seq))), ::std::convert::AsRef::as_ref(&(crate::host::copy_range_label(count)))); if ::ducktape_view_guest::state_changed!(self.sent, __ice_next) { self.sent = __ice_next; self.__ice_rev[85] += 1; } }
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::__0C4368617453637265656eH636861745f706f696e7465725f70726573736564(__scope, _x, y) => (|| {
-
-let _ = &_x;
-let _ = &y;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
-__local.chat_pointer_y = y;
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::__0C4368617453637265656eH636861745f726573697a6564(__scope, _width, height) => (|| {
-
-let _ = &_width;
-let _ = &height;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
-__local.chat_height = height;
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::__0C4368617453637265656eH7468726561645f706f696e7465725f70726573736564(__scope, _x, y) => (|| {
-
-let _ = &_x;
-let _ = &y;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
-__local.thread_pointer_y = y;
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::__0C4368617453637265656eH7468726561645f726573697a6564(__scope, _width, height) => (|| {
-
-let _ = &_width;
-let _ = &height;
-::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope.clone())); let __local = self.__ice_component_04368617453637265656e.entry(__scope.clone()).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),});
-__local.thread_height = height;
-::ducktape_view_guest::Task::none()
-})(),
-__ChatViewMessage::__0C4368617453637265656eB6d6573736167655f616374696f6e5f666f637573(__scope, value) => { ::ducktape_view_guest::invalidate_component("ChatScreen", &(__scope)); let __local = self.__ice_component_04368617453637265656e.entry(__scope).or_insert_with(|| __IceChatScreenState {message_action_focus: self.__ice_component_04368617453637265656e_initial.message_action_focus.clone(),chat_pointer_y: self.__ice_component_04368617453637265656e_initial.chat_pointer_y.clone(),chat_height: self.__ice_component_04368617453637265656e_initial.chat_height.clone(),thread_pointer_y: self.__ice_component_04368617453637265656e_initial.thread_pointer_y.clone(),thread_height: self.__ice_component_04368617453637265656e_initial.thread_height.clone(),}); __local.message_action_focus = value; ::ducktape_view_guest::Task::none() },
-__ChatViewMessage::__BindSearchDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.search_draft, __ice_next) { self.search_draft = __ice_next; self.__ice_rev[79] += 1; } } ::ducktape_view_guest::Task::none() }
-__ChatViewMessage::__BindChannelNameDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.channel_name_draft, __ice_next) { self.channel_name_draft = __ice_next; self.__ice_rev[81] += 1; } } ::ducktape_view_guest::Task::none() }
-__ChatViewMessage::__BindMemberKeyDraft(value) => { { let __ice_next = value; if ::ducktape_view_guest::state_changed!(self.member_key_draft, __ice_next) { self.member_key_draft = __ice_next; self.__ice_rev[82] += 1; } } ::ducktape_view_guest::Task::none() }
-__ChatViewMessage::__ExternNoop => ::ducktape_view_guest::Task::none(),
-}
+use super::*;
+impl super::ChatView {
+    pub(crate) fn update(&mut self, message: Message) -> ducktape_view_guest::Task<Message> {
+        match message {
+            Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx, _dy),
+            Message::DetailsResized(dx, _dy) => self.on_details_resized(dx, _dy),
+            Message::ThreadResized(dx, _dy) => self.on_thread_resized(dx, _dy),
+            Message::ChatViewportChanged(width, _height) => {
+                self.on_chat_viewport_changed(width, _height)
+            }
+            Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::ToneChanged(dark) => self.on_tone_changed(dark),
+            Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
+            Message::SnapStream(moved) => self.on_snap_stream(moved),
+            Message::RevealStream(target_key) => self.on_reveal_stream(target_key),
+            Message::RevealThread(target_key) => self.on_reveal_thread(target_key),
+            Message::RoomArrived(item) => self.on_room_arrived(item),
+            Message::ThreadArrived(item) => self.on_thread_arrived(item),
+            Message::SearchArrived(item) => self.on_search_arrived(item),
+            Message::ActDone(item) => self.on_act_done(item),
+            Message::SearchChatSubmit => self.on_search_chat_submit(),
+            Message::ClearChatSearch => self.on_clear_chat_search(),
+            Message::OpenChatSearchHit(channel_id, _root_seq, target_seq) => {
+                self.on_open_chat_search_hit(channel_id, _root_seq, target_seq)
+            }
+            Message::ToggleChannelCreate => self.on_toggle_channel_create(),
+            Message::ChooseChannel(id) => self.on_choose_channel(id),
+            Message::ChooseDm(peer_key) => self.on_choose_dm(peer_key),
+            Message::ToggleChannelSettings => self.on_toggle_channel_settings(),
+            Message::ShowHuddle => self.on_show_huddle(),
+            Message::LeaveHuddleHere => self.on_leave_huddle_here(),
+            Message::JoinHuddleSubmit => self.on_join_huddle_submit(),
+            Message::OpenMessageLink(url) => self.on_open_message_link(url),
+            Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
+            Message::CopyMessageLink(link) => self.on_copy_message_link(link),
+            Message::CancelRun(run_id) => self.on_cancel_run(run_id),
+            Message::OpenRun(dispatch_id) => self.on_open_run(dispatch_id),
+            Message::ChatScrolled(absolute_x, absolute_y, relative_x, relative_y) => {
+                self.on_chat_scrolled(absolute_x, absolute_y, relative_x, relative_y)
+            }
+            Message::LoadMoreHistory => self.on_load_more_history(),
+            Message::OpenMessageActions(seq, body, rev) => {
+                self.on_open_message_actions(seq, body, rev)
+            }
+            Message::OpenMessageReactions(seq, body, rev) => {
+                self.on_open_message_reactions(seq, body, rev)
+            }
+            Message::BeginMessageEdit(seq, body, rev) => self.on_begin_message_edit(seq, body, rev),
+            Message::ArmMessageDelete(seq, body, rev) => self.on_arm_message_delete(seq, body, rev),
+            Message::ClearMessageSelection => self.on_clear_message_selection(),
+            Message::OpenThreadMessageActions(seq, body, rev) => {
+                self.on_open_thread_message_actions(seq, body, rev)
+            }
+            Message::OpenThreadMessageReactions(seq, body, rev) => {
+                self.on_open_thread_message_reactions(seq, body, rev)
+            }
+            Message::BeginThreadMessageEdit(seq, body, rev) => {
+                self.on_begin_thread_message_edit(seq, body, rev)
+            }
+            Message::ArmThreadMessageDelete(seq, body, rev) => {
+                self.on_arm_thread_message_delete(seq, body, rev)
+            }
+            Message::ClearThreadMessageSelection => self.on_clear_thread_message_selection(),
+            Message::OpenThreadFor(seq) => self.on_open_thread_for(seq),
+            Message::CloseThread => self.on_close_thread(),
+            Message::LoadMoreThread => self.on_load_more_thread(),
+            Message::AddReactionSubmit(emoji) => self.on_add_reaction_submit(emoji),
+            Message::AddReactionAt(seq, emoji) => self.on_add_reaction_at(seq, emoji),
+            Message::RemoveReactionAt(seq, emoji) => self.on_remove_reaction_at(seq, emoji),
+            Message::DeleteMessageSubmit => self.on_delete_message_submit(),
+            Message::DeleteThreadMessageSubmit => self.on_delete_thread_message_submit(),
+            Message::RenameChannelSubmit => self.on_rename_channel_submit(),
+            Message::ArchiveChannelSubmit => self.on_archive_channel_submit(),
+            Message::UnarchiveChannelSubmit => self.on_unarchive_channel_submit(),
+            Message::AddChannelMemberSubmit => self.on_add_channel_member_submit(),
+            Message::RemoveChannelMemberSubmit(key) => self.on_remove_channel_member_submit(key),
+            Message::PressMessage(seq, surface) => self.on_press_message(seq, surface),
+            Message::ClearCopyRange => self.on_clear_copy_range(),
+            Message::CopySelectedMessages => self.on_copy_selected_messages(),
+            Message::CopyChord(fired) => self.on_copy_chord(fired),
+            Message::ChatScreenChatPointerPressed(scope, _x, y) => {
+                self.on_chat_screen_chat_pointer_pressed(scope, _x, y)
+            }
+            Message::ChatScreenChatResized(scope, _width, height) => {
+                self.on_chat_screen_chat_resized(scope, _width, height)
+            }
+            Message::ChatScreenThreadPointerPressed(scope, _x, y) => {
+                self.on_chat_screen_thread_pointer_pressed(scope, _x, y)
+            }
+            Message::ChatScreenThreadResized(scope, _width, height) => {
+                self.on_chat_screen_thread_resized(scope, _width, height)
+            }
+            Message::ChatScreenMessageActionFocusChanged(scope, value) => {
+                self.on_chat_screen_message_action_focus_changed(scope, value)
+            }
+            Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
+            Message::ChannelNameDraftChanged(value) => self.on_channel_name_draft_changed(value),
+            Message::MemberKeyDraftChanged(value) => self.on_member_key_draft_changed(value),
+            Message::Ignore => self.on_ignore(),
         }
+    }
+    fn on_sidebar_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
+        self.sidebar_width = crate::host::sidebar_width_after_delta(
+            self.sidebar_width,
+            dx,
+            self.chat_viewport_width,
+        );
+        self.details_width = crate::host::details_width_after_delta(
+            self.details_width,
+            0.0,
+            self.chat_viewport_width,
+            self.sidebar_width,
+        );
+        self.thread_width = crate::host::thread_width_after_delta(
+            self.thread_width,
+            0.0,
+            self.chat_viewport_width,
+            self.sidebar_width,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_details_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
+        self.details_width = crate::host::details_width_after_delta(
+            self.details_width,
+            -dx,
+            self.chat_viewport_width,
+            self.sidebar_width,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_thread_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
+        self.thread_width = crate::host::thread_width_after_delta(
+            self.thread_width,
+            -dx,
+            self.chat_viewport_width,
+            self.sidebar_width,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_viewport_changed(
+        &mut self,
+        width: f64,
+        _height: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.chat_viewport_width = width;
+        self.sidebar_width = crate::host::sidebar_width_after_delta(self.sidebar_width, 0.0, width);
+        self.details_width = crate::host::details_width_after_delta(
+            self.details_width,
+            0.0,
+            width,
+            self.sidebar_width,
+        );
+        self.thread_width = crate::host::thread_width_after_delta(
+            self.thread_width,
+            0.0,
+            width,
+            self.sidebar_width,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_session_arrived(
+        &mut self,
+        item: crate::host::SessionItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = item.error.to_owned();
+        if !(item.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let next = item.next.clone();
+        let sent_now = next.sent_serial != self.sent_serial;
+        let chord_now = next.copy_chord_serial != self.copy_chord_serial;
+        let moved_room =
+            (next.active_channel != self.active_channel) || (next.land_seq != self.land_seq);
+        self.sent_serial = next.sent_serial;
+        self.copy_chord_serial = next.copy_chord_serial;
+        self.connection_serial = crate::host::connection_serial_after(
+            self.connected,
+            next.connected,
+            self.connection_serial,
+        );
+        self.connected = next.connected;
+        self.endpoint = next.endpoint.to_owned();
+        self.network_name = next.network_name.to_owned();
+        self.network_chain_id = next.network_chain_id.to_owned();
+        self.status = next.status.to_owned();
+        self.block_height = next.block_height;
+        self.me = next.me.to_owned();
+        self.me_key = next.me_key.to_owned();
+        self.sent = crate::host::seat_reader(
+            ::std::convert::AsRef::as_ref(&(next.me)),
+            ::std::convert::AsRef::as_ref(&(next.me_key)),
+        );
+        self.names_serial = next.names_serial;
+        self.rooms = next.rooms.clone();
+        self.dm_rows = next.dm_rows.clone();
+        self.channel_create_open = next.channel_create_open;
+        self.active_channel = next.active_channel.to_owned();
+        self.active_dm_peer = next.active_dm_peer.to_owned();
+        self.active_dm = next.active_dm.clone();
+        self.land_seq = next.land_seq;
+        self.unread_boundary = next.unread_boundary;
+        self.session_loading = next.loading;
+        self.session_busy = next.busy;
+        self.busy = self.session_busy;
+        self.huddle_joined = next.huddle_joined;
+        self.huddle_channel = next.huddle_channel.to_owned();
+        self.huddle_channel_name = next.huddle_channel_name.to_owned();
+        self.huddle_joined_at = next.huddle_joined_at;
+        self.huddle_now = next.huddle_now;
+        self.call_muted = next.call_muted;
+        self.shift_held = next.shift_held;
+        self.pending_sends = next.pending_sends.clone();
+        self.live_agents = next.live_agents.clone();
+        self.loading = self.session_loading
+            || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel));
+        return ::ducktape_view_guest::Task::batch([
+            (::ducktape_view_guest::Task::done(moved_room))
+                .map(|value| Message::SessionSettled(value)),
+            (::ducktape_view_guest::Task::done(sent_now)).map(|value| Message::SnapStream(value)),
+            (::ducktape_view_guest::Task::done(chord_now)).map(|value| Message::CopyChord(value)),
+            (::ducktape_view_guest::Task::done(next.dark)).map(|value| Message::ToneChanged(value)),
+        ]);
+    }
+    fn on_tone_changed(&mut self, dark: bool) -> ducktape_view_guest::Task<Message> {
+        return match crate::host::tone_of(dark) {
+            Tone::Light => {
+                self.active_palette = AppTheme::App;
+                ::ducktape_view_guest::Task::none()
+            }
+            Tone::Dark => {
+                self.active_palette = AppTheme::AppDark;
+                ::ducktape_view_guest::Task::none()
+            }
+        };
+    }
+    fn on_session_settled(&mut self, moved_room: bool) -> ducktape_view_guest::Task<Message> {
+        return match crate::host::room_move(moved_room) {
+            RoomMove::Stayed => {
+                self.messages = crate::host::with_pending(
+                    ::std::convert::AsRef::as_ref(&(self.room_messages)),
+                    ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+                    0,
+                    ::std::convert::AsRef::as_ref(&(self.me)),
+                );
+                self.unread_marker_seq = crate::host::first_unread_seq(
+                    ::std::convert::AsRef::as_ref(&(self.messages)),
+                    self.unread_boundary,
+                );
+                {
+                    let next = crate::host::timeline_of(
+                        ::std::convert::AsRef::as_ref(&(self.messages)),
+                        ::std::convert::AsRef::as_ref(&(self.live_agents)),
+                    );
+                    if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                        self.timeline = next;
+                        self.timeline_revision += 1;
+                    }
+                }
+                self.room_key = crate::host::room_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    self.land_seq,
+                    self.history_pages,
+                );
+                self.thread_key = crate::host::thread_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    self.active_thread_seq,
+                    self.thread_target_seq,
+                    self.thread_pages,
+                );
+                ::ducktape_view_guest::Task::none()
+            }
+            RoomMove::Moved => {
+                self.history_pages = 0;
+                self.selected_message_seq = 0;
+                self.selected_message_rev = 0;
+                self.message_action = MessageAction::Toolbar;
+                self.message_edit_draft = "".to_owned();
+                self.active_thread_seq = 0;
+                self.thread_target_seq = 0;
+                self.thread_pages = 0;
+                {
+                    let next = Vec::new();
+                    if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                        self.thread_messages = next;
+                        self.thread_messages_revision += 1;
+                    }
+                }
+                self.thread_has_more = false;
+                self.thread_next_reply_seq = 0;
+                self.thread_loading = false;
+                self.thread_selected_seq = 0;
+                self.thread_selected_rev = 0;
+                self.thread_message_action = MessageAction::Toolbar;
+                self.thread_edit_draft = "".to_owned();
+                self.copy_anchor_seq = 0;
+                self.copy_head_seq = 0;
+                self.copy_surface = CopySurface::Nowhere;
+                self.channel_settings_open = false;
+                self.at_live_tail = true;
+                self.room_messages = Vec::new();
+                self.messages = Vec::new();
+                {
+                    let next = crate::host::timeline_of(
+                        ::std::convert::AsRef::as_ref(&(Vec::new())),
+                        ::std::convert::AsRef::as_ref(&(Vec::new())),
+                    );
+                    if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                        self.timeline = next;
+                        self.timeline_revision += 1;
+                    }
+                }
+                self.unread_marker_seq = 0;
+                self.channel_members = Vec::new();
+                self.post_refusal = "".to_owned();
+                self.has_older_history = false;
+                self.room_key = crate::host::room_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    self.land_seq,
+                    0,
+                );
+                self.thread_key = crate::host::thread_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    0,
+                    0,
+                    0,
+                );
+                ::ducktape_view_guest::Task::none()
+            }
+        };
+    }
+    fn on_snap_stream(&mut self, moved: bool) -> ducktape_view_guest::Task<Message> {
+        if !moved {
+            return ::ducktape_view_guest::Task::none();
+        }
+        return ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Snap {
+                target: String::from("ChatView/chat/message-stream"),
+                x: (0.0) as f32,
+                y: (0.0) as f32,
+            },
+        );
+    }
+    fn on_reveal_stream(&mut self, target_key: i64) -> ducktape_view_guest::Task<Message> {
+        if target_key <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        return ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
+                target: String::from("ChatView/chat/message-stream"),
+                key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key(),
+            },
+        );
+    }
+    fn on_reveal_thread(&mut self, target_key: i64) -> ducktape_view_guest::Task<Message> {
+        if target_key <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        return ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
+                target: String::from("ChatView/chat/thread-pane/thread-stream"),
+                key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key(),
+            },
+        );
+    }
+    fn on_room_arrived(
+        &mut self,
+        item: crate::host::RoomItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = item.error.to_owned();
+        self.history_loading = false;
+        if item.channel != self.active_channel {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.room_channel = item.channel.to_owned();
+        self.loading = self.session_loading;
+        if !(item.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.active_channel_name = item.name.to_owned();
+        self.active_channel_archived = item.archived;
+        self.active_channel_members_only = item.members_only;
+        self.channel_members = item.members.clone();
+        self.post_refusal = crate::host::post_gate(
+            item.archived,
+            item.members_only,
+            ::std::convert::AsRef::as_ref(&(item.members)),
+            ::std::convert::AsRef::as_ref(&(self.me)),
+        );
+        self.room_messages = item.messages.clone();
+        self.messages = crate::host::with_pending(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+            0,
+            ::std::convert::AsRef::as_ref(&(self.me)),
+        );
+        self.unread_marker_seq = crate::host::first_unread_seq(
+            ::std::convert::AsRef::as_ref(&(self.messages)),
+            self.unread_boundary,
+        );
+        {
+            let next = crate::host::timeline_of(
+                ::std::convert::AsRef::as_ref(&(self.messages)),
+                ::std::convert::AsRef::as_ref(&(self.live_agents)),
+            );
+            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                self.timeline = next;
+                self.timeline_revision += 1;
+            }
+        }
+        self.has_older_history = item.has_older;
+        self.history_view = (self.land_seq > 0) || (self.history_pages > 0);
+        self.stream_reveal_key = crate::host::message_target_key(
+            ::std::convert::AsRef::as_ref(&(self.messages)),
+            self.land_seq,
+            self.land_seq > 0,
+        );
+        return match crate::host::landing_thread(item.thread_root) {
+            LandingThread::Absent => (|| {
+                self.thread_key = crate::host::thread_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    self.active_thread_seq,
+                    self.thread_target_seq,
+                    self.thread_pages,
+                );
+                return (::ducktape_view_guest::Task::done(self.stream_reveal_key))
+                    .map(|value| Message::RevealStream(value));
+            })(),
+            LandingThread::Seated => (|| {
+                self.active_thread_seq = item.thread_root;
+                self.thread_target_seq = self.land_seq;
+                self.thread_pages = 0;
+                self.thread_loading = true;
+                self.thread_key = crate::host::thread_key(
+                    self.connection_serial + self.room_serial,
+                    self.names_serial,
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    item.thread_root,
+                    self.land_seq,
+                    0,
+                );
+                return (::ducktape_view_guest::Task::done(self.stream_reveal_key))
+                    .map(|value| Message::RevealStream(value));
+            })(),
+        };
+    }
+    fn on_thread_arrived(
+        &mut self,
+        item: crate::host::ThreadItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = item.error.to_owned();
+        self.thread_loading = false;
+        if item.root_seq != self.active_thread_seq {
+            return ::ducktape_view_guest::Task::none();
+        }
+        if !(item.error).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        {
+            let next = crate::host::with_pending(
+                ::std::convert::AsRef::as_ref(&(item.messages)),
+                ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+                self.active_thread_seq,
+                ::std::convert::AsRef::as_ref(&(self.me)),
+            );
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.thread_target_seq = item.target_seq;
+        self.thread_has_more = item.has_more;
+        self.thread_next_reply_seq = item.next_reply_seq;
+        self.thread_reveal_key = crate::host::message_target_key(
+            ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+            item.target_seq,
+            item.target_seq > 0,
+        );
+        return (::ducktape_view_guest::Task::done(self.thread_reveal_key))
+            .map(|value| Message::RevealThread(value));
+    }
+    fn on_search_arrived(
+        &mut self,
+        item: crate::host::SearchItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.host_error = item.error.to_owned();
+        if (item.query).is_empty() || (item.query != self.search_query) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.search_hits = item.hits.clone();
+        return match crate::host::search_outcome((item.error).is_empty()) {
+            SearchOutcome::Answered => {
+                self.search_phase = SearchPhase::Done;
+                ::ducktape_view_guest::Task::none()
+            }
+            SearchOutcome::Refused => {
+                self.search_phase = SearchPhase::Idle;
+                self.search_query = "".to_owned();
+                ::ducktape_view_guest::Task::none()
+            }
+        };
+    }
+    fn on_act_done(&mut self, item: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
+        self.busy = self.session_busy;
+        self.host_error = item.error.to_owned();
+        self.selected_message_seq = 0;
+        self.selected_message_rev = 0;
+        self.message_action = MessageAction::Toolbar;
+        self.message_edit_draft = "".to_owned();
+        self.thread_selected_seq = 0;
+        self.thread_selected_rev = 0;
+        self.thread_message_action = MessageAction::Toolbar;
+        self.thread_edit_draft = "".to_owned();
+        self.member_key_draft = "".to_owned();
+        self.room_serial = self.room_serial + 1;
+        self.room_key = crate::host::room_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.land_seq,
+            self.history_pages,
+        );
+        self.thread_key = crate::host::thread_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.active_thread_seq,
+            self.thread_target_seq,
+            self.thread_pages,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_search_chat_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if ((self.search_draft).trim().to_owned()).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.search_phase = SearchPhase::Searching;
+        self.search_hits = Vec::new();
+        self.search_query = (self.search_draft).trim().to_owned();
+        self.host_error = "".to_owned();
+        self.search_key = crate::host::search_key(
+            self.connection_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.search_query)),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_clear_chat_search(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.search_draft = "".to_owned();
+        self.search_query = "".to_owned();
+        self.search_hits = Vec::new();
+        self.search_phase = SearchPhase::Idle;
+        self.search_key = crate::host::search_key(
+            self.connection_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&("")),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_chat_search_hit(
+        &mut self,
+        channel_id: String,
+        _root_seq: i64,
+        target_seq: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.search_phase = SearchPhase::Idle;
+        self.search_hits = Vec::new();
+        self.search_query = "".to_owned();
+        self.sent =
+            crate::host::send_open_hit(::std::convert::AsRef::as_ref(&(channel_id)), target_seq);
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_channel_create(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_toggle_create();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_choose_channel(&mut self, id: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_choose_channel(::std::convert::AsRef::as_ref(&(id)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_choose_dm(&mut self, peer_key: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_choose_dm(::std::convert::AsRef::as_ref(&(peer_key)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_channel_settings(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (self.active_channel).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.channel_name_draft = self.active_channel_name.to_owned();
+        self.channel_settings_open = !self.channel_settings_open;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_show_huddle(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_show_huddle();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_leave_huddle_here(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_leave_huddle();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_join_huddle_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_join_huddle();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_open_link(::std::convert::AsRef::as_ref(&(url)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_copy_to_clipboard(
+        &mut self,
+        text: String,
+        label: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_copy(
+            ::std::convert::AsRef::as_ref(&(text)),
+            ::std::convert::AsRef::as_ref(&(label)),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_copy_message_link(&mut self, link: String) -> ducktape_view_guest::Task<Message> {
+        self.message_action = MessageAction::Toolbar;
+        self.thread_message_action = MessageAction::Toolbar;
+        if (link).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.sent = crate::host::send_copy_link(::std::convert::AsRef::as_ref(&(link)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_cancel_run(&mut self, run_id: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_cancel_run(::std::convert::AsRef::as_ref(&(run_id)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_run(&mut self, dispatch_id: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_open_run(::std::convert::AsRef::as_ref(&(dispatch_id)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_scrolled(
+        &mut self,
+        absolute_x: f64,
+        absolute_y: f64,
+        relative_x: f64,
+        relative_y: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.at_live_tail = crate::host::near_scroll_tail(relative_y);
+        self.sent = crate::host::send_scrolled(absolute_x, absolute_y, relative_x, relative_y);
+        if (((((!crate::host::near_scroll_top(relative_y)) || self.history_loading)
+            || self.loading)
+            || self.busy)
+            || (self.active_channel).is_empty())
+            || (!self.has_older_history)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.history_loading = true;
+        self.history_pages = self.history_pages + 1;
+        self.room_key = crate::host::room_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.land_seq,
+            self.history_pages,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_load_more_history(&mut self) -> ducktape_view_guest::Task<Message> {
+        if ((((self.history_loading || self.loading) || self.busy)
+            || (self.active_channel).is_empty())
+            || (self.messages).is_empty())
+            || (!self.has_older_history)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.history_loading = true;
+        self.history_pages = self.history_pages + 1;
+        self.room_key = crate::host::room_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.land_seq,
+            self.history_pages,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_message_actions(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.selected_message_seq = seq;
+        self.selected_message_rev = rev;
+        self.message_action = MessageAction::More;
+        self.message_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/message-action-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_open_message_reactions(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = crate::host::reaction_refusal(
+            self.active_channel_archived,
+            ::std::convert::AsRef::as_ref(&(self.host_error)),
+        );
+        if self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.selected_message_seq = seq;
+        self.selected_message_rev = rev;
+        self.message_action = MessageAction::Reactions;
+        self.message_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/message-reaction-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_begin_message_edit(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let seed =
+            crate::host::edit_body_of(::std::convert::AsRef::as_ref(&(self.messages)), seq, rev);
+        if (seed).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.sent = crate::host::send_begin_edit(
+            ::std::convert::AsRef::as_ref(
+                &(crate::host::edit_scope(
+                    ::std::convert::AsRef::as_ref(&(self.endpoint)),
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    seq,
+                )),
+            ),
+            ::std::convert::AsRef::as_ref(&(seed)),
+            seq,
+            rev,
+        );
+        self.selected_message_seq = seq;
+        self.selected_message_rev = rev;
+        self.message_action = MessageAction::Editing;
+        self.message_edit_draft = body.to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_arm_message_delete(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.selected_message_seq = seq;
+        self.selected_message_rev = rev;
+        self.message_action = MessageAction::Delete;
+        self.message_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/message-delete-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_clear_message_selection(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.selected_message_seq = 0;
+        self.selected_message_rev = 0;
+        self.message_action = MessageAction::Toolbar;
+        self.message_edit_draft = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_thread_message_actions(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.thread_selected_seq = seq;
+        self.thread_selected_rev = rev;
+        self.thread_message_action = MessageAction::More;
+        self.thread_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/thread-pane/thread-action-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_open_thread_message_reactions(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = crate::host::reaction_refusal(
+            self.active_channel_archived,
+            ::std::convert::AsRef::as_ref(&(self.host_error)),
+        );
+        if self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.thread_selected_seq = seq;
+        self.thread_selected_rev = rev;
+        self.thread_message_action = MessageAction::Reactions;
+        self.thread_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/thread-pane/thread-reaction-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_begin_thread_message_edit(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let seed = crate::host::edit_body_of(
+            ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+            seq,
+            rev,
+        );
+        if (seed).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.sent = crate::host::send_begin_edit(
+            ::std::convert::AsRef::as_ref(
+                &(crate::host::edit_scope(
+                    ::std::convert::AsRef::as_ref(&(self.endpoint)),
+                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
+                    seq,
+                )),
+            ),
+            ::std::convert::AsRef::as_ref(&(seed)),
+            seq,
+            rev,
+        );
+        self.thread_selected_seq = seq;
+        self.thread_selected_rev = rev;
+        self.thread_message_action = MessageAction::Editing;
+        self.thread_edit_draft = body.to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_arm_thread_message_delete(
+        &mut self,
+        seq: i64,
+        body: String,
+        rev: i64,
+    ) -> ducktape_view_guest::Task<Message> {
+        if seq <= 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.thread_selected_seq = seq;
+        self.thread_selected_rev = rev;
+        self.thread_message_action = MessageAction::Delete;
+        self.thread_edit_draft = body.to_owned();
+        return ::ducktape_view_guest::Task::none()
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: String::from("ChatView/chat/thread-pane/thread-delete-focus"),
+                },
+            ))
+            .chain(::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
+            ));
+    }
+    fn on_clear_thread_message_selection(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.thread_selected_seq = 0;
+        self.thread_selected_rev = 0;
+        self.thread_message_action = MessageAction::Toolbar;
+        self.thread_edit_draft = "".to_owned();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_open_thread_for(&mut self, seq: i64) -> ducktape_view_guest::Task<Message> {
+        if (seq <= 0) || (self.active_channel).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.channel_settings_open = false;
+        self.selected_message_seq = 0;
+        self.selected_message_rev = 0;
+        self.message_action = MessageAction::Toolbar;
+        self.message_edit_draft = "".to_owned();
+        self.thread_selected_seq = 0;
+        self.thread_selected_rev = 0;
+        self.thread_message_action = MessageAction::Toolbar;
+        self.thread_edit_draft = "".to_owned();
+        self.copy_anchor_seq = 0;
+        self.copy_head_seq = 0;
+        self.copy_surface = CopySurface::Nowhere;
+        self.thread_loading = true;
+        {
+            let next = Vec::new();
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.thread_has_more = false;
+        self.thread_next_reply_seq = 0;
+        self.thread_pages = 0;
+        self.active_thread_seq = seq;
+        self.thread_target_seq = 0;
+        self.thread_key = crate::host::thread_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            seq,
+            0,
+            0,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_close_thread(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.active_thread_seq = 0;
+        self.thread_target_seq = 0;
+        {
+            let next = Vec::new();
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.thread_pages = 0;
+        self.thread_has_more = false;
+        self.thread_next_reply_seq = 0;
+        self.thread_loading = false;
+        self.thread_selected_seq = 0;
+        self.thread_selected_rev = 0;
+        self.thread_message_action = MessageAction::Toolbar;
+        self.thread_edit_draft = "".to_owned();
+        self.copy_anchor_seq = 0;
+        self.copy_head_seq = 0;
+        self.copy_surface = CopySurface::Nowhere;
+        self.thread_key = crate::host::thread_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            0,
+            0,
+            0,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_load_more_thread(&mut self) -> ducktape_view_guest::Task<Message> {
+        if ((self.thread_loading || self.busy) || (self.active_thread_seq <= 0))
+            || (!self.thread_has_more)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.thread_loading = true;
+        self.thread_pages = self.thread_pages + 1;
+        self.thread_key = crate::host::thread_key(
+            self.connection_serial + self.room_serial,
+            self.names_serial,
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.active_thread_seq,
+            self.thread_target_seq,
+            self.thread_pages,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_add_reaction_submit(&mut self, emoji: String) -> ducktape_view_guest::Task<Message> {
+        if (self.active_channel).is_empty() || (self.selected_message_seq <= 0) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = crate::host::reaction_refusal(
+            self.active_channel_archived,
+            ::std::convert::AsRef::as_ref(&(self.host_error)),
+        );
+        if self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.room_messages = crate::host::reaction_applied(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            self.selected_message_seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            true,
+        );
+        self.messages = crate::host::with_pending(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+            0,
+            ::std::convert::AsRef::as_ref(&(self.me)),
+        );
+        {
+            let next = crate::host::timeline_of(
+                ::std::convert::AsRef::as_ref(&(self.messages)),
+                ::std::convert::AsRef::as_ref(&(self.live_agents)),
+            );
+            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                self.timeline = next;
+                self.timeline_revision += 1;
+            }
+        }
+        {
+            let next = crate::host::reaction_applied(
+                ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+                self.selected_message_seq,
+                ::std::convert::AsRef::as_ref(&(emoji)),
+                true,
+            );
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.sent = crate::host::write_reaction(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.selected_message_seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            true,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_add_reaction_at(
+        &mut self,
+        seq: i64,
+        emoji: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (self.active_channel).is_empty() || (seq <= 0) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = crate::host::reaction_refusal(
+            self.active_channel_archived,
+            ::std::convert::AsRef::as_ref(&(self.host_error)),
+        );
+        if self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.room_messages = crate::host::reaction_applied(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            true,
+        );
+        self.messages = crate::host::with_pending(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+            0,
+            ::std::convert::AsRef::as_ref(&(self.me)),
+        );
+        {
+            let next = crate::host::timeline_of(
+                ::std::convert::AsRef::as_ref(&(self.messages)),
+                ::std::convert::AsRef::as_ref(&(self.live_agents)),
+            );
+            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                self.timeline = next;
+                self.timeline_revision += 1;
+            }
+        }
+        {
+            let next = crate::host::reaction_applied(
+                ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+                seq,
+                ::std::convert::AsRef::as_ref(&(emoji)),
+                true,
+            );
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.sent = crate::host::write_reaction(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            true,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_remove_reaction_at(
+        &mut self,
+        seq: i64,
+        emoji: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (self.active_channel).is_empty() || (seq <= 0) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = crate::host::reaction_refusal(
+            self.active_channel_archived,
+            ::std::convert::AsRef::as_ref(&(self.host_error)),
+        );
+        if self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.room_messages = crate::host::reaction_applied(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            false,
+        );
+        self.messages = crate::host::with_pending(
+            ::std::convert::AsRef::as_ref(&(self.room_messages)),
+            ::std::convert::AsRef::as_ref(&(self.pending_sends)),
+            0,
+            ::std::convert::AsRef::as_ref(&(self.me)),
+        );
+        {
+            let next = crate::host::timeline_of(
+                ::std::convert::AsRef::as_ref(&(self.messages)),
+                ::std::convert::AsRef::as_ref(&(self.live_agents)),
+            );
+            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
+                self.timeline = next;
+                self.timeline_revision += 1;
+            }
+        }
+        {
+            let next = crate::host::reaction_applied(
+                ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+                seq,
+                ::std::convert::AsRef::as_ref(&(emoji)),
+                false,
+            );
+            if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
+                self.thread_messages = next;
+                self.thread_messages_revision += 1;
+            }
+        }
+        self.sent = crate::host::write_reaction(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            seq,
+            ::std::convert::AsRef::as_ref(&(emoji)),
+            false,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_delete_message_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if ((self.busy || (self.active_channel).is_empty()) || (self.selected_message_seq <= 0))
+            || (self.message_action != MessageAction::Delete)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_delete(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.selected_message_seq,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_delete_thread_message_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if ((self.busy || (self.active_channel).is_empty()) || (self.thread_selected_seq <= 0))
+            || (self.thread_message_action != MessageAction::Delete)
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_delete(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            self.thread_selected_seq,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_rename_channel_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (self.busy || (self.active_channel).is_empty())
+            || ((self.channel_name_draft).trim().to_owned()).is_empty()
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_rename(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            ::std::convert::AsRef::as_ref(&((self.channel_name_draft).trim().to_owned())),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_archive_channel_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (self.busy || (self.active_channel).is_empty()) || self.active_channel_archived {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_archived(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            true,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_unarchive_channel_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (self.busy || (self.active_channel).is_empty()) || (!self.active_channel_archived) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_archived(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            false,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_add_channel_member_submit(&mut self) -> ducktape_view_guest::Task<Message> {
+        if (self.busy || (self.active_channel).is_empty())
+            || ((self.member_key_draft).trim().to_owned()).is_empty()
+        {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_membership(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            ::std::convert::AsRef::as_ref(&((self.member_key_draft).trim().to_owned())),
+            true,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_remove_channel_member_submit(
+        &mut self,
+        key: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        if (self.busy || (self.active_channel).is_empty()) || (key).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.host_error = "".to_owned();
+        self.busy = crate::host::write_membership(
+            ::std::convert::AsRef::as_ref(&(self.active_channel)),
+            ::std::convert::AsRef::as_ref(&(key)),
+            false,
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_press_message(
+        &mut self,
+        seq: i64,
+        surface: CopySurface,
+    ) -> ducktape_view_guest::Task<Message> {
+        if !self.shift_held {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let range = crate::host::copy_range_after_press(
+            self.copy_anchor_seq,
+            self.copy_surface.clone(),
+            seq,
+            surface.clone(),
+        );
+        self.copy_anchor_seq = range.anchor;
+        self.copy_head_seq = range.head;
+        self.copy_surface =
+            crate::host::copy_surface_of(::std::convert::AsRef::as_ref(&(range.surface)));
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_clear_copy_range(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.copy_anchor_seq = 0;
+        self.copy_head_seq = 0;
+        self.copy_surface = CopySurface::Nowhere;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_copy_selected_messages(&mut self) -> ducktape_view_guest::Task<Message> {
+        let rows = crate::host::copy_range_rows(
+            ::std::convert::AsRef::as_ref(&(self.messages)),
+            ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+            self.copy_surface.clone(),
+        );
+        let count = crate::host::copy_range_count(
+            ::std::convert::AsRef::as_ref(&(rows)),
+            self.copy_anchor_seq,
+            self.copy_head_seq,
+        );
+        if count == 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.sent = crate::host::send_copy(
+            ::std::convert::AsRef::as_ref(
+                &(crate::host::copy_range_text(
+                    ::std::convert::AsRef::as_ref(&(rows)),
+                    self.copy_anchor_seq,
+                    self.copy_head_seq,
+                )),
+            ),
+            ::std::convert::AsRef::as_ref(&(crate::host::copy_range_label(count))),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_copy_chord(&mut self, fired: bool) -> ducktape_view_guest::Task<Message> {
+        if !fired {
+            return ::ducktape_view_guest::Task::none();
+        }
+        let rows = crate::host::copy_range_rows(
+            ::std::convert::AsRef::as_ref(&(self.messages)),
+            ::std::convert::AsRef::as_ref(&(self.thread_messages)),
+            self.copy_surface.clone(),
+        );
+        let count = crate::host::copy_range_count(
+            ::std::convert::AsRef::as_ref(&(rows)),
+            self.copy_anchor_seq,
+            self.copy_head_seq,
+        );
+        if count == 0 {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.sent = crate::host::send_copy(
+            ::std::convert::AsRef::as_ref(
+                &(crate::host::copy_range_text(
+                    ::std::convert::AsRef::as_ref(&(rows)),
+                    self.copy_anchor_seq,
+                    self.copy_head_seq,
+                )),
+            ),
+            ::std::convert::AsRef::as_ref(&(crate::host::copy_range_label(count))),
+        );
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_screen_chat_pointer_pressed(
+        &mut self,
+        scope: String,
+        _x: f64,
+        y: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
+        let local = self
+            .chat_screen_states
+            .entry(scope.clone())
+            .or_insert_with(|| ChatScreenState {
+                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
+                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
+                chat_height: self.chat_screen_initial.chat_height.clone(),
+                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
+                thread_height: self.chat_screen_initial.thread_height.clone(),
+            });
+        local.chat_pointer_y = y;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_screen_chat_resized(
+        &mut self,
+        scope: String,
+        _width: f64,
+        height: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
+        let local = self
+            .chat_screen_states
+            .entry(scope.clone())
+            .or_insert_with(|| ChatScreenState {
+                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
+                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
+                chat_height: self.chat_screen_initial.chat_height.clone(),
+                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
+                thread_height: self.chat_screen_initial.thread_height.clone(),
+            });
+        local.chat_height = height;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_screen_thread_pointer_pressed(
+        &mut self,
+        scope: String,
+        _x: f64,
+        y: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
+        let local = self
+            .chat_screen_states
+            .entry(scope.clone())
+            .or_insert_with(|| ChatScreenState {
+                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
+                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
+                chat_height: self.chat_screen_initial.chat_height.clone(),
+                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
+                thread_height: self.chat_screen_initial.thread_height.clone(),
+            });
+        local.thread_pointer_y = y;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_screen_thread_resized(
+        &mut self,
+        scope: String,
+        _width: f64,
+        height: f64,
+    ) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
+        let local = self
+            .chat_screen_states
+            .entry(scope.clone())
+            .or_insert_with(|| ChatScreenState {
+                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
+                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
+                chat_height: self.chat_screen_initial.chat_height.clone(),
+                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
+                thread_height: self.chat_screen_initial.thread_height.clone(),
+            });
+        local.thread_height = height;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_chat_screen_message_action_focus_changed(
+        &mut self,
+        scope: String,
+        value: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope));
+        let local = self
+            .chat_screen_states
+            .entry(scope)
+            .or_insert_with(|| ChatScreenState {
+                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
+                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
+                chat_height: self.chat_screen_initial.chat_height.clone(),
+                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
+                thread_height: self.chat_screen_initial.thread_height.clone(),
+            });
+        local.message_action_focus = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_search_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.search_draft = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_channel_name_draft_changed(
+        &mut self,
+        value: String,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.channel_name_draft = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_member_key_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.member_key_draft = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_ignore(&mut self) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::Task::none()
     }
 }

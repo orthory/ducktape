@@ -13,7 +13,10 @@
 
 pub mod host;
 
-include!("ui/app.rs");
+#[path = "ui/app.rs"]
+mod app;
+pub(crate) use app::*;
+pub use app::{FilesView, Message};
 
 ducktape_view_guest::export_app!(
     FilesView,

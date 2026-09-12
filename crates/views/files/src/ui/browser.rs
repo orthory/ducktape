@@ -1,287 +1,2289 @@
-#[allow(warnings, clippy::all)]
-mod __ice_group_browser_65823256 {
 use super::*;
 impl super::FilesView {
-pub(super) fn __ice_component_use_0(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String, __ice_cb_8: impl Fn(::std::string::String) -> __FilesViewMessage + Clone + 'static) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:130", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((50.0) as f32)), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (0.0) as f32, right: (20.0) as f32, bottom: (0.0) as f32, left: (20.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Button { checked: ::std::option::Option::None, expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:141", __ice_use_scope), content: ::ducktape_view_guest::wire::ButtonContent::Child(::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:146", __ice_use_scope), size: ::std::option::Option::Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[7]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("duckfs".to_owned()).to_string() };
-__ice_rendered
-})), label: ::std::option::Option::Some(::std::string::String::from("Go to the duckfs root".to_owned())), on_press: ::std::option::Option::Some(::ducktape_view_guest::slots::message((__ice_cb_8)("/".to_owned()))), width: ::std::option::Option::None, height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)), style: ::ducktape_view_guest::wire::ButtonStyle { preset: ::ducktape_view_guest::wire::ButtonPreset::Primary, recipe: Some(::ducktape_view_guest::wire::ButtonRecipe { base: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([8.0; 4]) }) }, hover_background: ::std::option::Option::Some(__ice_palette.colors[14]), pressed_background: ::std::option::Option::Some(__ice_palette.colors[39]), disabled_background: ::std::option::Option::None, disabled_text: ::std::option::Option::None, disabled_opacity: ::std::option::Option::Some(0.5f32), focus_ring: ::std::option::Option::Some(__ice_palette.colors[42]), text_size: ::std::option::Option::Some(12.5f32), line_height: ::std::option::Option::None, font: Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }), active: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[7]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((6.0) as f32).max(0.0).min(f32::MAX), ((6.0) as f32).max(0.0).min(f32::MAX), ((6.0) as f32).max(0.0).min(f32::MAX), ((6.0) as f32).max(0.0).min(f32::MAX)]) }) }, hovered: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[55]), text: ::std::option::Option::None, border: ::std::option::Option::None }), pressed: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[56]), text: ::std::option::Option::None, border: ::std::option::Option::None }), disabled: ::std::option::Option::None } };
-__ice_rendered
-}); if (!(self.path).is_empty()) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:156", __ice_use_scope), size: ::std::option::Option::Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[7]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (self.path.to_owned()).to_string() };
-__ice_rendered
-}); } if (!(crate::host::fs_counts_summary(self.connected, self.listed, ::std::convert::AsRef::as_ref(&(self.entries)))).is_empty()) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:163", __ice_use_scope), width: ::std::option::Option::None, height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (0.0) as f32, right: (0.0) as f32, bottom: (0.0) as f32, left: (4.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:164", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[72]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (crate::host::fs_counts_summary(self.connected, self.listed, ::std::convert::AsRef::as_ref(&(self.entries))).to_owned()).to_string() };
-__ice_rendered
-}) };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:135", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((6.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:170", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[60])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)) };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_4(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String, __ice_arg_0: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_3(__ice_palette, format!("{}/Icon@709", __ice_use_scope)))();
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Medium, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:90", __ice_use_scope), size: ::std::option::Option::Some(((12.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[5]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: (__ice_arg_0.to_owned()).to_string() };
-__ice_rendered
-}); if (!true) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Medium, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:98", __ice_use_scope), size: ::std::option::Option::Some(((12.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[4]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: (__ice_arg_0.to_owned()).to_string() };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((7.0) as f32), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (6.0) as f32, right: (12.0) as f32, bottom: (6.0) as f32, left: ((11.0 + (0.0 * 14.0))) as f32 }), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_5(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String, __ice_cb_8: impl Fn(::std::string::String) -> __FilesViewMessage + Clone + 'static, __ice_arg_0: crate::host::FsEntry) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (!false) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Button { checked: ::std::option::Option::Some(false), expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:54", __ice_use_scope), content: ::ducktape_view_guest::wire::ButtonContent::Child(::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_4(__ice_palette, format!("{}/FsTreeFace@686", __ice_use_scope), __ice_arg_0.name.to_owned()))();
-__ice_rendered
-})), label: ::std::option::Option::Some(::std::string::String::from("Open directory".to_owned())), on_press: ::std::option::Option::Some(::ducktape_view_guest::slots::message((__ice_cb_8)(__ice_arg_0.path.to_owned()))), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)), style: ::ducktape_view_guest::wire::ButtonStyle { preset: ::ducktape_view_guest::wire::ButtonPreset::Primary, recipe: Some(::ducktape_view_guest::wire::ButtonRecipe { base: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([8.0; 4]) }) }, hover_background: ::std::option::Option::Some(__ice_palette.colors[14]), pressed_background: ::std::option::Option::Some(__ice_palette.colors[39]), disabled_background: ::std::option::Option::None, disabled_text: ::std::option::Option::None, disabled_opacity: ::std::option::Option::Some(0.5f32), focus_ring: ::std::option::Option::Some(__ice_palette.colors[42]), text_size: ::std::option::Option::Some(12.5f32), line_height: ::std::option::Option::None, font: Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }), active: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[5]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((7.0) as f32).max(0.0).min(f32::MAX), ((7.0) as f32).max(0.0).min(f32::MAX), ((7.0) as f32).max(0.0).min(f32::MAX), ((7.0) as f32).max(0.0).min(f32::MAX)]) }) }, hovered: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[58]), text: ::std::option::Option::None, border: ::std::option::Option::None }), pressed: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[56]), text: ::std::option::Option::None, border: ::std::option::Option::None }), disabled: ::std::option::Option::None } };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_9(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:182", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((50.0) as f32)), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (0.0) as f32, right: (20.0) as f32, bottom: (0.0) as f32, left: (20.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:193", __ice_use_scope), size: ::std::option::Option::Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[97]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: ("NAME".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:200", __ice_use_scope), size: ::std::option::Option::Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[97]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((72.0) as f32)), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: ("SIZE".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:208", __ice_use_scope), size: ::std::option::Option::Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[97]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((92.0) as f32)), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: ("OBJECT".to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:187", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((12.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:218", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[60])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)) };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_13(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String, __ice_arg_0: crate::host::FsEntry) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (__ice_arg_0.kind == "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_11(__ice_palette, format!("{}/Icon@925", __ice_use_scope)))();
-__ice_rendered
-}); } if (__ice_arg_0.kind != "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_12(__ice_palette, format!("{}/Icon@931", __ice_use_scope)))();
-__ice_rendered
-}); } __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Medium, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:311", __ice_use_scope), size: ::std::option::Option::Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[15]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: (__ice_arg_0.name.to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: true, key: format!("{}/@layout:293", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((9.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: format!("{}/@container:318", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((72.0) as f32)), height: ::std::option::Option::None, padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (__ice_arg_0.kind == "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:321", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[41]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: ("—".to_owned()).to_string() };
-__ice_rendered
-}); } if (__ice_arg_0.kind != "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:330", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[41]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: (crate::host::size_label(__ice_arg_0.size)).to_string() };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:319", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: format!("{}/@container:338", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((92.0) as f32)), height: ::std::option::Option::None, padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (__ice_arg_0.object).is_empty() { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:341", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[72]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: ("—".to_owned()).to_string() };
-__ice_rendered
-}); } if (!(__ice_arg_0.object).is_empty()) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:350", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[72]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Right), content: (__ice_arg_0.object.to_owned()).to_string() };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:339", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: true, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((12.0) as f32), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (11.0) as f32, right: (20.0) as f32, bottom: (11.0) as f32, left: (20.0) as f32 }), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_14(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String, __ice_cb_8: impl Fn(::std::string::String) -> __FilesViewMessage + Clone + 'static, __ice_cb_9: impl Fn(::std::string::String) -> __FilesViewMessage + Clone + 'static, __ice_arg_0: crate::host::FsEntry, __ice_arg_1: bool) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (__ice_arg_0.kind == "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Button { checked: ::std::option::Option::None, expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:233", __ice_use_scope), content: ::ducktape_view_guest::wire::ButtonContent::Child(::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_13(__ice_palette, format!("{}/ObjectRowFace@864", __ice_use_scope), __ice_arg_0.clone()))();
-__ice_rendered
-})), label: ::std::option::Option::Some(::std::string::String::from("Open directory".to_owned())), on_press: ::std::option::Option::Some(::ducktape_view_guest::slots::message((__ice_cb_8)(__ice_arg_0.path.to_owned()))), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)), style: ::ducktape_view_guest::wire::ButtonStyle { preset: ::ducktape_view_guest::wire::ButtonPreset::Primary, recipe: Some(::ducktape_view_guest::wire::ButtonRecipe { base: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([8.0; 4]) }) }, hover_background: ::std::option::Option::Some(__ice_palette.colors[14]), pressed_background: ::std::option::Option::Some(__ice_palette.colors[39]), disabled_background: ::std::option::Option::None, disabled_text: ::std::option::Option::None, disabled_opacity: ::std::option::Option::Some(0.5f32), focus_ring: ::std::option::Option::Some(__ice_palette.colors[42]), text_size: ::std::option::Option::Some(12.5f32), line_height: ::std::option::Option::None, font: Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }), active: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX)]) }) }, hovered: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[57]), text: ::std::option::Option::None, border: ::std::option::Option::None }), pressed: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[56]), text: ::std::option::Option::None, border: ::std::option::Option::None }), disabled: ::std::option::Option::None } };
-__ice_rendered
-}); } if ((__ice_arg_0.kind != "dir") && __ice_arg_1) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Button { checked: ::std::option::Option::Some(__ice_arg_1), expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:244", __ice_use_scope), content: ::ducktape_view_guest::wire::ButtonContent::Child(::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_13(__ice_palette, format!("{}/ObjectRowFace@876", __ice_use_scope), __ice_arg_0.clone()))();
-__ice_rendered
-})), label: ::std::option::Option::Some(::std::string::String::from("Show object".to_owned())), on_press: ::std::option::Option::Some(::ducktape_view_guest::slots::message((__ice_cb_9)(__ice_arg_0.path.to_owned()))), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)), style: ::ducktape_view_guest::wire::ButtonStyle { preset: ::ducktape_view_guest::wire::ButtonPreset::Primary, recipe: Some(::ducktape_view_guest::wire::ButtonRecipe { base: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([8.0; 4]) }) }, hover_background: ::std::option::Option::Some(__ice_palette.colors[14]), pressed_background: ::std::option::Option::Some(__ice_palette.colors[39]), disabled_background: ::std::option::Option::None, disabled_text: ::std::option::Option::None, disabled_opacity: ::std::option::Option::Some(0.5f32), focus_ring: ::std::option::Option::Some(__ice_palette.colors[42]), text_size: ::std::option::Option::Some(12.5f32), line_height: ::std::option::Option::None, font: Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }), active: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[91]), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX)]) }) }, hovered: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[91]), text: ::std::option::Option::None, border: ::std::option::Option::None }), pressed: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[56]), text: ::std::option::Option::None, border: ::std::option::Option::None }), disabled: ::std::option::Option::None } };
-__ice_rendered
-}); } if ((__ice_arg_0.kind != "dir") && (!__ice_arg_1)) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Button { checked: ::std::option::Option::Some(__ice_arg_1), expanded: ::std::option::Option::None, description: ::std::option::Option::None, key: format!("{}/@button:256", __ice_use_scope), content: ::ducktape_view_guest::wire::ButtonContent::Child(::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_13(__ice_palette, format!("{}/ObjectRowFace@888", __ice_use_scope), __ice_arg_0.clone()))();
-__ice_rendered
-})), label: ::std::option::Option::Some(::std::string::String::from("Show object".to_owned())), on_press: ::std::option::Option::Some(::ducktape_view_guest::slots::message((__ice_cb_9)(__ice_arg_0.path.to_owned()))), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)), style: ::ducktape_view_guest::wire::ButtonStyle { preset: ::ducktape_view_guest::wire::ButtonPreset::Primary, recipe: Some(::ducktape_view_guest::wire::ButtonRecipe { base: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([8.0; 4]) }) }, hover_background: ::std::option::Option::Some(__ice_palette.colors[14]), pressed_background: ::std::option::Option::Some(__ice_palette.colors[39]), disabled_background: ::std::option::Option::None, disabled_text: ::std::option::Option::None, disabled_opacity: ::std::option::Option::Some(0.5f32), focus_ring: ::std::option::Option::Some(__ice_palette.colors[42]), text_size: ::std::option::Option::Some(12.5f32), line_height: ::std::option::Option::None, font: Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }), active: ::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), text: ::std::option::Option::Some(__ice_palette.colors[4]), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(::ducktape_view_guest::wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 0.000000])), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX), ((0.0) as f32).max(0.0).min(f32::MAX)]) }) }, hovered: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[57]), text: ::std::option::Option::None, border: ::std::option::Option::None }), pressed: ::std::option::Option::Some(::ducktape_view_guest::wire::Face { background: ::std::option::Option::Some(__ice_palette.colors[56]), text: ::std::option::Option::None, border: ::std::option::Option::None }), disabled: ::std::option::Option::None } };
-__ice_rendered
-}); } __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:267", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[6])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)) };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_15(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: __ice_node_scope.clone(), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (9.0) as f32, right: (12.0) as f32, bottom: (9.0) as f32, left: (12.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(__ice_palette.colors[63]), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:475", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[71]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("object id".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:482", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[13]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("—".to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:470", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((10.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_16(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: __ice_node_scope.clone(), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (9.0) as f32, right: (12.0) as f32, bottom: (9.0) as f32, left: (12.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(__ice_palette.colors[63]), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:475", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[71]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("object id".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:482", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[13]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (self.preview_entry.object.to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:470", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((10.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_17(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: __ice_node_scope.clone(), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (9.0) as f32, right: (12.0) as f32, bottom: (9.0) as f32, left: (12.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(__ice_palette.colors[63]), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:475", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[71]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("size".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:482", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[13]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("—".to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:470", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((10.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_18(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: true, key: __ice_node_scope.clone(), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (9.0) as f32, right: (12.0) as f32, bottom: (9.0) as f32, left: (12.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::Some(__ice_palette.colors[63]), width: ::std::option::Option::Some(((1.0) as f32).max(0.0).min(f32::MAX)), radius: ::std::option::Option::Some([((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX), ((8.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:475", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[71]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("size".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:482", __ice_use_scope), size: ::std::option::Option::Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[13]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: (crate::host::size_label(self.preview_entry.size).to_owned()).to_string() };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:470", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((10.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) } };
-__ice_rendered
-}; __component_content }
-pub(super) fn __ice_component_use_19(&self, __ice_palette: __IcePalette, __ice_use_scope: ::std::string::String) -> __IceElement<'_, __FilesViewMessage> { let __component_content: __IceElement<'_, __FilesViewMessage> = {
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let __ice_node_scope = format!("{}/root", __ice_use_scope); { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:365", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[54])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:371", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((50.0) as f32)), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (0.0) as f32, right: (16.0) as f32, bottom: (0.0) as f32, left: (16.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:382", __ice_use_scope), size: ::std::option::Option::Some(((13.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[4]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("Object".to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None };
-__ice_rendered
-}); if (self.preview_entry.kind == "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:390", __ice_use_scope), width: ::std::option::Option::None, height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (3.0) as f32, right: (7.0) as f32, bottom: (3.0) as f32, left: (7.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[55])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:396", __ice_use_scope), size: ::std::option::Option::Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[41]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("DIR".to_owned()).to_string() };
-__ice_rendered
-}) };
-__ice_rendered
-}); } if (self.preview_entry.kind != "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:403", __ice_use_scope), width: ::std::option::Option::None, height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (3.0) as f32, right: (7.0) as f32, bottom: (3.0) as f32, left: (7.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[55])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::Some(::ducktape_view_guest::wire::Border { color: ::std::option::Option::None, width: ::std::option::Option::None, radius: ::std::option::Option::Some([((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX), ((5.0) as f32).max(0.0).min(f32::MAX)]) }), snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::Some(::ducktape_view_guest::wire::Wrapping::None), tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:409", __ice_use_scope), size: ::std::option::Option::Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[41]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::None, align_x: ::std::option::Option::None, content: ("FILE".to_owned()).to_string() };
-__ice_rendered
-}) };
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:376", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::Some((8.0) as f32), padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align: ::std::option::Option::Some(::ducktape_view_guest::wire::AlignX::Center), background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:415", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), padding: ::std::option::Option::None, align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::Some(__ice_palette.colors[60])).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Space { width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)) };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Scroll { on_scroll: ::std::option::Option::None, virtual_rows: false, key: format!("{}/@layout:421", __ice_use_scope), direction: ::ducktape_view_guest::wire::ScrollDirection::Vertical, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), bar_hidden: false, bar_width: ::std::option::Option::None, bar_margin: ::std::option::Option::None, scroller_width: ::std::option::Option::None, bar_spacing: ::std::option::Option::None, anchor_x: ::ducktape_view_guest::wire::ScrollAnchor::Start, anchor_y: ::ducktape_view_guest::wire::ScrollAnchor::Start, auto_scroll: (false), background: ::std::option::Option::None, border: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::None, tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Semibold, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:427", __ice_use_scope), size: ::std::option::Option::Some(((13.5) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[7]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: (self.preview_entry.name.to_owned()).to_string() };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Container { shadow: ::ducktape_view_guest::wire::Shadow { color: ::std::option::Option::None, x: ::std::option::Option::None, y: ::std::option::Option::None, blur: ::std::option::Option::None }, max_width: ::std::option::Option::None, max_height: ::std::option::Option::None, clip: false, key: format!("{}/@container:433", __ice_use_scope), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (4.0) as f32, right: (0.0) as f32, bottom: (0.0) as f32, left: (0.0) as f32 }), align_x: ::std::option::Option::None, align_y: ::std::option::Option::None, background: (::std::option::Option::None).map(::ducktape_view_guest::wire::Background::Color), border: ::std::option::Option::None, snap: ::std::option::Option::None, content: ::std::boxed::Box::new({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = ::ducktape_view_guest::wire::Node::Text { options: ::ducktape_view_guest::wire::TextOptions { height: ::std::option::Option::None, align_y: ::std::option::Option::None, line_height: ::std::option::Option::None, shaping: ::std::option::Option::None, wrapping: ::std::option::Option::None, tracking: 0.0f32, font: ::std::option::Option::Some(::ducktape_view_guest::wire::NamedFont { family: ::ducktape_view_guest::wire::FontFamily::Named("Geist Mono".into()), weight: ::ducktape_view_guest::wire::Weight::Normal, stretch: ::ducktape_view_guest::wire::FontStretch::Normal, style: ::ducktape_view_guest::wire::FontStyle::Normal }) }, key: format!("{}/@text:434", __ice_use_scope), size: ::std::option::Option::Some(((10.5) as f32).max(f32::EPSILON).min(f32::MAX)), color: ::std::option::Option::Some(__ice_palette.colors[72]), font: ::ducktape_view_guest::wire::Font { monospace: false, weight: ::ducktape_view_guest::wire::Weight::Normal }, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align_x: ::std::option::Option::None, content: (self.preview_entry.path.to_owned()).to_string() };
-__ice_rendered
-}) };
-__ice_rendered
-}); __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = { let mut __children: ::std::vec::Vec<__IceElement<'_, __FilesViewMessage>> = ::std::vec::Vec::new(); if (self.preview_entry.object).is_empty() { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_15(__ice_palette, format!("{}/ObjectFact@1073", __ice_use_scope)))();
-__ice_rendered
-}); } if (!(self.preview_entry.object).is_empty()) { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_16(__ice_palette, format!("{}/ObjectFact@1075", __ice_use_scope)))();
-__ice_rendered
-}); } if (self.preview_entry.kind == "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_17(__ice_palette, format!("{}/ObjectFact@1077", __ice_use_scope)))();
-__ice_rendered
-}); } if (self.preview_entry.kind != "dir") { __children.push({
-let __ice_rendered: __IceElement<'_, __FilesViewMessage> = (|| self.__ice_component_use_18(__ice_palette, format!("{}/ObjectFact@1079", __ice_use_scope)))();
-__ice_rendered
-}); } ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:440", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::Some((7.0) as f32), padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (14.0) as f32, right: (0.0) as f32, bottom: (0.0) as f32, left: (0.0) as f32 }), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:426", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::Some(::ducktape_view_guest::wire::Edges { top: (16.0) as f32, right: (16.0) as f32, bottom: (16.0) as f32, left: (16.0) as f32 }), width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::None, align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: format!("{}/@layout:370", __ice_use_scope), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Column, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } };
-__ice_rendered
-}) };
-__ice_rendered
-}); ::ducktape_view_guest::wire::Node::Linear { max_width: ::std::option::Option::None, clip: false, key: __ice_node_scope.clone(), wrap: None, axis: ::ducktape_view_guest::wire::Axis::Row, spacing: ::std::option::Option::None, padding: ::std::option::Option::None, width: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fixed((self.object_width) as f32)), height: ::std::option::Option::Some(::ducktape_view_guest::wire::Length::Fill), align: ::std::option::Option::None, background: ::std::option::Option::None, border: ::std::option::Option::None, children: __children } } };
-__ice_rendered
-}; __component_content }
-}
+    pub(super) fn render_breadcrumb(
+        &self,
+        palette: Palette,
+        use_scope: String,
+        cb_8: impl Fn(String) -> Message + Clone + 'static,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: false,
+                    key: format!("{}/@container:130", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: Some(::ducktape_view_guest::wire::Length::Fixed((50.0) as f32)),
+                    padding: Some(::ducktape_view_guest::wire::Edges {
+                        top: (0.0) as f32,
+                        right: (20.0) as f32,
+                        bottom: (0.0) as f32,
+                        left: (20.0) as f32,
+                    }),
+                    align_x: None,
+                    align_y: None,
+                    background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new({
+                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                        children.push(::ducktape_view_guest::wire::Node::Button {
+                            checked: None,
+                            expanded: None,
+                            description: None,
+                            key: format!("{}/@button:141", use_scope),
+                            content: ::ducktape_view_guest::wire::ButtonContent::Child(Box::new(
+                                ::ducktape_view_guest::wire::Node::Text {
+                                    options: ::ducktape_view_guest::wire::TextOptions {
+                                        height: None,
+                                        align_y: None,
+                                        line_height: None,
+                                        shaping: None,
+                                        wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                        tracking: 0.0f32,
+                                        font: Some(::ducktape_view_guest::wire::NamedFont {
+                                            family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                "Geist Mono".into(),
+                                            ),
+                                            weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                            stretch:
+                                                ::ducktape_view_guest::wire::FontStretch::Normal,
+                                            style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                        }),
+                                    },
+                                    key: format!("{}/@text:146", use_scope),
+                                    size: Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                    color: Some(palette.colors[7]),
+                                    font: ::ducktape_view_guest::wire::Font {
+                                        monospace: false,
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                    },
+                                    width: None,
+                                    align_x: None,
+                                    content: ("duckfs".to_owned()).to_string(),
+                                },
+                            )),
+                            label: Some(String::from("Go to the duckfs root".to_owned())),
+                            on_press: Some(::ducktape_view_guest::slots::message((cb_8)(
+                                "/".to_owned(),
+                            ))),
+                            width: None,
+                            height: None,
+                            padding: Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)),
+                            style: ::ducktape_view_guest::wire::ButtonStyle {
+                                preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                                recipe: Some(::ducktape_view_guest::wire::ButtonRecipe {
+                                    base: ::ducktape_view_guest::wire::Face {
+                                        background: Some(::ducktape_view_guest::wire::Rgba([
+                                            0.0 / 255.0,
+                                            0.0 / 255.0,
+                                            0.0 / 255.0,
+                                            0.000000,
+                                        ])),
+                                        text: Some(palette.colors[4]),
+                                        border: Some(::ducktape_view_guest::wire::Border {
+                                            color: None,
+                                            width: None,
+                                            radius: Some([8.0; 4]),
+                                        }),
+                                    },
+                                    hover_background: Some(palette.colors[14]),
+                                    pressed_background: Some(palette.colors[39]),
+                                    disabled_background: None,
+                                    disabled_text: None,
+                                    disabled_opacity: Some(0.5f32),
+                                    focus_ring: Some(palette.colors[42]),
+                                    text_size: Some(12.5f32),
+                                    line_height: None,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                }),
+                                active: ::ducktape_view_guest::wire::Face {
+                                    background: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    text: Some(palette.colors[7]),
+                                    border: Some(::ducktape_view_guest::wire::Border {
+                                        color: Some(::ducktape_view_guest::wire::Rgba([
+                                            0.0 / 255.0,
+                                            0.0 / 255.0,
+                                            0.0 / 255.0,
+                                            0.000000,
+                                        ])),
+                                        width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                                        radius: Some([
+                                            ((6.0) as f32).max(0.0).min(f32::MAX),
+                                            ((6.0) as f32).max(0.0).min(f32::MAX),
+                                            ((6.0) as f32).max(0.0).min(f32::MAX),
+                                            ((6.0) as f32).max(0.0).min(f32::MAX),
+                                        ]),
+                                    }),
+                                },
+                                hovered: Some(::ducktape_view_guest::wire::Face {
+                                    background: Some(palette.colors[55]),
+                                    text: None,
+                                    border: None,
+                                }),
+                                pressed: Some(::ducktape_view_guest::wire::Face {
+                                    background: Some(palette.colors[56]),
+                                    text: None,
+                                    border: None,
+                                }),
+                                disabled: None,
+                            },
+                        });
+                        if !(self.path).is_empty() {
+                            children.push(::ducktape_view_guest::wire::Node::Text {
+                                options: ::ducktape_view_guest::wire::TextOptions {
+                                    height: None,
+                                    align_y: None,
+                                    line_height: None,
+                                    shaping: None,
+                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                    tracking: 0.0f32,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist Mono".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                },
+                                key: format!("{}/@text:156", use_scope),
+                                size: Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                color: Some(palette.colors[7]),
+                                font: ::ducktape_view_guest::wire::Font {
+                                    monospace: false,
+                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                },
+                                width: None,
+                                align_x: None,
+                                content: (self.path.to_owned()).to_string(),
+                            });
+                        }
+                        if !(crate::host::fs_counts_summary(
+                            self.connected,
+                            self.listed,
+                            ::std::convert::AsRef::as_ref(&(self.entries)),
+                        ))
+                        .is_empty()
+                        {
+                            children.push(::ducktape_view_guest::wire::Node::Container {
+                                shadow: ::ducktape_view_guest::wire::Shadow {
+                                    color: None,
+                                    x: None,
+                                    y: None,
+                                    blur: None,
+                                },
+                                max_width: None,
+                                max_height: None,
+                                clip: false,
+                                key: format!("{}/@container:163", use_scope),
+                                width: None,
+                                height: None,
+                                padding: Some(::ducktape_view_guest::wire::Edges {
+                                    top: (0.0) as f32,
+                                    right: (0.0) as f32,
+                                    bottom: (0.0) as f32,
+                                    left: (4.0) as f32,
+                                }),
+                                align_x: None,
+                                align_y: None,
+                                background: (None)
+                                    .map(::ducktape_view_guest::wire::Background::Color),
+                                border: None,
+                                snap: None,
+                                content: Box::new(::ducktape_view_guest::wire::Node::Text {
+                                    options: ::ducktape_view_guest::wire::TextOptions {
+                                        height: None,
+                                        align_y: None,
+                                        line_height: None,
+                                        shaping: None,
+                                        wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                        tracking: 0.0f32,
+                                        font: Some(::ducktape_view_guest::wire::NamedFont {
+                                            family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                "Geist Mono".into(),
+                                            ),
+                                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                            stretch:
+                                                ::ducktape_view_guest::wire::FontStretch::Normal,
+                                            style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                        }),
+                                    },
+                                    key: format!("{}/@text:164", use_scope),
+                                    size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                    color: Some(palette.colors[72]),
+                                    font: ::ducktape_view_guest::wire::Font {
+                                        monospace: false,
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                    },
+                                    width: None,
+                                    align_x: None,
+                                    content: (crate::host::fs_counts_summary(
+                                        self.connected,
+                                        self.listed,
+                                        ::std::convert::AsRef::as_ref(&(self.entries)),
+                                    )
+                                    .to_owned())
+                                    .to_string(),
+                                }),
+                            });
+                        }
+                        ::ducktape_view_guest::wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:135", use_scope),
+                            wrap: None,
+                            axis: ::ducktape_view_guest::wire::Axis::Row,
+                            spacing: Some((6.0) as f32),
+                            padding: None,
+                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                            height: Some(::ducktape_view_guest::wire::Length::Fill),
+                            align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    }),
+                });
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: false,
+                    key: format!("{}/@container:170", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    padding: None,
+                    align_x: None,
+                    align_y: None,
+                    background: (Some(palette.colors[60]))
+                        .map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                        height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    }),
+                });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Column,
+                    spacing: None,
+                    padding: None,
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: None,
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_fs_tree_face_4(
+        &self,
+        palette: Palette,
+        use_scope: String,
+        arg_0: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                children.push(self.icon(
+                    format!("{}/Icon@709", use_scope),
+                    "folder",
+                    13f32,
+                    (palette).colors[30usize],
+                    "@media:64",
+                ));
+                children.push(::ducktape_view_guest::wire::Node::Text {
+                    options: ::ducktape_view_guest::wire::TextOptions {
+                        height: None,
+                        align_y: None,
+                        line_height: None,
+                        shaping: None,
+                        wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                        tracking: 0.0f32,
+                        font: Some(::ducktape_view_guest::wire::NamedFont {
+                            family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                "Geist Mono".into(),
+                            ),
+                            weight: ::ducktape_view_guest::wire::Weight::Medium,
+                            stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                            style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                        }),
+                    },
+                    key: format!("{}/@text:90", use_scope),
+                    size: Some(((12.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                    color: Some(palette.colors[5]),
+                    font: ::ducktape_view_guest::wire::Font {
+                        monospace: false,
+                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                    },
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    align_x: None,
+                    content: (arg_0.to_owned()).to_string(),
+                });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Row,
+                    spacing: Some((7.0) as f32),
+                    padding: Some(::ducktape_view_guest::wire::Edges {
+                        top: (6.0) as f32,
+                        right: (12.0) as f32,
+                        bottom: (6.0) as f32,
+                        left: (11.0 + (0.0 * 14.0)) as f32,
+                    }),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_fs_tree_row_5(
+        &self,
+        palette: Palette,
+        use_scope: String,
+        cb_8: impl Fn(String) -> Message + Clone + 'static,
+        arg_0: crate::host::FsEntry,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                {
+                    children.push(::ducktape_view_guest::wire::Node::Button {
+                        checked: Some(false),
+                        expanded: None,
+                        description: None,
+                        key: format!("{}/@button:54", use_scope),
+                        content: ::ducktape_view_guest::wire::ButtonContent::Child(Box::new(
+                            self.render_fs_tree_face_4(
+                                palette,
+                                format!("{}/FsTreeFace@686", use_scope),
+                                arg_0.name.to_owned(),
+                            ),
+                        )),
+                        label: Some(String::from("Open directory".to_owned())),
+                        on_press: Some(::ducktape_view_guest::slots::message((cb_8)(
+                            arg_0.path.to_owned(),
+                        ))),
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        padding: Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)),
+                        style: ::ducktape_view_guest::wire::ButtonStyle {
+                            preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                            recipe: Some(::ducktape_view_guest::wire::ButtonRecipe {
+                                base: ::ducktape_view_guest::wire::Face {
+                                    background: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    text: Some(palette.colors[4]),
+                                    border: Some(::ducktape_view_guest::wire::Border {
+                                        color: None,
+                                        width: None,
+                                        radius: Some([8.0; 4]),
+                                    }),
+                                },
+                                hover_background: Some(palette.colors[14]),
+                                pressed_background: Some(palette.colors[39]),
+                                disabled_background: None,
+                                disabled_text: None,
+                                disabled_opacity: Some(0.5f32),
+                                focus_ring: Some(palette.colors[42]),
+                                text_size: Some(12.5f32),
+                                line_height: None,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            }),
+                            active: ::ducktape_view_guest::wire::Face {
+                                background: Some(::ducktape_view_guest::wire::Rgba([
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.000000,
+                                ])),
+                                text: Some(palette.colors[5]),
+                                border: Some(::ducktape_view_guest::wire::Border {
+                                    color: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                                    radius: Some([
+                                        ((7.0) as f32).max(0.0).min(f32::MAX),
+                                        ((7.0) as f32).max(0.0).min(f32::MAX),
+                                        ((7.0) as f32).max(0.0).min(f32::MAX),
+                                        ((7.0) as f32).max(0.0).min(f32::MAX),
+                                    ]),
+                                }),
+                            },
+                            hovered: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[58]),
+                                text: None,
+                                border: None,
+                            }),
+                            pressed: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[56]),
+                                text: None,
+                                border: None,
+                            }),
+                            disabled: None,
+                        },
+                    });
+                }
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Column,
+                    spacing: None,
+                    padding: None,
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: None,
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_object_table_header_9(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: false,
+                    key: format!("{}/@container:182", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: Some(::ducktape_view_guest::wire::Length::Fixed((50.0) as f32)),
+                    padding: Some(::ducktape_view_guest::wire::Edges {
+                        top: (0.0) as f32,
+                        right: (20.0) as f32,
+                        bottom: (0.0) as f32,
+                        left: (20.0) as f32,
+                    }),
+                    align_x: None,
+                    align_y: None,
+                    background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new({
+                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                        children.push(::ducktape_view_guest::wire::Node::Text {
+                            options: ::ducktape_view_guest::wire::TextOptions {
+                                height: None,
+                                align_y: None,
+                                line_height: None,
+                                shaping: None,
+                                wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                tracking: 0.0f32,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist Mono".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            },
+                            key: format!("{}/@text:193", use_scope),
+                            size: Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                            color: Some(palette.colors[97]),
+                            font: ::ducktape_view_guest::wire::Font {
+                                monospace: false,
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                            },
+                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                            align_x: None,
+                            content: ("NAME".to_owned()).to_string(),
+                        });
+                        children.push(::ducktape_view_guest::wire::Node::Text {
+                            options: ::ducktape_view_guest::wire::TextOptions {
+                                height: None,
+                                align_y: None,
+                                line_height: None,
+                                shaping: None,
+                                wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                tracking: 0.0f32,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist Mono".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            },
+                            key: format!("{}/@text:200", use_scope),
+                            size: Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                            color: Some(palette.colors[97]),
+                            font: ::ducktape_view_guest::wire::Font {
+                                monospace: false,
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                            },
+                            width: Some(::ducktape_view_guest::wire::Length::Fixed((72.0) as f32)),
+                            align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                            content: ("SIZE".to_owned()).to_string(),
+                        });
+                        children.push(::ducktape_view_guest::wire::Node::Text {
+                            options: ::ducktape_view_guest::wire::TextOptions {
+                                height: None,
+                                align_y: None,
+                                line_height: None,
+                                shaping: None,
+                                wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                tracking: 0.0f32,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist Mono".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            },
+                            key: format!("{}/@text:208", use_scope),
+                            size: Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                            color: Some(palette.colors[97]),
+                            font: ::ducktape_view_guest::wire::Font {
+                                monospace: false,
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                            },
+                            width: Some(::ducktape_view_guest::wire::Length::Fixed((92.0) as f32)),
+                            align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                            content: ("OBJECT".to_owned()).to_string(),
+                        });
+                        ::ducktape_view_guest::wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:187", use_scope),
+                            wrap: None,
+                            axis: ::ducktape_view_guest::wire::Axis::Row,
+                            spacing: Some((12.0) as f32),
+                            padding: None,
+                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                            height: Some(::ducktape_view_guest::wire::Length::Fill),
+                            align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    }),
+                });
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: false,
+                    key: format!("{}/@container:218", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    padding: None,
+                    align_x: None,
+                    align_y: None,
+                    background: (Some(palette.colors[60]))
+                        .map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                        height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    }),
+                });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Column,
+                    spacing: None,
+                    padding: None,
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: None,
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_object_row_face_13(
+        &self,
+        palette: Palette,
+        use_scope: String,
+        arg_0: crate::host::FsEntry,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                children.push({
+                    let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                    if arg_0.kind == "dir" {
+                        children.push(self.icon(
+                            format!("{}/Icon@925", use_scope),
+                            "folder",
+                            16f32,
+                            (palette).colors[30usize],
+                            "@media:64",
+                        ));
+                    }
+                    if arg_0.kind != "dir" {
+                        children.push(self.icon(
+                            format!("{}/Icon@931", use_scope),
+                            "file",
+                            16f32,
+                            (palette).colors[73usize],
+                            "@media:22",
+                        ));
+                    }
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Medium,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:311", use_scope),
+                        size: Some(((12.5) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[15]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        align_x: None,
+                        content: (arg_0.name.to_owned()).to_string(),
+                    });
+                    ::ducktape_view_guest::wire::Node::Linear {
+                        max_width: None,
+                        clip: true,
+                        key: format!("{}/@layout:293", use_scope),
+                        wrap: None,
+                        axis: ::ducktape_view_guest::wire::Axis::Row,
+                        spacing: Some((9.0) as f32),
+                        padding: None,
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                        background: None,
+                        border: None,
+                        children: children,
+                    }
+                });
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: true,
+                    key: format!("{}/@container:318", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fixed((72.0) as f32)),
+                    height: None,
+                    padding: None,
+                    align_x: None,
+                    align_y: None,
+                    background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new({
+                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                        if arg_0.kind == "dir" {
+                            children.push(::ducktape_view_guest::wire::Node::Text {
+                                options: ::ducktape_view_guest::wire::TextOptions {
+                                    height: None,
+                                    align_y: None,
+                                    line_height: None,
+                                    shaping: None,
+                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                    tracking: 0.0f32,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist Mono".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                },
+                                key: format!("{}/@text:321", use_scope),
+                                size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                color: Some(palette.colors[41]),
+                                font: ::ducktape_view_guest::wire::Font {
+                                    monospace: false,
+                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                },
+                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                                content: ("—".to_owned()).to_string(),
+                            });
+                        }
+                        if arg_0.kind != "dir" {
+                            children.push(::ducktape_view_guest::wire::Node::Text {
+                                options: ::ducktape_view_guest::wire::TextOptions {
+                                    height: None,
+                                    align_y: None,
+                                    line_height: None,
+                                    shaping: None,
+                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                    tracking: 0.0f32,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist Mono".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                },
+                                key: format!("{}/@text:330", use_scope),
+                                size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                color: Some(palette.colors[41]),
+                                font: ::ducktape_view_guest::wire::Font {
+                                    monospace: false,
+                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                },
+                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                                content: (crate::host::size_label(arg_0.size)).to_string(),
+                            });
+                        }
+                        ::ducktape_view_guest::wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:319", use_scope),
+                            wrap: None,
+                            axis: ::ducktape_view_guest::wire::Axis::Column,
+                            spacing: None,
+                            padding: None,
+                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                            height: None,
+                            align: None,
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    }),
+                });
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: true,
+                    key: format!("{}/@container:338", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fixed((92.0) as f32)),
+                    height: None,
+                    padding: None,
+                    align_x: None,
+                    align_y: None,
+                    background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new({
+                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                        if (arg_0.object).is_empty() {
+                            children.push(::ducktape_view_guest::wire::Node::Text {
+                                options: ::ducktape_view_guest::wire::TextOptions {
+                                    height: None,
+                                    align_y: None,
+                                    line_height: None,
+                                    shaping: None,
+                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                    tracking: 0.0f32,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist Mono".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                },
+                                key: format!("{}/@text:341", use_scope),
+                                size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                color: Some(palette.colors[72]),
+                                font: ::ducktape_view_guest::wire::Font {
+                                    monospace: false,
+                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                },
+                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                                content: ("—".to_owned()).to_string(),
+                            });
+                        }
+                        if !(arg_0.object).is_empty() {
+                            children.push(::ducktape_view_guest::wire::Node::Text {
+                                options: ::ducktape_view_guest::wire::TextOptions {
+                                    height: None,
+                                    align_y: None,
+                                    line_height: None,
+                                    shaping: None,
+                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                    tracking: 0.0f32,
+                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                            "Geist Mono".into(),
+                                        ),
+                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                    }),
+                                },
+                                key: format!("{}/@text:350", use_scope),
+                                size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                color: Some(palette.colors[72]),
+                                font: ::ducktape_view_guest::wire::Font {
+                                    monospace: false,
+                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                },
+                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                align_x: Some(::ducktape_view_guest::wire::AlignX::Right),
+                                content: (arg_0.object.to_owned()).to_string(),
+                            });
+                        }
+                        ::ducktape_view_guest::wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:339", use_scope),
+                            wrap: None,
+                            axis: ::ducktape_view_guest::wire::Axis::Column,
+                            spacing: None,
+                            padding: None,
+                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                            height: None,
+                            align: None,
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    }),
+                });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: true,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Row,
+                    spacing: Some((12.0) as f32),
+                    padding: Some(::ducktape_view_guest::wire::Edges {
+                        top: (11.0) as f32,
+                        right: (20.0) as f32,
+                        bottom: (11.0) as f32,
+                        left: (20.0) as f32,
+                    }),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_object_row_14(
+        &self,
+        palette: Palette,
+        use_scope: String,
+        cb_8: impl Fn(String) -> Message + Clone + 'static,
+        cb_9: impl Fn(String) -> Message + Clone + 'static,
+        arg_0: crate::host::FsEntry,
+        arg_1: bool,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                if arg_0.kind == "dir" {
+                    children.push(::ducktape_view_guest::wire::Node::Button {
+                        checked: None,
+                        expanded: None,
+                        description: None,
+                        key: format!("{}/@button:233", use_scope),
+                        content: ::ducktape_view_guest::wire::ButtonContent::Child(Box::new(
+                            self.render_object_row_face_13(
+                                palette,
+                                format!("{}/ObjectRowFace@864", use_scope),
+                                arg_0.clone(),
+                            ),
+                        )),
+                        label: Some(String::from("Open directory".to_owned())),
+                        on_press: Some(::ducktape_view_guest::slots::message((cb_8)(
+                            arg_0.path.to_owned(),
+                        ))),
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        padding: Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)),
+                        style: ::ducktape_view_guest::wire::ButtonStyle {
+                            preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                            recipe: Some(::ducktape_view_guest::wire::ButtonRecipe {
+                                base: ::ducktape_view_guest::wire::Face {
+                                    background: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    text: Some(palette.colors[4]),
+                                    border: Some(::ducktape_view_guest::wire::Border {
+                                        color: None,
+                                        width: None,
+                                        radius: Some([8.0; 4]),
+                                    }),
+                                },
+                                hover_background: Some(palette.colors[14]),
+                                pressed_background: Some(palette.colors[39]),
+                                disabled_background: None,
+                                disabled_text: None,
+                                disabled_opacity: Some(0.5f32),
+                                focus_ring: Some(palette.colors[42]),
+                                text_size: Some(12.5f32),
+                                line_height: None,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            }),
+                            active: ::ducktape_view_guest::wire::Face {
+                                background: Some(::ducktape_view_guest::wire::Rgba([
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.000000,
+                                ])),
+                                text: Some(palette.colors[4]),
+                                border: Some(::ducktape_view_guest::wire::Border {
+                                    color: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                                    radius: Some([
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                    ]),
+                                }),
+                            },
+                            hovered: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[57]),
+                                text: None,
+                                border: None,
+                            }),
+                            pressed: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[56]),
+                                text: None,
+                                border: None,
+                            }),
+                            disabled: None,
+                        },
+                    });
+                }
+                if (arg_0.kind != "dir") && arg_1 {
+                    children.push(::ducktape_view_guest::wire::Node::Button {
+                        checked: Some(arg_1),
+                        expanded: None,
+                        description: None,
+                        key: format!("{}/@button:244", use_scope),
+                        content: ::ducktape_view_guest::wire::ButtonContent::Child(Box::new(
+                            self.render_object_row_face_13(
+                                palette,
+                                format!("{}/ObjectRowFace@876", use_scope),
+                                arg_0.clone(),
+                            ),
+                        )),
+                        label: Some(String::from("Show object".to_owned())),
+                        on_press: Some(::ducktape_view_guest::slots::message((cb_9)(
+                            arg_0.path.to_owned(),
+                        ))),
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        padding: Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)),
+                        style: ::ducktape_view_guest::wire::ButtonStyle {
+                            preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                            recipe: Some(::ducktape_view_guest::wire::ButtonRecipe {
+                                base: ::ducktape_view_guest::wire::Face {
+                                    background: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    text: Some(palette.colors[4]),
+                                    border: Some(::ducktape_view_guest::wire::Border {
+                                        color: None,
+                                        width: None,
+                                        radius: Some([8.0; 4]),
+                                    }),
+                                },
+                                hover_background: Some(palette.colors[14]),
+                                pressed_background: Some(palette.colors[39]),
+                                disabled_background: None,
+                                disabled_text: None,
+                                disabled_opacity: Some(0.5f32),
+                                focus_ring: Some(palette.colors[42]),
+                                text_size: Some(12.5f32),
+                                line_height: None,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            }),
+                            active: ::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[91]),
+                                text: Some(palette.colors[4]),
+                                border: Some(::ducktape_view_guest::wire::Border {
+                                    color: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                                    radius: Some([
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                    ]),
+                                }),
+                            },
+                            hovered: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[91]),
+                                text: None,
+                                border: None,
+                            }),
+                            pressed: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[56]),
+                                text: None,
+                                border: None,
+                            }),
+                            disabled: None,
+                        },
+                    });
+                }
+                if (arg_0.kind != "dir") && (!arg_1) {
+                    children.push(::ducktape_view_guest::wire::Node::Button {
+                        checked: Some(arg_1),
+                        expanded: None,
+                        description: None,
+                        key: format!("{}/@button:256", use_scope),
+                        content: ::ducktape_view_guest::wire::ButtonContent::Child(Box::new(
+                            self.render_object_row_face_13(
+                                palette,
+                                format!("{}/ObjectRowFace@888", use_scope),
+                                arg_0.clone(),
+                            ),
+                        )),
+                        label: Some(String::from("Show object".to_owned())),
+                        on_press: Some(::ducktape_view_guest::slots::message((cb_9)(
+                            arg_0.path.to_owned(),
+                        ))),
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        padding: Some(::ducktape_view_guest::wire::Edges::all((0.0) as f32)),
+                        style: ::ducktape_view_guest::wire::ButtonStyle {
+                            preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                            recipe: Some(::ducktape_view_guest::wire::ButtonRecipe {
+                                base: ::ducktape_view_guest::wire::Face {
+                                    background: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    text: Some(palette.colors[4]),
+                                    border: Some(::ducktape_view_guest::wire::Border {
+                                        color: None,
+                                        width: None,
+                                        radius: Some([8.0; 4]),
+                                    }),
+                                },
+                                hover_background: Some(palette.colors[14]),
+                                pressed_background: Some(palette.colors[39]),
+                                disabled_background: None,
+                                disabled_text: None,
+                                disabled_opacity: Some(0.5f32),
+                                focus_ring: Some(palette.colors[42]),
+                                text_size: Some(12.5f32),
+                                line_height: None,
+                                font: Some(::ducktape_view_guest::wire::NamedFont {
+                                    family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                        "Geist".into(),
+                                    ),
+                                    weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                    stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                    style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                }),
+                            }),
+                            active: ::ducktape_view_guest::wire::Face {
+                                background: Some(::ducktape_view_guest::wire::Rgba([
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.0 / 255.0,
+                                    0.000000,
+                                ])),
+                                text: Some(palette.colors[4]),
+                                border: Some(::ducktape_view_guest::wire::Border {
+                                    color: Some(::ducktape_view_guest::wire::Rgba([
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.0 / 255.0,
+                                        0.000000,
+                                    ])),
+                                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                                    radius: Some([
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                        ((0.0) as f32).max(0.0).min(f32::MAX),
+                                    ]),
+                                }),
+                            },
+                            hovered: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[57]),
+                                text: None,
+                                border: None,
+                            }),
+                            pressed: Some(::ducktape_view_guest::wire::Face {
+                                background: Some(palette.colors[56]),
+                                text: None,
+                                border: None,
+                            }),
+                            disabled: None,
+                        },
+                    });
+                }
+                children.push(::ducktape_view_guest::wire::Node::Container {
+                    shadow: ::ducktape_view_guest::wire::Shadow {
+                        color: None,
+                        x: None,
+                        y: None,
+                        blur: None,
+                    },
+                    max_width: None,
+                    max_height: None,
+                    clip: false,
+                    key: format!("{}/@container:267", use_scope),
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    padding: None,
+                    align_x: None,
+                    align_y: None,
+                    background: (Some(palette.colors[6]))
+                        .map(::ducktape_view_guest::wire::Background::Color),
+                    border: None,
+                    snap: None,
+                    content: Box::new(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                        height: Some(::ducktape_view_guest::wire::Length::Fixed((1.0) as f32)),
+                    }),
+                });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Column,
+                    spacing: None,
+                    padding: None,
+                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                    height: None,
+                    align: None,
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
+    pub(super) fn render_object_fact_15(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            ::ducktape_view_guest::wire::Node::Container {
+                shadow: ::ducktape_view_guest::wire::Shadow {
+                    color: None,
+                    x: None,
+                    y: None,
+                    blur: None,
+                },
+                max_width: None,
+                max_height: None,
+                clip: true,
+                key: node_scope.clone(),
+                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                height: None,
+                padding: Some(::ducktape_view_guest::wire::Edges {
+                    top: (9.0) as f32,
+                    right: (12.0) as f32,
+                    bottom: (9.0) as f32,
+                    left: (12.0) as f32,
+                }),
+                align_x: None,
+                align_y: None,
+                background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                border: Some(::ducktape_view_guest::wire::Border {
+                    color: Some(palette.colors[63]),
+                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                    radius: Some([
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                    ]),
+                }),
+                snap: None,
+                content: Box::new({
+                    let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:475", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[71]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("object id".to_owned()).to_string(),
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:482", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[13]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("—".to_owned()).to_string(),
+                    });
+                    ::ducktape_view_guest::wire::Node::Linear {
+                        max_width: None,
+                        clip: false,
+                        key: format!("{}/@layout:470", use_scope),
+                        wrap: None,
+                        axis: ::ducktape_view_guest::wire::Axis::Row,
+                        spacing: Some((10.0) as f32),
+                        padding: None,
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                        background: None,
+                        border: None,
+                        children: children,
+                    }
+                }),
+            }
+        }
+    }
+    pub(super) fn render_object_fact_16(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            ::ducktape_view_guest::wire::Node::Container {
+                shadow: ::ducktape_view_guest::wire::Shadow {
+                    color: None,
+                    x: None,
+                    y: None,
+                    blur: None,
+                },
+                max_width: None,
+                max_height: None,
+                clip: true,
+                key: node_scope.clone(),
+                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                height: None,
+                padding: Some(::ducktape_view_guest::wire::Edges {
+                    top: (9.0) as f32,
+                    right: (12.0) as f32,
+                    bottom: (9.0) as f32,
+                    left: (12.0) as f32,
+                }),
+                align_x: None,
+                align_y: None,
+                background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                border: Some(::ducktape_view_guest::wire::Border {
+                    color: Some(palette.colors[63]),
+                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                    radius: Some([
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                    ]),
+                }),
+                snap: None,
+                content: Box::new({
+                    let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:475", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[71]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("object id".to_owned()).to_string(),
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:482", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[13]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: (self.preview_entry.object.to_owned()).to_string(),
+                    });
+                    ::ducktape_view_guest::wire::Node::Linear {
+                        max_width: None,
+                        clip: false,
+                        key: format!("{}/@layout:470", use_scope),
+                        wrap: None,
+                        axis: ::ducktape_view_guest::wire::Axis::Row,
+                        spacing: Some((10.0) as f32),
+                        padding: None,
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                        background: None,
+                        border: None,
+                        children: children,
+                    }
+                }),
+            }
+        }
+    }
+    pub(super) fn render_object_fact_17(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            ::ducktape_view_guest::wire::Node::Container {
+                shadow: ::ducktape_view_guest::wire::Shadow {
+                    color: None,
+                    x: None,
+                    y: None,
+                    blur: None,
+                },
+                max_width: None,
+                max_height: None,
+                clip: true,
+                key: node_scope.clone(),
+                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                height: None,
+                padding: Some(::ducktape_view_guest::wire::Edges {
+                    top: (9.0) as f32,
+                    right: (12.0) as f32,
+                    bottom: (9.0) as f32,
+                    left: (12.0) as f32,
+                }),
+                align_x: None,
+                align_y: None,
+                background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                border: Some(::ducktape_view_guest::wire::Border {
+                    color: Some(palette.colors[63]),
+                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                    radius: Some([
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                    ]),
+                }),
+                snap: None,
+                content: Box::new({
+                    let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:475", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[71]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("size".to_owned()).to_string(),
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:482", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[13]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("—".to_owned()).to_string(),
+                    });
+                    ::ducktape_view_guest::wire::Node::Linear {
+                        max_width: None,
+                        clip: false,
+                        key: format!("{}/@layout:470", use_scope),
+                        wrap: None,
+                        axis: ::ducktape_view_guest::wire::Axis::Row,
+                        spacing: Some((10.0) as f32),
+                        padding: None,
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                        background: None,
+                        border: None,
+                        children: children,
+                    }
+                }),
+            }
+        }
+    }
+    pub(super) fn render_object_fact_18(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            ::ducktape_view_guest::wire::Node::Container {
+                shadow: ::ducktape_view_guest::wire::Shadow {
+                    color: None,
+                    x: None,
+                    y: None,
+                    blur: None,
+                },
+                max_width: None,
+                max_height: None,
+                clip: true,
+                key: node_scope.clone(),
+                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                height: None,
+                padding: Some(::ducktape_view_guest::wire::Edges {
+                    top: (9.0) as f32,
+                    right: (12.0) as f32,
+                    bottom: (9.0) as f32,
+                    left: (12.0) as f32,
+                }),
+                align_x: None,
+                align_y: None,
+                background: (None).map(::ducktape_view_guest::wire::Background::Color),
+                border: Some(::ducktape_view_guest::wire::Border {
+                    color: Some(palette.colors[63]),
+                    width: Some(((1.0) as f32).max(0.0).min(f32::MAX)),
+                    radius: Some([
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                        ((8.0) as f32).max(0.0).min(f32::MAX),
+                    ]),
+                }),
+                snap: None,
+                content: Box::new({
+                    let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:475", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[71]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: ("size".to_owned()).to_string(),
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Space {
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                    });
+                    children.push(::ducktape_view_guest::wire::Node::Text {
+                        options: ::ducktape_view_guest::wire::TextOptions {
+                            height: None,
+                            align_y: None,
+                            line_height: None,
+                            shaping: None,
+                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                            tracking: 0.0f32,
+                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                    "Geist Mono".into(),
+                                ),
+                                weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                            }),
+                        },
+                        key: format!("{}/@text:482", use_scope),
+                        size: Some(((11.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                        color: Some(palette.colors[13]),
+                        font: ::ducktape_view_guest::wire::Font {
+                            monospace: false,
+                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        },
+                        width: None,
+                        align_x: None,
+                        content: (crate::host::size_label(self.preview_entry.size).to_owned())
+                            .to_string(),
+                    });
+                    ::ducktape_view_guest::wire::Node::Linear {
+                        max_width: None,
+                        clip: false,
+                        key: format!("{}/@layout:470", use_scope),
+                        wrap: None,
+                        axis: ::ducktape_view_guest::wire::Axis::Row,
+                        spacing: Some((10.0) as f32),
+                        padding: None,
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: None,
+                        align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                        background: None,
+                        border: None,
+                        children: children,
+                    }
+                }),
+            }
+        }
+    }
+    pub(super) fn render_object_panel(
+        &self,
+        palette: Palette,
+        use_scope: String,
+    ) -> ::ducktape_view_guest::wire::Node {
+        {
+            let node_scope = format!("{}/root", use_scope);
+            {
+                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                children
+                    .push(::ducktape_view_guest::wire::Node::Container {
+                        shadow: ::ducktape_view_guest::wire::Shadow {
+                            color: None,
+                            x: None,
+                            y: None,
+                            blur: None,
+                        },
+                        max_width: None,
+                        max_height: None,
+                        clip: false,
+                        key: format!("{}/@container:365", use_scope),
+                        width: Some(::ducktape_view_guest::wire::Length::Fill),
+                        height: Some(::ducktape_view_guest::wire::Length::Fill),
+                        padding: None,
+                        align_x: None,
+                        align_y: None,
+                        background: (Some(palette.colors[54]))
+                            .map(::ducktape_view_guest::wire::Background::Color),
+                        border: None,
+                        snap: None,
+                        content: Box::new({
+                            let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                            children
+                                .push(::ducktape_view_guest::wire::Node::Container {
+                                    shadow: ::ducktape_view_guest::wire::Shadow {
+                                        color: None,
+                                        x: None,
+                                        y: None,
+                                        blur: None,
+                                    },
+                                    max_width: None,
+                                    max_height: None,
+                                    clip: false,
+                                    key: format!("{}/@container:371", use_scope),
+                                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                    height: Some(
+                                        ::ducktape_view_guest::wire::Length::Fixed((50.0) as f32),
+                                    ),
+                                    padding: Some(::ducktape_view_guest::wire::Edges {
+                                        top: (0.0) as f32,
+                                        right: (16.0) as f32,
+                                        bottom: (0.0) as f32,
+                                        left: (16.0) as f32,
+                                    }),
+                                    align_x: None,
+                                    align_y: None,
+                                    background: (None)
+                                        .map(::ducktape_view_guest::wire::Background::Color),
+                                    border: None,
+                                    snap: None,
+                                    content: Box::new({
+                                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                                        children
+                                            .push(::ducktape_view_guest::wire::Node::Text {
+                                                options: ::ducktape_view_guest::wire::TextOptions {
+                                                    height: None,
+                                                    align_y: None,
+                                                    line_height: None,
+                                                    shaping: None,
+                                                    wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                                    tracking: 0.0f32,
+                                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                            "Geist".into(),
+                                                        ),
+                                                        weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                                    }),
+                                                },
+                                                key: format!("{}/@text:382", use_scope),
+                                                size: Some(((13.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                                color: Some(palette.colors[4]),
+                                                font: ::ducktape_view_guest::wire::Font {
+                                                    monospace: false,
+                                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                },
+                                                width: None,
+                                                align_x: None,
+                                                content: ("Object".to_owned()).to_string(),
+                                            });
+                                        children
+                                            .push(::ducktape_view_guest::wire::Node::Space {
+                                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                                height: None,
+                                            });
+                                        if self.preview_entry.kind == "dir"  {
+                                            children
+                                                .push(::ducktape_view_guest::wire::Node::Container {
+                                                    shadow: ::ducktape_view_guest::wire::Shadow {
+                                                        color: None,
+                                                        x: None,
+                                                        y: None,
+                                                        blur: None,
+                                                    },
+                                                    max_width: None,
+                                                    max_height: None,
+                                                    clip: false,
+                                                    key: format!("{}/@container:390", use_scope),
+                                                    width: None,
+                                                    height: None,
+                                                    padding: Some(::ducktape_view_guest::wire::Edges {
+                                                        top: (3.0) as f32,
+                                                        right: (7.0) as f32,
+                                                        bottom: (3.0) as f32,
+                                                        left: (7.0) as f32,
+                                                    }),
+                                                    align_x: None,
+                                                    align_y: None,
+                                                    background: (Some(palette.colors[55]))
+                                                        .map(::ducktape_view_guest::wire::Background::Color),
+                                                    border: Some(::ducktape_view_guest::wire::Border {
+                                                        color: None,
+                                                        width: None,
+                                                        radius: Some([
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                        ]),
+                                                    }),
+                                                    snap: None,
+                                                    content: Box::new(::ducktape_view_guest::wire::Node::Text {
+                                                        options: ::ducktape_view_guest::wire::TextOptions {
+                                                            height: None,
+                                                            align_y: None,
+                                                            line_height: None,
+                                                            shaping: None,
+                                                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                                            tracking: 0.0f32,
+                                                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                                    "Geist Mono".into(),
+                                                                ),
+                                                                weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                                            }),
+                                                        },
+                                                        key: format!("{}/@text:396", use_scope),
+                                                        size: Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                                        color: Some(palette.colors[41]),
+                                                        font: ::ducktape_view_guest::wire::Font {
+                                                            monospace: false,
+                                                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                        },
+                                                        width: None,
+                                                        align_x: None,
+                                                        content: ("DIR".to_owned()).to_string(),
+                                                    }),
+                                                });
+                                        }
+                                        if self.preview_entry.kind != "dir"  {
+                                            children
+                                                .push(::ducktape_view_guest::wire::Node::Container {
+                                                    shadow: ::ducktape_view_guest::wire::Shadow {
+                                                        color: None,
+                                                        x: None,
+                                                        y: None,
+                                                        blur: None,
+                                                    },
+                                                    max_width: None,
+                                                    max_height: None,
+                                                    clip: false,
+                                                    key: format!("{}/@container:403", use_scope),
+                                                    width: None,
+                                                    height: None,
+                                                    padding: Some(::ducktape_view_guest::wire::Edges {
+                                                        top: (3.0) as f32,
+                                                        right: (7.0) as f32,
+                                                        bottom: (3.0) as f32,
+                                                        left: (7.0) as f32,
+                                                    }),
+                                                    align_x: None,
+                                                    align_y: None,
+                                                    background: (Some(palette.colors[55]))
+                                                        .map(::ducktape_view_guest::wire::Background::Color),
+                                                    border: Some(::ducktape_view_guest::wire::Border {
+                                                        color: None,
+                                                        width: None,
+                                                        radius: Some([
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                            ((5.0) as f32).max(0.0).min(f32::MAX),
+                                                        ]),
+                                                    }),
+                                                    snap: None,
+                                                    content: Box::new(::ducktape_view_guest::wire::Node::Text {
+                                                        options: ::ducktape_view_guest::wire::TextOptions {
+                                                            height: None,
+                                                            align_y: None,
+                                                            line_height: None,
+                                                            shaping: None,
+                                                            wrapping: Some(::ducktape_view_guest::wire::Wrapping::None),
+                                                            tracking: 0.0f32,
+                                                            font: Some(::ducktape_view_guest::wire::NamedFont {
+                                                                family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                                    "Geist Mono".into(),
+                                                                ),
+                                                                weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                                                stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                                                style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                                            }),
+                                                        },
+                                                        key: format!("{}/@text:409", use_scope),
+                                                        size: Some(((9.0) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                                        color: Some(palette.colors[41]),
+                                                        font: ::ducktape_view_guest::wire::Font {
+                                                            monospace: false,
+                                                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                        },
+                                                        width: None,
+                                                        align_x: None,
+                                                        content: ("FILE".to_owned()).to_string(),
+                                                    }),
+                                                });
+                                        }
+                                        ::ducktape_view_guest::wire::Node::Linear {
+                                            max_width: None,
+                                            clip: false,
+                                            key: format!("{}/@layout:376", use_scope),
+                                            wrap: None,
+                                            axis: ::ducktape_view_guest::wire::Axis::Row,
+                                            spacing: Some((8.0) as f32),
+                                            padding: None,
+                                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                            height: Some(::ducktape_view_guest::wire::Length::Fill),
+                                            align: Some(::ducktape_view_guest::wire::AlignX::Center),
+                                            background: None,
+                                            border: None,
+                                            children: children,
+                                        }
+                                    }),
+                                });
+                            children
+                                .push(::ducktape_view_guest::wire::Node::Container {
+                                    shadow: ::ducktape_view_guest::wire::Shadow {
+                                        color: None,
+                                        x: None,
+                                        y: None,
+                                        blur: None,
+                                    },
+                                    max_width: None,
+                                    max_height: None,
+                                    clip: false,
+                                    key: format!("{}/@container:415", use_scope),
+                                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                    height: Some(
+                                        ::ducktape_view_guest::wire::Length::Fixed((1.0) as f32),
+                                    ),
+                                    padding: None,
+                                    align_x: None,
+                                    align_y: None,
+                                    background: (Some(palette.colors[60]))
+                                        .map(::ducktape_view_guest::wire::Background::Color),
+                                    border: None,
+                                    snap: None,
+                                    content: Box::new(::ducktape_view_guest::wire::Node::Space {
+                                        width: Some(
+                                            ::ducktape_view_guest::wire::Length::Fixed((1.0) as f32),
+                                        ),
+                                        height: Some(
+                                            ::ducktape_view_guest::wire::Length::Fixed((1.0) as f32),
+                                        ),
+                                    }),
+                                });
+                            children
+                                .push(::ducktape_view_guest::wire::Node::Scroll {
+                                    on_scroll: None,
+                                    virtual_rows: false,
+                                    key: format!("{}/@layout:421", use_scope),
+                                    direction: ::ducktape_view_guest::wire::ScrollDirection::Vertical,
+                                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                    height: Some(::ducktape_view_guest::wire::Length::Fill),
+                                    bar_hidden: false,
+                                    bar_width: None,
+                                    bar_margin: None,
+                                    scroller_width: None,
+                                    bar_spacing: None,
+                                    anchor_x: ::ducktape_view_guest::wire::ScrollAnchor::Start,
+                                    anchor_y: ::ducktape_view_guest::wire::ScrollAnchor::Start,
+                                    auto_scroll: (false),
+                                    background: None,
+                                    border: None,
+                                    content: Box::new({
+                                        let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                                        children
+                                            .push(::ducktape_view_guest::wire::Node::Text {
+                                                options: ::ducktape_view_guest::wire::TextOptions {
+                                                    height: None,
+                                                    align_y: None,
+                                                    line_height: None,
+                                                    shaping: None,
+                                                    wrapping: None,
+                                                    tracking: 0.0f32,
+                                                    font: Some(::ducktape_view_guest::wire::NamedFont {
+                                                        family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                            "Geist Mono".into(),
+                                                        ),
+                                                        weight: ::ducktape_view_guest::wire::Weight::Semibold,
+                                                        stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                                        style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                                    }),
+                                                },
+                                                key: format!("{}/@text:427", use_scope),
+                                                size: Some(((13.5) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                                color: Some(palette.colors[7]),
+                                                font: ::ducktape_view_guest::wire::Font {
+                                                    monospace: false,
+                                                    weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                },
+                                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                                align_x: None,
+                                                content: (self.preview_entry.name.to_owned()).to_string(),
+                                            });
+                                        children
+                                            .push(::ducktape_view_guest::wire::Node::Container {
+                                                shadow: ::ducktape_view_guest::wire::Shadow {
+                                                    color: None,
+                                                    x: None,
+                                                    y: None,
+                                                    blur: None,
+                                                },
+                                                max_width: None,
+                                                max_height: None,
+                                                clip: false,
+                                                key: format!("{}/@container:433", use_scope),
+                                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                                height: None,
+                                                padding: Some(::ducktape_view_guest::wire::Edges {
+                                                    top: (4.0) as f32,
+                                                    right: (0.0) as f32,
+                                                    bottom: (0.0) as f32,
+                                                    left: (0.0) as f32,
+                                                }),
+                                                align_x: None,
+                                                align_y: None,
+                                                background: (None)
+                                                    .map(::ducktape_view_guest::wire::Background::Color),
+                                                border: None,
+                                                snap: None,
+                                                content: Box::new(::ducktape_view_guest::wire::Node::Text {
+                                                    options: ::ducktape_view_guest::wire::TextOptions {
+                                                        height: None,
+                                                        align_y: None,
+                                                        line_height: None,
+                                                        shaping: None,
+                                                        wrapping: None,
+                                                        tracking: 0.0f32,
+                                                        font: Some(::ducktape_view_guest::wire::NamedFont {
+                                                            family: ::ducktape_view_guest::wire::FontFamily::Named(
+                                                                "Geist Mono".into(),
+                                                            ),
+                                                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                            stretch: ::ducktape_view_guest::wire::FontStretch::Normal,
+                                                            style: ::ducktape_view_guest::wire::FontStyle::Normal,
+                                                        }),
+                                                    },
+                                                    key: format!("{}/@text:434", use_scope),
+                                                    size: Some(((10.5) as f32).max(f32::EPSILON).min(f32::MAX)),
+                                                    color: Some(palette.colors[72]),
+                                                    font: ::ducktape_view_guest::wire::Font {
+                                                        monospace: false,
+                                                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                                                    },
+                                                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                                    align_x: None,
+                                                    content: (self.preview_entry.path.to_owned()).to_string(),
+                                                }),
+                                            });
+                                        children
+                                            .push({
+                                                let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+                                                if (self.preview_entry.object).is_empty() {
+                                                    children
+                                                        .push(
+                                                            self
+                                                                .render_object_fact_15(
+                                                                    palette,
+                                                                    format!("{}/ObjectFact@1073", use_scope),
+                                                                ),
+                                                        );
+                                                }
+                                                if !(self.preview_entry.object).is_empty()  {
+                                                    children
+                                                        .push(
+                                                            self
+                                                                .render_object_fact_16(
+                                                                    palette,
+                                                                    format!("{}/ObjectFact@1075", use_scope),
+                                                                ),
+                                                        );
+                                                }
+                                                if self.preview_entry.kind == "dir"  {
+                                                    children
+                                                        .push(
+                                                            self
+                                                                .render_object_fact_17(
+                                                                    palette,
+                                                                    format!("{}/ObjectFact@1077", use_scope),
+                                                                ),
+                                                        );
+                                                }
+                                                if self.preview_entry.kind != "dir"  {
+                                                    children
+                                                        .push(
+                                                            self
+                                                                .render_object_fact_18(
+                                                                    palette,
+                                                                    format!("{}/ObjectFact@1079", use_scope),
+                                                                ),
+                                                        );
+                                                }
+                                                ::ducktape_view_guest::wire::Node::Linear {
+                                                    max_width: None,
+                                                    clip: false,
+                                                    key: format!("{}/@layout:440", use_scope),
+                                                    wrap: None,
+                                                    axis: ::ducktape_view_guest::wire::Axis::Column,
+                                                    spacing: Some((7.0) as f32),
+                                                    padding: Some(::ducktape_view_guest::wire::Edges {
+                                                        top: (14.0) as f32,
+                                                        right: (0.0) as f32,
+                                                        bottom: (0.0) as f32,
+                                                        left: (0.0) as f32,
+                                                    }),
+                                                    width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                                    height: None,
+                                                    align: None,
+                                                    background: None,
+                                                    border: None,
+                                                    children: children,
+                                                }
+                                            });
+                                        ::ducktape_view_guest::wire::Node::Linear {
+                                            max_width: None,
+                                            clip: false,
+                                            key: format!("{}/@layout:426", use_scope),
+                                            wrap: None,
+                                            axis: ::ducktape_view_guest::wire::Axis::Column,
+                                            spacing: None,
+                                            padding: Some(::ducktape_view_guest::wire::Edges {
+                                                top: (16.0) as f32,
+                                                right: (16.0) as f32,
+                                                bottom: (16.0) as f32,
+                                                left: (16.0) as f32,
+                                            }),
+                                            width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                            height: None,
+                                            align: None,
+                                            background: None,
+                                            border: None,
+                                            children: children,
+                                        }
+                                    }),
+                                });
+                            ::ducktape_view_guest::wire::Node::Linear {
+                                max_width: None,
+                                clip: false,
+                                key: format!("{}/@layout:370", use_scope),
+                                wrap: None,
+                                axis: ::ducktape_view_guest::wire::Axis::Column,
+                                spacing: None,
+                                padding: None,
+                                width: Some(::ducktape_view_guest::wire::Length::Fill),
+                                height: Some(::ducktape_view_guest::wire::Length::Fill),
+                                align: None,
+                                background: None,
+                                border: None,
+                                children: children,
+                            }
+                        }),
+                    });
+                ::ducktape_view_guest::wire::Node::Linear {
+                    max_width: None,
+                    clip: false,
+                    key: node_scope.clone(),
+                    wrap: None,
+                    axis: ::ducktape_view_guest::wire::Axis::Row,
+                    spacing: None,
+                    padding: None,
+                    width: Some(::ducktape_view_guest::wire::Length::Fixed(
+                        (self.object_width) as f32,
+                    )),
+                    height: Some(::ducktape_view_guest::wire::Length::Fill),
+                    align: None,
+                    background: None,
+                    border: None,
+                    children: children,
+                }
+            }
+        }
+    }
 }

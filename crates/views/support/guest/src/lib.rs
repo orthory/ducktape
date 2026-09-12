@@ -7,19 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-
 pub use ui_lang_wire as wire;
 pub use wit_bindgen;
 
 use futures::StreamExt;
 use std::collections::HashSet;
 use task::BoxStream;
-pub mod task;
 pub mod rev;
 mod subscription;
+pub mod task;
+pub use subscription::{Recipe, Subscription};
 pub use task::Task;
-pub use subscription::{Subscription, Recipe};
-
 
 mod editor;
 mod editor_binding;
@@ -107,7 +105,6 @@ const MAX_ROUNDS: usize = 8;
 /// How many times one poll pass revisits the tasks still woken.
 const MAX_POLLS: usize = 64;
 
-
 impl<A: App> Driver<A> {
     pub fn new() -> Self {
         Self::with_macos(cfg!(target_os = "macos"))
@@ -156,7 +153,9 @@ impl<A: App> Driver<A> {
         self.settle();
         for event in events {
             let message = match event {
-                observation @ (wire::Event::Observation { .. } | wire::Event::Mouse { .. } | wire::Event::Keyboard { .. }) => {
+                observation @ (wire::Event::Observation { .. }
+                | wire::Event::Mouse { .. }
+                | wire::Event::Keyboard { .. }) => {
                     let valid = match &observation {
                         wire::Event::Observation { event, .. } => event.validate().is_ok(),
                         wire::Event::Mouse { event, .. } => event.sanitize().is_some(),
@@ -164,8 +163,15 @@ impl<A: App> Driver<A> {
                         _ => unreachable!(),
                     };
                     if valid {
-                        let messages: Vec<_> = self.observers.iter().filter_map(|observe| observe(&observation)).collect();
-                        for message in messages { spawn(&mut self.tasks, self.app.update(message)); self.settle(); }
+                        let messages: Vec<_> = self
+                            .observers
+                            .iter()
+                            .filter_map(|observe| observe(&observation))
+                            .collect();
+                        for message in messages {
+                            spawn(&mut self.tasks, self.app.update(message));
+                            self.settle();
+                        }
                     }
                     None
                 }
@@ -351,13 +357,22 @@ impl<A: App> Driver<A> {
         slots::set_mouse_interest(false);
         slots::clear_event_interest();
         let subscription = self.app.subscription();
-        let next: HashSet<_> = subscription.recipes.iter().map(|recipe| recipe.key).collect();
-        self.tasks.retain(|task| task.subscription.is_none_or(|key| next.contains(&key)));
+        let next: HashSet<_> = subscription
+            .recipes
+            .iter()
+            .map(|recipe| recipe.key)
+            .collect();
+        self.tasks
+            .retain(|task| task.subscription.is_none_or(|key| next.contains(&key)));
         self.subscriptions.retain(|key| next.contains(key));
         self.observers = subscription.observers;
         for recipe in subscription.recipes {
             if self.subscriptions.insert(recipe.key) {
-                self.tasks.push(Running { subscription: Some(recipe.key), woken: Arc::new(Woken(AtomicBool::new(true))), stream: (recipe.start)() });
+                self.tasks.push(Running {
+                    subscription: Some(recipe.key),
+                    woken: Arc::new(Woken(AtomicBool::new(true))),
+                    stream: (recipe.start)(),
+                });
             }
         }
     }
@@ -365,31 +380,48 @@ impl<A: App> Driver<A> {
 
 fn spawn<M: 'static>(tasks: &mut Vec<Running<M>>, task: Task<M>) {
     if let Some(stream) = task.0 {
-        tasks.push(Running { subscription: None, woken: Arc::new(Woken(AtomicBool::new(true))), stream });
+        tasks.push(Running {
+            subscription: None,
+            woken: Arc::new(Woken(AtomicBool::new(true))),
+            stream,
+        });
     }
 }
 struct Woken(AtomicBool);
 impl Wake for Woken {
-    fn wake(self: Arc<Self>) { self.0.store(true, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 fn poll_tasks<M: 'static>(tasks: &mut Vec<Running<M>>) -> (Vec<M>, bool) {
     let mut messages = Vec::new();
     for _ in 0..MAX_POLLS {
         let mut polled = false;
         tasks.retain_mut(|task| {
-            if !task.woken.0.swap(false, Ordering::SeqCst) { return true; }
+            if !task.woken.0.swap(false, Ordering::SeqCst) {
+                return true;
+            }
             polled = true;
             let waker = Waker::from(task.woken.clone());
             let mut context = Context::from_waker(&waker);
             match task.stream.as_mut().poll_next(&mut context) {
-                Poll::Ready(Some(message)) => { messages.push(message); task.woken.0.store(true, Ordering::SeqCst); true }
+                Poll::Ready(Some(message)) => {
+                    messages.push(message);
+                    task.woken.0.store(true, Ordering::SeqCst);
+                    true
+                }
                 Poll::Ready(None) => false,
                 Poll::Pending => true,
             }
         });
-        if !polled { return (messages, false); }
+        if !polled {
+            return (messages, false);
+        }
     }
-    (messages, tasks.iter().any(|task| task.woken.0.load(Ordering::SeqCst)))
+    (
+        messages,
+        tasks.iter().any(|task| task.woken.0.load(Ordering::SeqCst)),
+    )
 }
 
 /// An Ice `every` in a guest: a module has no clock, so the period is the
@@ -482,67 +514,64 @@ pub const fn manifest_bytes<const N: usize>(text: &str, preferred_size: &str) ->
 #[macro_export]
 macro_rules! export_app {
     ($app:ident, $name:expr, $description:expr, [$($capability:literal),* $(,)?]) => {
-        struct __IceApp($app);
-
-        impl $crate::App for __IceApp {
-            type Message = __IceMessage;
+        impl $crate::App for $app {
+            type Message = Message;
 
             fn boot() -> (Self, $crate::Task<Self::Message>) {
-                let (app, boot) = <$app>::__boot();
-                (Self(app), boot)
+                <$app>::boot()
             }
 
             fn view(&self) -> $crate::wire::Node {
-                self.0.__view()
+                <$app>::view(self)
             }
 
             fn update(&mut self, message: Self::Message) -> $crate::Task<Self::Message> {
-                self.0.__update(message)
+                <$app>::update(self, message)
             }
 
             fn subscription(&self) -> $crate::Subscription<Self::Message> {
-                self.0.__subscription()
+                <$app>::subscription(self)
             }
         }
 
-        impl $crate::SnapshotApp for __IceApp {
-            fn snapshot(&self) -> ::std::result::Result<::std::vec::Vec<u8>, ::std::string::String> { self.0.__snapshot() }
-            fn restore(bytes: &[u8]) -> ::std::result::Result<Self, ::std::string::String> { <$app>::__restore(bytes).map(Self) }
+        impl $crate::SnapshotApp for $app {
+            fn snapshot(&self) -> ::std::result::Result<::std::vec::Vec<u8>, ::std::string::String> { <$app>::snapshot(self) }
+            fn restore(bytes: &[u8]) -> ::std::result::Result<Self, ::std::string::String> { <$app>::restore(bytes) }
         }
 
-        const __ICE_MANIFEST: &str = concat!("ice.manifest.v2\n", $name, "\n", $description, "\n" $(, $capability, ",")*, "\n");
+        const MANIFEST: &str = concat!("ice.manifest.v2\n", $name, "\n", $description, "\n" $(, $capability, ",")*, "\n");
 
         #[unsafe(link_section = "ice.manifest")]
         #[used]
-        static __ICE_MANIFEST_SECTION: [u8; __ICE_MANIFEST.len() + <$app>::__PREFERRED_WINDOW_SIZE.len() + 2 + $crate::wire::WIRE_EPOCH.ilog10() as usize] =
-            $crate::manifest_bytes(__ICE_MANIFEST, <$app>::__PREFERRED_WINDOW_SIZE);
+        static MANIFEST_SECTION: [u8; MANIFEST.len() + <$app>::PREFERRED_WINDOW_SIZE.len() + 2 + $crate::wire::WIRE_EPOCH.ilog10() as usize] =
+            $crate::manifest_bytes(MANIFEST, <$app>::PREFERRED_WINDOW_SIZE);
 
         thread_local! {
-            static __ICE_DRIVER: ::std::cell::RefCell<Option<$crate::Driver<__IceApp>>> =
+            static DRIVER: ::std::cell::RefCell<Option<$crate::Driver<$app>>> =
                 const { ::std::cell::RefCell::new(None) };
         }
 
 
         pub fn boot_native() {
-            __ICE_DRIVER.with(|driver| *driver.borrow_mut() = Some($crate::Driver::new()));
+            DRIVER.with(|driver| *driver.borrow_mut() = Some($crate::Driver::new()));
         }
 
         pub fn snapshot_native() -> ::std::result::Result<::std::vec::Vec<u8>, ::std::string::String> {
-            __ICE_DRIVER.with(|driver| driver.borrow().as_ref().ok_or_else(|| ::std::string::String::from("initialize first"))?.snapshot())
+            DRIVER.with(|driver| driver.borrow().as_ref().ok_or_else(|| ::std::string::String::from("initialize first"))?.snapshot())
         }
 
         pub fn restore_native(bytes: &[u8], macos: bool) -> ::std::result::Result<(), ::std::string::String> {
             let candidate = $crate::Driver::from_snapshot(bytes, macos)?;
-            __ICE_DRIVER.with(|driver| *driver.borrow_mut() = Some(candidate));
+            DRIVER.with(|driver| *driver.borrow_mut() = Some(candidate));
             ::std::result::Result::Ok(())
         }
 
         pub fn tick_native(events: Vec<$crate::wire::Event>) -> $crate::wire::Frame {
-            __ICE_DRIVER.with(|driver| driver.borrow_mut().as_mut().expect("boot first").tick(events))
+            DRIVER.with(|driver| driver.borrow_mut().as_mut().expect("boot first").tick(events))
         }
 
         #[cfg(target_arch = "wasm32")]
-        mod __ice_exports {
+        mod wasm_exports {
             macro_rules! bindings {
                 ($wit:literal) => {
                     $crate::wit_bindgen::generate!({
@@ -553,7 +582,7 @@ macro_rules! export_app {
             }
             $crate::wire::with_view_wit!(bindings);
 
-            struct __IceComponent;
+            struct Component;
 
             fn install_panic_hook() {
                     // A trapped instance can never be entered again, so the
@@ -574,10 +603,10 @@ macro_rules! export_app {
                     }));
             }
 
-            impl Guest for __IceComponent {
+            impl Guest for Component {
                 fn init(macos: bool) {
                     install_panic_hook();
-                    super::__ICE_DRIVER.with(|driver| *driver.borrow_mut() = Some($crate::Driver::with_macos(macos)));
+                    super::DRIVER.with(|driver| *driver.borrow_mut() = Some($crate::Driver::with_macos(macos)));
                 }
 
                 fn snapshot() -> Result<Vec<u8>, String> { super::snapshot_native() }
@@ -599,11 +628,10 @@ macro_rules! export_app {
                 }
             }
 
-            export!(__IceComponent);
+            export!(Component);
         }
     };
 }
-
 
 mod combo;
 pub use combo::Combo;
