@@ -149,8 +149,10 @@ struct Desktop {
     state: Ducktape,
     tray: crate::tray::Tray,
     windows: BTreeMap<WindowKey, gpui_kit::AnyWindowHandle>,
+    views: BTreeMap<WindowKey, gpui_kit::WeakEntity<DesktopWindow>>,
     streams: HashMap<u64, gpui_kit::Task<()>>,
     pending_focus: Option<String>,
+    pending_urls: Vec<String>,
 }
 
 impl Desktop {
@@ -164,6 +166,19 @@ impl Desktop {
         self.start(task, cx).detach();
         self.subscriptions(cx);
         cx.notify();
+        self.open_pending_urls(cx);
+    }
+
+    fn open_pending_urls(&mut self, cx: &mut Context<Self>) {
+        let ready = self.state.connected
+            && self.state.console_win.is_some()
+            && !self.state.network_chain_id.is_empty();
+        if !ready {
+            return;
+        }
+        for url in std::mem::take(&mut self.pending_urls) {
+            self.dispatch(Message::OpenMessageLink(url), cx);
+        }
     }
 
     fn sync_appearance(&self, cx: &mut Context<Self>) {
@@ -275,8 +290,13 @@ impl Desktop {
             .map(std::sync::Arc::new),
             ..Default::default()
         };
+        let mut opened_view = None;
         match cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| {
+                cx.on_release(|this: &mut DesktopWindow, cx| {
+                    this.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
+                })
+                .detach();
                 let observer = cx.observe(&model, |_, _, cx| cx.notify());
                 let activation = cx.observe_window_activation(
                     window,
@@ -306,10 +326,21 @@ impl Desktop {
                     _observer: observer,
                 }
             });
+            opened_view = Some(view.downgrade());
+            let closing = view.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                let _ = closing.update(cx, |this, cx| {
+                    this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
+                });
+                true
+            });
             cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
         }) {
             Ok(handle) => {
                 self.windows.insert(key, handle.into());
+                if let Some(view) = opened_view {
+                    self.views.insert(key, view);
+                }
                 let _ = reply.send(key);
             }
             Err(error) => {
@@ -324,6 +355,11 @@ impl Desktop {
         let Some(handle) = self.windows.remove(&key) else {
             return;
         };
+        if let Some(view) = self.views.remove(&key) {
+            let _ = view.update(cx, |this, cx| {
+                this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
+            });
+        }
         let _ = handle.update(cx, |_, window, _| window.remove_window());
         self.dispatch(Message::WindowWasClosed(key), cx);
     }
@@ -384,6 +420,15 @@ struct NativeInput {
 }
 
 impl DesktopWindow {
+    fn observe_module_window(
+        &mut self,
+        event: ui_lang_wire::events::Window,
+        cx: &mut gpui_kit::App,
+    ) {
+        if let Some((_, module)) = &self.module {
+            module.update(cx, |module, cx| module.observe_window(event, cx));
+        }
+    }
     #[cfg(test)]
     pub(crate) fn test_state<'a>(&self, cx: &'a gpui_kit::App) -> &'a Ducktape {
         &self.model.read(cx).state
@@ -1221,9 +1266,6 @@ impl Render for DesktopWindow {
                     state.channel_create_open,
                 );
                 let global = palette != "none" || !escape.is_empty();
-                this.model.update(cx, |model, cx| {
-                    model.dispatch(Message::ModifierStateChanged(key.modifiers), cx)
-                });
                 match chord {
                     crate::CommandChord::Quit | crate::CommandChord::CloseWindow => {
                         this.model.update(cx, |model, cx| {
@@ -1246,6 +1288,9 @@ impl Render for DesktopWindow {
                     key: event.keystroke.key.clone(),
                     modifiers: event.keystroke.modifiers,
                 };
+                let copy = this.model.read(cx).state.shell_tab == ShellTab::Chat
+                    && crate::backend::is_copy_chord(key.key.clone(), key.modifiers);
+                if !copy { return; }
                 this.model.update(cx, |model, cx| {
                     model.dispatch(Message::CopyChordPressed(key), cx)
                 });
@@ -1272,8 +1317,10 @@ pub(crate) fn test_window(
         state,
         tray: crate::tray::Tray::without_status_item(),
         windows: BTreeMap::new(),
+        views: BTreeMap::new(),
         streams: HashMap::new(),
         pending_focus: None,
+        pending_urls: Vec::new(),
     });
     cx.new(|cx| {
         let observer = cx.observe(&model, |_, _, cx| cx.notify());
@@ -1295,7 +1342,14 @@ pub(crate) fn test_window(
 }
 
 pub(crate) fn run() {
-    gpui_kit::application().run(|cx| {
+    let application = gpui_kit::application();
+    let (url_sender, mut urls) = mpsc::unbounded::<Vec<String>>();
+    // Install before launching: macOS may deliver its initial URL before the
+    // desktop actor exists. The channel keeps it until the actor can receive.
+    application.on_open_urls(move |urls| {
+        let _ = url_sender.unbounded_send(urls);
+    });
+    application.run(move |cx| {
         gpui_kit::init(cx);
         let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
             std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/Geist[wght].ttf")),
@@ -1318,10 +1372,24 @@ pub(crate) fn run() {
             state,
             tray,
             windows: BTreeMap::new(),
+            views: BTreeMap::new(),
             streams: HashMap::new(),
             pending_focus: None,
+            pending_urls: Vec::new(),
         });
         desktop.update(cx, |desktop, cx| desktop.sync_appearance(cx));
+        let url_desktop = desktop.downgrade();
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            while let Some(urls) = urls.next().await {
+                let result = url_desktop.update(cx, |desktop, cx| {
+                    desktop.pending_urls.extend(urls.into_iter().filter(|url| url.starts_with("duck://")));
+                    desktop.open_pending_urls(cx);
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+        }).detach();
         let tray_desktop = desktop.downgrade();
         cx.spawn(async move |cx: &mut AsyncApp| {
             while let Some(row) = tray_events.next().await {
@@ -1348,6 +1416,7 @@ pub(crate) fn run() {
                     return;
                 };
                 desktop.windows.remove(&key);
+                desktop.views.remove(&key);
                 desktop.dispatch(Message::WindowWasClosed(key), cx);
             });
         })

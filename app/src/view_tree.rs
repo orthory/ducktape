@@ -103,6 +103,8 @@ struct Field {
     guest_value: String,
     placeholder: String,
     secure: bool,
+    ime: Option<crate::module_view::input::ImeState>,
+    _observer: Subscription,
     _subscription: Subscription,
 }
 
@@ -278,7 +280,10 @@ impl ViewTree {
 
     #[cfg(test)]
     pub(crate) fn scroll_offset(&self, key: &str) -> Option<Point<Pixels>> {
-        self.scrolls.get(key).map(ScrollHandle::offset)
+        self.lists
+            .get(key)
+            .map(|list| list.state.scroll_px_offset_for_scrollbar())
+            .or_else(|| self.scrolls.get(key).map(ScrollHandle::offset))
     }
 
     pub fn new(root: wire::Node) -> Self {
@@ -730,6 +735,30 @@ impl ViewTree {
                 state
             });
             let input_key = key.clone();
+            let observed_key = key.clone();
+            let observer = cx.observe_in(&state, window, move |this, input, window, cx| {
+                let Some(field) = this.fields.get_mut(&observed_key) else {
+                    return;
+                };
+                let (text, marked, cursor, selection) = input.update(cx, |input, cx| {
+                    let marked = input.marked_text_range(window, cx);
+                    (
+                        input.value().to_string(),
+                        marked,
+                        input.cursor(),
+                        input.selected_range(),
+                    )
+                });
+                for event in crate::module_view::input::ime_events(
+                    &mut field.ime,
+                    &text,
+                    marked,
+                    cursor,
+                    selection,
+                ) {
+                    cx.emit(event);
+                }
+            });
             let subscription = cx.subscribe_in(&state, window, move |this, input, event, _, cx| {
                 let Some(field) = this.fields.get_mut(&input_key) else {
                     return;
@@ -764,6 +793,8 @@ impl ViewTree {
                     guest_value: value.clone(),
                     placeholder: placeholder.clone(),
                     secure: *secure,
+                    ime: None,
+                    _observer: observer,
                     _subscription: subscription,
                 },
             );
@@ -1227,7 +1258,7 @@ impl ViewTree {
                 on_release,
                 on_drag,
                 content,
-                ..
+                cursor,
             } => {
                 let press_key = key.clone();
                 let move_key = key.clone();
@@ -1237,6 +1268,7 @@ impl ViewTree {
                 let drag = *on_drag;
                 div()
                     .id(key.clone())
+                    .cursor(native_cursor(*cursor))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2516,6 +2548,38 @@ impl Render for ViewTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.mounted.clear();
         self.node(&self.root.clone(), window, cx)
+    }
+}
+
+fn native_cursor(cursor: Option<wire::mouse::Cursor>) -> CursorStyle {
+    use wire::mouse::Cursor as C;
+    match cursor {
+        Some(C::ResizingHorizontally) => CursorStyle::ResizeLeftRight,
+        Some(C::ResizingVertically) => CursorStyle::ResizeUpDown,
+        Some(C::ResizingDiagonallyUp) => CursorStyle::ResizeUpRightDownLeft,
+        Some(C::ResizingDiagonallyDown) => CursorStyle::ResizeUpLeftDownRight,
+        Some(C::ResizingColumn) => CursorStyle::ResizeColumn,
+        Some(C::ResizingRow) => CursorStyle::ResizeRow,
+        Some(C::Pointer) => CursorStyle::PointingHand,
+        Some(C::Grab) => CursorStyle::OpenHand,
+        Some(C::Grabbing | C::Move | C::AllScroll) => CursorStyle::ClosedHand,
+        Some(C::Text) => CursorStyle::IBeam,
+        Some(C::Cell | C::Crosshair) => CursorStyle::Crosshair,
+        Some(C::NoDrop | C::NotAllowed) => CursorStyle::OperationNotAllowed,
+        Some(C::Alias) => CursorStyle::DragLink,
+        Some(C::Copy) => CursorStyle::DragCopy,
+        Some(C::ContextMenu) => CursorStyle::ContextualMenu,
+        Some(
+            C::None
+            | C::Hidden
+            | C::Idle
+            | C::Help
+            | C::Progress
+            | C::Wait
+            | C::ZoomIn
+            | C::ZoomOut,
+        )
+        | None => CursorStyle::Arrow,
     }
 }
 
