@@ -509,7 +509,7 @@ impl ViewTree {
             return false;
         }
         if let Some(field) = self.fields.get(target) {
-            return field.state.read(cx).focus_handle().is_focused(window);
+            return field.state.read(cx).focus_handle(cx).is_focused(window);
         }
         if let Some(picker) = self.pickers.get(target) {
             return picker
@@ -2087,7 +2087,7 @@ impl ViewTree {
             let message = *message;
             element = element.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_, event, _, cx| {
+                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
                     if event.click_count == 2 {
                         cx.emit(wire::Event::Message(message));
                     }
@@ -2624,7 +2624,7 @@ impl ViewTree {
         let (minimum, maximum) = options.scale_bounds.unwrap_or((0.25, 10.0));
         let step = options.scale_step.unwrap_or(0.1);
         let wheel_key = key.clone();
-        element = element.on_scroll_wheel(cx.listener(move |this, event, _, cx| {
+        element = element.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
             let delta = match event.delta {
                 ScrollDelta::Pixels(delta) => f32::from(delta.y),
                 ScrollDelta::Lines(delta) => delta.y,

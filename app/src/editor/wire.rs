@@ -8,7 +8,7 @@ use std::time::Instant;
 use ui_lang_wire as wire;
 use wire::editor_document::{
     EditorDocumentMessage as DocumentMessage, EditorDocumentRef, EditorTransferId,
-    EditorTransferReceiver, EditorTransferSender, MAX_EDITOR_DOCUMENT_BYTES,
+    EditorTransferReceiver, EditorTransferSender,
     MAX_EDITOR_LIVE_BYTES, MAX_EDITOR_PROJECTION_BYTES, editor_changed_span,
 };
 

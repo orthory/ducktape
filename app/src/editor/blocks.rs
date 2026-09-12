@@ -308,7 +308,7 @@ impl WireEditor {
                 .input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window);
+                .focus(window, cx);
         }
         self.projection = Some(projection);
     }
