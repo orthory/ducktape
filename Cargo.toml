@@ -200,7 +200,7 @@ members = [
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 # The shared design crate belongs to the views workspace so Cargo gives
 # its guest dependency a checkout-independent package identity.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design"]
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design", "crates/views/support/guest"]
 
 [workspace.package]
 edition = "2024"
@@ -463,15 +463,6 @@ opt-level = 2
 [profile.dev.package.design]
 opt-level = 2
 
-[profile.dev.package.winit]
-opt-level = 2
-
-[profile.dev.package.lilt]
-opt-level = 2
-
-[profile.dev.package.cryoglyph]
-opt-level = 2
-
 [profile.dev.package.fontdb]
 opt-level = 2
 
@@ -544,19 +535,8 @@ opt-level = 2
 [profile.dev.package.usvg]
 opt-level = 2
 
-[profile.dev.package.softbuffer]
-opt-level = 2
-
-# The Markdown parse and the syntect pass every fenced code block pays — the
-# agent transcript, the forge reader and the Files preview all render through
-# them, and a regex engine at opt-0 is the slowest thing on that path.
+# The native document readers parse Markdown on their presentation path.
 [profile.dev.package.pulldown-cmark]
-opt-level = 2
-
-[profile.dev.package.syntect]
-opt-level = 2
-
-[profile.dev.package.fancy-regex]
 opt-level = 2
 
 [profile.dev.package.regex-automata]

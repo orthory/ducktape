@@ -1,6 +1,6 @@
 ---
 name: qa
-description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transaction round-trips, the real-socket cluster e2e, the desktop app's own unit lane, and the live huddle lane. The app has no headless driving lane; its suites run with cargo test -p ducktape-app.
+description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transactions, real-socket cluster e2e, native GPUI app suites, and the live huddle lane. App suites run with cargo test -p ducktape-app; device and pixel checks require platform support.
 ---
 
 # Node QA

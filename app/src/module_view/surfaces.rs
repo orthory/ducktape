@@ -156,6 +156,8 @@ impl NativeModuleView {
             let Slot::Ready(guest) = &mut locked.slot else { return; };
             let current_instance = generation_matches && Arc::ptr_eq(&alive, &guest.alive);
             if !current_instance { return; }
+            let current_frame = guest.frame_rev == this.revision;
+            if !current_frame { cx.notify(); return; }
             guest.surface_event(handler, value.clone());
             cx.notify();
         })
