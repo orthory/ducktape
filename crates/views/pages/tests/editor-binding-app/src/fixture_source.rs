@@ -1,5 +1,4 @@
 //! Synthetic chunked source for editor transaction tests, not a Pages host capability.
-use crate::fixture_source::DocumentIdentity;
 use ducktape_view_guest::{host, wire};
 use futures::{StreamExt, future};
 use wire::editor_document::{EditorTransfer, EditorTransferReceiver};
