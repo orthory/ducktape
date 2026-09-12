@@ -91,6 +91,39 @@ pub struct WireEditor {
 
 impl EventEmitter<()> for WireEditor {}
 
+#[cfg(test)]
+#[gpui_kit::test]
+fn readonly_cut_keeps_preview_selection_and_transaction_queue(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = EditorStore::new(77);
+    let window = cx.open_window(gpui_kit::size(px(400.), px(200.)), |window, cx| {
+        WireEditor::new("document".into(), store.clone(), window, cx)
+    });
+    let editor = window.root(cx).unwrap();
+    cx.update(|cx| editor.update(cx, |editor, cx| {
+        let text: Arc<str> = Arc::from("Read only 한글");
+        let cursor = wire::EditorCursor {
+            position: position(&text, text.len()),
+            selection: Some(Default::default()),
+        };
+        editor.preview = text.clone();
+        editor.cursor = cursor;
+        editor.projection = Some(Projection {
+            reference: wire::editor_document::EditorDocumentRef {
+                document: "readonly".into(), reset: 1, text_revision: 0, revision: 0,
+                cursor, byte_len: text.len() as u32,
+            },
+            text: Some(text.clone()), options: Default::default(), placeholder: String::new(),
+            editable: false, pending: false, fault: None,
+        });
+        assert!(editor.document_command(&wire::keyboard::Key::Character("c".into()), cx));
+        assert!(editor.document_command(&wire::keyboard::Key::Character("x".into()), cx));
+        assert_eq!(editor.preview, text);
+        assert_eq!(editor.cursor, cursor);
+        assert!(store.drain().is_empty());
+    }));
+}
+
 impl WireEditor {
     pub fn new(
         key: String,
@@ -535,6 +568,12 @@ impl WireEditor {
                 true
             }
             "c" | "x" => {
+                let writable = self.projection.as_ref().is_some_and(|projection| {
+                    projection.editable && projection.fault.is_none() && projection.text.is_some()
+                });
+                if key == "x" && !writable {
+                    return true;
+                }
                 let Some(anchor) = self.cursor.selection else {
                     return false;
                 };

@@ -2226,7 +2226,7 @@ impl ViewTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let wire::Node::Editor { key, document, .. } = node else {
+        let wire::Node::Editor { key, document, width, height, min_height, max_height, .. } = node else {
             unreachable!()
         };
         let Some(store) = self.editor_store.clone() else {
@@ -2263,11 +2263,15 @@ impl ViewTree {
             });
         }
         let view = editor.view.clone();
-        div()
-            .relative()
-            // WireEditor itself is size_full: keep its existing containing
-            // block instead of letting an auto-sized measuring wrapper collapse.
-            .size_full()
+        let mut element = dimensions(
+            div().relative(),
+            Some(width.map_or(wire::Length::Fill, wire::Length::Fixed)),
+            Some(height.unwrap_or(wire::Length::Fill)),
+        ).min_h(px(min_height.unwrap_or(0.)));
+        if let Some(maximum) = max_height {
+            element = element.max_h(px(*maximum));
+        }
+        element
             .child(view)
             .child(self.measure(key, cx))
             .into_any_element()
@@ -3890,6 +3894,39 @@ fn append_arc_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn editor_obeys_authored_size_and_height_limits(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        for (height, minimum, maximum, expected) in [
+            (Some(wire::Length::Fixed(60.)), None, None, 60.),
+            (Some(wire::Length::Fixed(60.)), Some(100.), None, 100.),
+            (Some(wire::Length::Fixed(180.)), None, Some(100.), 100.),
+            (None, None, None, 300.),
+        ] {
+            let root = wire::Node::Editor {
+                key: "document".into(), options: Box::default(), placeholder: String::new(),
+                document: wire::editor_document::EditorDocumentRef {
+                    document: "sizing".into(), reset: 1, text_revision: 0, revision: 0,
+                    cursor: Default::default(), byte_len: 0,
+                },
+                on_document: 0, editable: false, width: Some(240.), height,
+                min_height: minimum, max_height: maximum,
+            };
+            let store = crate::editor::wire::EditorStore::new(91);
+            store.replace(&root).unwrap();
+            let window = cx.open_window(size(px(400.), px(300.)), |_, cx| {
+                let mut tree = ViewTree::new(root);
+                tree.set_editor_store(store, cx);
+                tree
+            });
+            let tree = window.root(cx).unwrap();
+            let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+            native.update(|window, cx| window.render_frame(cx));
+            let bounds = tree.read_with(&native, |tree, _| tree.measured_bounds("document")).unwrap();
+            assert_eq!(bounds.size, size(px(240.), px(expected)));
+        }
+    }
 
     #[test]
     fn geometry_and_pixels_keep_the_wire_meaning() {
