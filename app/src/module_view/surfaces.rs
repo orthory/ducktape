@@ -245,11 +245,10 @@ impl NativeModuleView {
                 return;
             }
             let mut locked = seat.lock().expect("module view lock");
-            let generation_matches = locked.generation == generation;
             let Slot::Ready(guest) = &mut locked.slot else {
                 return;
             };
-            if !generation_matches
+            if guest.seated_generation() != generation
                 || !Arc::ptr_eq(&alive, &guest.alive)
                 || guest.frame_rev != this.revision
             {
@@ -282,11 +281,11 @@ impl NativeModuleView {
                 return;
             }
             let mut locked = seat.lock().expect("module view lock");
-            let generation_matches = locked.generation == generation;
             let Slot::Ready(guest) = &mut locked.slot else {
                 return;
             };
-            let current_instance = generation_matches && Arc::ptr_eq(&alive, &guest.alive);
+            let current_instance =
+                guest.seated_generation() == generation && Arc::ptr_eq(&alive, &guest.alive);
             if !current_instance {
                 return;
             }

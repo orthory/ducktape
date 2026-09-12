@@ -167,6 +167,85 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
     }
 }
 #[gpui_kit::test]
+fn candidate_preparation_and_rejection_keep_the_seated_native_input(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let (view, mut native) = open(cx);
+    let input = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("seated Chat")
+        };
+        let mut found = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Input {
+                key,
+                value,
+                options,
+                ..
+            } = node
+                && options.label == "Search messages"
+            {
+                found = Some((key.clone(), value.clone()));
+            }
+        });
+        found.expect("Chat search input")
+    };
+    let key = input().0;
+    native.update(|window, cx| window.click(key.clone(), cx));
+    let content = view.read_with(&native, |view, _| view.content.clone().unwrap());
+    let attempt = seat.lock().unwrap().start(Some([7; 32]));
+
+    // A real OS key may arrive before the first repaint after a deployment
+    // check. TestWindowExt::input paints first, which would hide that race.
+    native.update(|window, cx| {
+        let mut key = gpui::Keystroke::parse("x").unwrap();
+        key.key_char = Some("x".into());
+        window.dispatch_keystroke(key, cx);
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        input().1,
+        "x",
+        "candidate preparation lost the accepted key"
+    );
+    assert_eq!(
+        view.read_with(&native, |view, _| view
+            .content
+            .as_ref()
+            .unwrap()
+            .entity_id()),
+        content.entity_id(),
+        "an uninstalled candidate must not replace native controls"
+    );
+    {
+        let mut locked = seat.lock().unwrap();
+        assert_eq!(locked.generation, attempt);
+        locked.in_flight = false;
+        locked.retry = Some(Retry::after(None, Some([7; 32])));
+    }
+    native.update(|window, cx| {
+        let mut key = gpui::Keystroke::parse("y").unwrap();
+        key.key_char = Some("y".into());
+        window.dispatch_keystroke(key, cx);
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        input().1,
+        "xy",
+        "rejected candidate disabled the seated input"
+    );
+    assert_eq!(
+        view.read_with(&native, |view, _| view
+            .content
+            .as_ref()
+            .unwrap()
+            .entity_id()),
+        content.entity_id()
+    );
+}
+
+#[gpui_kit::test]
 fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();
     let seat = seated(&["More message actions"]);

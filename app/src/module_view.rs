@@ -1965,6 +1965,12 @@ impl Guest {
         !self.ever_valid_tree
     }
 
+    /// Candidate attempts do not retire a seated view or its input routes.
+    /// Direct test fixtures have no loader-assigned generation and use zero.
+    fn seated_generation(&self) -> u64 {
+        self.installed_generation.unwrap_or_default()
+    }
+
     /// Everything this instance was asked to do is done: nothing pending,
     /// no request the host has yet to route, no trap. A replacement not
     /// yet redrawn is settled too: the only requests its first tree
@@ -2651,14 +2657,11 @@ impl NativeModuleView {
         };
         let seat = mounted(self.module);
         let mut mounted = seat.lock().expect("module view lock");
-        if mounted.generation != self.generation {
-            return Vec::new();
-        }
         let Mounted { slot, props, .. } = &mut *mounted;
         let Slot::Ready(guest) = slot else {
             return Vec::new();
         };
-        if !Arc::ptr_eq(alive, &guest.alive) {
+        if guest.seated_generation() != self.generation || !Arc::ptr_eq(alive, &guest.alive) {
             return Vec::new();
         }
         let accepted = input::deliver(guest, wire::Event::Observation {
@@ -2683,7 +2686,6 @@ impl NativeModuleView {
         let Mounted {
             slot,
             props,
-            generation,
             ..
         } = &mut *locked;
         let guest = match slot {
@@ -2700,6 +2702,7 @@ impl NativeModuleView {
             Slot::Failed(reason) => return Err(reason.clone()),
             Slot::Ready(guest) => guest,
         };
+        let generation = guest.seated_generation();
         let ticks = guest.ticks;
         let again = guest.redraw(props);
         if again {
@@ -2722,7 +2725,7 @@ impl NativeModuleView {
         if let Some(fault) = &guest.fault {
             return Err(format!("This view was stopped: {fault}"));
         }
-        let same_instance = self.generation == *generation
+        let same_instance = self.generation == generation
             && self
                 .alive
                 .as_ref()
@@ -2736,7 +2739,7 @@ impl NativeModuleView {
                 (Some(content), true) => content.update(cx, |tree, cx| tree.replace(root, cx)),
                 _ => {
                     self.surfaces.clear();
-                    self.generation = *generation;
+                    self.generation = generation;
                     self.alive = Some(guest.alive.clone());
                     let mut changes = guest.replies.changes();
                     self.replies_changed = Some(cx.spawn(async move |view, cx| {
@@ -2759,16 +2762,14 @@ impl NativeModuleView {
                         tree.set_editor_store(guest.inputs.clone(), cx)
                     });
                     let seat = mounted.clone();
-                    let generation = *generation;
                     let alive = guest.alive.clone();
                     self.subscription = Some(cx.subscribe(&content, move |this, _, event, cx| {
                         let mut locked = seat.lock().expect("module view lock");
-                        let generation_matches = locked.generation == generation;
                         let Slot::Ready(guest) = &mut locked.slot else {
                             return;
                         };
                         let current_instance =
-                            generation_matches && Arc::ptr_eq(&alive, &guest.alive);
+                            guest.seated_generation() == generation && Arc::ptr_eq(&alive, &guest.alive);
                         if !current_instance || guest.frame_rev != this.revision {
                             cx.notify();
                             return;
@@ -2858,6 +2859,7 @@ pub(crate) mod tests {
             .join("../target/views/governance_view.wasm");
         assert!(path.is_file(), "close regression requires the staged governance view");
         let mut guest = Guest::load_from("governance", &path).expect("close observer guest");
+        guest.installed_generation = Some(1);
         guest.redraw(&None);
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
         let mut view = NativeModuleView::new("governance");

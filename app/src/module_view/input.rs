@@ -86,13 +86,13 @@ struct Route {
 impl Route {
     fn deliver(&self, event: wire::Event, cx: &mut App) {
         let mut locked = self.seat.lock().expect("module view lock");
-        if locked.generation != self.generation {
-            return;
-        }
         let Slot::Ready(guest) = &mut locked.slot else {
             return;
         };
-        if !Arc::ptr_eq(&guest.alive, &self.alive) || guest.frame_rev != self.revision {
+        if guest.seated_generation() != self.generation
+            || !Arc::ptr_eq(&guest.alive, &self.alive)
+            || guest.frame_rev != self.revision
+        {
             let view = self.view.clone();
             cx.defer(move |cx| {
                 let _ = view.update(cx, |_, cx| cx.notify());
