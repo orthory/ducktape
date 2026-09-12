@@ -842,7 +842,7 @@ impl DesktopWindow {
             .into_any_element()
     }
 
-    fn huddle(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::*;
         let state = &self.model.read(cx).state;
         let mute = if state.call_muted { "Unmute" } else { "Mute" };
@@ -858,7 +858,10 @@ impl DesktopWindow {
         };
         let stage = state.huddle_stage.clone();
         let video_live = state.call_video_live;
-        let rows = state.huddle_rows.clone();
+        let row_count = state.huddle_rows.len();
+        let columns = ((f32::from(window.viewport_size().width) - 24.) / 128.)
+            .floor()
+            .max(1.) as usize;
         let title = state.huddle_channel_name.clone();
         let status = state.call_status.clone();
         let elapsed = if state.huddle_joined_at > 0 {
@@ -887,7 +890,7 @@ impl DesktopWindow {
             .id("huddle-stage")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .p_3()
             .flex()
             .flex_col()
@@ -899,31 +902,47 @@ impl DesktopWindow {
             body = body.child(tiles.clone());
         }
         body = body.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .children(rows.into_iter().map(|row| {
-                    let caption = match (row.person.is_you, row.muted) {
-                        (true, true) => "you · muted",
-                        (true, false) => "you",
-                        (false, true) => "muted",
-                        (false, false) => "",
-                    };
-                    div()
-                        .min_w(px(120.))
-                        .flex_1()
-                        .p_3()
-                        .border_1()
-                        .rounded_lg()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_2()
-                        .child(row.person.initials)
-                        .child(row.person.label)
-                        .child(div().text_xs().child(caption))
-                })),
+            uniform_list("huddle-roster", row_count.div_ceil(columns), {
+                let model = self.model.clone();
+                move |range, _, cx| {
+                    let state = &model.read(cx).state;
+                    range
+                        .map(|index| {
+                            div().h(px(112.)).pb_2().flex().gap_2().children(
+                                state
+                                    .huddle_rows
+                                    .iter()
+                                    .skip(index * columns)
+                                    .take(columns)
+                                    .map(|row| {
+                                        let caption = match (row.person.is_you, row.muted) {
+                                            (true, true) => "you · muted",
+                                            (true, false) => "you",
+                                            (false, true) => "muted",
+                                            (false, false) => "",
+                                        };
+                                        div()
+                                            .w_0()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .p_3()
+                                            .border_1()
+                                            .rounded_lg()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(row.person.initials.clone())
+                                            .child(div().truncate().child(row.person.label.clone()))
+                                            .child(div().text_xs().child(caption))
+                                    }),
+                            )
+                        })
+                        .collect()
+                }
+            })
+            .flex_1()
+            .min_h_0(),
         );
         let controls = div()
             .flex()
@@ -1248,7 +1267,7 @@ impl Render for DesktopWindow {
         let content = match self.kind {
             WindowKind::Console => self.console(window, cx),
             WindowKind::Onboarding => self.onboarding(window, cx),
-            WindowKind::Huddle => self.huddle(cx),
+            WindowKind::Huddle => self.huddle(window, cx),
         };
         let pending_focus = self.model.read(cx).pending_focus.clone();
         if let Some(key) = pending_focus {
