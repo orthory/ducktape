@@ -28,6 +28,15 @@ struct RangeControl {
     _subscription: Subscription,
 }
 
+#[derive(Clone, Copy)]
+enum ScrollRequest {
+    Relative(f32, f32),
+    Absolute(f32, f32),
+    By(f32, f32),
+    End,
+    Key(u64),
+}
+
 struct SensorState {
     reset: Option<wire::SurfaceValue>,
     size: Option<Size<Pixels>>,
@@ -102,6 +111,7 @@ pub struct ViewTree {
     surfaces: HashMap<String, AnyView>,
     editor_store: Option<crate::editor::wire::EditorStore>,
     editors: HashMap<String, EditorMount>,
+    mounted: std::collections::HashSet<String>,
 }
 
 impl EventEmitter<wire::Event> for ViewTree {}
@@ -126,6 +136,7 @@ impl ViewTree {
             surfaces: HashMap::new(),
             editor_store: None,
             editors: HashMap::new(),
+            mounted: Default::default(),
         }
     }
 
@@ -160,6 +171,240 @@ impl ViewTree {
         requests
     }
 
+    pub fn execute_widget_command(
+        &mut self,
+        mut command: wire::WidgetCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<u8>, String> {
+        use wire::WidgetCommand as C;
+        command.validate()?;
+        match command {
+            C::Focused { target } => Ok(wire::encode(&self.target_focused(&target, window, cx))),
+            C::FocusPrevious => self.focus_relative(false, window, cx),
+            C::FocusNext => self.focus_relative(true, window, cx),
+            C::Focus { ref target }
+            | C::CursorFront { ref target }
+            | C::CursorEnd { ref target }
+            | C::Cursor { ref target, .. }
+            | C::SelectAll { ref target }
+            | C::Select { ref target, .. } => self.input_command(target, &command, window, cx),
+            C::Snap { target, x, y } => {
+                self.scroll_command(&target, ScrollRequest::Relative(x, y), cx)
+            }
+            C::SnapEnd { target } => self.scroll_command(&target, ScrollRequest::End, cx),
+            C::ScrollTo { target, x, y } => {
+                self.scroll_command(&target, ScrollRequest::Absolute(x, y), cx)
+            }
+            C::ScrollBy { target, x, y } => {
+                self.scroll_command(&target, ScrollRequest::By(x, y), cx)
+            }
+            C::ScrollToKey { target, key } => {
+                self.scroll_command(&target, ScrollRequest::Key(key), cx)
+            }
+        }
+    }
+
+    fn target_focused(&self, target: &str, window: &Window, cx: &App) -> bool {
+        if !self.mounted.contains(target) {
+            return false;
+        }
+        if let Some(field) = self.fields.get(target) {
+            return field.state.read(cx).focus_handle().is_focused(window);
+        }
+        if let Some(picker) = self.pickers.get(target) {
+            return picker
+                .state
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx);
+        }
+        self.editors
+            .get(target)
+            .is_some_and(|editor| editor.view.read(cx).is_focused(window, cx))
+    }
+
+    fn focus_relative(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<u8>, String> {
+        let mut targets = Vec::new();
+        self.root.clone().for_each_mut(&mut |node| {
+            let Some(key) = node.key() else {
+                return;
+            };
+            let available = self.mounted.contains(key)
+                && (self.fields.contains_key(key)
+                    || self.pickers.contains_key(key)
+                    || self.editors.contains_key(key));
+            if available {
+                targets.push(key.to_owned());
+            }
+        });
+        if targets.is_empty() {
+            return Ok(wire::encode(&()));
+        }
+        let current = targets
+            .iter()
+            .position(|key| self.target_focused(key, window, cx));
+        let index = match (current, forward) {
+            (Some(index), true) => (index + 1) % targets.len(),
+            (Some(index), false) => (index + targets.len() - 1) % targets.len(),
+            (None, true) => 0,
+            (None, false) => targets.len() - 1,
+        };
+        let target = &targets[index];
+        self.input_command(
+            target,
+            &wire::WidgetCommand::Focus {
+                target: target.clone(),
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn input_command(
+        &mut self,
+        target: &str,
+        command: &wire::WidgetCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<u8>, String> {
+        use wire::WidgetCommand as C;
+        if !self.mounted.contains(target) {
+            return Ok(wire::encode(&()));
+        }
+        if let Some(editor) = self.editors.get(target) {
+            editor.view.update(cx, |editor, cx| {
+                editor.widget_command(command, window, cx);
+            });
+            return Ok(wire::encode(&()));
+        }
+        if let Some(picker) = self.pickers.get(target) {
+            if matches!(command, C::Focus { .. }) {
+                picker
+                    .state
+                    .update(cx, |picker, cx| picker.focus(window, cx));
+            }
+            return Ok(wire::encode(&()));
+        }
+        let Some(field) = self.fields.get(target) else {
+            return Ok(wire::encode(&()));
+        };
+        field.state.update(cx, |input, cx| {
+            let text = input.value();
+            let byte = |index: u32| {
+                unicode_segmentation::UnicodeSegmentation::grapheme_indices(text.as_ref(), true)
+                    .nth(index as usize)
+                    .map_or(text.len(), |(offset, _)| offset)
+            };
+            match command {
+                C::Focus { .. } => input.focus(window, cx),
+                C::CursorFront { .. } => input.set_selected_range(0..0, cx),
+                C::CursorEnd { .. } => input.set_selected_range(text.len()..text.len(), cx),
+                C::Cursor { position, .. } => {
+                    let offset = byte(*position);
+                    input.set_selected_range(offset..offset, cx);
+                }
+                C::SelectAll { .. } => input.select_all(window, cx),
+                C::Select { start, end, .. } => {
+                    input.set_selected_range(byte(*start)..byte(*end), cx)
+                }
+                _ => {}
+            }
+        });
+        Ok(wire::encode(&()))
+    }
+
+    fn scroll_command(
+        &mut self,
+        target: &str,
+        request: ScrollRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.mounted.contains(target) {
+            return Ok(wire::encode(&()));
+        }
+        let Some(handle) = self.scrolls.get(target) else {
+            return Ok(wire::encode(&()));
+        };
+        let maximum = handle.max_offset();
+        let mut anchors = (wire::ScrollAnchor::Start, wire::ScrollAnchor::Start);
+        let mut row = None;
+        self.root.clone().for_each_mut(&mut |node| {
+            let wire::Node::Scroll {
+                key,
+                content,
+                anchor_x,
+                anchor_y,
+                ..
+            } = node
+            else {
+                return;
+            };
+            if key != target {
+                return;
+            }
+            anchors = (*anchor_x, *anchor_y);
+            if let ScrollRequest::Key(requested) = request {
+                content.for_each_mut(&mut |node| {
+                    let wire::Node::KeyedColumn {
+                        key,
+                        keys: Some(keys),
+                        ..
+                    } = node
+                    else {
+                        return;
+                    };
+                    if keys.iter().any(|key| key.virtual_key() == requested) {
+                        row = Some(format!("{key}/@row:{requested}"));
+                    }
+                });
+            }
+        });
+        let from_anchor = |distance: f32, maximum: Pixels, anchor: wire::ScrollAnchor| match anchor
+        {
+            wire::ScrollAnchor::End => px(distance) - maximum,
+            wire::ScrollAnchor::Start | wire::ScrollAnchor::Keep => -px(distance),
+        };
+        let next = match request {
+            ScrollRequest::Relative(x, y) => point(
+                from_anchor(x * f32::from(maximum.x), maximum.x, anchors.0),
+                from_anchor(y * f32::from(maximum.y), maximum.y, anchors.1),
+            ),
+            ScrollRequest::Absolute(x, y) => point(
+                from_anchor(x, maximum.x, anchors.0),
+                from_anchor(y, maximum.y, anchors.1),
+            ),
+            ScrollRequest::By(x, y) => {
+                let direction = |delta: f32, anchor: wire::ScrollAnchor| match anchor {
+                    wire::ScrollAnchor::End => px(delta),
+                    _ => -px(delta),
+                };
+                handle.offset() + point(direction(x, anchors.0), direction(y, anchors.1))
+            }
+            ScrollRequest::End => -maximum,
+            ScrollRequest::Key(_) => {
+                let Some(bounds) = row.and_then(|row| self.bounds.get(&row)) else {
+                    return Ok(wire::encode(&()));
+                };
+                point(
+                    handle.offset().x,
+                    handle.offset().y - (bounds.origin.y - handle.bounds().origin.y),
+                )
+            }
+        };
+        handle.set_offset(point(
+            next.x.clamp(-maximum.x, px(0.0)),
+            next.y.clamp(-maximum.y, px(0.0)),
+        ));
+        cx.notify();
+        Ok(wire::encode(&()))
+    }
+
     pub fn replace(&mut self, mut root: wire::Node, cx: &mut Context<Self>) {
         let mut inputs = std::collections::HashSet::new();
         let mut scrolls = std::collections::HashSet::new();
@@ -187,6 +432,15 @@ impl ViewTree {
                 }
                 wire::Node::Responsive { key, .. } => {
                     containers.insert(key.clone());
+                }
+                wire::Node::KeyedColumn {
+                    key,
+                    keys: Some(keys),
+                    ..
+                } => {
+                    for identity in keys {
+                        live_keys.insert(format!("{key}/@row:{}", identity.virtual_key()));
+                    }
                 }
                 wire::Node::Sensor { key, .. }
                 | wire::Node::Slider { key, .. }
@@ -371,6 +625,9 @@ impl ViewTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(key) = node.key() {
+            self.mounted.insert(key.to_owned());
+        }
         use wire::Node;
         match node {
             Node::Text {
@@ -439,6 +696,8 @@ impl ViewTree {
                 element.into_any_element()
             }
             Node::KeyedColumn {
+                key,
+                keys,
                 spacing,
                 padding,
                 width,
@@ -465,8 +724,21 @@ impl ViewTree {
                 if let Some(width) = max_width {
                     element = element.max_w(px(*width));
                 }
-                for child in children {
-                    element = element.child(self.node(child, window, cx));
+                for (index, child) in children.iter().enumerate() {
+                    let content = self.node(child, window, cx);
+                    let identity = keys.as_ref().and_then(|keys| keys.get(index));
+                    element = match identity {
+                        Some(identity) => {
+                            let row = format!("{key}/@row:{}", identity.virtual_key());
+                            element.child(
+                                div()
+                                    .relative()
+                                    .child(content)
+                                    .child(self.measure(&row, cx)),
+                            )
+                        }
+                        None => element.child(content),
+                    };
                 }
                 element.into_any_element()
             }
@@ -573,6 +845,10 @@ impl ViewTree {
                                     previous.is_none() && anchor == wire::ScrollAnchor::End;
                                 if initialize_end || (follow && at_end) {
                                     *position = -maximum;
+                                } else if anchor == wire::ScrollAnchor::Keep {
+                                    if let Some((offset,old_maximum)) = previous {
+                                        if offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
+                                    }
                                 }
                             }
                             if next != offset {
@@ -584,8 +860,11 @@ impl ViewTree {
                             this.scroll_positions.insert(route.clone(), (next, maximum));
                             if changed {
                                 if let Some(handler) = handler {
-                                    let x = -f32::from(next.x);
-                                    let y = -f32::from(next.y);
+                                    let distance = |offset:Pixels,maximum:Pixels,anchor:wire::ScrollAnchor| match anchor {
+                                        wire::ScrollAnchor::End => f32::from(maximum+offset), _=>-f32::from(offset),
+                                    };
+                                    let x = distance(next.x,maximum.x,anchors.0);
+                                    let y = distance(next.y,maximum.y,anchors.1);
                                     let relative_x = x / f32::from(maximum.x).max(1.0);
                                     let relative_y = y / f32::from(maximum.y).max(1.0);
                                     cx.emit(wire::Event::ScrollOffset {
@@ -2018,6 +2297,7 @@ impl ViewTree {
 
 impl Render for ViewTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.mounted.clear();
         self.node(&self.root.clone(), window, cx)
     }
 }
