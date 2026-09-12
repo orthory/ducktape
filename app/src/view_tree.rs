@@ -248,6 +248,19 @@ struct Field {
     _subscription: Subscription,
 }
 
+#[derive(Default)]
+pub(crate) struct NativePresentation {
+    inputs: HashMap<String, InputPresentation>,
+    editors: HashMap<String, wire::editor_document::EditorDocumentRef>,
+}
+
+struct InputPresentation {
+    value: String,
+    secure: bool,
+    selection: std::ops::Range<usize>,
+    focused: bool,
+}
+
 pub struct ViewTree {
     root: wire::Node,
     fields: HashMap<String, Field>,
@@ -269,6 +282,7 @@ pub struct ViewTree {
     editor_store: Option<crate::editor::wire::EditorStore>,
     editors: HashMap<String, EditorMount>,
     mounted: std::collections::HashSet<String>,
+    presentation: NativePresentation,
 }
 
 impl EventEmitter<wire::Event> for ViewTree {}
@@ -486,6 +500,7 @@ impl ViewTree {
             editor_store: None,
             editors: HashMap::new(),
             mounted: Default::default(),
+            presentation: NativePresentation::default(),
         }
     }
 
@@ -886,6 +901,51 @@ impl ViewTree {
         cx.notify();
     }
 
+    /// Copied presentation only: no native entity, callback, handler id, or IME
+    /// preedit crosses a guest generation. Document selection remains guest-owned.
+    pub(crate) fn presentation(&self, window: &Window, cx: &App) -> NativePresentation {
+        let inputs = self
+            .fields
+            .iter()
+            .map(|(key, field)| {
+                let input = field.state.read(cx);
+                let range = input.selected_range();
+                let selection = if input.cursor() == range.start {
+                    range.end..range.start
+                } else {
+                    range
+                };
+                (
+                    key.clone(),
+                    InputPresentation {
+                        value: input.value().to_string(),
+                        secure: field.secure,
+                        selection,
+                        focused: input.focus_handle(cx).is_focused(window),
+                    },
+                )
+            })
+            .collect();
+        let mut editors = HashMap::new();
+        self.root.clone().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { key, document, .. } = node {
+                let focused = self
+                    .editors
+                    .get(key)
+                    .is_some_and(|editor| editor.view.read(cx).is_focused(window, cx));
+                if focused {
+                    editors.insert(key.clone(), document.clone());
+                }
+            }
+        });
+        NativePresentation { inputs, editors }
+    }
+
+    pub(crate) fn with_presentation(mut self, presentation: NativePresentation) -> Self {
+        self.presentation = presentation;
+        self
+    }
+
     fn input(
         &mut self,
         node: &wire::Node,
@@ -908,11 +968,22 @@ impl ViewTree {
             unreachable!()
         };
         if !self.fields.contains_key(key) {
+            let presentation = self
+                .presentation
+                .inputs
+                .remove(key)
+                .filter(|saved| saved.value == *value && saved.secure == *secure);
             let state = cx.new(|cx| {
                 let mut state = InputState::new(window, cx)
                     .placeholder(placeholder.clone())
                     .masked(*secure);
                 state.set_value(value.clone(), window, cx);
+                if let Some(saved) = presentation {
+                    state.set_selected_range(saved.selection, cx);
+                    if saved.focused {
+                        state.focus(window, cx);
+                    }
+                }
                 state
             });
             let input_key = key.clone();
@@ -2073,7 +2144,7 @@ impl ViewTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let wire::Node::Editor { key, .. } = node else {
+        let wire::Node::Editor { key, document, .. } = node else {
             unreachable!()
         };
         let Some(store) = self.editor_store.clone() else {
@@ -2098,6 +2169,17 @@ impl ViewTree {
         }
         let editor = self.editors.get(key).expect("editor inserted");
         editor.view.update(cx, |editor, cx| editor.sync(window, cx));
+        if self.presentation.editors.remove(key).as_ref() == Some(document) {
+            editor.view.update(cx, |editor, cx| {
+                editor.widget_command(
+                    &wire::WidgetCommand::Focus {
+                        target: key.clone(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        }
         let view = editor.view.clone();
         div()
             .relative()
@@ -2857,7 +2939,10 @@ impl ViewTree {
 impl Render for ViewTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.mounted.clear();
-        self.node(&self.root.clone(), window, cx)
+        let node = self.node(&self.root.clone(), window, cx);
+        // Only controls mounted by this replacement frame may recover focus.
+        self.presentation = NativePresentation::default();
+        node
     }
 }
 

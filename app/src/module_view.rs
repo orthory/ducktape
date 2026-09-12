@@ -2747,7 +2747,10 @@ impl NativeModuleView {
                     if guest.replies.answer_owed() {
                         window.request_animation_frame();
                     }
-                    let content = cx.new(|_| crate::view_tree::ViewTree::new(root));
+                    let presentation = self.content.as_ref()
+                        .map(|content| content.read(cx).presentation(window, cx))
+                        .unwrap_or_default();
+                    let content = cx.new(|_| crate::view_tree::ViewTree::new(root).with_presentation(presentation));
                     content.update(cx, |tree, cx| {
                         tree.set_editor_store(guest.inputs.clone(), cx)
                     });
