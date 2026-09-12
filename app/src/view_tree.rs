@@ -4093,7 +4093,7 @@ mod tests {
         });
         native.update(|window, cx| window.render_frame(cx));
         let old = tree.read_with(&native, |tree, _| tree.pickers["combo"].state.clone());
-        native.update(|window, cx| window.click("combo", cx));
+        native.update(|window, cx| window.within("combo").click("input", cx));
         native.update(|window, cx| window.render_frame(cx));
         native.simulate_input("Be");
         native.run_until_parked();
