@@ -21,11 +21,9 @@ resources = ["../target/views"]
 camera = "Ducktape uses the camera for video in huddles."
 microphone = "Ducktape uses the microphone for voice in huddles."
 
-[build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0" }
-
 [dependencies]
 gpui-kit = "=0.6.1"
+qrcode = { version = "0.14", default-features = false }
 futures.workspace = true
 pulldown-cmark = "0.12.2"
 # the program-account module: the Agents editor provisions a new agent's
@@ -139,7 +137,6 @@ zeroize.workspace = true
 # speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 # The module-owned views (`src/module_view.rs`): the wire a view's tree and
 # events cross on, and the runtime that executes the view's component. The

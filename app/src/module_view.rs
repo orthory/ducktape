@@ -2793,6 +2793,93 @@ mod input_tests;
 
 // ---------- the widget ----------
 
+/// The native window retains this entity while a tab is open. A deployment
+/// replacement gets a fresh native tree, so no focus or event route survives
+/// across guest instances; ordinary guest frames retain keyed control state.
+pub(crate) struct NativeModuleView {
+    module: &'static str,
+    content: Option<gpui_kit::Entity<crate::view_tree::ViewTree>>,
+    subscription: Option<gpui_kit::Subscription>,
+    generation: u64,
+    revision: u64,
+    alive: Option<Arc<()>>,
+}
+
+impl gpui_kit::EventEmitter<ModuleViewEvent> for NativeModuleView {}
+
+impl NativeModuleView {
+    pub(crate) fn new(module: &'static str) -> Self {
+        Self { module, content: None, subscription: None, generation: 0, revision: 0, alive: None }
+    }
+
+    pub(crate) fn set_props(&mut self, props: Vec<u8>, cx: &mut gpui_kit::Context<Self>) {
+        mounted(self.module).lock().expect("module view lock").props = Some(props);
+        cx.notify();
+    }
+
+    fn frame(&mut self, window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Self>) -> Result<(), String> {
+        let mounted = mounted(self.module);
+        let mut locked = mounted.lock().expect("module view lock");
+        let Mounted { slot, props, generation, .. } = &mut *locked;
+        let guest = match slot {
+            Slot::Loading => {
+                window.request_animation_frame();
+                return Err("Loading the view…".into());
+            }
+            Slot::Empty => return Err(format!("This network has no {} view. An admin can activate a deployment that ships one.", self.module)),
+            Slot::Failed(reason) => return Err(reason.clone()),
+            Slot::Ready(guest) => guest,
+        };
+        let again = guest.redraw(props);
+        let asynchronous_work = guest.replies.answer_owed() || !guest.clocks.is_empty();
+        if again || asynchronous_work { window.request_animation_frame(); }
+        if let Some(fault) = &guest.fault { return Err(format!("This view was stopped: {fault}")); }
+        let same_instance = self.generation == *generation
+            && self.alive.as_ref().is_some_and(|alive| Arc::ptr_eq(alive, &guest.alive));
+        let changed = !same_instance || self.revision != guest.frame_rev;
+        if changed {
+            let root = guest.frame.root.clone().unwrap_or_else(wire::Node::empty);
+            self.revision = guest.frame_rev;
+            match (&self.content, same_instance) {
+                (Some(content), true) => content.update(cx, |tree, cx| tree.replace(root, cx)),
+                _ => {
+                    self.generation = *generation;
+                    self.alive = Some(guest.alive.clone());
+                    let content = cx.new(|_| crate::view_tree::ViewTree::new(root));
+                    let seat = mounted.clone();
+                    let generation = *generation;
+                    let alive = guest.alive.clone();
+                    self.subscription = Some(cx.subscribe(&content, move |_, _, event, cx| {
+                        let mut locked = seat.lock().expect("module view lock");
+                        let generation_matches = locked.generation == generation;
+                        let Slot::Ready(guest) = &mut locked.slot else { return; };
+                        let current_instance = generation_matches && Arc::ptr_eq(&alive, &guest.alive);
+                        if !current_instance { return; }
+                        guest.pending.push(event.clone());
+                        cx.notify();
+                    }));
+                    self.content = Some(content);
+                }
+            }
+        }
+        for intent in std::mem::take(&mut guest.intents) { cx.emit(intent); }
+        Ok(())
+    }
+}
+
+impl gpui_kit::Render for NativeModuleView {
+    fn render(&mut self, window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Self>) -> impl gpui_kit::IntoElement {
+        use gpui_kit::{IntoElement as _, ParentElement as _, Styled as _};
+        match self.frame(window, cx) {
+            Ok(()) => match &self.content {
+                Some(content) => content.clone().into_any_element(),
+                None => gpui_kit::div().size_full().into_any_element(),
+            },
+            Err(reason) => gpui_kit::div().size_full().flex().items_center().justify_center().child(reason).into_any_element(),
+        }
+    }
+}
+
 /// The tree the guest last sent, rendered with the app's own widgets and
 /// wrapped so that every redraw ticks the guest, everything the user does
 /// inside goes back as the guest's own events, and a changed tree is

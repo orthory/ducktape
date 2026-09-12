@@ -1,4 +1,4 @@
-ui_lang::include_app!("src/ui/app.ice");
+include!("ui/app.rs");
 
 mod backend;
 mod call;
