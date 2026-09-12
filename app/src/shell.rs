@@ -1730,6 +1730,7 @@ mod close_tests {
     #[gpui_kit::test]
     fn closing_a_focused_native_input_releases_its_handler(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::Focusable as _;
         cx.update(gpui_kit::init);
         let mut presenter = None;
         let handle = cx.open_window(gpui_kit::size(gpui_kit::px(600.), gpui_kit::px(700.)), |window, cx| {
@@ -1739,15 +1740,16 @@ mod close_tests {
             presenter = Some(view.downgrade());
             gpui_kit::component::Root::new(view, window, cx)
         });
+        let handle: gpui_kit::AnyWindowHandle = handle.into();
         handle.update(cx, |_, window, cx| {
             window.render_frame(cx);
-            window.click("remote", cx);
-            window.render_frame(cx);
-            window.input("typing-before-close", cx);
         }).unwrap();
         let presenter = presenter.unwrap();
         let input = presenter.update(cx, |view, _| view.inputs["remote"].state.downgrade()).unwrap();
         handle.update(cx, |_, window, cx| {
+            input.upgrade().unwrap().update(cx, |input, cx| input.focus(window, cx));
+            window.render_frame(cx);
+            window.input("typing-before-close", cx);
             assert!(input.upgrade().unwrap().read(cx).focus_handle(cx).is_focused(window));
             release_window_input(window, cx);
             assert!(window.focused(cx).is_none());
