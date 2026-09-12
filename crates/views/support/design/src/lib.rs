@@ -1,24 +1,17 @@
 //! Desktop font identity and the product type scale. Shared color, shape, and
-//! component tokens come from `ducktape-ui`; this crate only owns assets that
+//! component tokens belong to the guest palette and native toolkit; this crate owns assets that
 //! are specific to the Ducktape application.
 
-/// Font identity. The app embeds these files via `app.ice` `font "…"`
-/// settings (paths under this crate's `assets/fonts/`), and `theme.ice`
-/// binds roles to the family names. Swap the face by replacing the asset
-/// and the family constant together — the app's guard test pins the two to
-/// each other.
+/// Font identity. The native shell loads these files into GPUI's text system.
+/// Guest wire text names the same families. Replace an asset and its family
+/// constant together when changing the product face.
 pub mod fonts {
     /// the UI face — every sans role (default, medium, display).
     pub const FAMILY_UI: &str = "Geist";
     /// the data face — hashes, seqs, diffs, code, the log ring.
     pub const FAMILY_MONO: &str = "Geist Mono";
-    /// the embedded files, relative to this crate's root — what `app.ice`
-    /// points its `font` settings at. The emoji face is not a type role:
-    /// it exists so cosmic-text's emoji fallback RESOLVES in-process — an
-    /// unresolved emoji re-scans the whole font database on every fresh
-    /// paragraph (~3.7ms per emoji, uncached), and the chat row toolbar
-    /// carries three of them, which turned every freshly mounted row into
-    /// ~11ms of layout and a channel switch into a half-second freeze.
+    /// Bundled files relative to this crate. The emoji face supplies fallback
+    /// glyphs; it is not a separate product type role.
     pub const ASSETS: [&str; 3] = [
         "assets/fonts/Geist[wght].ttf",
         "assets/fonts/GeistMono[wght].ttf",
@@ -26,8 +19,7 @@ pub mod fonts {
     ];
 }
 
-/// The product type roles from the canonical Ducktape design artifact. The
-/// drift guard walks every app-authored `.ice` source and rejects other sizes.
+/// Product type roles shared by the Rust-authored views.
 pub mod type_scale {
     pub const MICRO: f64 = 7.5;
     pub const BADGE: f64 = 9.0;
@@ -45,7 +37,7 @@ pub mod type_scale {
     pub const SCREEN_TITLE: f64 = 20.0;
     pub const DISPLAY: f64 = 22.0;
 
-    /// every legal `size=` literal in `.ice` sources, the guard's whitelist.
+    /// The complete product scale.
     /// `1.0` is the established off-screen focus-shim size, not a text step.
     ///
     /// A role earns its place here by being USED. The whitelist is the only
