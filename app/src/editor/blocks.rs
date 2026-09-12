@@ -60,6 +60,7 @@ impl LineProjection {
 
 struct LineInput {
     input: Entity<EditorState>,
+    ime: Option<crate::module_view::input::ImeState>,
     decorations: TextDecorationCollection,
     _observation: Subscription,
     projection: LineProjection,
@@ -212,6 +213,7 @@ impl WireEditor {
                     });
                     self.lines.push(LineInput {
                         input,
+                        ime: None,
                         decorations,
                         _observation: observation,
                         height: px(line.line_height + 2.),
@@ -323,7 +325,30 @@ impl WireEditor {
         let focused = self.focused_line(window, cx) == Some(index);
         self.store
             .set_focused(&self.key, self.focused_line(window, cx).is_some());
-        if !focused || self.composing(index, window, cx) {
+        if !focused {
+            return;
+        }
+        let Some(row) = self.lines.get_mut(index) else {
+            return;
+        };
+        let (text, marked, caret, selection) = row.input.update(cx, |input, cx| {
+            (
+                input.value().to_string(),
+                input.marked_text_range(window, cx),
+                input.cursor(),
+                input.selected_range(),
+            )
+        });
+        let composing = marked.is_some();
+        let events =
+            crate::module_view::input::ime_events(&mut row.ime, &text, marked, caret, selection);
+        if !events.is_empty() {
+            self.store.observe_ime(events);
+            cx.emit(());
+        }
+        // Preedit is observation only. The committed native edit follows the
+        // ordinary guest transaction path exactly once after composition ends.
+        if composing {
             return;
         }
         let Some(row) = self.lines.get(index) else {
