@@ -9,11 +9,10 @@
 //!
 //! The boundary is the screen component's own contract. Its props go in as
 //! JSON, one item per change, on the guest's `<module>.props` subscription;
-//! its emits come out as intents the widget hands the app as
-//! [`ModuleViewEvent`]s, so every write keeps going through the handler that
-//! signs it today. The guest sees no key, no endpoint and no clock — a view
-//! that holds none of them cannot leak one — and a view that traps shows why
-//! in its place instead of taking the window with it.
+//! its emits come out as [`ModuleViewEvent`] intents or kernel operations.
+//! The host authorizes and signs writes. Props may carry public connection
+//! context, but the guest receives no signing secret or direct OS clock.
+//! A view that traps shows why in its place instead of taking the window with it.
 
 mod kernel;
 
@@ -709,7 +708,7 @@ pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember])
 /// seated key. Two events come back, both OS doors the app owns: `open_link`
 /// for a link the Markdown reader activated, and `at` naming the directory a
 /// file dropped on the window lands in. The picture viewer, the highlighted
-/// reader and the Markdown document are host surfaces (`surfaces_of("files")`).
+/// reader and the Markdown document are host surfaces defined in `surfaces.rs`.
 ///
 /// `route` is the one navigation fact that cannot be the view's: a
 /// `duck://files/<path>` link is resolved by the shell's link plane, which
@@ -1450,8 +1449,16 @@ pub(crate) mod canary {
     use std::sync::{Mutex, mpsc};
 
     pub(crate) use super::tests::connection_turn;
-    pub(crate) fn input_presentation(view: &super::NativeModuleView, key: &str, window: &gpui_kit::Window, cx: &gpui_kit::App) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
-        view.content.as_ref()?.read(cx).input_presentation(key, window, cx)
+    pub(crate) fn input_presentation(
+        view: &super::NativeModuleView,
+        key: &str,
+        window: &gpui_kit::Window,
+        cx: &gpui_kit::App,
+    ) -> Option<(String, usize, std::ops::Range<usize>, bool)> {
+        view.content
+            .as_ref()?
+            .read(cx)
+            .input_presentation(key, window, cx)
     }
 
     pub(crate) fn frame(module: &'static str) -> Option<super::wire::Node> {
@@ -1846,7 +1853,7 @@ impl Guest {
             // the instance in the slot, if the deployment is a new one for
             // it: the replacement is seated only against that very
             // instance at that very tick count
-            let (against, replacement) = {
+            let (mut against, replacement) = {
                 let locked = mounted.lock().expect("module view lock");
                 let against = match &locked.slot {
                     Slot::Ready(old) if old.hash == Some(hash) => return Ok(Loaded::Unchanged),
@@ -1866,12 +1873,10 @@ impl Guest {
             let prepared = (|| -> Result<Self, String> {
                 let mut fresh = Self::instantiate(module, &component, &shown)?;
                 fresh.deployed(hash, assets);
-                match against {
+                match &mut against {
                     // A once-valid view carries its state over. Only an
                     // explicitly admitted never-valid recovery may initialize.
-                    Some((_, ticks))
-                        if ticks > 0 && matches!(replacement, Replacement::Preserve) =>
-                    {
+                    Some((alive, ticks)) => {
                         let snapshot = {
                             let mut locked = mounted.lock().expect("module view lock");
                             let Slot::Ready(old) = &mut locked.slot else {
@@ -1879,25 +1884,34 @@ impl Guest {
                                     "the view left while its replacement was prepared".into()
                                 );
                             };
-                            if !old.settled() {
+                            if !Arc::ptr_eq(alive, &old.alive) {
+                                return Err(
+                                    "the view changed while its replacement was prepared".into()
+                                );
+                            }
+                            // Compilation may take many old-view frames. Fence the
+                            // state actually captured here, not its precompile tick.
+                            *ticks = old.ticks;
+                            let preserve =
+                                *ticks > 0 && matches!(replacement, Replacement::Preserve);
+                            if preserve && !old.settled() {
                                 return Err(
                                     "the view has pending work; its replacement waits".into()
                                 );
                             }
-                            old.snapshot()?
+                            if preserve {
+                                Some(old.snapshot()?)
+                            } else {
+                                None
+                            }
                         };
-                        wire::Snapshot::decode(&snapshot)?;
-                        fresh.restore(&snapshot, &shown)?;
-                        let framed = Instant::now();
-                        let frame = fresh.first_frame(&shown);
-                        timing.first_frame = Some(framed.elapsed());
-                        frame?;
-                    }
-                    // one mounted but never ticked has no state worth carrying;
-                    // its replacement still proves its first tree before it
-                    // takes the slot
-                    Some(_) => {
-                        fresh.init(&shown)?;
+                        match snapshot {
+                            Some(snapshot) => {
+                                wire::Snapshot::decode(&snapshot)?;
+                                fresh.restore(&snapshot, &shown)?;
+                            }
+                            None => fresh.init(&shown)?,
+                        }
                         let framed = Instant::now();
                         let frame = fresh.first_frame(&shown);
                         timing.first_frame = Some(framed.elapsed());
@@ -2450,14 +2464,16 @@ impl Guest {
                 let inherits = frame.root.is_none();
                 let mut previous = self.frame.root.take();
                 let mut accepted = true;
-                let merged = merge(&mut previous, &mut frame).map_err(str::to_owned).and_then(|changed| {
-                    if changed.0
-                        && let Some(root) = &frame.root
-                    {
-                        self.inputs.validate(root)?;
-                    }
-                    Ok(changed)
-                });
+                let merged = merge(&mut previous, &mut frame)
+                    .map_err(str::to_owned)
+                    .and_then(|changed| {
+                        if changed.0
+                            && let Some(root) = &frame.root
+                        {
+                            self.inputs.validate(root)?;
+                        }
+                        Ok(changed)
+                    });
                 match merged {
                     Ok((false, _)) => {}
                     Ok((true, report)) => {
@@ -2668,10 +2684,13 @@ impl NativeModuleView {
         if guest.seated_generation() != self.generation || !Arc::ptr_eq(alive, &guest.alive) {
             return Vec::new();
         }
-        let accepted = input::deliver(guest, wire::Event::Observation {
-            event: wire::events::Event::Window(event),
-            captured: false,
-        });
+        let accepted = input::deliver(
+            guest,
+            wire::Event::Observation {
+                event: wire::events::Event::Window(event),
+                captured: false,
+            },
+        );
         if !accepted {
             return Vec::new();
         }
@@ -2687,11 +2706,7 @@ impl NativeModuleView {
     ) -> Result<(), String> {
         let mounted = mounted(self.module);
         let mut locked = mounted.lock().expect("module view lock");
-        let Mounted {
-            slot,
-            props,
-            ..
-        } = &mut *locked;
+        let Mounted { slot, props, .. } = &mut *locked;
         let guest = match slot {
             Slot::Loading => {
                 window.request_animation_frame();
@@ -2758,10 +2773,14 @@ impl NativeModuleView {
                     if guest.replies.answer_owed() {
                         window.request_animation_frame();
                     }
-                    let presentation = self.content.as_ref()
+                    let presentation = self
+                        .content
+                        .as_ref()
                         .map(|content| content.read(cx).presentation(window, cx))
                         .unwrap_or_default();
-                    let content = cx.new(|_| crate::view_tree::ViewTree::new(root).with_presentation(presentation));
+                    let content = cx.new(|_| {
+                        crate::view_tree::ViewTree::new(root).with_presentation(presentation)
+                    });
                     content.update(cx, |tree, cx| {
                         tree.set_editor_store(guest.inputs.clone(), cx)
                     });
@@ -2772,8 +2791,8 @@ impl NativeModuleView {
                         let Slot::Ready(guest) = &mut locked.slot else {
                             return;
                         };
-                        let current_instance =
-                            guest.seated_generation() == generation && Arc::ptr_eq(&alive, &guest.alive);
+                        let current_instance = guest.seated_generation() == generation
+                            && Arc::ptr_eq(&alive, &guest.alive);
                         if !current_instance || guest.frame_rev != this.revision {
                             cx.notify();
                             return;
@@ -2861,7 +2880,10 @@ pub(crate) mod tests {
     pub(crate) fn close_observer_fixture() -> NativeModuleView {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../target/views/governance_view.wasm");
-        assert!(path.is_file(), "close regression requires the staged governance view");
+        assert!(
+            path.is_file(),
+            "close regression requires the staged governance view"
+        );
         let mut guest = Guest::load_from("governance", &path).expect("close observer guest");
         guest.installed_generation = Some(1);
         guest.redraw(&None);
@@ -2880,17 +2902,24 @@ pub(crate) mod tests {
     pub(crate) fn queue_close_intent(detail: &str) {
         let seat = mounted("governance");
         let mut seat = seat.lock().unwrap();
-        let Slot::Ready(guest) = &mut seat.slot else { panic!("close guest missing") };
+        let Slot::Ready(guest) = &mut seat.slot else {
+            panic!("close guest missing")
+        };
         // Governance does not request window events itself. Rearm this host
         // fixture after each real WASM frame and seed an already-produced intent.
         guest.frame.event_interest.close = true;
-        guest.intents.push(ModuleViewEvent { kind: "close-test".into(), detail: detail.into() });
+        guest.intents.push(ModuleViewEvent {
+            kind: "close-test".into(),
+            detail: detail.into(),
+        });
     }
 
     pub(crate) fn close_observer_reading() -> (u64, usize) {
         let seat = mounted("governance");
         let seat = seat.lock().unwrap();
-        let Slot::Ready(guest) = &seat.slot else { panic!("close guest missing") };
+        let Slot::Ready(guest) = &seat.slot else {
+            panic!("close guest missing")
+        };
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
         (guest.ticks, guest.pending.len())
     }
@@ -3553,15 +3582,13 @@ pub(crate) mod tests {
         app.connected = true;
         app.loading = false;
         let serial = app.views_live_serial;
-        let _ = app.update(crate::AppMessage::LiveUpdated(
-            crate::backend::LiveUpdate {
-                kind: crate::LiveKind::Chat,
-                status: "Live".into(),
-                height: 12,
-                module: "chat".into(),
-                ..crate::backend::LiveUpdate::default()
-            },
-        ));
+        let _ = app.update(crate::AppMessage::LiveUpdated(crate::backend::LiveUpdate {
+            kind: crate::LiveKind::Chat,
+            status: "Live".into(),
+            height: 12,
+            module: "chat".into(),
+            ..crate::backend::LiveUpdate::default()
+        }));
 
         let locked = seat.lock().expect("module view lock");
         let Slot::Ready(guest) = &locked.slot else {
@@ -5116,7 +5143,10 @@ pub(crate) mod tests {
             let mut replacement = root.clone();
             if reordered {
                 replacement.for_each_mut(&mut |node| {
-                    if let wire::Node::KeyedColumn { keys: Some(keys), .. } = node {
+                    if let wire::Node::KeyedColumn {
+                        keys: Some(keys), ..
+                    } = node
+                    {
                         keys.reverse();
                     }
                 });
@@ -5127,39 +5157,103 @@ pub(crate) mod tests {
             let fresh = window.root(cx).unwrap();
             let mut fresh_window = VisualTestContext::from_window(window.into(), cx);
             fresh_window.update(|window, cx| window.render_frame(cx));
-            let offset = fresh.read_with(&fresh_window, |view, _| view.scroll_offset("list")).unwrap();
-            assert_eq!(-f32::from(offset.y), if reordered { 0. } else { 90. }, "scroll restoration requires the same ordered row keys");
+            let offset = fresh
+                .read_with(&fresh_window, |view, _| view.scroll_offset("list"))
+                .unwrap();
+            assert_eq!(
+                -f32::from(offset.y),
+                if reordered { 0. } else { 90. },
+                "scroll restoration requires the same ordered row keys"
+            );
         }
     }
 
     #[gpui_kit::test]
-    fn replacement_inputs_restore_selection_only_for_identical_values_and_fresh_handlers(cx: &mut TestAppContext) {
+    fn replacement_inputs_restore_selection_only_for_identical_values_and_fresh_handlers(
+        cx: &mut TestAppContext,
+    ) {
         let input = |value: &str, secure, handler| wire::Node::Input {
-            options: Default::default(), key: "draft".into(), placeholder: String::new(),
-            value: value.into(), on_input: handler, on_submit: None, width: None,
-            secure, style: Box::default(),
+            options: Default::default(),
+            key: "draft".into(),
+            placeholder: String::new(),
+            value: value.into(),
+            on_input: handler,
+            on_submit: None,
+            width: None,
+            secure,
+            style: Box::default(),
         };
-        let (old, mut old_window) = native_tree(input("가🙂나", false, 1), gpui::size(gpui::px(300.),gpui::px(100.)),cx);
-        native_command(&old,&mut old_window,wire::WidgetCommand::Focus {target:"draft".into()}).unwrap();
-        native_command(&old,&mut old_window,wire::WidgetCommand::Select {target:"draft".into(),start:1,end:2}).unwrap();
-        for (value,secure,restore) in [("가🙂나",false,true),("changed",false,false),("가🙂나",true,false)] {
-            let saved = old_window.update(|window,cx|old.read(cx).presentation(window,cx));
-            let root = input(value,secure,77);
-            let window = cx.open_window(gpui::size(gpui::px(300.),gpui::px(100.)),|_,_| {
+        let (old, mut old_window) = native_tree(
+            input("가🙂나", false, 1),
+            gpui::size(gpui::px(300.), gpui::px(100.)),
+            cx,
+        );
+        native_command(
+            &old,
+            &mut old_window,
+            wire::WidgetCommand::Focus {
+                target: "draft".into(),
+            },
+        )
+        .unwrap();
+        native_command(
+            &old,
+            &mut old_window,
+            wire::WidgetCommand::Select {
+                target: "draft".into(),
+                start: 1,
+                end: 2,
+            },
+        )
+        .unwrap();
+        for (value, secure, restore) in [
+            ("가🙂나", false, true),
+            ("changed", false, false),
+            ("가🙂나", true, false),
+        ] {
+            let saved = old_window.update(|window, cx| old.read(cx).presentation(window, cx));
+            let root = input(value, secure, 77);
+            let window = cx.open_window(gpui::size(gpui::px(300.), gpui::px(100.)), |_, _| {
                 crate::view_tree::ViewTree::new(root).with_presentation(saved)
             });
             let view = window.root(cx).unwrap();
-            let mut native = VisualTestContext::from_window(window.into(),cx);
-            native.update(|window,cx|window.render_frame(cx));
-            let focused: bool = wire::decode(&native_command(&view,&mut native,wire::WidgetCommand::Focused {target:"draft".into()}).unwrap()).unwrap();
-            assert_eq!(focused,restore,"restore requires exact source and masking");
-            if !restore {continue}
+            let mut native = VisualTestContext::from_window(window.into(), cx);
+            native.update(|window, cx| window.render_frame(cx));
+            let focused: bool = wire::decode(
+                &native_command(
+                    &view,
+                    &mut native,
+                    wire::WidgetCommand::Focused {
+                        target: "draft".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                focused, restore,
+                "restore requires exact source and masking"
+            );
+            if !restore {
+                continue;
+            }
             let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let observed = events.clone();
-            let _subscription = native.update(|_,cx|cx.subscribe(&view,move|_,event:&wire::Event,_|observed.borrow_mut().push(event.clone())));
+            let _subscription = native.update(|_, cx| {
+                cx.subscribe(&view, move |_, event: &wire::Event, _| {
+                    observed.borrow_mut().push(event.clone())
+                })
+            });
             native.simulate_input("X");
-            assert!(events.borrow().iter().any(|event|matches!(event,wire::Event::Input {handler:77,text} if text == "가X나")));
-            assert!(!events.borrow().iter().any(|event|matches!(event,wire::Event::Input {handler:1,..})));
+            assert!(events.borrow().iter().any(
+                |event| matches!(event,wire::Event::Input {handler:77,text} if text == "가X나")
+            ));
+            assert!(
+                !events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, wire::Event::Input { handler: 1, .. }))
+            );
         }
     }
 
@@ -5337,7 +5431,10 @@ pub(crate) mod tests {
             // Install the event bridge before mounting the guest, as the real
             // NativeModuleView does. Otherwise its first Sensor::on_show is lost.
             let (view, mut native) = native_tree(
-                wire::Node::Space { width: None, height: None },
+                wire::Node::Space {
+                    width: None,
+                    height: None,
+                },
                 gpui::size(gpui::px(width), gpui::px(700.)),
                 cx,
             );
@@ -5378,12 +5475,25 @@ pub(crate) mod tests {
                         }
                     }
                 });
-                assert_eq!(published_width, Some(688.), "the measured pane must reach the guest before native layout");
+                assert_eq!(
+                    published_width,
+                    Some(688.),
+                    "the measured pane must reach the guest before native layout"
+                );
             }
             view.read_with(&native, |view, _| {
-                let pane = view.measured_bounds("PagesView/root/pages/pane-measure").expect("pane sensor");
-                assert_eq!(f32::from(pane.size.width), width - 240., "pane must exclude the fixed sidebar");
-                assert!(f32::from(pane.size.height) > 0., "the pane measurement must have visible height: {pane:?}");
+                let pane = view
+                    .measured_bounds("PagesView/root/pages/pane-measure")
+                    .expect("pane sensor");
+                assert_eq!(
+                    f32::from(pane.size.width),
+                    width - 240.,
+                    "pane must exclude the fixed sidebar"
+                );
+                assert!(
+                    f32::from(pane.size.height) > 0.,
+                    "the pane measurement must have visible height: {pane:?}"
+                );
                 (
                     view.measured_bounds("PagesView/root/pages/document")
                         .expect("document editor"),
@@ -5404,7 +5514,10 @@ pub(crate) mod tests {
         assert!(squeeze_editor.size.width < beside_editor.size.width);
         let (inline_editor, inline_card) = measured(1100.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
-        assert_eq!(inline_card.size.width + gpui::px(2.), inline_editor.size.width);
+        assert_eq!(
+            inline_card.size.width + gpui::px(2.),
+            inline_editor.size.width
+        );
     }
 
     /// The forge view draws itself against session facts only; everything
@@ -6606,7 +6719,11 @@ pub(crate) mod tests {
     fn oversized_request_batches_are_refused_before_any_prefix_can_execute() {
         let mut frame = wire::Frame {
             requests: (0..MAX_REQUESTS_PER_TICK as u64)
-                .map(|id| wire::Request { id, kind: "op.submit".into(), payload: Vec::new() })
+                .map(|id| wire::Request {
+                    id,
+                    kind: "op.submit".into(),
+                    payload: Vec::new(),
+                })
                 .collect(),
             ..Default::default()
         };
