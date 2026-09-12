@@ -378,20 +378,134 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
-    let forge = include_str!("../../../crates/views/forge/src/ui/forge.rs");
-    let connected = branches(forge)
-        .into_iter()
-        .filter(|(condition, _, _)| {
-            condition.contains("connected") && !condition.contains("!self.connected")
-        })
-        .collect::<Vec<_>>();
-    assert!(!connected.is_empty(), "connected data arms are present");
-    for (_, body, _) in connected {
-        assert!(
-            body.contains("Node::"),
-            "the gate encloses the data rendering"
-        );
+    use std::collections::{BTreeMap, BTreeSet};
+    const LISTS: &[&str] = &[
+        "repos",
+        "branches",
+        "items",
+        "forge_item_blocks",
+        "diff_rows",
+        "forge_item_reviews",
+        "discussion",
+        "linked_note",
+        "merge_conflicts",
+        "staged_comments",
+        "tree_entries",
+    ];
+    fn self_field(expr: &syn::Expr, name: &str) -> bool {
+        match expr {
+            syn::Expr::Paren(expr) => self_field(&expr.expr, name),
+            syn::Expr::Field(field) => {
+                matches!(&*field.base,syn::Expr::Path(path) if path.path.is_ident("self"))
+                    && matches!(&field.member,syn::Member::Named(member) if member == name)
+            }
+            _ => false,
+        }
     }
+    fn connected(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Paren(expr) => connected(&expr.expr),
+            syn::Expr::Binary(expr) => match expr.op {
+                syn::BinOp::And(_) => connected(&expr.left) || connected(&expr.right),
+                syn::BinOp::Or(_) => connected(&expr.left) && connected(&expr.right),
+                _ => false,
+            },
+            _ => self_field(expr, "connected"),
+        }
+    }
+    #[derive(Default)]
+    struct Reading {
+        gated: bool,
+        reads: bool,
+        calls: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for Reading {
+        fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
+            let outer = self.gated;
+            self.gated = outer || connected(&expr.cond);
+            self.visit_expr(&expr.cond);
+            self.visit_block(&expr.then_branch);
+            self.gated = outer;
+            if let Some((_, otherwise)) = &expr.else_branch {
+                self.visit_expr(otherwise);
+            }
+        }
+        fn visit_expr_field(&mut self, expr: &'ast syn::ExprField) {
+            let tracked = matches!(&*expr.base,syn::Expr::Path(path) if path.path.is_ident("self"))
+                && matches!(&expr.member,syn::Member::Named(field) if LISTS.iter().any(|name| field == name));
+            if tracked && !self.gated {
+                self.reads = true;
+            }
+            syn::visit::visit_expr_field(self, expr);
+        }
+        fn visit_expr_method_call(&mut self, expr: &'ast syn::ExprMethodCall) {
+            let local =
+                matches!(&*expr.receiver,syn::Expr::Path(path) if path.path.is_ident("self"));
+            if local && !self.gated {
+                self.calls.insert(expr.method.to_string());
+            }
+            syn::visit::visit_expr_method_call(self, expr);
+        }
+        fn visit_expr_call(&mut self, expr: &'ast syn::ExprCall) {
+            // A header's summary explicitly takes connected and folds its own
+            // claim, just as a branch gates a list of rendered rows.
+            if expr.args.iter().any(|arg| self_field(arg, "connected")) {
+                return;
+            }
+            syn::visit::visit_expr_call(self, expr);
+        }
+    }
+    #[derive(Default)]
+    struct Methods(BTreeMap<String, Reading>);
+    impl<'ast> Visit<'ast> for Methods {
+        fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+            let mut reading = Reading::default();
+            reading.visit_block(&method.block);
+            self.0.insert(method.sig.ident.to_string(), reading);
+        }
+    }
+    let mut methods = Methods::default();
+    for source in [
+        include_str!("../../../crates/views/forge/src/ui/app_view.rs"),
+        include_str!("../../../crates/views/forge/src/ui/forge.rs"),
+        include_str!("../../../crates/views/forge/src/ui/components.rs"),
+        include_str!("../../../crates/views/forge/src/ui/kit.rs"),
+        include_str!("../../../crates/views/forge/src/ui/icon.rs"),
+    ] {
+        methods.visit_file(&syn::parse_file(source).unwrap());
+    }
+    let mut requires_connection: BTreeSet<_> = methods
+        .0
+        .iter()
+        .filter(|(name, reading)| name.as_str() != "__view" && reading.reads)
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert!(
+        !requires_connection.is_empty(),
+        "the sweep sees actual register-reading components"
+    );
+    loop {
+        let inherited: Vec<_> = methods
+            .0
+            .iter()
+            .filter(|(name, reading)| {
+                !requires_connection.contains(*name)
+                    && reading
+                        .calls
+                        .iter()
+                        .any(|call| requires_connection.contains(call))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if inherited.is_empty() {
+            break;
+        }
+        requires_connection.extend(inherited);
+    }
+    assert!(
+        !requires_connection.contains("__view"),
+        "a disconnected entrypoint reaches an ungated register-reading component"
+    );
 }
 
 /// AND THE HEADER SUBTITLES ARE CLAIMS TOO — the subtler half. `Agents 0 agents ·
