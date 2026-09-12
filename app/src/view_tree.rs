@@ -3582,6 +3582,10 @@ fn text_options(
         // A non-wrapping label still owns only its allocated box. In a row,
         // painting the full intrinsic line would cover the following fields.
         element = element.truncate();
+    } else {
+        // Native buttons set inherited nowrap. A wire label's wrapping is
+        // independent of its interactive ancestor, including the default.
+        element = element.whitespace_normal();
     }
     element
 }
@@ -4102,9 +4106,9 @@ mod tests {
                 text("height", "17968".into(), None, Some(wire::Wrapping::None)),
                 text(
                     "hash",
-                    "0123456789abcdef".repeat(4),
+                    "0123456789abcdef".repeat(16),
                     Some(wire::Length::Fill),
-                    Some(wire::Wrapping::None),
+                    Some(wire::Wrapping::WordOrGlyph),
                 ),
                 text("count", "12 ops".into(), None, Some(wire::Wrapping::None)),
             ],
@@ -4149,8 +4153,21 @@ mod tests {
             wrap: None,
             children: vec![paragraph, row, reference, header],
         };
-        let window = cx.open_window(size(px(800.), px(500.)), |_, _| ViewTree::new(root));
-        let tree = window.root(cx).unwrap();
+        struct ButtonTree(Entity<ViewTree>);
+        impl Render for ButtonTree {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui_kit::component::button::Button::new("wrapping-parent")
+                    .w_full()
+                    .child(self.0.clone())
+            }
+        }
+        let window = cx.open_window(size(px(800.), px(500.)), |_, cx| {
+            ButtonTree(cx.new(|_| ViewTree::new(root)))
+        });
+        let tree = window
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |parent, _| parent.0.clone());
         let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
         native.update(|window, cx| window.render_frame(cx));
         tree.read_with(&native, |tree, _| {
@@ -4169,6 +4186,10 @@ mod tests {
                 "default wrapping creates multiple lines"
             );
             assert!(hash.right() <= count.left());
+            assert!(
+                hash.size.height > tree.measured_bounds("reference").unwrap().size.height,
+                "WordOrGlyph must override a native Button's inherited nowrap"
+            );
             assert!(count.right() <= px(620.));
         });
         let mut nowrap = text_options(
