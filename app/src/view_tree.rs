@@ -1,8 +1,8 @@
 //! GPUI rendering of the existing WASM tree. Widget identities retain native
 //! input state; interaction uses the same semantic events the guests consume.
 
-use gpui_kit::component::radio::Radio;
 use gpui_kit::MouseUpEvent;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
     Disableable,
@@ -196,6 +196,7 @@ struct VirtualScroll {
     state: ListState,
     rows: Vec<VirtualRow>,
     anchor: wire::ScrollAnchor,
+    measured_width: Option<Pixels>,
 }
 
 struct EditorMount {
@@ -302,6 +303,7 @@ impl ViewTree {
                 ),
                 rows: Vec::new(),
                 anchor,
+                measured_width: None,
             });
         let prefix = list
             .rows
@@ -408,6 +410,33 @@ impl ViewTree {
         })
         .w_full()
         .h_full();
+        let route = key.to_owned();
+        let weak = cx.entity().downgrade();
+        let retain_estimates = canvas(
+            move |bounds, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(list) = this.lists.get_mut(&route) else {
+                        return;
+                    };
+                    if list.measured_width == Some(bounds.size.width) {
+                        return;
+                    }
+                    list.measured_width = Some(bounds.size.width);
+                    // GPUI invalidates every height hint on first prepaint and
+                    // width changes. Restore the guest's estimate after that pass;
+                    // measured rows keep their actual height via size_hint().
+                    let estimate = list
+                        .rows
+                        .first()
+                        .map_or(44., |row| row.estimated_height + row.gap);
+                    list.state.clone().with_uniform_item_height(px(estimate));
+                    cx.notify();
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
         // The native list owns scrolling, including off-screen measurements;
         // the wire scroll remains the identity addressed by widget commands.
         decoration(
@@ -417,6 +446,7 @@ impl ViewTree {
         )
         .id(key.to_owned())
         .child(native)
+        .child(retain_estimates)
         .child(self.measure(key, cx))
         .into_any_element()
     }
@@ -1424,36 +1454,55 @@ impl ViewTree {
                 let release = *on_release;
                 let drag = *on_drag;
                 let view = cx.entity().downgrade();
-                let capture = canvas(|_, _, _| (), move |_, _, window, _| {
-                    let moving = view.clone();
-                    let move_key = move_key.clone();
-                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                        if phase != gpui_kit::DispatchPhase::Capture { return; }
-                        let _ = moving.update(cx, |this, cx| {
-                            let Some(previous) = this.drags.get_mut(&move_key) else { return; };
-                            if event.pressed_button != Some(MouseButton::Left) {
-                                this.drags.remove(&move_key);
+                let capture = canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        let moving = view.clone();
+                        let move_key = move_key.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui_kit::DispatchPhase::Capture {
                                 return;
                             }
-                            let delta = event.position - *previous;
-                            *previous = event.position;
-                            if let Some(handler) = drag {
-                                cx.emit(wire::Event::Drag { handler, dx: f32::from(delta.x) as f64, dy: f32::from(delta.y) as f64 });
-                            }
+                            let _ = moving.update(cx, |this, cx| {
+                                let Some(previous) = this.drags.get_mut(&move_key) else {
+                                    return;
+                                };
+                                if event.pressed_button != Some(MouseButton::Left) {
+                                    this.drags.remove(&move_key);
+                                    return;
+                                }
+                                let delta = event.position - *previous;
+                                *previous = event.position;
+                                if let Some(handler) = drag {
+                                    cx.emit(wire::Event::Drag {
+                                        handler,
+                                        dx: f32::from(delta.x) as f64,
+                                        dy: f32::from(delta.y) as f64,
+                                    });
+                                }
+                            });
                         });
-                    });
-                    let releasing = view.clone();
-                    let release_key = release_key.clone();
-                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-                        if phase != gpui_kit::DispatchPhase::Capture || event.button != MouseButton::Left { return; }
-                        let _ = releasing.update(cx, |this, cx| {
-                            let was_dragging = this.drags.remove(&release_key).is_some();
-                            if was_dragging {
-                                if let Some(message) = release { cx.emit(wire::Event::Message(message)); }
+                        let releasing = view.clone();
+                        let release_key = release_key.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase != gpui_kit::DispatchPhase::Capture
+                                || event.button != MouseButton::Left
+                            {
+                                return;
                             }
+                            let _ = releasing.update(cx, |this, cx| {
+                                let was_dragging = this.drags.remove(&release_key).is_some();
+                                if was_dragging {
+                                    if let Some(message) = release {
+                                        cx.emit(wire::Event::Message(message));
+                                    }
+                                }
+                            });
                         });
-                    });
-                }).absolute().inset_0();
+                    },
+                )
+                .absolute()
+                .inset_0();
                 div()
                     .id(key.clone())
                     .relative()
@@ -2855,14 +2904,14 @@ fn dimensions<T: Styled>(
     height: Option<wire::Length>,
 ) -> T {
     element = match width {
-        Some(wire::Length::Fixed(value)) => element.w(px(value)),
-        Some(wire::Length::Fill) => element.w_full(),
+        Some(wire::Length::Fixed(value)) => element.w(px(value)).min_w(px(value)),
+        Some(wire::Length::Fill) => element.w_full().min_w_0(),
         Some(wire::Length::FillPortion(_)) => element.flex_1(),
         Some(wire::Length::Shrink) | None => element,
     };
     match height {
-        Some(wire::Length::Fixed(value)) => element.h(px(value)),
-        Some(wire::Length::Fill) => element.h_full(),
+        Some(wire::Length::Fixed(value)) => element.h(px(value)).min_h(px(value)),
+        Some(wire::Length::Fill) => element.h_full().min_h_0(),
         Some(wire::Length::FillPortion(_)) => element.flex_1(),
         Some(wire::Length::Shrink) | None => element,
     }
