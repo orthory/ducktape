@@ -5357,9 +5357,21 @@ pub(crate) mod tests {
             let key = button_key(&guest, "Comments");
             native.update(|window, cx| window.click(key, cx));
             layout!();
+            if width == 1300. {
+                let mut published_width = None;
+                guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                    if let wire::Node::Container { key, max_width, .. } = node {
+                        if key == "PagesView/root/pages/@container:436" {
+                            published_width = *max_width;
+                        }
+                    }
+                });
+                assert_eq!(published_width, Some(688.), "the measured pane must reach the guest before native layout");
+            }
             view.read_with(&native, |view, _| {
                 let pane = view.measured_bounds("PagesView/root/pages/pane-measure").expect("pane sensor");
                 assert_eq!(f32::from(pane.size.width), width - 240., "pane must exclude the fixed sidebar");
+                assert!(f32::from(pane.size.height) > 0., "the pane measurement must have visible height: {pane:?}");
                 (
                     view.measured_bounds("PagesView/root/pages/document")
                         .expect("document editor"),
