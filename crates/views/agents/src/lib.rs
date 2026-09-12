@@ -3514,12 +3514,11 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::journal_width_after_delta(
+                self.journal_width = crate::host::journal_width_after_delta(
                     self.journal_width,
                     (-dx),
                     self.viewport_width,
                 );
-                self.journal_width = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3531,12 +3530,11 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::editor_width_after_delta(
+                self.editor_width = crate::host::editor_width_after_delta(
                     self.editor_width,
                     (-dx),
                     self.viewport_width,
                 );
-                self.editor_width = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3548,24 +3546,21 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = width;
-                self.viewport_width = next;
+                self.viewport_width = width;
             }
             {
-                let next = crate::host::journal_width_after_delta(
+                self.journal_width = crate::host::journal_width_after_delta(
                     self.journal_width,
                     0.0,
                     width,
                 );
-                self.journal_width = next;
             }
             {
-                let next = crate::host::editor_width_after_delta(
+                self.editor_width = crate::host::editor_width_after_delta(
                     self.editor_width,
                     0.0,
                     width,
                 );
-                self.editor_width = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3576,12 +3571,11 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::pick_str(
+                self.expanded_receipt = crate::host::pick_str(
                     (self.expanded_receipt != value),
                     ::std::convert::AsRef::as_ref(&(value)),
                     ::std::convert::AsRef::as_ref(&("")),
                 );
-                self.expanded_receipt = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3592,76 +3586,65 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
             {
-                let next = crate::host::connection_serial_after(
+                self.connection_serial = crate::host::connection_serial_after(
                     self.connected,
                     next.connected,
                     self.connection_serial,
                 );
-                self.connection_serial = next;
             }
             {
-                let next = next.connected;
-                self.connected = next;
+                self.connected = next.connected;
             }
             {
-                let next = next.account.to_owned();
-                self.account = next;
+                self.account = next.account.to_owned();
             }
             {
-                let next = next.open_run.to_owned();
-                self.open_run = next;
+                self.open_run = next.open_run.to_owned();
             }
             {
-                let next = crate::host::run_at(
+                self.open_row = crate::host::run_at(
                     ::std::convert::AsRef::as_ref(&(self.runs)),
                     ::std::convert::AsRef::as_ref(&(self.open_run)),
                 );
-                self.open_row = next;
             }
             let door_pressed = ((next.opened != self.opened)
                 && (!(next.open_run).is_empty()));
             {
-                let next = next.opened;
-                self.opened = next;
+                self.opened = next.opened;
             }
             {
-                let next = crate::host::pick_str(
+                self.panel = crate::host::pick_str(
                     door_pressed,
                     ::std::convert::AsRef::as_ref(&("runs")),
                     ::std::convert::AsRef::as_ref(&(self.panel)),
                 );
-                self.panel = next;
             }
             let row = crate::host::row_named(
                 ::std::convert::AsRef::as_ref(&(self.rows)),
                 ::std::convert::AsRef::as_ref(&(self.selected)),
             );
             {
-                let next = crate::host::editable(
+                self.can_edit = crate::host::editable(
                     self.connected,
                     ::std::convert::AsRef::as_ref(&(self.account)),
                     ::std::convert::AsRef::as_ref(&(row.controller)),
                 );
-                self.can_edit = next;
             }
             {
-                let next = AppTheme::App;
-                self.active_palette = next;
+                self.active_palette = AppTheme::App;
             }
             if (!next.dark) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = AppTheme::AppDark;
-                self.active_palette = next;
+                self.active_palette = AppTheme::AppDark;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3672,42 +3655,35 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             {
-                let next = true;
-                self.answered = next;
+                self.answered = true;
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.rows.clone();
-                self.rows = next;
+                self.rows = item.rows.clone();
             }
             {
-                let next = item.runs.clone();
-                self.runs = next;
+                self.runs = item.runs.clone();
             }
             {
-                let next = item.capabilities.clone();
-                self.capabilities = next;
+                self.capabilities = item.capabilities.clone();
             }
             {
-                let next = crate::host::run_at(
+                self.open_row = crate::host::run_at(
                     ::std::convert::AsRef::as_ref(&(self.runs)),
                     ::std::convert::AsRef::as_ref(&(self.open_run)),
                 );
-                self.open_row = next;
             }
             {
-                let next = (crate::host::badge(
+                self.sent = (crate::host::badge(
                     crate::host::working_agents(
                         ::std::convert::AsRef::as_ref(&(self.rows)),
                     ),
                 ));
-                self.sent = next;
             }
             let consumed = crate::host::drafts_consumed(
                 self.committed,
@@ -3717,60 +3693,52 @@ impl AgentsView {
                 ::std::convert::AsRef::as_ref(&(self.draft_id)),
             );
             {
-                let next = self.committed;
-                self.seeded = next;
+                self.seeded = self.committed;
             }
             {
-                let next = crate::host::pick_str(
+                self.selected = crate::host::pick_str(
                     (consumed && self.creating),
                     ::std::convert::AsRef::as_ref(&(self.draft_id)),
                     ::std::convert::AsRef::as_ref(&(self.selected)),
                 );
-                self.selected = next;
             }
             {
-                let next = (self.creating && (!consumed));
-                self.creating = next;
+                self.creating = (self.creating && (!consumed));
             }
             let row = crate::host::row_named(
                 ::std::convert::AsRef::as_ref(&(self.rows)),
                 ::std::convert::AsRef::as_ref(&(self.selected)),
             );
             {
-                let next = crate::host::editable(
+                self.can_edit = crate::host::editable(
                     self.connected,
                     ::std::convert::AsRef::as_ref(&(self.account)),
                     ::std::convert::AsRef::as_ref(&(row.controller)),
                 );
-                self.can_edit = next;
             }
             {
-                let next = row.status.to_owned();
-                self.selected_status = next;
+                self.selected_status = row.status.to_owned();
             }
             {
-                let next = crate::host::pick_str(
+                self.draft_name = crate::host::pick_str(
                     consumed,
                     ::std::convert::AsRef::as_ref(&(row.name)),
                     ::std::convert::AsRef::as_ref(&(self.draft_name)),
                 );
-                self.draft_name = next;
             }
             {
-                let next = crate::host::pick_capability(
+                self.draft_capability = crate::host::pick_capability(
                     consumed,
                     ::std::convert::AsRef::as_ref(&(row.capability)),
                     ::std::borrow::Borrow::borrow(&(self.draft_capability)),
                 );
-                self.draft_capability = next;
             }
             {
-                let next = crate::host::pick_skills(
+                self.draft_skills = crate::host::pick_skills(
                     consumed,
                     ::std::convert::AsRef::as_ref(&(row.skills)),
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                 );
-                self.draft_skills = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3781,8 +3749,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if ((!(item.error).is_empty())
                 || (item.journal.dispatch_id != self.open_run))
@@ -3790,8 +3757,7 @@ impl AgentsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.journal.clone();
-                self.journal = next;
+                self.journal = item.journal.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3802,8 +3768,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.clone();
-                self.live = next;
+                self.live = item.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3814,15 +3779,13 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = (self.committed + 1);
-                self.committed = next;
+                self.committed = (self.committed + 1);
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3834,58 +3797,46 @@ impl AgentsView {
                 ::std::convert::AsRef::as_ref(&(id)),
             );
             {
-                let next = id.to_owned();
-                self.selected = next;
+                self.selected = id.to_owned();
             }
             {
-                let next = false;
-                self.creating = next;
+                self.creating = false;
             }
             {
-                let next = crate::host::editable(
+                self.can_edit = crate::host::editable(
                     self.connected,
                     ::std::convert::AsRef::as_ref(&(self.account)),
                     ::std::convert::AsRef::as_ref(&(row.controller)),
                 );
-                self.can_edit = next;
             }
             {
-                let next = row.status.to_owned();
-                self.selected_status = next;
+                self.selected_status = row.status.to_owned();
             }
             {
-                let next = row.id.to_owned();
-                self.draft_id = next;
+                self.draft_id = row.id.to_owned();
             }
             {
-                let next = row.name.to_owned();
-                self.draft_name = next;
+                self.draft_name = row.name.to_owned();
             }
             {
-                let next = crate::host::some_str(
+                self.draft_capability = crate::host::some_str(
                     ::std::convert::AsRef::as_ref(&(row.capability)),
                 );
-                self.draft_capability = next;
             }
             {
-                let next = row.skills.clone();
-                self.draft_skills = next;
+                self.draft_skills = row.skills.clone();
             }
             {
-                let next = "".to_owned();
-                self.skill_name = next;
+                self.skill_name = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_prefix = next;
+                self.skill_prefix = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_snapshot = next;
+                self.skill_snapshot = "".to_owned();
             }
             {
-                let next = false;
-                self.skill_always = next;
+                self.skill_always = false;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3893,52 +3844,40 @@ impl AgentsView {
     fn on_open_new(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = "registry".to_owned();
-                self.panel = next;
+                self.panel = "registry".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.selected = next;
+                self.selected = "".to_owned();
             }
             {
-                let next = true;
-                self.creating = next;
+                self.creating = true;
             }
             {
-                let next = (self.connected && (!(self.account).is_empty()));
-                self.can_edit = next;
+                self.can_edit = (self.connected && (!(self.account).is_empty()));
             }
             {
-                let next = "".to_owned();
-                self.draft_id = next;
+                self.draft_id = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.draft_name = next;
+                self.draft_name = "".to_owned();
             }
             {
-                let next = None;
-                self.draft_capability = next;
+                self.draft_capability = None;
             }
             {
-                let next = Vec::new();
-                self.draft_skills = next;
+                self.draft_skills = Vec::new();
             }
             {
-                let next = "".to_owned();
-                self.skill_name = next;
+                self.skill_name = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_prefix = next;
+                self.skill_prefix = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_snapshot = next;
+                self.skill_snapshot = "".to_owned();
             }
             {
-                let next = false;
-                self.skill_always = next;
+                self.skill_always = false;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3946,12 +3885,10 @@ impl AgentsView {
     fn on_close_editor(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = "".to_owned();
-                self.selected = next;
+                self.selected = "".to_owned();
             }
             {
-                let next = false;
-                self.creating = next;
+                self.creating = false;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3959,8 +3896,7 @@ impl AgentsView {
     fn on_choose_panel(&mut self, next: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = next.to_owned();
-                self.panel = next;
+                self.panel = next.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3971,25 +3907,21 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = "".to_owned();
-                self.expanded_receipt = next;
+                self.expanded_receipt = "".to_owned();
             }
             {
-                let next = crate::host::run_named(
+                self.open_row = crate::host::run_named(
                     ::std::convert::AsRef::as_ref(&(self.runs)),
                     ::std::convert::AsRef::as_ref(&(run_id)),
                 );
-                self.open_row = next;
             }
             {
-                let next = self.open_row.dispatch_id.to_owned();
-                self.open_run = next;
+                self.open_run = self.open_row.dispatch_id.to_owned();
             }
             {
-                let next = crate::host::open_run(
+                self.sent = crate::host::open_run(
                     ::std::convert::AsRef::as_ref(&(self.open_row.dispatch_id)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3997,28 +3929,22 @@ impl AgentsView {
     fn on_close_run(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = "".to_owned();
-                self.expanded_receipt = next;
+                self.expanded_receipt = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.open_run = next;
+                self.open_run = "".to_owned();
             }
             {
-                let next = crate::host::empty_run();
-                self.open_row = next;
+                self.open_row = crate::host::empty_run();
             }
             {
-                let next = crate::host::empty_journal();
-                self.journal = next;
+                self.journal = crate::host::empty_journal();
             }
             {
-                let next = crate::host::empty_live();
-                self.live = next;
+                self.live = crate::host::empty_live();
             }
             {
-                let next = crate::host::open_run(::std::convert::AsRef::as_ref(&("")));
-                self.sent = next;
+                self.sent = crate::host::open_run(::std::convert::AsRef::as_ref(&("")));
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4026,8 +3952,9 @@ impl AgentsView {
     fn on_open_place(&mut self, url: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::open_link(::std::convert::AsRef::as_ref(&(url)));
-                self.sent = next;
+                self.sent = crate::host::open_link(
+                    ::std::convert::AsRef::as_ref(&(url)),
+                );
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4038,8 +3965,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = Some(value.to_owned());
-                self.draft_capability = next;
+                self.draft_capability = Some(value.to_owned());
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4047,8 +3973,7 @@ impl AgentsView {
     fn on_set_skill_always(&mut self, on: bool) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = on;
-                self.skill_always = next;
+                self.skill_always = on;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4056,7 +3981,7 @@ impl AgentsView {
     fn on_add_skill(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::with_skill(
+                self.draft_skills = crate::host::with_skill(
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                     ::std::convert::AsRef::as_ref(&(self.skill_name)),
                     ::std::convert::AsRef::as_ref(
@@ -4073,23 +3998,18 @@ impl AgentsView {
                     ::std::convert::AsRef::as_ref(&(self.skill_snapshot)),
                     self.skill_always,
                 );
-                self.draft_skills = next;
             }
             {
-                let next = "".to_owned();
-                self.skill_name = next;
+                self.skill_name = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_prefix = next;
+                self.skill_prefix = "".to_owned();
             }
             {
-                let next = "".to_owned();
-                self.skill_snapshot = next;
+                self.skill_snapshot = "".to_owned();
             }
             {
-                let next = false;
-                self.skill_always = next;
+                self.skill_always = false;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4097,11 +4017,10 @@ impl AgentsView {
     fn on_remove_skill(&mut self, name: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::without_skill(
+                self.draft_skills = crate::host::without_skill(
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                     ::std::convert::AsRef::as_ref(&(name)),
                 );
-                self.draft_skills = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4113,12 +4032,11 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::skill_loaded(
+                self.draft_skills = crate::host::skill_loaded(
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                     ::std::convert::AsRef::as_ref(&(name)),
                     always,
                 );
-                self.draft_skills = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4130,11 +4048,10 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = (crate::host::status(
+                self.sent = (crate::host::status(
                     ::std::convert::AsRef::as_ref(&(agent_id)),
                     paused,
                 ));
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4142,7 +4059,7 @@ impl AgentsView {
     fn on_submit_save(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = (crate::host::save(
+                self.sent = (crate::host::save(
                     ::std::convert::AsRef::as_ref(&(self.selected)),
                     ::std::convert::AsRef::as_ref(&(self.draft_name)),
                     ::std::convert::AsRef::as_ref(
@@ -4152,7 +4069,6 @@ impl AgentsView {
                     ),
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                 ));
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4160,7 +4076,7 @@ impl AgentsView {
     fn on_submit_register(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::register_agent(
+                self.sent = crate::host::register_agent(
                     ::std::convert::AsRef::as_ref(&(self.draft_id)),
                     ::std::convert::AsRef::as_ref(&(self.draft_name)),
                     ::std::convert::AsRef::as_ref(
@@ -4170,7 +4086,6 @@ impl AgentsView {
                     ),
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4181,8 +4096,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.draft_id = next;
+                self.draft_id = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4193,8 +4107,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.draft_name = next;
+                self.draft_name = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4205,8 +4118,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.skill_name = next;
+                self.skill_name = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4217,8 +4129,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.skill_prefix = next;
+                self.skill_prefix = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -4229,8 +4140,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.skill_snapshot = next;
+                self.skill_snapshot = value;
             }
             ::ducktape_view_guest::Task::none()
         }

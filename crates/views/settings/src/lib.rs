@@ -2677,167 +2677,135 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
             {
-                let next = crate::host::connection_serial_after(
+                self.connection_serial = crate::host::connection_serial_after(
                     self.connected,
                     next.connected,
                     self.connection_serial,
                 );
-                self.connection_serial = next;
             }
             {
-                let next = next.connected;
-                self.connected = next;
+                self.connected = next.connected;
             }
             {
-                let next = next.loading;
-                self.loading = next;
+                self.loading = next.loading;
             }
             {
-                let next = next.status.to_owned();
-                self.status = next;
+                self.status = next.status.to_owned();
             }
             {
-                let next = next.busy;
-                self.busy = next;
+                self.busy = next.busy;
             }
             {
-                let next = next.recovering;
-                self.recovering = next;
+                self.recovering = next.recovering;
             }
             {
-                let next = next.appearance.to_owned();
-                self.appearance = next;
+                self.appearance = next.appearance.to_owned();
             }
             {
-                let next = next.desktop_notifications;
-                self.desktop_notifications = next;
+                self.desktop_notifications = next.desktop_notifications;
             }
             {
-                let next = next.unlocked;
-                self.unlocked = next;
+                self.unlocked = next.unlocked;
             }
             {
-                let next = next.seat_key.to_owned();
-                self.seat_key = next;
+                self.seat_key = next.seat_key.to_owned();
             }
             {
-                let next = next.account_name.to_owned();
-                self.account_name = next;
+                self.account_name = next.account_name.to_owned();
             }
             {
-                let next = next.network_name.to_owned();
-                self.network_name = next;
+                self.network_name = next.network_name.to_owned();
             }
             {
-                let next = next.connected_rpc.to_owned();
-                self.connected_rpc = next;
+                self.connected_rpc = next.connected_rpc.to_owned();
             }
             {
-                let next = next.account_ceremony_phase.to_owned();
-                self.account_ceremony_phase = next;
+                self.account_ceremony_phase = next.account_ceremony_phase.to_owned();
             }
             {
-                let next = next.account_ceremony_qr.to_owned();
-                self.account_ceremony_qr = next;
+                self.account_ceremony_qr = next.account_ceremony_qr.to_owned();
             }
             {
-                let next = next.account_ceremony_detail.to_owned();
-                self.account_ceremony_detail = next;
+                self.account_ceremony_detail = next.account_ceremony_detail.to_owned();
             }
             {
-                let next = next.account_ceremony_left.to_owned();
-                self.account_ceremony_left = next;
+                self.account_ceremony_left = next.account_ceremony_left.to_owned();
             }
             {
-                let next = next.settings_key_state.to_owned();
-                self.settings_key_state = next;
+                self.settings_key_state = next.settings_key_state.to_owned();
             }
             {
-                let next = next.settings_key_path.to_owned();
-                self.settings_key_path = next;
+                self.settings_key_path = next.settings_key_path.to_owned();
             }
             {
-                let next = next.account_busy;
-                self.account_busy = next;
+                self.account_busy = next.account_busy;
             }
             {
-                let next = next.account_ticket.to_owned();
-                self.account_ticket = next;
+                self.account_ticket = next.account_ticket.to_owned();
             }
             let renamed = crate::host::renamed_to(
                 ::std::convert::AsRef::as_ref(&(next.account_name)),
                 ::std::convert::AsRef::as_ref(&(self.renaming_to)),
             );
             {
-                let next = crate::host::keep_draft(
+                self.renaming_to = crate::host::keep_draft(
                     renamed,
                     ::std::convert::AsRef::as_ref(&(self.renaming_to)),
                 );
-                self.renaming_to = next;
             }
             {
-                let next = crate::host::keep_draft(
+                self.account_name_draft = crate::host::keep_draft(
                     renamed,
                     ::std::convert::AsRef::as_ref(&(self.account_name_draft)),
                 );
-                self.account_name_draft = next;
             }
             let founded = (next.account_exists && (!self.account_exists));
             {
-                let next = next.account_exists;
-                self.account_exists = next;
+                self.account_exists = next.account_exists;
             }
             {
-                let next = next.account_number.to_owned();
-                self.account_number = next;
+                self.account_number = next.account_number.to_owned();
             }
             {
-                let next = crate::host::keep_draft(
+                self.account_create_draft = crate::host::keep_draft(
                     founded,
                     ::std::convert::AsRef::as_ref(&(self.account_create_draft)),
                 );
-                self.account_create_draft = next;
             }
             {
-                let next = crate::host::keep_draft(
+                self.account_join_draft = crate::host::keep_draft(
                     founded,
                     ::std::convert::AsRef::as_ref(&(self.account_join_draft)),
                 );
-                self.account_join_draft = next;
             }
             let minted = (!(next.account_ticket).is_empty());
             {
-                let next = crate::host::keep_draft(
+                self.account_key_draft = crate::host::keep_draft(
                     minted,
                     ::std::convert::AsRef::as_ref(&(self.account_key_draft)),
                 );
-                self.account_key_draft = next;
             }
             {
-                let next = crate::host::keep_draft(
+                self.account_key_label_draft = crate::host::keep_draft(
                     minted,
                     ::std::convert::AsRef::as_ref(&(self.account_key_label_draft)),
                 );
-                self.account_key_label_draft = next;
             }
             {
-                let next = AppTheme::App;
-                self.active_palette = next;
+                self.active_palette = AppTheme::App;
             }
             if (!next.dark) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = AppTheme::AppDark;
-                self.active_palette = next;
+                self.active_palette = AppTheme::AppDark;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2848,27 +2816,22 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             {
-                let next = item.answered;
-                self.members_answered = next;
+                self.members_answered = item.answered;
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.next.tier.to_owned();
-                self.tier = next;
+                self.tier = item.next.tier.to_owned();
             }
             {
-                let next = item.next.admin;
-                self.admin = next;
+                self.admin = item.next.admin;
             }
             {
-                let next = item.next.members_line.to_owned();
-                self.members_line = next;
+                self.members_line = item.next.members_line.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2879,15 +2842,13 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.rows.clone();
-                self.account_key_rows = next;
+                self.account_key_rows = item.rows.clone();
                 self.derived.account_keys.take();
             }
             ::ducktape_view_guest::Task::none()
@@ -2896,8 +2857,7 @@ impl SettingsView {
     fn on_show_tab(&mut self, tab: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::open_tab(::std::convert::AsRef::as_ref(&(tab)));
-                self.sent = next;
+                self.sent = crate::host::open_tab(::std::convert::AsRef::as_ref(&(tab)));
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2905,8 +2865,7 @@ impl SettingsView {
     fn on_reconnect(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::reconnect_network();
-                self.sent = next;
+                self.sent = crate::host::reconnect_network();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2914,8 +2873,7 @@ impl SettingsView {
     fn on_switch_network(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::switch_workspace();
-                self.sent = next;
+                self.sent = crate::host::switch_workspace();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2929,8 +2887,7 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = crate::host::unlock(::std::convert::AsRef::as_ref(&(pw)));
-                self.sent = next;
+                self.sent = crate::host::unlock(::std::convert::AsRef::as_ref(&(pw)));
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2938,8 +2895,7 @@ impl SettingsView {
     fn on_lock_session(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::lock();
-                self.sent = next;
+                self.sent = crate::host::lock();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2952,16 +2908,14 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = (self.account_name_draft).trim().to_owned();
-                self.renaming_to = next;
+                self.renaming_to = (self.account_name_draft).trim().to_owned();
             }
             {
-                let next = crate::host::rename_account(
+                self.sent = crate::host::rename_account(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_name_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2974,12 +2928,11 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = crate::host::create_account(
+                self.sent = crate::host::create_account(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_create_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2992,7 +2945,7 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = crate::host::mint_ticket(
+                self.sent = crate::host::mint_ticket(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_key_draft).trim().to_owned()),
                     ),
@@ -3000,7 +2953,6 @@ impl SettingsView {
                         &((self.account_key_label_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3013,12 +2965,11 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = crate::host::join_account(
+                self.sent = crate::host::join_account(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_join_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3034,10 +2985,9 @@ impl SettingsView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = crate::host::remove_key(
+                self.sent = crate::host::remove_key(
                     ::std::convert::AsRef::as_ref(&(pubkey)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3045,12 +2995,11 @@ impl SettingsView {
     fn on_account_passkey_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::add_passkey(
+                self.sent = crate::host::add_passkey(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_key_label_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3058,12 +3007,11 @@ impl SettingsView {
     fn on_account_passkey_desktop(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::add_passkey_here(
+                self.sent = crate::host::add_passkey_here(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_key_label_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3071,8 +3019,7 @@ impl SettingsView {
     fn on_account_ceremony_cancel(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::cancel_ceremony();
-                self.sent = next;
+                self.sent = crate::host::cancel_ceremony();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3080,12 +3027,11 @@ impl SettingsView {
     fn on_account_wallet_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::link_wallet(
+                self.sent = crate::host::link_wallet(
                     ::std::convert::AsRef::as_ref(
                         &((self.account_key_label_draft).trim().to_owned()),
                     ),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3093,8 +3039,7 @@ impl SettingsView {
     fn on_account_login_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::login();
-                self.sent = next;
+                self.sent = crate::host::login();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3106,11 +3051,10 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::copy(
+                self.sent = crate::host::copy(
                     ::std::convert::AsRef::as_ref(&(text)),
                     ::std::convert::AsRef::as_ref(&(label)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3118,8 +3062,7 @@ impl SettingsView {
     fn on_set_appearance_light(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::set_light();
-                self.sent = next;
+                self.sent = crate::host::set_light();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3127,8 +3070,7 @@ impl SettingsView {
     fn on_set_appearance_dark(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::set_dark();
-                self.sent = next;
+                self.sent = crate::host::set_dark();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3139,8 +3081,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::set_notifications(enabled);
-                self.sent = next;
+                self.sent = crate::host::set_notifications(enabled);
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3163,8 +3104,7 @@ impl SettingsView {
                     settings_pane: self.settings_screen_initial.settings_pane.clone(),
                 });
             {
-                let next = picked.clone();
-                local.settings_pane = next;
+                local.settings_pane = picked.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3184,8 +3124,7 @@ impl SettingsView {
                     settings_pane: self.settings_screen_initial.settings_pane.clone(),
                 });
             {
-                let next = value;
-                local.key_pw = next;
+                local.key_pw = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3196,8 +3135,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.account_name_draft = next;
+                self.account_name_draft = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3208,8 +3146,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.account_create_draft = next;
+                self.account_create_draft = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3220,8 +3157,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.account_join_draft = next;
+                self.account_join_draft = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3232,8 +3168,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.account_key_draft = next;
+                self.account_key_draft = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3244,8 +3179,7 @@ impl SettingsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.account_key_label_draft = next;
+                self.account_key_label_draft = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -5143,25 +5077,6 @@ impl SettingsView {
         palette: Palette,
         use_scope: String,
         ctx_0: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn() -> Message + Clone + 'static,
-        cb_2: impl Fn() -> Message + Clone + 'static,
-        cb_3: impl Fn() -> Message + Clone + 'static,
-        cb_4: impl Fn(String) -> Message + Clone + 'static,
-        cb_5: impl Fn() -> Message + Clone + 'static,
-        cb_6: impl Fn() -> Message + Clone + 'static,
-        cb_7: impl Fn() -> Message + Clone + 'static,
-        cb_8: impl Fn() -> Message + Clone + 'static,
-        cb_9: impl Fn() -> Message + Clone + 'static,
-        cb_10: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_11: impl Fn() -> Message + Clone + 'static,
-        cb_12: impl Fn() -> Message + Clone + 'static,
-        cb_13: impl Fn() -> Message + Clone + 'static,
-        cb_14: impl Fn() -> Message + Clone + 'static,
-        cb_15: impl Fn(bool) -> Message + Clone + 'static,
-        cb_16: impl Fn(String) -> Message + Clone + 'static,
-        cb_17: impl Fn(String) -> Message + Clone + 'static,
-        cb_18: impl Fn() -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -5318,7 +5233,7 @@ impl SettingsView {
                                                 label: None,
                                                 on_press: Some(
                                                     ::ducktape_view_guest::slots::message(
-                                                        (cb_17)("members".to_owned()),
+                                                        Message::ShowTab("members".to_owned()),
                                                     ),
                                                 ),
                                                 width: None,
@@ -5523,7 +5438,7 @@ impl SettingsView {
                                                 label: None,
                                                 on_press: Some(
                                                     ::ducktape_view_guest::slots::message(
-                                                        (cb_17)("node".to_owned()),
+                                                        Message::ShowTab("node".to_owned()),
                                                     ),
                                                 ),
                                                 width: None,
@@ -5697,7 +5612,9 @@ impl SettingsView {
                                                 {
                                                     None
                                                 } else {
-                                                    Some(::ducktape_view_guest::slots::message((cb_12)()))
+                                                    Some(
+                                                            ::ducktape_view_guest::slots::message(Message::Reconnect),
+                                                        )
                                                 },
                                                 width: None,
                                                 height: None,
@@ -5752,7 +5669,11 @@ impl SettingsView {
                                                 on_press: if (self.busy) {
                                                     None
                                                 } else {
-                                                    Some(::ducktape_view_guest::slots::message((cb_18)()))
+                                                    Some(
+                                                            ::ducktape_view_guest::slots::message(
+                                                                Message::SwitchNetwork,
+                                                            ),
+                                                        )
                                                 },
                                                 width: None,
                                                 height: None,
@@ -6180,7 +6101,6 @@ impl SettingsView {
         &self,
         palette: Palette,
         use_scope: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -6286,7 +6206,9 @@ impl SettingsView {
                                 ),
                                 label: None,
                                 on_press: Some(
-                                    ::ducktape_view_guest::slots::message((cb_0)()),
+                                    ::ducktape_view_guest::slots::message(
+                                        Message::AccountCeremonyCancel,
+                                    ),
                                 ),
                                 width: None,
                                 height: None,
@@ -6376,7 +6298,9 @@ impl SettingsView {
                                 ),
                                 label: None,
                                 on_press: Some(
-                                    ::ducktape_view_guest::slots::message((cb_0)()),
+                                    ::ducktape_view_guest::slots::message(
+                                        Message::AccountCeremonyCancel,
+                                    ),
                                 ),
                                 width: None,
                                 height: None,
@@ -6555,25 +6479,6 @@ impl SettingsView {
         palette: Palette,
         use_scope: String,
         ctx_0: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn() -> Message + Clone + 'static,
-        cb_2: impl Fn() -> Message + Clone + 'static,
-        cb_3: impl Fn() -> Message + Clone + 'static,
-        cb_4: impl Fn(String) -> Message + Clone + 'static,
-        cb_5: impl Fn() -> Message + Clone + 'static,
-        cb_6: impl Fn() -> Message + Clone + 'static,
-        cb_7: impl Fn() -> Message + Clone + 'static,
-        cb_8: impl Fn() -> Message + Clone + 'static,
-        cb_9: impl Fn() -> Message + Clone + 'static,
-        cb_10: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_11: impl Fn() -> Message + Clone + 'static,
-        cb_12: impl Fn() -> Message + Clone + 'static,
-        cb_13: impl Fn() -> Message + Clone + 'static,
-        cb_14: impl Fn() -> Message + Clone + 'static,
-        cb_15: impl Fn(bool) -> Message + Clone + 'static,
-        cb_16: impl Fn(String) -> Message + Clone + 'static,
-        cb_17: impl Fn(String) -> Message + Clone + 'static,
-        cb_18: impl Fn() -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -6780,7 +6685,7 @@ impl SettingsView {
                                                     } else {
                                                         Some(
                                                                 ::ducktape_view_guest::slots::message(
-                                                                    (cb_4)(row.pubkey.to_owned()),
+                                                                    Message::AccountKeyRemove(row.pubkey.to_owned()),
                                                                 ),
                                                             )
                                                     },
@@ -7139,7 +7044,11 @@ impl SettingsView {
                                                         {
                                                             None
                                                         } else {
-                                                            Some(::ducktape_view_guest::slots::message((cb_2)()))
+                                                            Some(
+                                                                    ::ducktape_view_guest::slots::message(
+                                                                        Message::AccountKeyAddSubmit,
+                                                                    ),
+                                                                )
                                                         },
                                                         width: None,
                                                         height: None,
@@ -7246,7 +7155,11 @@ impl SettingsView {
                                                             on_press: if ((self.account_busy || (!self.unlocked))) {
                                                                 None
                                                             } else {
-                                                                Some(::ducktape_view_guest::slots::message((cb_7)()))
+                                                                Some(
+                                                                        ::ducktape_view_guest::slots::message(
+                                                                            Message::AccountPasskeySubmit,
+                                                                        ),
+                                                                    )
                                                             },
                                                             width: None,
                                                             height: None,
@@ -7302,7 +7215,11 @@ impl SettingsView {
                                                         on_press: if ((self.account_busy || (!self.unlocked))) {
                                                             None
                                                         } else {
-                                                            Some(::ducktape_view_guest::slots::message((cb_6)()))
+                                                            Some(
+                                                                    ::ducktape_view_guest::slots::message(
+                                                                        Message::AccountPasskeyDesktop,
+                                                                    ),
+                                                                )
                                                         },
                                                         width: None,
                                                         height: None,
@@ -7357,7 +7274,11 @@ impl SettingsView {
                                                         on_press: if ((self.account_busy || (!self.unlocked))) {
                                                             None
                                                         } else {
-                                                            Some(::ducktape_view_guest::slots::message((cb_9)()))
+                                                            Some(
+                                                                    ::ducktape_view_guest::slots::message(
+                                                                        Message::AccountWalletSubmit,
+                                                                    ),
+                                                                )
                                                         },
                                                         width: None,
                                                         height: None,
@@ -7418,11 +7339,7 @@ impl SettingsView {
                                         children
                                             .push({
                                                 let node_scope = format!("{}/account-ceremony", node_scope);
-                                                self.render_settings_loading(
-                                                    palette,
-                                                    node_scope.clone(),
-                                                    (cb_0).clone(),
-                                                )
+                                                self.render_settings_loading(palette, node_scope.clone())
                                             });
                                         if (!(self.account_ticket).is_empty()) {
                                             children
@@ -7471,7 +7388,7 @@ impl SettingsView {
                                                             label: None,
                                                             on_press: Some(
                                                                 ::ducktape_view_guest::slots::message(
-                                                                    (cb_10)(
+                                                                    Message::CopyToClipboard(
                                                                         self.account_ticket.to_owned(),
                                                                         "Ticket copied".to_owned(),
                                                                     ),
@@ -7966,25 +7883,6 @@ impl SettingsView {
         palette: Palette,
         use_scope: String,
         ctx_0: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn() -> Message + Clone + 'static,
-        cb_2: impl Fn() -> Message + Clone + 'static,
-        cb_3: impl Fn() -> Message + Clone + 'static,
-        cb_4: impl Fn(String) -> Message + Clone + 'static,
-        cb_5: impl Fn() -> Message + Clone + 'static,
-        cb_6: impl Fn() -> Message + Clone + 'static,
-        cb_7: impl Fn() -> Message + Clone + 'static,
-        cb_8: impl Fn() -> Message + Clone + 'static,
-        cb_9: impl Fn() -> Message + Clone + 'static,
-        cb_10: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_11: impl Fn() -> Message + Clone + 'static,
-        cb_12: impl Fn() -> Message + Clone + 'static,
-        cb_13: impl Fn() -> Message + Clone + 'static,
-        cb_14: impl Fn() -> Message + Clone + 'static,
-        cb_15: impl Fn(bool) -> Message + Clone + 'static,
-        cb_16: impl Fn(String) -> Message + Clone + 'static,
-        cb_17: impl Fn(String) -> Message + Clone + 'static,
-        cb_18: impl Fn() -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -8120,7 +8018,7 @@ impl SettingsView {
                                                                 ),
                                                                 on_submit: Some(
                                                                     ::ducktape_view_guest::slots::message(
-                                                                        (cb_16)(
+                                                                        Message::SettingsUnlockSubmit(
                                                                             self
                                                                                 .settings_screen_states
                                                                                 .get(&ctx_0)
@@ -8226,7 +8124,7 @@ impl SettingsView {
                                                             } else {
                                                                 Some(
                                                                         ::ducktape_view_guest::slots::message(
-                                                                            (cb_16)(
+                                                                            Message::SettingsUnlockSubmit(
                                                                                 self
                                                                                     .settings_screen_states
                                                                                     .get(&ctx_0)
@@ -8340,7 +8238,7 @@ impl SettingsView {
                                                             ),
                                                             label: None,
                                                             on_press: Some(
-                                                                ::ducktape_view_guest::slots::message((cb_11)()),
+                                                                ::ducktape_view_guest::slots::message(Message::LockSession),
                                                             ),
                                                             width: None,
                                                             height: None,
@@ -9797,9 +9695,7 @@ impl SettingsView {
                                                                     label: None,
                                                                     on_press: Some(
                                                                         ::ducktape_view_guest::slots::message(
-                                                                            (move |event_0| Message::SetDesktopNotifications(
-                                                                                event_0,
-                                                                            ))(true),
+                                                                            Message::SetDesktopNotifications(true),
                                                                         ),
                                                                     ),
                                                                     width: None,
@@ -9860,9 +9756,7 @@ impl SettingsView {
                                                                     label: None,
                                                                     on_press: Some(
                                                                         ::ducktape_view_guest::slots::message(
-                                                                            (move |event_0| Message::SetDesktopNotifications(
-                                                                                event_0,
-                                                                            ))(true),
+                                                                            Message::SetDesktopNotifications(true),
                                                                         ),
                                                                     ),
                                                                     width: None,
@@ -9919,9 +9813,7 @@ impl SettingsView {
                                                                     label: None,
                                                                     on_press: Some(
                                                                         ::ducktape_view_guest::slots::message(
-                                                                            (move |event_0| Message::SetDesktopNotifications(
-                                                                                event_0,
-                                                                            ))(false),
+                                                                            Message::SetDesktopNotifications(false),
                                                                         ),
                                                                     ),
                                                                     width: None,
@@ -9982,9 +9874,7 @@ impl SettingsView {
                                                                     label: None,
                                                                     on_press: Some(
                                                                         ::ducktape_view_guest::slots::message(
-                                                                            (move |event_0| Message::SetDesktopNotifications(
-                                                                                event_0,
-                                                                            ))(false),
+                                                                            Message::SetDesktopNotifications(false),
                                                                         ),
                                                                     ),
                                                                     width: None,
@@ -10100,31 +9990,6 @@ impl SettingsView {
                                                             palette,
                                                             format!("{}/GroupCard@800", use_scope),
                                                             use_scope.clone(),
-                                                            (move || Message::AccountCeremonyCancel).clone(),
-                                                            (move || Message::AccountCreateSubmit).clone(),
-                                                            (move || Message::AccountKeyAddSubmit).clone(),
-                                                            (move || Message::AccountKeyJoinSubmit).clone(),
-                                                            (move |event_0| Message::AccountKeyRemove(event_0)).clone(),
-                                                            (move || Message::AccountLoginSubmit).clone(),
-                                                            (move || Message::AccountPasskeyDesktop).clone(),
-                                                            (move || Message::AccountPasskeySubmit).clone(),
-                                                            (move || Message::AccountRenameSubmit).clone(),
-                                                            (move || Message::AccountWalletSubmit).clone(),
-                                                            (move |event_0, event_1| Message::CopyToClipboard(
-                                                                event_0,
-                                                                event_1,
-                                                            ))
-                                                                .clone(),
-                                                            (move || Message::LockSession).clone(),
-                                                            (move || Message::Reconnect).clone(),
-                                                            (move || Message::SetAppearanceDark).clone(),
-                                                            (move || Message::SetAppearanceLight).clone(),
-                                                            (move |event_0| Message::SetDesktopNotifications(event_0))
-                                                                .clone(),
-                                                            (move |event_0| Message::SettingsUnlockSubmit(event_0))
-                                                                .clone(),
-                                                            (move |event_0| Message::ShowTab(event_0)).clone(),
-                                                            (move || Message::SwitchNetwork).clone(),
                                                         ),
                                                 );
                                             ::ducktape_view_guest::wire::Node::Linear {
@@ -11192,11 +11057,7 @@ impl SettingsView {
                                                                             let node_scope = format!(
                                                                                 "{}/account-login-ceremony", node_scope
                                                                             );
-                                                                            self.render_settings_loading(
-                                                                                palette,
-                                                                                node_scope.clone(),
-                                                                                (move || Message::AccountCeremonyCancel).clone(),
-                                                                            )
+                                                                            self.render_settings_loading(palette, node_scope.clone())
                                                                         });
                                                                 }
                                                                 if self.account_exists {
@@ -11281,10 +11142,7 @@ impl SettingsView {
                                                                                     } else {
                                                                                         Some(
                                                                                                 ::ducktape_view_guest::slots::message(
-                                                                                                    (move |event_0, event_1| Message::CopyToClipboard(
-                                                                                                        event_0,
-                                                                                                        event_1,
-                                                                                                    ))(
+                                                                                                    Message::CopyToClipboard(
                                                                                                         self.account_number.to_owned(),
                                                                                                         "Number copied".to_owned(),
                                                                                                     ),
@@ -11416,31 +11274,6 @@ impl SettingsView {
                                                                 palette,
                                                                 format!("{}/GroupCard@1148", use_scope),
                                                                 use_scope.clone(),
-                                                                (move || Message::AccountCeremonyCancel).clone(),
-                                                                (move || Message::AccountCreateSubmit).clone(),
-                                                                (move || Message::AccountKeyAddSubmit).clone(),
-                                                                (move || Message::AccountKeyJoinSubmit).clone(),
-                                                                (move |event_0| Message::AccountKeyRemove(event_0)).clone(),
-                                                                (move || Message::AccountLoginSubmit).clone(),
-                                                                (move || Message::AccountPasskeyDesktop).clone(),
-                                                                (move || Message::AccountPasskeySubmit).clone(),
-                                                                (move || Message::AccountRenameSubmit).clone(),
-                                                                (move || Message::AccountWalletSubmit).clone(),
-                                                                (move |event_0, event_1| Message::CopyToClipboard(
-                                                                    event_0,
-                                                                    event_1,
-                                                                ))
-                                                                    .clone(),
-                                                                (move || Message::LockSession).clone(),
-                                                                (move || Message::Reconnect).clone(),
-                                                                (move || Message::SetAppearanceDark).clone(),
-                                                                (move || Message::SetAppearanceLight).clone(),
-                                                                (move |event_0| Message::SetDesktopNotifications(event_0))
-                                                                    .clone(),
-                                                                (move |event_0| Message::SettingsUnlockSubmit(event_0))
-                                                                    .clone(),
-                                                                (move |event_0| Message::ShowTab(event_0)).clone(),
-                                                                (move || Message::SwitchNetwork).clone(),
                                                             ),
                                                     );
                                                 ::ducktape_view_guest::wire::Node::Linear {
@@ -11499,31 +11332,6 @@ impl SettingsView {
                                                             palette,
                                                             format!("{}/GroupCard@1295", use_scope),
                                                             use_scope.clone(),
-                                                            (move || Message::AccountCeremonyCancel).clone(),
-                                                            (move || Message::AccountCreateSubmit).clone(),
-                                                            (move || Message::AccountKeyAddSubmit).clone(),
-                                                            (move || Message::AccountKeyJoinSubmit).clone(),
-                                                            (move |event_0| Message::AccountKeyRemove(event_0)).clone(),
-                                                            (move || Message::AccountLoginSubmit).clone(),
-                                                            (move || Message::AccountPasskeyDesktop).clone(),
-                                                            (move || Message::AccountPasskeySubmit).clone(),
-                                                            (move || Message::AccountRenameSubmit).clone(),
-                                                            (move || Message::AccountWalletSubmit).clone(),
-                                                            (move |event_0, event_1| Message::CopyToClipboard(
-                                                                event_0,
-                                                                event_1,
-                                                            ))
-                                                                .clone(),
-                                                            (move || Message::LockSession).clone(),
-                                                            (move || Message::Reconnect).clone(),
-                                                            (move || Message::SetAppearanceDark).clone(),
-                                                            (move || Message::SetAppearanceLight).clone(),
-                                                            (move |event_0| Message::SetDesktopNotifications(event_0))
-                                                                .clone(),
-                                                            (move |event_0| Message::SettingsUnlockSubmit(event_0))
-                                                                .clone(),
-                                                            (move |event_0| Message::ShowTab(event_0)).clone(),
-                                                            (move || Message::SwitchNetwork).clone(),
                                                         ),
                                                 );
                                             ::ducktape_view_guest::wire::Node::Linear {

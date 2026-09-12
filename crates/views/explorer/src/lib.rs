@@ -2524,9 +2524,7 @@ impl ExplorerView {
                             label: Some(String::from("Inspect block".to_owned())),
                             on_press: Some(
                                 ::ducktape_view_guest::slots::message(
-                                    (move |event_0| Message::SelectExplorerBlock(
-                                        event_0,
-                                    ))(arg_0.height),
+                                    Message::SelectExplorerBlock(arg_0.height),
                                 ),
                             ),
                             width: Some(::ducktape_view_guest::wire::Length::Fill),
@@ -2625,9 +2623,7 @@ impl ExplorerView {
                             label: Some(String::from("Inspect block".to_owned())),
                             on_press: Some(
                                 ::ducktape_view_guest::slots::message(
-                                    (move |event_0| Message::SelectExplorerBlock(
-                                        event_0,
-                                    ))(arg_0.height),
+                                    Message::SelectExplorerBlock(arg_0.height),
                                 ),
                             ),
                             width: Some(::ducktape_view_guest::wire::Length::Fill),
@@ -2814,10 +2810,10 @@ impl ExplorerView {
                         label: Some(String::from("Copy block hash".to_owned())),
                         on_press: Some(
                             ::ducktape_view_guest::slots::message(
-                                (move |event_0, event_1| Message::CopyToClipboard(
-                                    event_0,
-                                    event_1,
-                                ))(arg_1.to_owned(), "Block hash copied".to_owned()),
+                                Message::CopyToClipboard(
+                                    arg_1.to_owned(),
+                                    "Block hash copied".to_owned(),
+                                ),
                             ),
                         ),
                         width: None,
@@ -3003,10 +2999,10 @@ impl ExplorerView {
                         label: Some(String::from("Copy commit hash".to_owned())),
                         on_press: Some(
                             ::ducktape_view_guest::slots::message(
-                                (move |event_0, event_1| Message::CopyToClipboard(
-                                    event_0,
-                                    event_1,
-                                ))(arg_1.to_owned(), "Commit hash copied".to_owned()),
+                                Message::CopyToClipboard(
+                                    arg_1.to_owned(),
+                                    "Commit hash copied".to_owned(),
+                                ),
                             ),
                         ),
                         width: None,
@@ -3192,10 +3188,10 @@ impl ExplorerView {
                         label: Some(String::from("Copy op hash".to_owned())),
                         on_press: Some(
                             ::ducktape_view_guest::slots::message(
-                                (move |event_0, event_1| Message::CopyToClipboard(
-                                    event_0,
-                                    event_1,
-                                ))(arg_1.to_owned(), "Op hash copied".to_owned()),
+                                Message::CopyToClipboard(
+                                    arg_1.to_owned(),
+                                    "Op hash copied".to_owned(),
+                                ),
                             ),
                         ),
                         width: None,
@@ -3381,10 +3377,10 @@ impl ExplorerView {
                         label: Some(String::from("Copy proposer".to_owned())),
                         on_press: Some(
                             ::ducktape_view_guest::slots::message(
-                                (move |event_0, event_1| Message::CopyToClipboard(
-                                    event_0,
-                                    event_1,
-                                ))(arg_1.to_owned(), "Proposer copied".to_owned()),
+                                Message::CopyToClipboard(
+                                    arg_1.to_owned(),
+                                    "Proposer copied".to_owned(),
+                                ),
                             ),
                         ),
                         width: None,
@@ -3519,51 +3515,43 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
             {
-                let next = next.head;
-                self.head = next;
+                self.head = next.head;
             }
             {
-                let next = next.sync_line.to_owned();
-                self.sync_line = next;
+                self.sync_line = next.sync_line.to_owned();
             }
             {
-                let next = crate::host::connection_serial_after(
+                self.ledger_serial = crate::host::connection_serial_after(
                     self.connected,
                     next.connected,
                     self.ledger_serial,
                 );
-                self.ledger_serial = next;
             }
             {
-                let next = crate::host::loading_after(
+                self.loading = crate::host::loading_after(
                     self.connected,
                     next.connected,
                     self.loading,
                 );
-                self.loading = next;
             }
             {
-                let next = next.connected;
-                self.connected = next;
+                self.connected = next.connected;
             }
             {
-                let next = AppTheme::App;
-                self.active_palette = next;
+                self.active_palette = AppTheme::App;
             }
             if (!next.dark) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = AppTheme::AppDark;
-                self.active_palette = next;
+                self.active_palette = AppTheme::AppDark;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3574,23 +3562,19 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = false;
-                self.loading = next;
+                self.loading = false;
             }
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.blocks.clone();
-                self.blocks = next;
+                self.blocks = item.blocks.clone();
             }
             {
-                let next = item.ops.clone();
-                self.ops = next;
+                self.ops = item.ops.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3601,27 +3585,22 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = false;
-                self.searching = next;
+                self.searching = false;
             }
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.hits.clone();
-                self.hits = next;
+                self.hits = item.hits.clone();
             }
             {
-                let next = item.kinds.clone();
-                self.kinds = next;
+                self.kinds = item.kinds.clone();
             }
             {
-                let next = item.partial.to_owned();
-                self.partial = next;
+                self.partial = item.partial.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3632,12 +3611,10 @@ impl ExplorerView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = true;
-                self.loading = next;
+                self.loading = true;
             }
             {
-                let next = (self.ledger_serial + 1);
-                self.ledger_serial = next;
+                self.ledger_serial = (self.ledger_serial + 1);
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3649,11 +3626,10 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::copy(
+                self.sent = crate::host::copy(
                     ::std::convert::AsRef::as_ref(&(text)),
                     ::std::convert::AsRef::as_ref(&(label)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3666,32 +3642,25 @@ impl ExplorerView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = "all".to_owned();
-                self.kind = next;
+                self.kind = "all".to_owned();
             }
             {
-                let next = Vec::new();
-                self.hits = next;
+                self.hits = Vec::new();
             }
             {
-                let next = Vec::new();
-                self.kinds = next;
+                self.kinds = Vec::new();
             }
             {
-                let next = "".to_owned();
-                self.partial = next;
+                self.partial = "".to_owned();
             }
             {
-                let next = true;
-                self.searching = next;
+                self.searching = true;
             }
             {
-                let next = (self.search_serial + 1);
-                self.search_serial = next;
+                self.search_serial = (self.search_serial + 1);
             }
             {
-                let next = (self.query).trim().to_owned();
-                self.sent_query = next;
+                self.sent_query = (self.query).trim().to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3699,32 +3668,25 @@ impl ExplorerView {
     fn on_clear_explorer_search(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = "".to_owned();
-                self.query = next;
+                self.query = "".to_owned();
             }
             {
-                let next = "all".to_owned();
-                self.kind = next;
+                self.kind = "all".to_owned();
             }
             {
-                let next = Vec::new();
-                self.hits = next;
+                self.hits = Vec::new();
             }
             {
-                let next = Vec::new();
-                self.kinds = next;
+                self.kinds = Vec::new();
             }
             {
-                let next = "".to_owned();
-                self.partial = next;
+                self.partial = "".to_owned();
             }
             {
-                let next = false;
-                self.searching = next;
+                self.searching = false;
             }
             {
-                let next = "".to_owned();
-                self.sent_query = next;
+                self.sent_query = "".to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3735,8 +3697,7 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = next.to_owned();
-                self.kind = next;
+                self.kind = next.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3747,8 +3708,7 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = height;
-                self.selected = next;
+                self.selected = height;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3760,12 +3720,11 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::ledger_width_after_delta(
+                self.ledger_width = crate::host::ledger_width_after_delta(
                     self.ledger_width,
                     dx,
                     self.viewport_width,
                 );
-                self.ledger_width = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3777,16 +3736,14 @@ impl ExplorerView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = width;
-                self.viewport_width = next;
+                self.viewport_width = width;
             }
             {
-                let next = crate::host::ledger_width_after_delta(
+                self.ledger_width = crate::host::ledger_width_after_delta(
                     self.ledger_width,
                     0.0,
                     width,
                 );
-                self.ledger_width = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3794,8 +3751,7 @@ impl ExplorerView {
     fn on_bind_query(&mut self, value: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.query = next;
+                self.query = value;
             }
             ::ducktape_view_guest::Task::none()
         }

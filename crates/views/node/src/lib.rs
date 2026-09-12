@@ -2640,9 +2640,7 @@ impl NodeView {
                                                 label: Some(String::from("Node overview".to_owned())),
                                                 on_press: Some(
                                                     ::ducktape_view_guest::slots::message(
-                                                        (move |event_0| Message::SelectNodeTab(
-                                                            event_0,
-                                                        ))(NodeTab::Overview),
+                                                        Message::SelectNodeTab(NodeTab::Overview),
                                                     ),
                                                 ),
                                                 width: None,
@@ -2776,9 +2774,7 @@ impl NodeView {
                                                 label: Some(String::from("Node permissions".to_owned())),
                                                 on_press: Some(
                                                     ::ducktape_view_guest::slots::message(
-                                                        (move |event_0| Message::SelectNodeTab(
-                                                            event_0,
-                                                        ))(NodeTab::Permissions),
+                                                        Message::SelectNodeTab(NodeTab::Permissions),
                                                     ),
                                                 ),
                                                 width: None,
@@ -2912,9 +2908,7 @@ impl NodeView {
                                                 label: Some(String::from("Node activity".to_owned())),
                                                 on_press: Some(
                                                     ::ducktape_view_guest::slots::message(
-                                                        (move |event_0| Message::SelectNodeTab(
-                                                            event_0,
-                                                        ))(NodeTab::Activity),
+                                                        Message::SelectNodeTab(NodeTab::Activity),
                                                     ),
                                                 ),
                                                 width: None,
@@ -3203,18 +3197,6 @@ impl NodeView {
                                                 .render_log_timeline_frame_59(
                                                     palette,
                                                     format!("{}/LogTimeline.Frame@2189", use_scope),
-                                                    (move || Message::ApplyLiveLogFilter).clone(),
-                                                    (move |event_0, event_1| Message::CopyToClipboard(
-                                                        event_0,
-                                                        event_1,
-                                                    ))
-                                                        .clone(),
-                                                    (move |event_0| Message::LiveLogFilterChanged(event_0))
-                                                        .clone(),
-                                                    (move |event_0| Message::NodeLogFilterChanged(event_0))
-                                                        .clone(),
-                                                    (move || Message::OpenNodeModules).clone(),
-                                                    (move |event_0| Message::SelectNodeTab(event_0)).clone(),
                                                 ),
                                         );
                                 }
@@ -3261,10 +3243,7 @@ impl NodeView {
                                                     } else {
                                                         Some(
                                                                 ::ducktape_view_guest::slots::message(
-                                                                    (move |event_0, event_1| Message::CopyToClipboard(
-                                                                        event_0,
-                                                                        event_1,
-                                                                    ))(
+                                                                    Message::CopyToClipboard(
                                                                         self.facts.node_key.to_owned(),
                                                                         "Node key copied".to_owned(),
                                                                     ),
@@ -3461,18 +3440,6 @@ impl NodeView {
                                                         .render_group_card_75(
                                                             palette,
                                                             format!("{}/GroupCard@2279", use_scope),
-                                                            (move || Message::ApplyLiveLogFilter).clone(),
-                                                            (move |event_0, event_1| Message::CopyToClipboard(
-                                                                event_0,
-                                                                event_1,
-                                                            ))
-                                                                .clone(),
-                                                            (move |event_0| Message::LiveLogFilterChanged(event_0))
-                                                                .clone(),
-                                                            (move |event_0| Message::NodeLogFilterChanged(event_0))
-                                                                .clone(),
-                                                            (move || Message::OpenNodeModules).clone(),
-                                                            (move |event_0| Message::SelectNodeTab(event_0)).clone(),
                                                         ),
                                                 );
                                             if (!(self.node_peers).is_empty()) {
@@ -3493,18 +3460,6 @@ impl NodeView {
                                                                     .render_group_card_77(
                                                                         palette,
                                                                         format!("{}/GroupCard@2313", use_scope),
-                                                                        (move || Message::ApplyLiveLogFilter).clone(),
-                                                                        (move |event_0, event_1| Message::CopyToClipboard(
-                                                                            event_0,
-                                                                            event_1,
-                                                                        ))
-                                                                            .clone(),
-                                                                        (move |event_0| Message::LiveLogFilterChanged(event_0))
-                                                                            .clone(),
-                                                                        (move |event_0| Message::NodeLogFilterChanged(event_0))
-                                                                            .clone(),
-                                                                        (move || Message::OpenNodeModules).clone(),
-                                                                        (move |event_0| Message::SelectNodeTab(event_0)).clone(),
                                                                     ),
                                                             );
                                                         ::ducktape_view_guest::wire::Node::Linear {
@@ -3614,55 +3569,45 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
             {
-                let next = crate::host::connection_serial_after(
+                self.connection_serial = crate::host::connection_serial_after(
                     self.connected,
                     next.connected,
                     self.connection_serial,
                 );
-                self.connection_serial = next;
             }
             {
-                let next = next.connected;
-                self.connected = next;
+                self.connected = next.connected;
             }
             {
-                let next = next.admin;
-                self.admin = next;
+                self.admin = next.admin;
             }
             {
-                let next = next.tier.to_owned();
-                self.tier = next;
+                self.tier = next.tier.to_owned();
             }
             {
-                let next = next.status.to_owned();
-                self.status = next;
+                self.status = next.status.to_owned();
             }
             {
-                let next = next.data_dir.to_owned();
-                self.node_data_dir = next;
+                self.node_data_dir = next.data_dir.to_owned();
             }
             {
-                let next = next.wall_now;
-                self.wall_now = next;
+                self.wall_now = next.wall_now;
             }
             {
-                let next = AppTheme::App;
-                self.active_palette = next;
+                self.active_palette = AppTheme::App;
             }
             if (!next.dark) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = AppTheme::AppDark;
-                self.active_palette = next;
+                self.active_palette = AppTheme::AppDark;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3673,19 +3618,16 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             {
-                let next = false;
-                self.loading = next;
+                self.loading = false;
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.facts.clone();
-                self.facts = next;
+                self.facts = item.facts.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3696,15 +3638,13 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.rows.clone();
-                self.node_peers = next;
+                self.node_peers = item.rows.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3715,15 +3655,13 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             if (!(item.error).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = item.rows.clone();
-                self.module_rows = next;
+                self.module_rows = item.rows.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3734,15 +3672,13 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             {
-                let next = crate::host::push_logs(
+                self.log_lines = crate::host::push_logs(
                     ::std::convert::AsRef::as_ref(&(self.log_lines)),
                     ::std::convert::AsRef::as_ref(&(item.lines)),
                 );
-                self.log_lines = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3753,16 +3689,14 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = item.error.to_owned();
-                self.host_error = next;
+                self.host_error = item.error.to_owned();
             }
             {
-                let next = crate::host::keep_str(
+                self.live_filter_note = crate::host::keep_str(
                     (item.error).is_empty(),
                     ::std::convert::AsRef::as_ref(&(item.reply)),
                     ::std::convert::AsRef::as_ref(&(item.error)),
                 );
-                self.live_filter_note = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3773,8 +3707,7 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = next.clone();
-                self.node_tab = next;
+                self.node_tab = next.clone();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3782,8 +3715,7 @@ impl NodeView {
     fn on_open_node_modules(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = NodeTab::Modules;
-                self.node_tab = next;
+                self.node_tab = NodeTab::Modules;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3794,8 +3726,7 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = next.to_owned();
-                self.node_log_filter = next;
+                self.node_log_filter = next.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3806,8 +3737,7 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = next.to_owned();
-                self.live_log_filter = next;
+                self.live_log_filter = next.to_owned();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3818,14 +3748,12 @@ impl NodeView {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                let next = "".to_owned();
-                self.live_filter_note = next;
+                self.live_filter_note = "".to_owned();
             }
             {
-                let next = (crate::host::set_log_filter(
+                self.sent = (crate::host::set_log_filter(
                     ::std::convert::AsRef::as_ref(&(self.live_log_filter)),
                 ));
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3837,11 +3765,10 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = crate::host::copy(
+                self.sent = crate::host::copy(
                     ::std::convert::AsRef::as_ref(&(text)),
                     ::std::convert::AsRef::as_ref(&(label)),
                 );
-                self.sent = next;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3852,8 +3779,7 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.node_log_filter = next;
+                self.node_log_filter = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -3864,8 +3790,7 @@ impl NodeView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                let next = value;
-                self.live_log_filter = next;
+                self.live_log_filter = value;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -7839,12 +7764,6 @@ impl NodeView {
         &self,
         palette: Palette,
         use_scope: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_2: impl Fn(String) -> Message + Clone + 'static,
-        cb_3: impl Fn(String) -> Message + Clone + 'static,
-        cb_4: impl Fn() -> Message + Clone + 'static,
-        cb_5: impl Fn(NodeTab) -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -8000,12 +7919,6 @@ impl NodeView {
         &self,
         palette: Palette,
         use_scope: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_2: impl Fn(String) -> Message + Clone + 'static,
-        cb_3: impl Fn(String) -> Message + Clone + 'static,
-        cb_4: impl Fn() -> Message + Clone + 'static,
-        cb_5: impl Fn(NodeTab) -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -8244,12 +8157,6 @@ impl NodeView {
         &self,
         palette: Palette,
         use_scope: String,
-        cb_0: impl Fn() -> Message + Clone + 'static,
-        cb_1: impl Fn(String, String) -> Message + Clone + 'static,
-        cb_2: impl Fn(String) -> Message + Clone + 'static,
-        cb_3: impl Fn(String) -> Message + Clone + 'static,
-        cb_4: impl Fn() -> Message + Clone + 'static,
-        cb_5: impl Fn(NodeTab) -> Message + Clone + 'static,
     ) -> ::ducktape_view_guest::wire::Node {
         {
             let node_scope = format!("{}/root", use_scope);
@@ -8410,7 +8317,10 @@ impl NodeView {
                                                 >(
                                                     Box::new({
                                                         let route = {
-                                                            let route_callback = (cb_3).clone();
+                                                            let route_callback = (|event_0| Message::NodeLogFilterChanged(
+                                                                event_0,
+                                                            ))
+                                                                .clone();
                                                             move |value| (route_callback)(value)
                                                         };
                                                         move |sent: String| Some(route(sent))
@@ -8511,14 +8421,19 @@ impl NodeView {
                                                     >(
                                                         Box::new({
                                                             let route = {
-                                                                let route_callback = (cb_2).clone();
+                                                                let route_callback = (|event_0| Message::LiveLogFilterChanged(
+                                                                    event_0,
+                                                                ))
+                                                                    .clone();
                                                                 move |value| (route_callback)(value)
                                                             };
                                                             move |sent: String| Some(route(sent))
                                                         }),
                                                     ),
                                                     on_submit: Some(
-                                                        ::ducktape_view_guest::slots::message((cb_0)()),
+                                                        ::ducktape_view_guest::slots::message(
+                                                            Message::ApplyLiveLogFilter,
+                                                        ),
                                                     ),
                                                     width: Some(
                                                         ::ducktape_view_guest::wire::Length::Fixed((260.0) as f32),
@@ -8589,7 +8504,11 @@ impl NodeView {
                                                 on_press: if ((self.live_log_filter).is_empty()) {
                                                     None
                                                 } else {
-                                                    Some(::ducktape_view_guest::slots::message((cb_0)()))
+                                                    Some(
+                                                            ::ducktape_view_guest::slots::message(
+                                                                Message::ApplyLiveLogFilter,
+                                                            ),
+                                                        )
                                                 },
                                                 width: None,
                                                 height: None,
