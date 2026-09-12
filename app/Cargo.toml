@@ -141,6 +141,9 @@ objc2-user-notifications = { version = "0.2", default-features = false, features
 zbus = "5"
 
 [dev-dependencies]
+gpui-kit = { version = "=0.6.1", features = ["test-support"] }
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
 commonware-cryptography.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true

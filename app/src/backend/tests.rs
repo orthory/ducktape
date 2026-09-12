@@ -41,13 +41,6 @@ mod shell;
 mod status;
 mod wire;
 
-fn alpha_of(background: iced::Background) -> f32 {
-    let iced::Background::Color(color) = background else {
-        panic!("a depth role paints a flat colour");
-    };
-    color.a
-}
-
 /// A node that serves `GET /v1/status` EXACTLY ONCE and answers `500` to every
 /// later ask for it. `/v1/peers` answers every time — the pin is on the status
 /// document, not on the peer sample.

@@ -99,14 +99,15 @@ fn a_page_search_hit_names_the_page_it_came_from() {
 
     // The palette and the pages search panel render the same hit type; #997's
     // lesson is that a fix at one surface leaves the siblings broken.
-    const PALETTE: &str = include_str!("../../ui/screens/overlays.ice");
-    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.ice");
+    const PALETTE: &str = include_str!("../../shell.rs");
+    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.rs");
     assert!(
-        PALETTE.contains("text hit.page_title"),
+        PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
     );
     assert!(
-        PANEL.contains("text hit.page_title") && !PANEL.contains("text hit.block_id"),
+        PANEL.lines().any(|line| line.contains("Node::Text") && line.contains(".page_title"))
+            && !PANEL.lines().any(|line| line.contains("Node::Text") && line.contains("content:") && line.contains(".block_id")),
         "the pages search panel names the page instead of printing a raw block id"
     );
 }

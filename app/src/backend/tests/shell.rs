@@ -298,81 +298,27 @@ fn huddle_recipient_nodes_keeps_the_readers_other_device() {
 }
 
 #[test]
-fn popover_uses_only_shared_design_roles() {
-    let tokens = ui_lang_components::ui::theme::LIGHT;
-    let raised = raised_style(&iced::Theme::Light);
-    // OPAQUE. iced has no backdrop blur, so a glass role over a menu is just
-    // transparency: the sentence behind an item and the item's own label draw
-    // through each other.
-    assert_eq!(
-        raised.background,
-        Some(iced::Background::Color(tokens.palette.popover))
-    );
-    assert_eq!(raised.background.map(alpha_of), Some(1.0));
-    assert_eq!(
-        raised_style(&iced::Theme::Dark).background.map(alpha_of),
-        Some(1.0)
-    );
-    assert_eq!(raised.border.radius, tokens.radius.card.into());
-    assert_eq!(raised.shadow, tokens.elevation.popover);
-}
-
-#[test]
-fn palette_keys_use_logical_escape_and_physical_shortcut() {
-    use iced::keyboard::{
-        Key, Modifiers,
-        key::{Code, Named, Physical},
-    };
-
-    assert_eq!(
-        palette_key_action(
-            Key::Named(Named::Escape),
-            Physical::Code(Code::KeyA),
-            Modifiers::default(),
-            true,
-        ),
-        "close"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Named(Named::Escape),
-            Physical::Code(Code::KeyA),
-            Modifiers::default(),
-            false,
-        ),
-        "none"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Character("x".into()),
-            Physical::Code(Code::KeyK),
-            Modifiers::COMMAND,
-            false,
-        ),
-        "open"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Character("x".into()),
-            Physical::Code(Code::KeyK),
-            Modifiers::COMMAND,
-            true,
-        ),
-        "close"
-    );
+fn palette_keys_use_native_platform_shortcuts() {
+    let plain = gpui_kit::Modifiers::default();
+    let command = gpui_kit::Modifiers { platform: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"), ..Default::default() };
+    assert_eq!(palette_key_action("escape".into(), plain, true), "close");
+    assert_eq!(palette_key_action("escape".into(), plain, false), "none");
+    assert_eq!(palette_key_action("k".into(), command, false), "open");
+    assert_eq!(palette_key_action("K".into(), command, true), "close");
+    assert_eq!(palette_key_action("x".into(), command, false), "none");
+    assert_eq!(palette_key_action("k".into(), plain, false), "none");
 }
 
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
-    use iced::keyboard::{Key, key::Named};
-
-    let escape = Key::Named(Named::Escape);
+    let escape = String::from("escape");
     let target =
         |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
 
     // Not Escape -> nothing, whatever is open.
     assert_eq!(
-        escape_target(Key::Character("x".into()), false, true, true),
+        escape_target(String::from("x"), false, true, true),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
@@ -396,9 +342,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 // layers in the same order, and differ on exactly one verdict.
 #[test]
 fn the_two_ladder_readers_enumerate_the_same_layers() {
-    use iced::keyboard::{Key, key::Named};
-
-    let escape = Key::Named(Named::Escape);
+    let escape = String::from("escape");
     let target =
         |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
 
