@@ -2044,6 +2044,9 @@ impl ViewTree {
         let view = editor.view.clone();
         div()
             .relative()
+            // WireEditor itself is size_full: keep its existing containing
+            // block instead of letting an auto-sized measuring wrapper collapse.
+            .size_full()
             .child(view)
             .child(self.measure(key, cx))
             .into_any_element()
