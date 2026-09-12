@@ -38,10 +38,9 @@ fn main() {
     shell::run();
 }
 
-/// the app's own sink: `<DUCKTAPE_HOME or ~/.ducktape>/app.log`, rotated at
+/// The app's sink is `app.log` in its platform state directory, rotated at
 /// open exactly like the node's `daemon.log`, plus a panic hook that lands in
-/// it. the FILE ONLY — a GUI's stderr is `/dev/null` under every launcher a
-/// member actually uses, and iced's own prints are all a terminal should see.
+/// it. The file remains available when a desktop launcher discards stderr.
 ///
 /// `RUST_LOG` ADDS to `info` rather than replacing it, the `noded::log` rule:
 /// `RUST_LOG=ducktape::auth=debug` turns one plane up without turning the rest
