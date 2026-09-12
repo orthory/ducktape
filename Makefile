@@ -133,7 +133,7 @@ $(WASM_TOOLS_BIN):
 		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
 
 ## Compile Rust-authored views and stage dynamically loaded WASM components.
-VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($0 == "[package]") } in_package && /^name *= *"/ { split($0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
+VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
 
 views: $(WASM_TOOLS_BIN)
 	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" CARGO="$(CARGO)" bash ops/build-views.sh $(VIEW_PACKAGES)

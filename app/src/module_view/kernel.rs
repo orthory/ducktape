@@ -59,13 +59,13 @@
 //!   whose records are addressed by ids its WRITER mints. A view has no
 //!   clock and no entropy of its own, so the app mints it.
 //! - `clock.ticks` `<period, i64 ms little-endian>` — a subscription that
-//!   gets one item per period. A wasm module has no clock, so an Ice
-//!   `every`/`repeat` in a view is this door; the window thread keeps the
+//!   gets one item per period. A wasm module has no clock, so the guest's
+//!   recurring tasks use this door; the window thread keeps the
 //!   deadline and the shell draws the frame it comes due on.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
-//! view's next redraw; the widget polls while any is in flight.
+//! view's next redraw; reply notifications wake the native presenter.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -120,8 +120,8 @@ impl Replies {
     }
 
     pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) -> Result<(), String> {
-        if let Some(fault) = self.fault() { return Err(fault); }
         let mut events = self.events.lock().expect("kernel replies");
+        if let Some(fault) = self.fault() { return Err(fault); }
         pending.append(&mut events);
         Ok(())
     }
