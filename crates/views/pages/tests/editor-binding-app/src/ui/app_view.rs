@@ -1,8 +1,8 @@
 impl PagesEditorFixture {
-    pub(crate) fn view(&self) -> ::ducktape_view_guest::wire::Node {
+    pub(crate) fn view(&self) -> wire::Node {
         let palette = self.palette();
         {
-            let mut children: Vec<::ducktape_view_guest::wire::Node> = Vec::new();
+            let mut children: Vec<wire::Node> = Vec::new();
             children.push({
                 let node_scope = format!("{}/document", "PagesEditorFixture");
                 {
@@ -12,8 +12,8 @@ impl PagesEditorFixture {
                         Message::DocumentUpdated
                             as fn(::ducktape_view_guest::EditorDocumentUpdate) -> Message,
                     );
-                    ::ducktape_view_guest::wire::Node::Editor {
-                        options: Box::new(::ducktape_view_guest::wire::EditorOptions {
+                    wire::Node::Editor {
+                        options: Box::new(wire::EditorOptions {
                             binding: Some(Box::new(
                                 crate::editor_binding::keys(
                                     self.history.clone(),
@@ -42,7 +42,7 @@ impl PagesEditorFixture {
                             line_height: None,
                             wrapping: None,
                             font: None,
-                            style: ::ducktape_view_guest::wire::InputStyle {
+                            style: wire::InputStyle {
                                 active: ::std::default::Default::default(),
                                 hovered: None,
                                 focused: None,
@@ -53,8 +53,8 @@ impl PagesEditorFixture {
                         }),
                         key: node_scope.clone(),
                         placeholder: String::new(),
-                        document: document,
-                        on_document: on_document,
+                        document,
+                        on_document,
                         editable: true,
                         width: Some((640.0) as f32),
                         height: None,
@@ -66,8 +66,8 @@ impl PagesEditorFixture {
             if (64000 > (((self.document).text()).len() as i64)) {
                 children.push({
                     let node_scope = format!("{}/echo", "PagesEditorFixture");
-                    ::ducktape_view_guest::wire::Node::Text {
-                        options: ::ducktape_view_guest::wire::TextOptions {
+                    wire::Node::Text {
+                        options: wire::TextOptions {
                             height: None,
                             align_y: None,
                             line_height: None,
@@ -79,9 +79,9 @@ impl PagesEditorFixture {
                         key: node_scope.clone(),
                         size: None,
                         color: None,
-                        font: ::ducktape_view_guest::wire::Font {
+                        font: wire::Font {
                             monospace: false,
-                            weight: ::ducktape_view_guest::wire::Weight::Normal,
+                            weight: wire::Weight::Normal,
                         },
                         width: None,
                         align_x: None,
@@ -91,8 +91,8 @@ impl PagesEditorFixture {
             }
             children.push({
                 let node_scope = format!("{}/formatting-notice", "PagesEditorFixture");
-                ::ducktape_view_guest::wire::Node::Text {
-                    options: ::ducktape_view_guest::wire::TextOptions {
+                wire::Node::Text {
+                    options: wire::TextOptions {
                         height: None,
                         align_y: None,
                         line_height: None,
@@ -104,19 +104,19 @@ impl PagesEditorFixture {
                     key: node_scope.clone(),
                     size: None,
                     color: None,
-                    font: ::ducktape_view_guest::wire::Font {
+                    font: wire::Font {
                         monospace: false,
-                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        weight: wire::Weight::Normal,
                     },
                     width: None,
                     align_x: None,
-                    content: (self.formatting_notice.to_owned()).to_string(),
+                    content: self.formatting_notice.to_owned(),
                 }
             });
             children.push({
                 let node_scope = format!("{}/load-error", "PagesEditorFixture");
-                ::ducktape_view_guest::wire::Node::Text {
-                    options: ::ducktape_view_guest::wire::TextOptions {
+                wire::Node::Text {
+                    options: wire::TextOptions {
                         height: None,
                         align_y: None,
                         line_height: None,
@@ -128,51 +128,49 @@ impl PagesEditorFixture {
                     key: node_scope.clone(),
                     size: None,
                     color: None,
-                    font: ::ducktape_view_guest::wire::Font {
+                    font: wire::Font {
                         monospace: false,
-                        weight: ::ducktape_view_guest::wire::Weight::Normal,
+                        weight: wire::Weight::Normal,
                     },
                     width: None,
                     align_x: None,
-                    content: (self.load_error.to_owned()).to_string(),
+                    content: self.load_error.to_owned(),
                 }
             });
-            children.push(::ducktape_view_guest::wire::Node::Button {
+            children.push(wire::Node::Button {
                 checked: None,
                 expanded: None,
                 description: None,
                 key: format!("{}/@button:81", "PagesEditorFixture"),
-                content: ::ducktape_view_guest::wire::ButtonContent::Label(String::from(
-                    "Load document",
-                )),
+                content: wire::ButtonContent::Label(String::from("Load document")),
                 label: None,
                 on_press: Some(::ducktape_view_guest::slots::message(Message::Load)),
                 width: None,
                 height: None,
                 padding: None,
-                style: ::ducktape_view_guest::wire::ButtonStyle {
-                    preset: ::ducktape_view_guest::wire::ButtonPreset::Primary,
+                style: wire::ButtonStyle {
+                    preset: wire::ButtonPreset::Primary,
                     recipe: None,
-                    active: ::ducktape_view_guest::wire::Face::default(),
+                    active: wire::Face::default(),
                     hovered: None,
                     pressed: None,
                     disabled: None,
                 },
             });
-            ::ducktape_view_guest::wire::Node::Linear {
+            wire::Node::Linear {
                 max_width: None,
                 clip: false,
                 key: format!("{}/@layout:69", "PagesEditorFixture"),
                 wrap: None,
-                axis: ::ducktape_view_guest::wire::Axis::Column,
+                axis: wire::Axis::Column,
                 spacing: Some((8.0) as f32),
                 padding: None,
-                width: Some(::ducktape_view_guest::wire::Length::Fixed((640.0) as f32)),
+                width: Some(wire::Length::Fixed((640.0) as f32)),
                 height: None,
                 align: None,
                 background: None,
                 border: None,
-                children: children,
+                children,
             }
         }
     }

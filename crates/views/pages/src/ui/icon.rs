@@ -1,11 +1,5 @@
 impl PagesView {
-    fn icon(
-        &self,
-        palette: Palette,
-        scope: String,
-        name: &str,
-        size: f32,
-    ) -> ducktape_view_guest::wire::Node {
+    fn icon(&self, palette: Palette, scope: String, name: &str, size: f32) -> wire::Node {
         use ducktape_view_guest::wire::{Length, Node};
         let (hash, bytes) = ducktape_view_guest::slots::picture(crate::host::icon(name));
         Node::Svg {

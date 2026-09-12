@@ -1,7 +1,7 @@
 impl PagesView {
-    pub(crate) fn view(&self) -> ::ducktape_view_guest::wire::Node {
+    pub(crate) fn view(&self) -> wire::Node {
         let palette = self.palette();
-        ::ducktape_view_guest::wire::Node::Sensor {
+        wire::Node::Sensor {
             key: format!("{}/@sensor:721", "PagesView"),
             reset: None,
             on_show: Some(
@@ -23,8 +23,8 @@ impl PagesView {
             delay: None,
             child: Box::new({
                 let node_scope = format!("{}/root", "PagesView");
-                ::ducktape_view_guest::wire::Node::Container {
-                    shadow: ::ducktape_view_guest::wire::Shadow {
+                wire::Node::Container {
+                    shadow: wire::Shadow {
                         color: None,
                         x: None,
                         y: None,
@@ -34,13 +34,12 @@ impl PagesView {
                     max_height: None,
                     clip: false,
                     key: node_scope.clone(),
-                    width: Some(::ducktape_view_guest::wire::Length::Fill),
-                    height: Some(::ducktape_view_guest::wire::Length::Fill),
+                    width: Some(wire::Length::Fill),
+                    height: Some(wire::Length::Fill),
                     padding: None,
                     align_x: None,
                     align_y: None,
-                    background: (Some(palette.colors[2]))
-                        .map(::ducktape_view_guest::wire::Background::Color),
+                    background: (Some(palette.colors[2])).map(wire::Background::Color),
                     border: None,
                     snap: None,
                     content: Box::new({

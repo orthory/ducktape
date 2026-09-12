@@ -1,18 +1,18 @@
 impl PagesEditorFixture {
     #[allow(clippy::assign_op_pattern)]
-    pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
+    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Load => {
                 self.source = crate::fixture::large_source();
-                ::ducktape_view_guest::Task::none()
+                Task::none()
             }
             Message::DocumentArrived(item) => {
                 if (item.source != self.source.reference) {
-                    return ::ducktape_view_guest::Task::none();
+                    return Task::none();
                 }
                 self.load_error = item.error.to_owned();
                 if (!(item.error).is_empty()) {
-                    return ::ducktape_view_guest::Task::none();
+                    return Task::none();
                 }
                 self.formatting_notice = item.notice.to_owned();
                 {
@@ -25,24 +25,21 @@ impl PagesEditorFixture {
                 };
                 self.installed_source = item.source.clone();
                 self.menu = crate::editor_binding::initial_menu();
-                ::ducktape_view_guest::Task::none()
+                Task::none()
             }
             Message::Committed(next) => {
                 self.formatting_notice = next.notice.to_owned();
                 self.history = next.history.clone();
                 self.menu = next.menu.clone();
-                ::ducktape_view_guest::Task::none()
+                Task::none()
             }
             Message::DocumentTransaction(transaction) => {
                 let route = transaction.apply(&mut self.document);
-                route.map_or_else(
-                    ::ducktape_view_guest::Task::none,
-                    ::ducktape_view_guest::Task::done,
-                )
+                route.map_or_else(Task::none, Task::done)
             }
             Message::DocumentUpdated(document) => {
                 document.apply(&mut self.document);
-                ::ducktape_view_guest::Task::none()
+                Task::none()
             }
         }
     }

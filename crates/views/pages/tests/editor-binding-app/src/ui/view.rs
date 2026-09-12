@@ -3,10 +3,11 @@
 pub(crate) enum AppTheme {
     App,
 }
+use ducktape_view_guest::{Subscription, Task, wire};
 #[derive(Clone, Copy)]
 struct Palette {
     name: &'static str,
-    colors: [::ducktape_view_guest::wire::Rgba; 4],
+    colors: [wire::Rgba; 4],
 }
 #[allow(dead_code)]
 pub struct PagesEditorFixture {
@@ -44,30 +45,10 @@ impl PagesEditorFixture {
         Palette {
             name: "app",
             colors: [
-                ::ducktape_view_guest::wire::Rgba([
-                    255.0 / 255.0,
-                    255.0 / 255.0,
-                    255.0 / 255.0,
-                    1.000000,
-                ]),
-                ::ducktape_view_guest::wire::Rgba([
-                    0.0 / 255.0,
-                    0.0 / 255.0,
-                    0.0 / 255.0,
-                    1.000000,
-                ]),
-                ::ducktape_view_guest::wire::Rgba([
-                    255.0 / 255.0,
-                    0.0 / 255.0,
-                    0.0 / 255.0,
-                    1.000000,
-                ]),
-                ::ducktape_view_guest::wire::Rgba([
-                    255.0 / 255.0,
-                    0.0 / 255.0,
-                    255.0 / 255.0,
-                    1.000000,
-                ]),
+                wire::Rgba([255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 1.000000]),
+                wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]),
+                wire::Rgba([255.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]),
+                wire::Rgba([255.0 / 255.0, 0.0 / 255.0, 255.0 / 255.0, 1.000000]),
             ],
         }
     }
@@ -87,16 +68,16 @@ impl PagesEditorFixture {
             commented: Vec::new(),
         }
     }
-    pub(crate) fn boot() -> (Self, ducktape_view_guest::Task<Message>) {
-        (Self::initial_state(), ducktape_view_guest::Task::none())
+    pub(crate) fn boot() -> (Self, Task<Message>) {
+        (Self::initial_state(), Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "d58bf2b798ab09bc7584235aa6d369a976f67b3396fb454eef1417f7f456836b";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        ::ducktape_view_guest::wire::Snapshot {
+        wire::Snapshot {
             schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: ::ducktape_view_guest::wire::SnapshotValue::Record {
+            state: wire::SnapshotValue::Record {
                 name: String::from("PagesEditorFixture"),
                 fields: vec![
                     (
@@ -180,13 +161,13 @@ impl PagesEditorFixture {
         .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot = ::ducktape_view_guest::wire::Snapshot::decode(bytes)?;
+        let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
             return Err(String::from("snapshot schema mismatch"));
         }
         let value = snapshot.state;
         ((|| {
-            let ::ducktape_view_guest::wire::SnapshotValue::Record {
+            let wire::SnapshotValue::Record {
                 name: name,
                 fields: fields,
             } = value
@@ -202,7 +183,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let formatting_notice: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -210,9 +191,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let document: ::ducktape_view_guest::Editor = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bytes(bytes) => {
-                    ::ducktape_view_guest::Editor::restore(&bytes)
-                }
+                wire::SnapshotValue::Bytes(bytes) => ::ducktape_view_guest::Editor::restore(&bytes),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -220,7 +199,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let history: crate::editor_binding::HistoryState = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
+                let wire::SnapshotValue::Record {
                     name: name,
                     fields: fields,
                 } = value
@@ -237,7 +216,7 @@ impl PagesEditorFixture {
                 }
                 Some(crate::editor_binding::HistoryState {
                     snapshot: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes(item) => Some(item),
+                        wire::SnapshotValue::Bytes(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -247,7 +226,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let menu: crate::editor_binding::MenuState = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
+                let wire::SnapshotValue::Record {
                     name: name,
                     fields: fields,
                 } = value
@@ -264,7 +243,7 @@ impl PagesEditorFixture {
                 }
                 Some(crate::editor_binding::MenuState {
                     snapshot: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes(item) => Some(item),
+                        wire::SnapshotValue::Bytes(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -274,7 +253,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let source: crate::fixture_source::DocumentSource = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
+                let wire::SnapshotValue::Record {
                     name: name,
                     fields: fields,
                 } = value
@@ -291,7 +270,7 @@ impl PagesEditorFixture {
                 }
                 Some(crate::fixture_source::DocumentSource {
                     reference: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes(item) => Some(item),
+                        wire::SnapshotValue::Bytes(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -301,7 +280,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let installed_source: Vec<u8> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bytes(item) => Some(item),
+                wire::SnapshotValue::Bytes(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -309,7 +288,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let load_error: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -317,7 +296,7 @@ impl PagesEditorFixture {
                 return None;
             }
             let paint_dark: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -325,10 +304,10 @@ impl PagesEditorFixture {
                 return None;
             }
             let commented: Vec<i64> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => items
+                wire::SnapshotValue::List(items) => items
                     .into_iter()
                     .map(|item| match item {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>(),
@@ -351,17 +330,15 @@ impl PagesEditorFixture {
 }
 #[allow(unused_parens)]
 impl PagesEditorFixture {
-    fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
-        ::ducktape_view_guest::Subscription::batch([
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
             if ((!(self.source.reference).is_empty())
                 && (self.source.reference != self.installed_source))
             {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::fixture_source::document_source(self.source.clone())
-                        .map(move |value| Message::DocumentArrived(value)),
-                ])
+                Subscription::batch([crate::fixture_source::document_source(self.source.clone())
+                    .map(move |value| Message::DocumentArrived(value))])
             } else {
-                ::ducktape_view_guest::Subscription::none()
+                Subscription::none()
             },
         ])
     }
