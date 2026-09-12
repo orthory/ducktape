@@ -1,6 +1,5 @@
 macro_rules! __ice_generated_items_506167657356696577 { ($($item:item)*) => { $(#[allow(warnings, clippy::all)] $item)* }; }
 __ice_generated_items_506167657356696577! {
-type __IceElement<'a, Message, Theme = ()> = <(&'a (), Message, Theme) as ::ducktape_view_guest::wire::Erase>::Node;
 pub(crate) type __IceMessage = __PagesViewMessage;
 type __IceKeyRelease = ::ducktape_view_guest::wire::keyboard::KeyState;
 #[allow(dead_code)]
@@ -84,7 +83,6 @@ pub(crate) page_saved_text: ::std::string::String,
 pub(crate) buffer_page: ::std::string::String,
 pub(crate) page_inflight_text: ::std::string::String,
 pub(crate) sent: bool,
-pub(crate) __ice_rev: [u64; 64],
 }
 impl ::std::fmt::Debug for PagesView { fn fmt(&self, __formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result { __formatter.write_str("PagesView") } }
 #[derive(Clone)]
@@ -410,7 +408,6 @@ page_saved_text: "".to_owned(),
 buffer_page: "".to_owned(),
 page_inflight_text: "".to_owned(),
 sent: false,
-__ice_rev: [::ducktape_view_guest::rev::seed(); 64],
 }
 }
 fn __boot_task(&mut self) -> ::ducktape_view_guest::Task<__PagesViewMessage> {
@@ -491,7 +488,6 @@ page_saved_text: page_saved_text,
 buffer_page: buffer_page,
 page_inflight_text: page_inflight_text,
 sent: sent,
-__ice_rev: [::ducktape_view_guest::rev::seed(); 64],
 }
 }
 pub(crate) const __SNAPSHOT_SCHEMA: &'static str = "c2f5109c2b49baedbfd71e93d0db94a8e7ded190eefbfd51fd62505ca3524897";
@@ -509,8 +505,8 @@ __ice_generated_items_506167657356696577! {
 impl PagesView {
 fn __subscription(&self) -> ::ducktape_view_guest::Subscription<__PagesViewMessage> {
 ::ducktape_view_guest::Subscription::batch([
-::ducktape_view_guest::mouse::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Mouse { event: ::ducktape_view_guest::wire::mouse::Event::CursorMoved { x, y }, .. } => Some(__PagesViewMessage::CommentPointerMoved(*x as f64, *y as f64)), _ => None })), 
-::ducktape_view_guest::mouse::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Mouse { event: ::ducktape_view_guest::wire::mouse::Event::ButtonReleased(button), .. } => Some(__PagesViewMessage::DocumentPointerReleased(*button)), _ => None })), 
+::ducktape_view_guest::mouse::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Mouse { event: ::ducktape_view_guest::wire::mouse::Event::CursorMoved { x, y }, .. } => Some(__PagesViewMessage::CommentPointerMoved(*x as f64, *y as f64)), _ => None })),
+::ducktape_view_guest::mouse::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Mouse { event: ::ducktape_view_guest::wire::mouse::Event::ButtonReleased(button), .. } => Some(__PagesViewMessage::DocumentPointerReleased(*button)), _ => None })),
 ::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Keyboard { event: ::ducktape_view_guest::wire::keyboard::Event::Release(key), .. } => Some(__PagesViewMessage::DocumentKeyReleased(key.clone())), _ => None }),
 ::ducktape_view_guest::events::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Observation { event: ::ducktape_view_guest::wire::events::Event::Window(::ducktape_view_guest::wire::events::Window::Focused), .. } => Some(__PagesViewMessage::DocumentWindowFocused), _ => None }), ::ducktape_view_guest::wire::events::Interest { focus: true, ..Default::default() }),
 ::ducktape_view_guest::events::observe(::ducktape_view_guest::Subscription::filter_events(|event| match event { ::ducktape_view_guest::wire::Event::Observation { event: ::ducktape_view_guest::wire::events::Event::Window(::ducktape_view_guest::wire::events::Window::Unfocused), .. } => Some(__PagesViewMessage::DocumentWindowUnfocused), _ => None }), ::ducktape_view_guest::wire::events::Interest { focus: true, ..Default::default() }),
