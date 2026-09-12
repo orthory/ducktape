@@ -8,7 +8,7 @@ use ducktape_view_guest::{EditorBinding, EditorKeyRequest, EditorTransactionEven
 use std::{cell::RefCell, rc::Rc};
 use wire::keyboard::{Key, Modifiers, Named};
 
-/// Ordinary Ice data: retained in the app state and therefore in snapshots.
+/// Guest-owned editor history retained in state snapshots.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistoryState {
     pub snapshot: Vec<u8>,

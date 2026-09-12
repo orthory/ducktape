@@ -1891,7 +1891,7 @@ mod tests {
 
     #[test]
     fn the_card_floats_right_beside_the_document_and_onto_its_text_column_inline() {
-        // The float in `pages.ice` computes exactly this.
+        // The authored comments overlay computes this placement.
         let placed = |pane: f64, viewport_width: f64, original_x: f64, card: f64| {
             (0.0 + viewport_width - original_x - card) * comments_right_anchor(pane)
                 + comments_left_inset(pane)

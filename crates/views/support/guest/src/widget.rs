@@ -1,4 +1,4 @@
-//! Existing Ice widget statements use the mounted host's operation channel.
+//! Widget operations use the mounted host's scoped request channel.
 use crate::{host, wire};
 
 /// Execute a mutation inside this guest's mounted widget tree.

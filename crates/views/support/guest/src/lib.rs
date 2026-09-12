@@ -424,7 +424,7 @@ fn poll_tasks<M: 'static>(tasks: &mut Vec<Running<M>>) -> (Vec<M>, bool) {
     )
 }
 
-/// An Ice `every` in a guest: a module has no clock, so the period is the
+/// A periodic guest subscription: a module has no clock, so the period is the
 /// host's `clock.ticks` — which the app's manifest must declare `clock`
 /// for. The route carries no instant, because a guest cannot make one.
 /// A refusal is logged and ends the stream; the recipe hashes by period,
@@ -433,8 +433,7 @@ pub fn every(period: Duration) -> Subscription<()> {
     Subscription::run_with(period, |period| ticks(*period))
 }
 
-/// An Ice `repeat f() every d` in a guest: `f` at once, then once per host
-/// tick.
+/// Run `f` immediately, then once per host tick.
 pub fn repeat<F, T>(f: fn() -> F, period: Duration) -> Subscription<T>
 where
     F: Future<Output = T> + 'static,

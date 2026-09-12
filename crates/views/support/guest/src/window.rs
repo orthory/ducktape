@@ -1,4 +1,4 @@
-//! Direct Ice window effects use the host's scoped request channel.
+//! Window effects use the host's scoped request channel.
 use crate::{host, wire};
 
 /// Completion acknowledges submission to the native runtime, not OS application.
