@@ -249,6 +249,24 @@ fn canary_follows_a_live_node() {
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
     cx.run_until_parked();
+    // A node can transiently refuse one initial module read while still
+    // serving the workspace. Let its real block feed drive normal recovery.
+    let mut initial_events = 0;
+    while frame("chat").is_none() {
+        let update = runtime
+            .block_on(live.next())
+            .expect("live block stream closed");
+        height = height.max(update.height);
+        drop(update);
+        initial_events += 1;
+        assert!(
+            initial_events < 250,
+            "Chat did not become ready on live block events"
+        );
+        cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
     let input = |label: &str| {
         let mut root = frame("chat").expect("live Chat frame");
         let mut found = None;
