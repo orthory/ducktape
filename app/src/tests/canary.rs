@@ -25,14 +25,6 @@ fn marker(module: &str) -> &'static str {
     }
 }
 
-/// What a capture left behind, for the next one of the same module to be
-/// judged against.
-struct Seen {
-    state: String,
-    hash: String,
-    seal: Vec<u8>,
-}
-
 struct Transition {
     module: String,
     state: String,
@@ -53,38 +45,6 @@ fn parse(line: &str) -> Option<Transition> {
     })
 }
 
-fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
-    let module = &step.module;
-    let readable = module == "governance"
-        || (!shown.is_empty() && !shown.iter().any(|text| text.contains("Not connected")));
-    match step.state.as_str() {
-        "Ready" => assert!(
-            !marked,
-            "{module} shows the B marker before any swap: {shown:?}"
-        ),
-        "Swapped" => {
-            if let Some(before) = before {
-                assert_ne!(before.hash, step.hash, "{module} swapped to the same hash");
-            }
-            assert!(
-                marked || !readable,
-                "{module} swapped without its marker {:?}: {shown:?}",
-                marker(module)
-            );
-            if module == "governance" && before.is_some_and(|before| before.state == "Swapped") {
-                assert!(
-                    before.is_some_and(|before| before.seal != seal),
-                    "the governance seal did not change between B and B′"
-                );
-            }
-        }
-        "Missing" => assert!(
-            shown.is_empty(),
-            "{module} removed but still drawn: {shown:?}"
-        ),
-        _ => {}
-    }
-}
 fn capture(module: &'static str, path: &Path) -> Vec<u8> {
     let mut cx = crate::frame_probe::headless_context();
     let mut app = super::Ducktape::__state();
@@ -95,6 +55,7 @@ fn capture(module: &'static str, path: &Path) -> Vec<u8> {
         "files" => super::ShellTab::Files,
         "members" => super::ShellTab::Members,
         "governance" => super::ShellTab::Governance,
+        "forge" => super::ShellTab::Forge,
         _ => panic!("unknown canary module {module}"),
     };
     let (spec, _) = app.native_view();
@@ -243,73 +204,191 @@ fn the_canary_captures_every_transition_of_a_deployment() {
         assert_eq!(pixels(3, &removed, true), 0);
     }
 }
+/// A live chain is supplied by a disposable fixture, never booted or restarted
+/// by this test. The deployment CLI changes only its Chat view artifact.
 #[test]
-#[ignore = "needs a live node and staged views"]
+#[ignore = "needs a disposable live node, node CLI, and A/B/C view artifacts"]
 fn canary_follows_a_live_node() {
     use futures::StreamExt;
+    use gpui_kit::test::TestWindowExt as _;
     let node = std::env::var("DUCKTAPE_NODE").expect("DUCKTAPE_NODE");
-    let out = std::env::var("DUCKTAPE_CANARY_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| "target/canary".into());
+    let fixture =
+        PathBuf::from(std::env::var("DUCKTAPE_CANARY_FIXTURE").expect("DUCKTAPE_CANARY_FIXTURE"));
+    let cli = std::env::var("DUCKTAPE_NODE_BIN").expect("DUCKTAPE_NODE_BIN");
+    let out = fixture.join("evidence");
     std::fs::create_dir_all(&out).unwrap();
-    let steps = std::env::var("DUCKTAPE_CANARY_STEPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0usize);
     let runtime = runtime();
+    let _runtime = runtime.enter();
     let _turn = runtime.block_on(crate::module_view::canary::connection_turn());
     let transitions = tap();
-    let _ = runtime.block_on(crate::backend::connect(node.clone(), 0, 0));
-    let mut live = crate::backend::live_events(node);
-    let mut count = 0;
-    let mut log = String::new();
-    let markers = std::env::var_os("DUCKTAPE_CANARY_MARKERS").is_some();
-    let mut seen = std::collections::HashMap::new();
-    loop {
-        for line in transitions.try_iter() {
-            log.push_str(&line);
-            log.push('\n');
-            let fields = line
-                .split_whitespace()
-                .filter_map(|s| s.split_once('='))
-                .collect::<std::collections::HashMap<_, _>>();
-            let state = fields.get("state").copied().unwrap_or("");
-            if !["Ready", "Swapped", "Missing", "Failed"].contains(&state) {
-                continue;
+    let workspace = runtime
+        .block_on(crate::backend::connect(node.clone(), 0, 0))
+        .expect("connect real node");
+    let mut height = workspace.height;
+    let mut live = crate::backend::live_events(node.clone());
+    let mut cx = crate::frame_probe::headless_context();
+    let mut app = super::Ducktape::__state();
+    app.connected = true;
+    app.connected_rpc = node;
+    app.shell_tab = super::ShellTab::Chat;
+    app.channel_create_open = true;
+    let (spec, _) = app.native_view();
+    let mut entity = None;
+    let window = cx
+        .open_window(size(px(1100.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = crate::module_view::NativeModuleView::new("chat");
+                view.set_props(spec.props, cx);
+                view
+            });
+            entity = Some(view.clone());
+            cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+        })
+        .unwrap();
+    let entity = entity.unwrap();
+    let identity = entity.entity_id();
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let input = |label: &str| {
+        let mut root = frame("chat").expect("live Chat frame");
+        let mut found = None;
+        root.for_each_mut(&mut |node| {
+            if let ui_lang_wire::Node::Input {
+                key,
+                options,
+                value,
+                ..
+            } = node
+                && options.label == label
+            {
+                found = Some((key.clone(), value.clone()));
             }
-            let Some(module) = crate::backend::view_source::MODULE_OWNED
-                .into_iter()
-                .find(|module| Some(module) == fields.get("module"))
-            else {
-                continue;
-            };
-            count += 1;
-            let captured = capture(module, &out.join(format!("{count}-{module}-{state}")));
-            if let Some(step) = parse(&line) {
-                let shown = texts(module);
-                let marked = shown.iter().any(|text| text.contains(marker(module)));
-                if markers {
-                    judge(&step, marked, &shown, &captured, seen.get(module));
-                }
-                seen.insert(
-                    module.to_owned(),
-                    Seen {
-                        state: step.state,
-                        hash: step.hash,
-                        seal: captured,
-                    },
+        });
+        found.expect("live native input")
+    };
+    let draft = "retained-live-draft-오리";
+    let (key, _) = input("Channel name");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(key, cx);
+        window.input(draft, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert_eq!(
+        input("Channel name").1,
+        draft,
+        "native typing reaches guest state"
+    );
+    let mut hash = seated_hash("chat").expect("A deployed hash");
+    assert!(
+        !texts("chat")
+            .iter()
+            .any(|text| text.contains(marker("chat")))
+    );
+    let mut log = format!(
+        "phase=A height={height} native_entity={identity:?} hash={hash:?} draft_preserved=true\n"
+    );
+    std::fs::write(out.join("live-canary.log"), &log).unwrap();
+    for (variant, expected_state) in [("B", "Swapped"), ("C", "Failed")] {
+        let view = fixture.join(format!("view-{variant}.wasm"));
+        let component = fixture.join("modules/chat.component.wasm");
+        let index = fixture.join("modules/chat.index.wasm");
+        let artifact = module_artifact::ModuleArtifact {
+            component: std::fs::read(&component).unwrap(),
+            index: Some(std::fs::read(&index).unwrap()),
+            view: Some(module_artifact::ViewArtifact {
+                component: std::fs::read(&view).unwrap(),
+                assets: Default::default(),
+            }),
+        };
+        let expected_hash = artifact.hash();
+        let deployed = std::process::Command::new(&cli)
+            .env("DUCKTAPE_HOME", fixture.join("home"))
+            .args(["module", "update", "chat"])
+            .arg(component)
+            .arg("--index")
+            .arg(index)
+            .arg("--view")
+            .arg(view)
+            .args(["--after", "50", "--config"])
+            .arg(fixture.join("workspace/node.toml"))
+            .output()
+            .expect("start deployment CLI");
+        std::fs::write(
+            out.join(format!("deploy-{variant}.log")),
+            [&deployed.stdout[..], &deployed.stderr[..]].concat(),
+        )
+        .unwrap();
+        assert!(
+            deployed.status.success(),
+            "deployment {variant} refused; see evidence log"
+        );
+        let before = height;
+        let mut blocks = 0;
+        loop {
+            let update = runtime
+                .block_on(live.next())
+                .expect("live block stream closed");
+            if update.kind == super::LiveKind::Tip {
+                height = update.height;
+                blocks += 1;
+                assert!(
+                    blocks < 250,
+                    "deployment did not reach host within 250 actual block events"
                 );
             }
-            std::fs::write(out.join("view_source.log"), &log).unwrap();
-            if steps > 0 && count >= steps {
-                return;
+            drop(update);
+            // The production Tip handler initiates deployment checks. No
+            // test call requests a reload or replaces the mounted entity.
+            cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+            let arrived = transitions.try_iter().any(|line| {
+                log.push_str(&line);
+                log.push('\n');
+                parse(&line).is_some_and(|step| {
+                    step.module == "chat"
+                        && step.state == expected_state
+                        && step.hash == crate::backend::hex_encode(&expected_hash)
+                })
+            });
+            if !arrived {
+                continue;
             }
+            assert!(height > before, "chain must advance through deployment");
+            assert_eq!(entity.entity_id(), identity, "native view was not replaced");
+            assert_eq!(
+                input("Channel name").1,
+                draft,
+                "snapshot must preserve typed guest draft"
+            );
+            assert!(
+                texts("chat")
+                    .iter()
+                    .any(|text| text.contains(marker("chat"))),
+                "B's visible marker must remain"
+            );
+            match variant {
+                "B" => {
+                    assert_ne!(hash, expected_hash);
+                    assert_eq!(seated_hash("chat"), Some(expected_hash));
+                    hash = expected_hash;
+                }
+                "C" => assert_eq!(seated_hash("chat"), Some(hash), "failed C preserves B"),
+                _ => unreachable!(),
+            }
+            log.push_str(&format!("phase={variant} height={height} native_entity={identity:?} seated_hash={hash:?} draft_preserved=true\n"));
+            std::fs::write(
+                out.join(format!("{variant}.wire")),
+                ui_lang_wire::encode(&frame("chat")),
+            )
+            .unwrap();
+            std::fs::write(out.join(format!("{variant}.txt")), texts("chat").join("\n")).unwrap();
+            std::fs::write(out.join("live-canary.log"), &log).unwrap();
+            break;
         }
-        runtime
-            .block_on(live.next())
-            .expect("live stream ended before captures");
-        runtime
-            .block_on(crate::module_view::deployments_checked())
-            .joined();
     }
 }
