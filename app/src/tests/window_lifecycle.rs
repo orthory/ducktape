@@ -120,9 +120,52 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     assert_eq!(app.onboarding_win, None);
     assert_eq!(app.console_win, Some(console));
     let route = handler_body("WindowWasClosed");
-    let guarded_exits = route.matches("last_window_closed_exits(").count();
-    assert!(guarded_exits > 0);
-    assert_eq!(route.matches("shell::quit").count(), guarded_exits);
+    assert!(route.contains("letleaving=crate::backend::last_window_closed_exits("));
+    use quote::ToTokens as _;
+    use syn::visit::Visit as _;
+    struct Exits(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Exits {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            for (index, statement) in block.stmts.iter().enumerate() {
+                let syn::Stmt::Expr(syn::Expr::Return(returned), _) = statement else {
+                    continue;
+                };
+                let Some(syn::Expr::Call(call)) = returned.expr.as_deref() else {
+                    continue;
+                };
+                let syn::Expr::Path(path) = call.func.as_ref() else {
+                    continue;
+                };
+                if !path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|part| part.ident == "quit")
+                {
+                    continue;
+                }
+                let Some(syn::Stmt::Expr(syn::Expr::If(guard), _)) = index
+                    .checked_sub(1)
+                    .and_then(|index| block.stmts.get(index))
+                else {
+                    panic!("every close exit needs its immediate non-leaving guard");
+                };
+                let condition = guard.cond.to_token_stream().to_string().replace(' ', "");
+                assert_eq!(condition.trim_matches(['(', ')']), "!leaving");
+                let refusal = guard
+                    .then_branch
+                    .to_token_stream()
+                    .to_string()
+                    .replace(' ', "");
+                assert_eq!(refusal, "{return::ducktape_view_guest::Task::none();}");
+                self.0 += 1;
+            }
+            syn::visit::visit_block(self, block);
+        }
+    }
+    let mut exits = Exits(0);
+    exits.visit_expr(&syn::parse_str(&route).expect("native window close route"));
+    assert!(exits.0 > 0);
 }
 #[test]
 fn only_the_tray_row_and_the_quit_chord_leave() {
