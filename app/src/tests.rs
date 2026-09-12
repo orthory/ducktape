@@ -236,6 +236,17 @@ fn command_chord(key: &str) -> crate::shell::KeyPress {
 
 /// Parse Rust tokens so formatting and comments cannot satisfy a source rule.
 pub(crate) fn rust_tokens(source: &str) -> String {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || rust_tokens_on_stack(source))
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+}
+
+fn rust_tokens_on_stack(source: &str) -> String {
     use quote::ToTokens;
     syn::parse_file(source)
         .expect("valid Rust source")

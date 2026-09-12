@@ -575,16 +575,60 @@ fn a_disconnected_screen_stands_its_registers_down_too() {
 /// can quietly drop the guard.
 #[test]
 fn every_header_subtitle_is_gated_on_the_connection() {
+    struct Summaries(Vec<String>);
+    impl<'ast> Visit<'ast> for Summaries {
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            if item
+                .path
+                .segments
+                .last()
+                .unwrap()
+                .ident
+                .to_string()
+                .starts_with("__ice_generated_items_")
+            {
+                self.visit_file(&syn::parse2(item.tokens.clone()).unwrap());
+            }
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .unwrap()
+                    .ident
+                    .to_string()
+                    .ends_with("_summary")
+                {
+                    self.0.push(
+                        call.args
+                            .first()
+                            .expect("summary connection argument")
+                            .to_token_stream()
+                            .to_string(),
+                    );
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
     for source in [
         include_str!("../../../crates/views/forge/src/ui/forge.rs"),
         include_str!("../../../crates/views/members/src/lib.rs"),
     ] {
-        let source = rust_tokens(source);
-        for (_, tail) in source
-            .match_indices("_summary(")
-            .map(|(at, _)| (at, &source[at..]))
-        {
-            let arguments = tail.split(';').next().unwrap();
+        let arguments = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut summaries = Summaries(Vec::new());
+                summaries.visit_file(&syn::parse_file(source).unwrap());
+                summaries.0
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!arguments.is_empty(), "screen owns a measured subtitle");
+        for arguments in arguments {
             assert!(
                 arguments.contains("connected"),
                 "summary must distinguish no answer from measured zero"
