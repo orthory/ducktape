@@ -24,10 +24,11 @@ fn pane_arms() -> Vec<(String, String)> {
 }
 
 fn authored_items() -> syn::File {
-    let file = syn::parse_file(SETTINGS).unwrap();
-    file.items
+    let mut file = syn::parse_file(SETTINGS).unwrap();
+    let items = file
+        .items
         .iter()
-        .find_map(|item| match item {
+        .filter_map(|item| match item {
             syn::Item::Macro(item)
                 if item
                     .mac
@@ -39,11 +40,19 @@ fn authored_items() -> syn::File {
                     .to_string()
                     .starts_with("__ice_generated_items_") =>
             {
-                Some(syn::parse2(item.mac.tokens.clone()).unwrap())
+                Some(
+                    syn::parse2::<syn::File>(item.mac.tokens.clone())
+                        .unwrap()
+                        .items,
+                )
             }
             _ => None,
         })
-        .expect("authored item wrapper")
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(!items.is_empty(), "authored item wrappers");
+    file.items = items;
+    file
 }
 
 fn pane_arms_on_stack() -> Vec<(String, String)> {

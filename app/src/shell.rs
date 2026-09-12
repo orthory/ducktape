@@ -943,7 +943,7 @@ impl DesktopWindow {
                                             .gap_2()
                                             .child(row.person.initials.clone())
                                             .child(div().truncate().child(row.person.label.clone()))
-                                            .child(div().text_xs().child(caption))
+                                            .child(caption)
                                     }),
                             )
                         })

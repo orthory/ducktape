@@ -893,5 +893,9 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
             && locked.contains("self.live_agents=")
             && locked.contains("lock_signer(")
     );
-    assert!(handler_body("NetworkEntered").contains("self.signer_key="));
+    let leaving = handler_body("OnboardingReopened");
+    assert!(
+        leaving.contains("self.signer_key=\"\".to_owned()")
+            && leaving.contains("self.live_agents=")
+    );
 }

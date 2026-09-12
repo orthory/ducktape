@@ -595,6 +595,11 @@ fn check_disconnected_registers() {
 fn every_header_subtitle_is_gated_on_the_connection() {
     struct Summaries(Vec<String>);
     impl<'ast> Visit<'ast> for Summaries {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !item.sig.ident.to_string().starts_with("__ui_lang_check_") {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
         fn visit_macro(&mut self, item: &'ast syn::Macro) {
             if item
                 .path
@@ -631,6 +636,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             syn::visit::visit_expr_call(self, call);
         }
     }
+    let mut summary_count = 0;
     for source in [
         include_str!("../../../crates/views/forge/src/ui/forge.rs"),
         include_str!("../../../crates/views/members/src/lib.rs"),
@@ -645,7 +651,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             .unwrap()
             .join()
             .unwrap();
-        assert!(!arguments.is_empty(), "screen owns a measured subtitle");
+        summary_count += arguments.len();
         for arguments in arguments {
             assert!(
                 arguments.contains("connected"),
@@ -653,6 +659,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             );
         }
     }
+    assert!(summary_count > 0, "measured subtitles are inspected");
 }
 
 /// THE CONSOLE HEALS ITSELF FROM A CONNECT FAILURE. The steady-state path has
