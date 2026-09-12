@@ -39,11 +39,13 @@ directory into `Ducktape.app` as resources linked beside the executable, and the
 it first. A tab whose view is not
 staged says so in its place.
 
-A view is a pure function of the props the app pushes it (`<module>.props`,
-one JSON item per change) and speaks back only in intents (`governance.vote`,
-`members.propose`, …) that the tab's handler signs and submits exactly as the
-native screen did; a view with nothing to write, like Agents, declares none. The guest sees no key, no endpoint and no clock, and a view
-that traps shows why in its place instead of taking the window with it. A
+A view owns its state, receives session and domain props (`<module>.props`,
+one JSON item per change), and emits a wire tree rendered by native gpui-kit
+controls. It can emit intents (`governance.vote`, `members.propose`, …) to
+the app or request operations through the host kernel. Signing secrets stay
+in the app; network access and timers run through the kernel rather than
+direct guest OS access. A view that traps shows why in its place instead of
+taking the window with it. A
 view can also request `host.widget` operations on its own mounted tree and nested overlays:
 focus traversal, targeted focus and focus queries; native text-input cursor
 and selection operations; and scroll offsets, relative movement, end snapping
@@ -52,10 +54,10 @@ matching native frame is laid out and editor work has drained, and are refused
 if their frame was replaced. They cannot address another view's widgets.
 A view may leave a slot for something only the host can draw: the Node view's
 Activity tab declares `node_log_timeline` as a host surface, and the app
-paints its own retained log ring there (`surfaces_of` in `module_view.rs`),
+paints its own retained log ring there (`src/module_view/surfaces.rs`),
 queuing what the reader does in it for the handler to drain. A view that
-needs the network asks through an intent and reads the answer off its props:
-the Explorer's workspace search is run by the app on the view's behalf. A
+needs the network can use the kernel's bounded request/reply interface:
+Explorer queries through `rpc.query` and `rpc.view`. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
@@ -191,7 +193,7 @@ the native renderer owns platform blur. Depth comes from surface steps and warm 
 
 ## Design system
 
-The native shell uses GPUI components. WASM views describe their own faces,
+The native shell and wire renderer use `gpui-kit`. WASM views describe their own faces,
 layout and editor presentation through the shared wire vocabulary. The local
 `design` crate owns application font assets and the product type scale.
 
