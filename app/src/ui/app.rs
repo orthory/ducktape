@@ -474,59 +474,59 @@ pub(crate) __ice_accessibility: ::ui_lang_runtime::Bridge<__DucktapeMessage>,
 #[cfg(all(target_os = "macos", not(test)))]
 pub(crate) __ice_accessibility_windows: ::ui_lang_runtime::WindowBridges<__DucktapeMessage>,
 pub(crate) __ice_run_lane_0_generation: u64,
-pub(crate) __ice_run_lane_0_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_0_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_1_generation: u64,
-pub(crate) __ice_run_lane_1_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_1_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_2_generation: u64,
-pub(crate) __ice_run_lane_2_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_2_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_3_generation: u64,
-pub(crate) __ice_run_lane_3_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_3_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_4_generation: u64,
-pub(crate) __ice_run_lane_4_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_4_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_5_generation: u64,
-pub(crate) __ice_run_lane_5_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_5_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_6_generation: u64,
-pub(crate) __ice_run_lane_6_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_6_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_7_generation: u64,
-pub(crate) __ice_run_lane_7_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_7_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_8_generation: u64,
-pub(crate) __ice_run_lane_8_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_8_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_9_generation: u64,
-pub(crate) __ice_run_lane_9_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_9_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_10_generation: u64,
-pub(crate) __ice_run_lane_10_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_10_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_11_generation: u64,
-pub(crate) __ice_run_lane_11_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_11_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_12_generation: u64,
-pub(crate) __ice_run_lane_12_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_12_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_13_generation: u64,
-pub(crate) __ice_run_lane_13_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_13_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_14_generation: u64,
-pub(crate) __ice_run_lane_14_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_14_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_15_generation: u64,
-pub(crate) __ice_run_lane_15_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_15_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_16_generation: u64,
-pub(crate) __ice_run_lane_16_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_16_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_17_generation: u64,
-pub(crate) __ice_run_lane_17_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_17_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_18_generation: u64,
-pub(crate) __ice_run_lane_18_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_18_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_19_generation: u64,
-pub(crate) __ice_run_lane_19_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_19_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_20_generation: u64,
-pub(crate) __ice_run_lane_20_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_20_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_21_generation: u64,
-pub(crate) __ice_run_lane_21_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_21_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_22_generation: u64,
-pub(crate) __ice_run_lane_22_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_22_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_23_generation: u64,
-pub(crate) __ice_run_lane_23_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_23_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_24_generation: u64,
-pub(crate) __ice_run_lane_24_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_24_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_25_generation: u64,
-pub(crate) __ice_run_lane_25_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_25_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) __ice_run_lane_26_generation: u64,
-pub(crate) __ice_run_lane_26_handle: ::std::option::Option<::iced::task::Handle>,
+pub(crate) __ice_run_lane_26_handle: ::std::option::Option<::ducktape_view_guest::task::Handle>,
 pub(crate) app_palette: AppTheme,
 pub(crate) appearance: Appearance,
 pub(crate) desktop_notifications: bool,
@@ -540,7 +540,7 @@ pub(crate) loading: bool,
 pub(crate) views_live_serial: i64,
 pub(crate) cmd_held: bool,
 pub(crate) shift_held: bool,
-pub(crate) focused_win: ::std::option::Option<::iced::window::Id>,
+pub(crate) focused_win: ::std::option::Option<::crate::shell::WindowKey>,
 pub(crate) block_height: i64,
 pub(crate) hydration_generation: i64,
 pub(crate) connect_generation: i64,
@@ -648,9 +648,9 @@ pub(crate) toast: ::std::string::String,
 pub(crate) toast_age: i64,
 pub(crate) page_route: ::std::string::String,
 pub(crate) page_route_serial: i64,
-pub(crate) onboarding_win: ::std::option::Option<::iced::window::Id>,
-pub(crate) console_win: ::std::option::Option<::iced::window::Id>,
-pub(crate) huddle_win: ::std::option::Option<::iced::window::Id>,
+pub(crate) onboarding_win: ::std::option::Option<::crate::shell::WindowKey>,
+pub(crate) console_win: ::std::option::Option<::crate::shell::WindowKey>,
+pub(crate) huddle_win: ::std::option::Option<::crate::shell::WindowKey>,
 pub(crate) network_name: ::std::string::String,
 pub(crate) hub_step: HubStep,
 pub(crate) hub_networks: ::std::vec::Vec<crate::backend::HubNetwork>,
@@ -702,20 +702,20 @@ impl ::std::fmt::Debug for Ducktape { fn fmt(&self, __formatter: &mut ::std::fmt
 pub(crate) enum __DucktapeMessage {
 __AccessibilitySnapshot(::std::boxed::Box<::ui_lang_runtime::Snapshot<__DucktapeMessage>>),
 __AccessibilityAction(::ui_lang_runtime::ActionRequest),
-__AccessibilityWindow(::iced::window::Id, ::iced::window::Event),
+__AccessibilityWindow(::crate::shell::WindowKey, ::iced::window::Event),
 #[cfg(all(any(target_os = "windows", target_os = "macos"), not(test)))]
 __AccessibilityNativeWindow(::ui_lang_runtime::NativeWindow),
-__AccessibilityFocusNext(::std::option::Option<::iced::window::Id>),
-__AccessibilityFocusPrevious(::std::option::Option<::iced::window::Id>),
+__AccessibilityFocusNext(::std::option::Option<::crate::shell::WindowKey>),
+__AccessibilityFocusPrevious(::std::option::Option<::crate::shell::WindowKey>),
 __TemplateChanged,
 #[cfg(all(target_os = "macos", not(test)))]
 __AccessibilityWindowNative(::ui_lang_runtime::NativeWindow),
 #[cfg(all(target_os = "macos", not(test)))]
-__AccessibilityWindowSnapshot(::iced::window::Id, ::std::boxed::Box<::ui_lang_runtime::Snapshot<__DucktapeMessage>>),
+__AccessibilityWindowSnapshot(::crate::shell::WindowKey, ::std::boxed::Box<::ui_lang_runtime::Snapshot<__DucktapeMessage>>),
 #[cfg(all(target_os = "macos", not(test)))]
-__AccessibilityWindowAction(::iced::window::Id, ::ui_lang_runtime::ActionRequest),
+__AccessibilityWindowAction(::crate::shell::WindowKey, ::ui_lang_runtime::ActionRequest),
 #[cfg(all(target_os = "macos", not(test)))]
-__AccessibilityWindowEvent(::iced::window::Id, ::iced::window::Event),
+__AccessibilityWindowEvent(::crate::shell::WindowKey, ::iced::window::Event),
 __RequestLane0(u64, ::std::boxed::Box<__DucktapeMessage>),
 __RequestLane1(u64, ::std::boxed::Box<__DucktapeMessage>),
 __RequestLane2(u64, ::std::boxed::Box<__DucktapeMessage>),
@@ -763,14 +763,14 @@ DmPeersLoadSelected(crate::backend::LoadRequest),
 NamesMovedSelected(crate::backend::LoadRequest),
 Tick,
 WallTick,
-WindowWasClosed(::iced::window::Id),
+WindowWasClosed(::crate::shell::WindowKey),
 TrayOpen,
 TrayQuit,
 ModifierStateChanged(::iced::keyboard::Modifiers),
 DragLaunchWindow,
 CloseLaunchWindow,
-WindowFocused(::iced::window::Id),
-WindowUnfocused(::iced::window::Id),
+WindowFocused(::crate::shell::WindowKey),
+WindowUnfocused(::crate::shell::WindowKey),
 WindowFocusNoted,
 CommandChordPressed(__IceKeyPress),
 TrayOpenBell,
@@ -866,7 +866,7 @@ PagesViewEvent(crate::module_view::ModuleViewEvent),
 OpenPageSearchHit(::std::string::String, ::std::string::String),
 ExternalUrlOpened(bool),
 ExternalUrlFailed(crate::backend::AppError),
-OnboardingOpened(::iced::window::Id),
+OnboardingOpened(::crate::shell::WindowKey),
 HubBooted(crate::backend::HubState),
 HubRefreshed(crate::backend::HubState),
 NetworkProbed(crate::backend::HubProbe),
@@ -903,7 +903,7 @@ WelcomeDesktopDone(bool),
 CeremonyStepped(crate::backend::CeremonyStep),
 WelcomeFailed(crate::backend::AppError),
 NetworkEntered,
-ConsoleOpened(::iced::window::Id),
+ConsoleOpened(::crate::shell::WindowKey),
 ForgetNetworkSubmit(::std::string::String),
 NetworkForgotten(bool),
 GoJoin,
@@ -916,16 +916,16 @@ CopyOnboardingInvite,
 EnterConsole,
 OnboardingFailed(crate::backend::AppError),
 SwitchNetwork,
-OnboardingReopened(::iced::window::Id),
+OnboardingReopened(::crate::shell::WindowKey),
 DismissAccountBanner,
 OpenAccountWelcome,
-WelcomeReopened(::iced::window::Id),
+WelcomeReopened(::crate::shell::WindowKey),
 CallEvent(crate::call::CallEvent),
 ToggleCallMute,
 ToggleCallCamera,
 ToggleCallScreen,
 ShowHuddle,
-HuddleOpened(::iced::window::Id),
+HuddleOpened(::crate::shell::WindowKey),
 HuddleGoChannel,
 LeaveHuddleHere,
 HuddleLeft(bool),
@@ -1369,11 +1369,11 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] fn __ui_lang_check_pure_bell_worst_severity<'a>(arg0: &'a [crate::backend::BellItem]) { let _: ::std::string::String = crate::backend::bell_worst_severity(arg0); }
 #[allow(dead_code)] async fn __ui_lang_check_future_load_bell(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::std::result::Result<crate::backend::BellData, crate::backend::AppError> = crate::backend::load_bell(arg0, arg1).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_mark_bell_read(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: i64) { let _: ::std::result::Result<crate::backend::BellDelta, crate::backend::AppError> = crate::backend::mark_bell_read(arg0, arg1, arg2, arg3).await; }
-#[allow(dead_code)] fn __ui_lang_check_task_note_window_focus(arg0: bool) { let _: ::iced::Task<()> = crate::backend::note_window_focus(arg0); }
+#[allow(dead_code)] fn __ui_lang_check_task_note_window_focus(arg0: bool) { let _: ::ducktape_view_guest::Task<()> = crate::backend::note_window_focus(arg0); }
 #[allow(dead_code)] fn __ui_lang_check_container_style_raised_style(theme: &::iced::Theme) { let _: ::iced::widget::container::Style = crate::backend::raised_style(theme); }
 #[allow(dead_code)] fn __ui_lang_check_pure_icon<'a>(arg0: &'a str) { let _: ::std::vec::Vec<u8> = crate::backend::icon(arg0); }
 #[allow(dead_code)] async fn __ui_lang_check_future_connect(arg0: ::std::string::String, arg1: i64, arg2: i64) { let _: ::std::result::Result<crate::backend::WorkspaceData, crate::backend::HydrationError> = crate::backend::connect(arg0, arg1, arg2).await; }
-#[allow(dead_code)] fn __ui_lang_check_stream_live_events(arg0: ::std::string::String) { let _: ::iced::Task<crate::backend::LiveUpdate> = ::iced::Task::run(crate::backend::live_events(arg0), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_live_events(arg0: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::LiveUpdate> = ::ducktape_view_guest::Task::run(crate::backend::live_events(arg0), |value| value); }
 #[allow(dead_code)] fn __ui_lang_check_pure_fold_live_chat(arg0: ::std::vec::Vec<crate::backend::ChatDelta>, arg1: ::std::vec::Vec<crate::backend::ChatChannel>, arg2: ::std::vec::Vec<crate::backend::ChatMember>, arg3: ::std::vec::Vec<crate::backend::ChannelRead>, arg4: ::std::vec::Vec<crate::backend::DmPeer>, arg5: ::std::string::String, arg6: ::std::string::String, arg7: bool, arg8: bool, arg9: ::std::string::String, arg10: bool, arg11: bool) { let _: crate::backend::ChatLiveFold = crate::backend::fold_live_chat(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11); }
 #[allow(dead_code)] async fn __ui_lang_check_future_live_resync_load(arg0: ::std::string::String, arg1: ::std::string::String, arg2: bool, arg3: bool, arg4: i64, arg5: i64) { let _: ::std::result::Result<crate::backend::LiveRefresh, crate::backend::HydrationError> = crate::backend::live_resync_load(arg0, arg1, arg2, arg3, arg4, arg5).await; }
 #[allow(dead_code)] fn __ui_lang_check_sync_fresh_operation_id(arg0: ::std::string::String) { let _: ::std::string::String = crate::backend::fresh_operation_id(arg0); }
@@ -1383,11 +1383,11 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] fn __ui_lang_check_sync_canonical_endpoint(arg0: ::std::string::String) { let _: ::std::string::String = crate::backend::canonical_endpoint(arg0); }
 #[allow(dead_code)] async fn __ui_lang_check_future_join_network(arg0: ::ui_lang_runtime::Secret) { let _: ::std::result::Result<crate::backend::WorkspaceInit, crate::backend::AppError> = crate::backend::join_network(arg0).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_mint_invite(arg0: ::std::string::String) { let _: ::std::result::Result<::std::string::String, crate::backend::AppError> = crate::backend::mint_invite(arg0).await; }
-#[allow(dead_code)] fn __ui_lang_check_stream_provision_progress(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::iced::Task<crate::backend::ProvisionStep> = ::iced::Task::run(crate::backend::provision_progress(arg0, arg1), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_provision_progress(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::ProvisionStep> = ::ducktape_view_guest::Task::run(crate::backend::provision_progress(arg0, arg1), |value| value); }
 #[allow(dead_code)] async fn __ui_lang_check_future_hub_state() { let _: crate::backend::HubState = crate::backend::hub_state().await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_load_wallets(arg0: ::std::string::String) { let _: crate::backend::WalletList = crate::backend::load_wallets(arg0).await; }
 #[allow(dead_code)] fn __ui_lang_check_pure_wallet_door<'a>(arg0: &'a crate::backend::WalletList) { let _: WalletDoor = crate::backend::wallet_door(arg0); }
-#[allow(dead_code)] fn __ui_lang_check_stream_probe_known_networks() { let _: ::iced::Task<crate::backend::HubProbe> = ::iced::Task::run(crate::backend::probe_known_networks(), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_probe_known_networks() { let _: ::ducktape_view_guest::Task<crate::backend::HubProbe> = ::ducktape_view_guest::Task::run(crate::backend::probe_known_networks(), |value| value); }
 #[allow(dead_code)] fn __ui_lang_check_pure_apply_network_probe(arg0: ::std::vec::Vec<crate::backend::HubNetwork>, arg1: crate::backend::HubProbe) { let _: ::std::vec::Vec<crate::backend::HubNetwork> = crate::backend::apply_network_probe(arg0, arg1); }
 #[allow(dead_code)] fn __ui_lang_check_pure_network_run_hint<'a>(arg0: &'a crate::backend::HubNetwork) { let _: ::std::string::String = crate::backend::network_run_hint(arg0); }
 #[allow(dead_code)] fn __ui_lang_check_pure_hub_entry_step(arg0: ::std::vec::Vec<crate::backend::WalletInfo>) { let _: HubStep = crate::backend::hub_entry_step(arg0); }
@@ -1401,13 +1401,13 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] fn __ui_lang_check_pure_selected_network_name(arg0: ::std::vec::Vec<crate::backend::HubNetwork>, arg1: ::std::string::String) { let _: ::std::string::String = crate::backend::selected_network_name(arg0, arg1); }
 #[allow(dead_code)] fn __ui_lang_check_pure_refreshed_hub_selection(arg0: ::std::vec::Vec<crate::backend::HubNetwork>, arg1: ::std::string::String, arg2: ::std::string::String) { let _: ::std::string::String = crate::backend::refreshed_hub_selection(arg0, arg1, arg2); }
 #[allow(dead_code)] fn __ui_lang_check_pure_password_problem<'a>(arg0: &'a str, arg1: &'a str) { let _: ::std::string::String = crate::backend::password_problem(arg0, arg1); }
-#[allow(dead_code)] fn __ui_lang_check_pure_without_window(arg0: ::std::option::Option<::iced::window::Id>, arg1: ::iced::window::Id) { let _: ::std::option::Option<::iced::window::Id> = crate::backend::without_window(arg0, arg1); }
+#[allow(dead_code)] fn __ui_lang_check_pure_without_window(arg0: ::std::option::Option<::crate::shell::WindowKey>, arg1: ::crate::shell::WindowKey) { let _: ::std::option::Option<::crate::shell::WindowKey> = crate::backend::without_window(arg0, arg1); }
 #[allow(dead_code)] fn __ui_lang_check_pure_ceremony_retirement(arg0: bool, arg1: bool) { let _: CeremonyRetirement = crate::backend::ceremony_retirement(arg0, arg1); }
-#[allow(dead_code)] fn __ui_lang_check_pure_last_window_closed_exits(arg0: ::std::option::Option<::iced::window::Id>, arg1: ::std::option::Option<::iced::window::Id>) { let _: bool = crate::backend::last_window_closed_exits(arg0, arg1); }
+#[allow(dead_code)] fn __ui_lang_check_pure_last_window_closed_exits(arg0: ::std::option::Option<::crate::shell::WindowKey>, arg1: ::std::option::Option<::crate::shell::WindowKey>) { let _: bool = crate::backend::last_window_closed_exits(arg0, arg1); }
 #[allow(dead_code)] fn __ui_lang_check_pure_tray_open_action(arg0: bool, arg1: bool) { let _: TrayOpen = crate::backend::tray_open_action(arg0, arg1); }
-#[allow(dead_code)] fn __ui_lang_check_pure_huddle_summon(arg0: ::std::option::Option<::iced::window::Id>) { let _: WindowSummon = crate::backend::huddle_summon(arg0); }
-#[allow(dead_code)] fn __ui_lang_check_sync_window_target(arg0: ::std::option::Option<::iced::window::Id>) { let _: ::iced::window::Id = crate::backend::window_target(arg0); }
-#[allow(dead_code)] fn __ui_lang_check_sync_window_target_unless(arg0: bool, arg1: ::std::option::Option<::iced::window::Id>) { let _: ::iced::window::Id = crate::backend::window_target_unless(arg0, arg1); }
+#[allow(dead_code)] fn __ui_lang_check_pure_huddle_summon(arg0: ::std::option::Option<::crate::shell::WindowKey>) { let _: WindowSummon = crate::backend::huddle_summon(arg0); }
+#[allow(dead_code)] fn __ui_lang_check_sync_window_target(arg0: ::std::option::Option<::crate::shell::WindowKey>) { let _: ::crate::shell::WindowKey = crate::backend::window_target(arg0); }
+#[allow(dead_code)] fn __ui_lang_check_sync_window_target_unless(arg0: bool, arg1: ::std::option::Option<::crate::shell::WindowKey>) { let _: ::crate::shell::WindowKey = crate::backend::window_target_unless(arg0, arg1); }
 #[allow(dead_code)] async fn __ui_lang_check_future_create_device_key(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::std::result::Result<::std::string::String, crate::backend::AppError> = crate::backend::create_device_key(arg0, arg1).await; }
 #[allow(dead_code)] fn __ui_lang_check_pure_phrase_rows() { let _: ::std::vec::Vec<crate::backend::PhraseRow> = crate::backend::phrase_rows(); }
 #[allow(dead_code)] fn __ui_lang_check_pure_phrase_rows_of<'a>(arg0: &'a str) { let _: ::std::vec::Vec<crate::backend::PhraseRow> = crate::backend::phrase_rows_of(arg0); }
@@ -1460,7 +1460,7 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] async fn __ui_lang_check_future_load_node_facts(arg0: ::std::string::String) { let _: ::std::result::Result<crate::backend::NodeFacts, crate::backend::AppError> = crate::backend::load_node_facts(arg0).await; }
 #[allow(dead_code)] fn __ui_lang_check_pure_optional_number(arg0: ::std::option::Option<i64>) { let _: ::std::string::String = crate::backend::optional_number(arg0); }
 #[allow(dead_code)] fn __ui_lang_check_pure_sync_label<'a>(arg0: &'a str, arg1: i64, arg2: i64) { let _: ::std::string::String = crate::backend::sync_label(arg0, arg1, arg2); }
-#[allow(dead_code)] fn __ui_lang_check_stream_node_status_live(arg0: ::std::string::String) { let _: ::iced::Task<crate::backend::NodeFacts> = ::iced::Task::run(crate::backend::node_status_live(arg0), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_node_status_live(arg0: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::NodeFacts> = ::ducktape_view_guest::Task::run(crate::backend::node_status_live(arg0), |value| value); }
 #[allow(dead_code)] async fn __ui_lang_check_future_load_account(arg0: ::std::string::String, arg1: i64) { let _: ::std::result::Result<crate::backend::AccountData, crate::backend::HydrationError> = crate::backend::load_account(arg0, arg1).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_chain_id_of(arg0: ::std::string::String) { let _: ::std::result::Result<::std::string::String, crate::backend::AppError> = crate::backend::chain_id_of(arg0).await; }
 #[allow(dead_code)] fn __ui_lang_check_pure_account_data_none(arg0: i64) { let _: crate::backend::AccountData = crate::backend::account_data_none(arg0); }
@@ -1473,9 +1473,9 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] async fn __ui_lang_check_future_register_passkey(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::register_passkey(arg0, arg1, arg2, arg3).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_link_wallet(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::link_wallet(arg0, arg1, arg2, arg3).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_login_with_passkey(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::login_with_passkey(arg0, arg1, arg2, arg3).await; }
-#[allow(dead_code)] fn __ui_lang_check_stream_create_account_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::iced::Task<crate::backend::CeremonyStep> = ::iced::Task::run(crate::backend::create_account_by_qr(arg0, arg1, arg2, arg3), |value| value); }
-#[allow(dead_code)] fn __ui_lang_check_stream_login_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String) { let _: ::iced::Task<crate::backend::CeremonyStep> = ::iced::Task::run(crate::backend::login_by_qr(arg0, arg1, arg2), |value| value); }
-#[allow(dead_code)] fn __ui_lang_check_stream_add_passkey_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::iced::Task<crate::backend::CeremonyStep> = ::iced::Task::run(crate::backend::add_passkey_by_qr(arg0, arg1, arg2, arg3), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_create_account_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::CeremonyStep> = ::ducktape_view_guest::Task::run(crate::backend::create_account_by_qr(arg0, arg1, arg2, arg3), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_login_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::CeremonyStep> = ::ducktape_view_guest::Task::run(crate::backend::login_by_qr(arg0, arg1, arg2), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_add_passkey_by_qr(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::CeremonyStep> = ::ducktape_view_guest::Task::run(crate::backend::add_passkey_by_qr(arg0, arg1, arg2, arg3), |value| value); }
 #[allow(dead_code)] fn __ui_lang_check_pure_ceremony_step(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String) { let _: crate::backend::CeremonyStep = crate::backend::ceremony_step(arg0, arg1, arg2); }
 #[allow(dead_code)] fn __ui_lang_check_pure_ceremony_phase<'a>(arg0: &'a crate::backend::CeremonyStep) { let _: CeremonyPhase = crate::backend::ceremony_phase(arg0); }
 #[allow(dead_code)] fn __ui_lang_check_pure_welcome_door<'a>(arg0: &'a str) { let _: WelcomeDoor = crate::backend::welcome_door(arg0); }
@@ -1536,14 +1536,14 @@ let _: &::std::string::String = &_value.detail;
 #[allow(dead_code)] async fn __ui_lang_check_future_send_reply(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: i64, arg4: ::std::string::String, arg5: ::std::string::String) { let _: ::std::result::Result<crate::backend::SendReceipt, crate::backend::OptimisticMutationError> = crate::backend::send_reply(arg0, arg1, arg2, arg3, arg4, arg5).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_edit_message(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String, arg3: i64, arg4: i64, arg5: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::edit_message(arg0, arg1, arg2, arg3, arg4, arg5).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_cancel_agent_run(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::cancel_agent_run(arg0, arg1, arg2).await; }
-#[allow(dead_code)] fn __ui_lang_check_stream_chat_live_agents(arg0: ::std::string::String, arg1: ::std::string::String, arg2: i64, arg3: ::std::string::String) { let _: ::iced::Task<crate::backend::LiveAgentNotice> = ::iced::Task::run(crate::backend::chat_live_agents(arg0, arg1, arg2, arg3), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_chat_live_agents(arg0: ::std::string::String, arg1: ::std::string::String, arg2: i64, arg3: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::backend::LiveAgentNotice> = ::ducktape_view_guest::Task::run(crate::backend::chat_live_agents(arg0, arg1, arg2, arg3), |value| value); }
 #[allow(dead_code)] fn __ui_lang_check_pure_live_agents_stale<'a>(arg0: &'a crate::backend::LiveAgentNotice, arg1: &'a str, arg2: &'a str, arg3: i64, arg4: &'a str) { let _: bool = crate::backend::live_agents_stale(arg0, arg1, arg2, arg3, arg4); }
 #[allow(dead_code)] fn __ui_lang_check_pure_live_agent_row(arg0: ::std::string::String, arg1: i64, arg2: ::std::string::String, arg3: ::std::string::String, arg4: ::std::string::String) { let _: crate::backend::LiveAgentRow = crate::backend::live_agent_row(arg0, arg1, arg2, arg3, arg4); }
 #[allow(dead_code)] async fn __ui_lang_check_future_open_external_url(arg0: ::std::string::String) { let _: ::std::result::Result<bool, crate::backend::AppError> = crate::backend::open_external_url(arg0).await; }
 #[allow(dead_code)] fn __ui_lang_check_pure_count_label(arg0: i64) { let _: ::std::string::String = crate::backend::count_label(arg0); }
 #[allow(dead_code)] async fn __ui_lang_check_future_search_pages(arg0: ::std::string::String, arg1: ::std::string::String, arg2: ::std::string::String) { let _: ::std::result::Result<crate::backend::PageSearchData, crate::backend::AppError> = crate::backend::search_pages(arg0, arg1, arg2).await; }
 #[allow(dead_code)] async fn __ui_lang_check_future_palette_search(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::std::result::Result<crate::backend::PaletteSearchData, crate::backend::AppError> = crate::backend::palette_search(arg0, arg1).await; }
-#[allow(dead_code)] fn __ui_lang_check_stream_call_session(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::iced::Task<crate::call::CallEvent> = ::iced::Task::run(crate::call::call_session(arg0, arg1), |value| value); }
+#[allow(dead_code)] fn __ui_lang_check_stream_call_session(arg0: ::std::string::String, arg1: ::std::string::String) { let _: ::ducktape_view_guest::Task<crate::call::CallEvent> = ::ducktape_view_guest::Task::run(crate::call::call_session(arg0, arg1), |value| value); }
 #[allow(dead_code)] fn __ui_lang_check_sync_call_set_muted(arg0: bool) { let _: bool = crate::call::call_set_muted(arg0); }
 #[allow(dead_code)] fn __ui_lang_check_pure_call_status_after(arg0: ::std::string::String, arg1: crate::call::CallEvent) { let _: ::std::string::String = crate::call::call_status_after(arg0, arg1); }
 #[allow(dead_code)] fn __ui_lang_check_pure_apply_call_peer(arg0: ::std::vec::Vec<crate::call::CallEvent>, arg1: crate::call::CallEvent) { let _: ::std::vec::Vec<crate::call::CallEvent> = crate::call::apply_call_peer(arg0, arg1); }
@@ -1597,56 +1597,17 @@ fn __ice_derived_app_text(&self) -> &::std::string::String { self.__ice_derived.
 fn __ice_derived_has_error(&self) -> &bool { self.__ice_derived.has_error.get_or_init(|| (!(self.error).is_empty())) }
 fn __ice_derived_mutation_busy(&self) -> &bool { self.__ice_derived.mutation_busy.get_or_init(|| (self.mutation_phase != MutationPhase::Idle)) }
 fn __ice_derived_hub_busy(&self) -> &bool { self.__ice_derived.hub_busy.get_or_init(|| ((*self.__ice_derived_mutation_busy()) || ((self.console_entry == ConsoleEntry::Entering) && (self.onboarding_error).is_empty()))) }
-fn __window_0() -> ::iced::window::Settings { ::iced::window::Settings { 
-size: ::iced::Size::new(480 as f32, 680 as f32),
-resizable: false,
-decorations: false,
-position: ::iced::window::Position::Centered,
-icon: ::std::option::Option::Some(::iced::window::icon::from_rgba({ const __ICE_RGBA: &[u8] = include_bytes!("../../assets/icon.rgba"); const _: () = ::std::assert!(__ICE_RGBA.len() == 65536, "window icon RGBA byte length does not match width × height × 4"); __ICE_RGBA }.to_vec(), 128, 128).expect("statically checked RGBA window icon")),
-platform_specific: { #[cfg(target_os = "linux")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default(); 
-__platform.application_id = "dev.ducktape.app".to_owned();
- __platform } #[cfg(target_os = "windows")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(target_os = "macos")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(target_arch = "wasm32")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_arch = "wasm32")))] { ::std::default::Default::default() } }, ..::std::default::Default::default() } }
-fn __window_1() -> ::iced::window::Settings { ::iced::window::Settings { 
-size: ::iced::Size::new(1280 as f32, 800 as f32),
-position: ::iced::window::Position::Centered,
-min_size: ::std::option::Option::Some(::iced::Size::new(1040 as f32, 540 as f32)),
-icon: ::std::option::Option::Some(::iced::window::icon::from_rgba({ const __ICE_RGBA: &[u8] = include_bytes!("../../assets/icon.rgba"); const _: () = ::std::assert!(__ICE_RGBA.len() == 65536, "window icon RGBA byte length does not match width × height × 4"); __ICE_RGBA }.to_vec(), 128, 128).expect("statically checked RGBA window icon")),
-platform_specific: { #[cfg(target_os = "linux")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default(); 
-__platform.application_id = "dev.ducktape.app".to_owned();
- __platform } #[cfg(target_os = "windows")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(target_os = "macos")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default(); 
-__platform.title_hidden = true;
-__platform.titlebar_transparent = true;
-__platform.fullsize_content_view = true;
- __platform } #[cfg(target_arch = "wasm32")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_arch = "wasm32")))] { ::std::default::Default::default() } }, ..::std::default::Default::default() } }
-fn __window_2() -> ::iced::window::Settings { ::iced::window::Settings { 
-size: ::iced::Size::new(320 as f32, 460 as f32),
-min_size: ::std::option::Option::Some(::iced::Size::new(320 as f32, 340 as f32)),
-level: ::iced::window::Level::AlwaysOnTop,
-icon: ::std::option::Option::Some(::iced::window::icon::from_rgba({ const __ICE_RGBA: &[u8] = include_bytes!("../../assets/icon.rgba"); const _: () = ::std::assert!(__ICE_RGBA.len() == 65536, "window icon RGBA byte length does not match width × height × 4"); __ICE_RGBA }.to_vec(), 128, 128).expect("statically checked RGBA window icon")),
-platform_specific: { #[cfg(target_os = "linux")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default(); 
-__platform.application_id = "dev.ducktape.app".to_owned();
- __platform } #[cfg(target_os = "windows")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(target_os = "macos")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(target_arch = "wasm32")] { #[allow(unused_mut)] let mut __platform: ::iced::window::settings::PlatformSpecific = ::std::default::Default::default();  __platform } #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_arch = "wasm32")))] { ::std::default::Default::default() } }, ..::std::default::Default::default() } }
-fn __program() -> ::iced::Daemon<impl ::iced::Program<State = Self, Message = __DucktapeMessage, Theme = ::iced::Theme>> {
-::iced::daemon(Self::__boot, Self::__update, Self::__view).title(Self::__title).subscription(Self::__subscription).theme(Self::__theme).style(Self::__style).settings(::iced::Settings { 
-id: ::std::option::Option::Some("dev.ducktape.app".to_owned()),
-default_text_size: ::iced::Pixels(13.5 as f32),
-antialiasing: true,
- ..::std::default::Default::default() }).default_font(Self::default_font())
-.font(include_bytes!("../../../crates/views/support/design/assets/fonts/Geist[wght].ttf").as_slice())
-.font(include_bytes!("../../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf").as_slice())
-.font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
-.presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)])
-}
-#[allow(dead_code)]
-pub fn run() -> ::iced::Result {
-Self::__program().run()
-}
+fn __window_0() -> crate::shell::WindowKind { crate::shell::WindowKind::Onboarding }
+fn __window_1() -> crate::shell::WindowKind { crate::shell::WindowKind::Console }
+fn __window_2() -> crate::shell::WindowKind { crate::shell::WindowKind::Huddle }
+
+
 }
 }
 __ice_generated_items_2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f6170702e696365! {
 #[allow(unused_parens)]
 impl Ducktape {
-fn __palette(&self, window: ::iced::window::Id) -> __IcePalette {
+fn __palette(&self, window: ::crate::shell::WindowKey) -> __IcePalette {
 let _ = &window;
 match self.app_palette.clone() {
 AppTheme::App => __IcePalette { name: "app", colors: [::iced::Color::from_rgba8(58, 56, 51, 1.000000), ::iced::Color::from_rgba8(212, 210, 202, 1.000000), ::iced::Color::from_rgba8(253, 253, 251, 1.000000), ::iced::Color::from_rgba8(255, 255, 255, 1.000000), ::iced::Color::from_rgba8(44, 43, 39, 1.000000), ::iced::Color::from_rgba8(107, 105, 98, 1.000000), ::iced::Color::from_rgba8(246, 245, 242, 1.000000), ::iced::Color::from_rgba8(38, 37, 31, 1.000000), ::iced::Color::from_rgba8(50, 47, 40, 1.000000), ::iced::Color::from_rgba8(255, 255, 255, 1.000000), ::iced::Color::from_rgba8(236, 235, 230, 1.000000), ::iced::Color::from_rgba8(179, 177, 168, 1.000000), ::iced::Color::from_rgba8(255, 255, 255, 1.000000), ::iced::Color::from_rgba8(94, 92, 85, 1.000000), ::iced::Color::from_rgba8(243, 242, 239, 1.000000), ::iced::Color::from_rgba8(63, 62, 57, 1.000000), ::iced::Color::from_rgba8(160, 90, 60, 1.000000), ::iced::Color::from_rgba8(255, 255, 255, 1.000000), ::iced::Color::from_rgba8(249, 241, 234, 1.000000), ::iced::Color::from_rgba8(231, 210, 196, 1.000000), ::iced::Color::from_rgba8(184, 84, 76, 1.000000), ::iced::Color::from_rgba8(255, 255, 255, 1.000000), ::iced::Color::from_rgba8(253, 244, 243, 1.000000), ::iced::Color::from_rgba8(239, 214, 211, 1.000000), ::iced::Color::from_rgba8(224, 101, 92, 1.000000), ::iced::Color::from_rgba8(95, 158, 116, 1.000000), ::iced::Color::from_rgba8(21, 20, 16, 1.000000), ::iced::Color::from_rgba8(238, 245, 240, 1.000000), ::iced::Color::from_rgba8(207, 227, 215, 1.000000), ::iced::Color::from_rgba8(92, 180, 95, 1.000000), ::iced::Color::from_rgba8(160, 123, 50, 1.000000), ::iced::Color::from_rgba8(21, 20, 16, 1.000000), ::iced::Color::from_rgba8(251, 244, 230, 1.000000), ::iced::Color::from_rgba8(236, 220, 174, 1.000000), ::iced::Color::from_rgba8(227, 180, 67, 1.000000), ::iced::Color::from_rgba8(210, 208, 199, 1.000000), ::iced::Color::from_rgba8(79, 77, 71, 1.000000), ::iced::Color::from_rgba8(38, 37, 31, 1.000000), ::iced::Color::from_rgba8(243, 241, 234, 1.000000), ::iced::Color::from_rgba8(231, 230, 226, 1.000000), ::iced::Color::from_rgba8(224, 223, 215, 1.000000), ::iced::Color::from_rgba8(138, 137, 131, 1.000000), ::iced::Color::from_rgba8(38, 37, 31, 1.000000), ::iced::Color::from_rgba8(253, 252, 250, 0.501961), ::iced::Color::from_rgba8(253, 252, 250, 0.619608), ::iced::Color::from_rgba8(253, 252, 250, 0.858824), ::iced::Color::from_rgba8(40, 38, 34, 0.129412), ::iced::Color::from_rgba8(40, 38, 34, 0.219608), ::iced::Color::from_rgba8(40, 38, 34, 0.301961), ::iced::Color::from_rgba8(40, 38, 34, 0.219608), ::iced::Color::from_rgba8(40, 38, 34, 0.101961), ::iced::Color::from_rgba8(227, 225, 217, 1.000000), ::iced::Color::from_rgba8(236, 234, 227, 1.000000), ::iced::Color::from_rgba8(250, 250, 248, 1.000000), ::iced::Color::from_rgba8(251, 251, 249, 1.000000), ::iced::Color::from_rgba8(243, 242, 239, 1.000000), ::iced::Color::from_rgba8(236, 235, 230, 1.000000), ::iced::Color::from_rgba8(248, 247, 243, 1.000000), ::iced::Color::from_rgba8(240, 239, 234, 1.000000), ::iced::Color::from_rgba8(214, 212, 204, 1.000000), ::iced::Color::from_rgba8(239, 238, 233, 1.000000), ::iced::Color::from_rgba8(9, 11, 14, 1.000000), ::iced::Color::from_rgba8(36, 42, 51, 1.000000), ::iced::Color::from_rgba8(236, 233, 225, 1.000000), ::iced::Color::from_rgba8(236, 214, 208, 1.000000), ::iced::Color::from_rgba8(253, 246, 244, 1.000000), ::iced::Color::from_rgba8(163, 82, 72, 1.000000), ::iced::Color::from_rgba8(143, 70, 61, 1.000000), ::iced::Color::from_rgba8(50, 47, 40, 1.000000), ::iced::Color::from_rgba8(58, 57, 52, 1.000000), ::iced::Color::from_rgba8(154, 152, 143, 1.000000), ::iced::Color::from_rgba8(167, 165, 155, 1.000000), ::iced::Color::from_rgba8(179, 177, 168, 1.000000), ::iced::Color::from_rgba8(189, 187, 177, 1.000000), ::iced::Color::from_rgba8(203, 201, 191, 1.000000), ::iced::Color::from_rgba8(123, 167, 140, 1.000000), ::iced::Color::from_rgba8(95, 122, 158, 1.000000), ::iced::Color::from_rgba8(238, 242, 247, 1.000000), ::iced::Color::from_rgba8(218, 226, 236, 1.000000), ::iced::Color::from_rgba8(127, 154, 184, 1.000000), ::iced::Color::from_rgba8(163, 82, 72, 1.000000), ::iced::Color::from_rgba8(251, 236, 234, 1.000000), ::iced::Color::from_rgba8(236, 207, 201, 1.000000), ::iced::Color::from_rgba8(207, 106, 94, 1.000000), ::iced::Color::from_rgba8(251, 248, 240, 1.000000), ::iced::Color::from_rgba8(40, 38, 34, 0.341176), ::iced::Color::from_rgba8(247, 246, 242, 1.000000), ::iced::Color::from_rgba8(250, 249, 246, 1.000000), ::iced::Color::from_rgba8(252, 251, 249, 1.000000), ::iced::Color::from_rgba8(251, 250, 247, 1.000000), ::iced::Color::from_rgba8(253, 248, 243, 1.000000), ::iced::Color::from_rgba8(240, 236, 225, 1.000000), ::iced::Color::from_rgba8(244, 231, 200, 1.000000), ::iced::Color::from_rgba8(217, 216, 208, 1.000000), ::iced::Color::from_rgba8(213, 211, 202, 1.000000), ::iced::Color::from_rgba8(182, 180, 168, 1.000000), ::iced::Color::from_rgba8(200, 198, 188, 1.000000), ::iced::Color::from_rgba8(194, 192, 182, 1.000000), ::iced::Color::from_rgba8(208, 206, 196, 1.000000), ::iced::Color::from_rgba8(220, 219, 212, 1.000000), ::iced::Color::from_rgba8(122, 120, 114, 1.000000), ::iced::Color::from_rgba8(126, 158, 136, 1.000000), ::iced::Color::from_rgba8(102, 100, 94, 1.000000), ::iced::Color::from_rgba8(122, 111, 158, 1.000000), ::iced::Color::from_rgba8(241, 237, 245, 1.000000), ::iced::Color::from_rgba8(221, 210, 230, 1.000000), ::iced::Color::from_rgba8(240, 245, 241, 1.000000), ::iced::Color::from_rgba8(220, 235, 224, 1.000000), ::iced::Color::from_rgba8(238, 246, 239, 1.000000), ::iced::Color::from_rgba8(225, 239, 227, 1.000000), ::iced::Color::from_rgba8(47, 107, 65, 1.000000), ::iced::Color::from_rgba8(251, 238, 236, 1.000000), ::iced::Color::from_rgba8(244, 221, 216, 1.000000), ::iced::Color::from_rgba8(161, 67, 56, 1.000000), ::iced::Color::from_rgba8(246, 243, 249, 1.000000), ::iced::Color::from_rgba8(74, 72, 67, 1.000000), ::iced::Color::from_rgba8(224, 145, 138, 1.000000), ::iced::Color::from_rgba8(160, 138, 90, 1.000000), ::iced::Color::from_rgba8(95, 138, 114, 1.000000), ::iced::Color::from_rgba8(237, 244, 239, 1.000000), ::iced::Color::from_rgba8(122, 111, 158, 1.000000), ::iced::Color::from_rgba8(241, 239, 247, 1.000000), ::iced::Color::from_rgba8(74, 72, 67, 1.000000), ::iced::Color::from_rgba8(242, 241, 237, 1.000000), ::iced::Color::from_rgba8(185, 113, 78, 1.000000), ::iced::Color::from_rgba8(250, 240, 233, 1.000000), ::iced::Color::from_rgba8(192, 138, 62, 1.000000), ::iced::Color::from_rgba8(250, 243, 230, 1.000000)] },
@@ -1671,10 +1632,10 @@ danger: __ice_palette.colors[20],
 *__cached.borrow_mut() = ::std::option::Option::Some((__ice_palette, __theme.clone()));
 __theme })
 }
-pub(crate) fn __theme(&self, window: ::iced::window::Id) -> ::iced::Theme {
+pub(crate) fn __theme(&self, window: ::crate::shell::WindowKey) -> ::iced::Theme {
 Self::__app_theme(self.__palette(window))
 }
-fn __title(&self, window: ::iced::window::Id) -> ::std::string::String { "Ducktape".to_owned() }
+fn __title(&self, window: ::crate::shell::WindowKey) -> ::std::string::String { "Ducktape".to_owned() }
 fn __style(&self, __theme: &::iced::Theme) -> ::iced::theme::Style { let mut __style = ::iced::theme::Base::base(__theme);
 __style.background_color = ((*self.__ice_derived_app_background()).to_owned()).parse::<::iced::Color>().unwrap_or(__style.background_color);
 __style.text_color = ((*self.__ice_derived_app_text()).to_owned()).parse::<::iced::Color>().unwrap_or(__style.text_color);
@@ -1746,7 +1707,7 @@ __ice_run_lane_26_handle: ::std::option::Option::None,
 app_palette: AppTheme::App,
 appearance: Appearance::System,
 desktop_notifications: true,
-wall_now: ({ let __ice_call = ::ui_lang_runtime::dev::Span::extern_call("current_wall_seconds", "extern/backend.ice:187"); crate::backend::current_wall_seconds() }),
+wall_now: ({ crate::backend::current_wall_seconds() }),
 rpc: "".to_owned(),
 connected_rpc: "".to_owned(),
 password: "".to_owned(),
@@ -1914,13 +1875,13 @@ __ice_component_04e6574776f726b7353637265656e: ::std::collections::HashMap::new(
 __ice_component_04e6574776f726b7353637265656e_initial: ::std::default::Default::default(),
 }
 }
-fn __boot_task(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __boot_task(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
-{ let (_, __task) = ::iced::window::open(Self::__window_0()); __task.map(move |value| __DucktapeMessage::OnboardingOpened(value)) }
+{ let (_, __task) = ::crate::shell::open(Self::__window_0()); __task.map(move |value| __DucktapeMessage::OnboardingOpened(value)) }
 })();
 task
 }
-pub(crate) fn __boot() -> (Self, ::iced::Task<__DucktapeMessage>) {
+pub(crate) fn __boot() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -1965,7 +1926,7 @@ fn __tray_sync(&self) {
 __ice_generated_items_2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f6170702e696365! {
 #[allow(unused_parens)]
 impl Ducktape {
-fn __preset_task_0(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_0(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.rpc, __ice_next) { self.rpc = __ice_next; self.__ice_rev[4] += 1; } }
 { let __ice_next = "Offline".to_owned(); if ::ui_lang_runtime::state_changed!(self.status, __ice_next) { self.status = __ice_next; self.__ice_rev[7] += 1; } }
@@ -1978,11 +1939,11 @@ let task = (|| {
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.channel_create_members_only, __ice_next) { self.channel_create_members_only = __ice_next; self.__ice_rev[45] += 1; } }
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.palette_open, __ice_next) { self.palette_open = __ice_next; self.__ice_rev[104] += 1; } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.palette_draft, __ice_next) { self.palette_draft = __ice_next; self.__ice_rev[113] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_0() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_0() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2005,7 +1966,7 @@ let task = state.__preset_task_0();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_1(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_1(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "Offline".to_owned(); if ::ui_lang_runtime::state_changed!(self.status, __ice_next) { self.status = __ice_next; self.__ice_rev[7] += 1; } }
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
@@ -2014,11 +1975,11 @@ let task = (|| {
 { let __ice_next = ShellTab::Chat; if ::ui_lang_runtime::state_changed!(self.shell_tab, __ice_next) { self.shell_tab = __ice_next; self.__ice_rev[55] += 1; } }
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.palette_open, __ice_next) { self.palette_open = __ice_next; self.__ice_rev[104] += 1; } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.palette_draft, __ice_next) { self.palette_draft = __ice_next; self.__ice_rev[113] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_1() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_1() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2041,7 +2002,7 @@ let task = state.__preset_task_1();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_2(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_2(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.rpc, __ice_next) { self.rpc = __ice_next; self.__ice_rev[4] += 1; } }
 { let __ice_next = "Offline".to_owned(); if ::ui_lang_runtime::state_changed!(self.status, __ice_next) { self.status = __ice_next; self.__ice_rev[7] += 1; } }
@@ -2050,11 +2011,11 @@ let task = (|| {
 { let __ice_next = MutationPhase::Idle; if ::ui_lang_runtime::state_changed!(self.mutation_phase, __ice_next) { self.mutation_phase = __ice_next; self.__ice_rev[19] += 1; self.__ice_derived.mutation_busy.take(); self.__ice_derived.hub_busy.take(); } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.error, __ice_next) { self.error = __ice_next; self.__ice_rev[20] += 1; self.__ice_derived.has_error.take(); } }
 { let __ice_next = ShellTab::Settings; if ::ui_lang_runtime::state_changed!(self.shell_tab, __ice_next) { self.shell_tab = __ice_next; self.__ice_rev[55] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_2() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_2() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2077,14 +2038,14 @@ let task = state.__preset_task_2();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_3(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_3(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "Connection failed".to_owned(); if ::ui_lang_runtime::state_changed!(self.error, __ice_next) { self.error = __ice_next; self.__ice_rev[20] += 1; self.__ice_derived.has_error.take(); } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_3() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_3() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2107,7 +2068,7 @@ let task = state.__preset_task_3();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_4(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_4(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = MutationPhase::Idle; if ::ui_lang_runtime::state_changed!(self.mutation_phase, __ice_next) { self.mutation_phase = __ice_next; self.__ice_rev[19] += 1; self.__ice_derived.mutation_busy.take(); self.__ice_derived.hub_busy.take(); } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.onboarding_error, __ice_next) { self.onboarding_error = __ice_next; self.__ice_rev[131] += 1; self.__ice_derived.hub_busy.take(); } }
@@ -2118,11 +2079,11 @@ let task = (|| {
 { let __ice_next = "hunter2-hunter2".to_owned(); if ::ui_lang_runtime::state_changed!(self.password, __ice_next) { self.password = __ice_next; self.__ice_rev[6] += 1; } }
 { let __ice_next = ::std::vec![crate::backend::wallet_info("alice".to_owned(), "aabbccddeeff00112233".to_owned(), "encrypted".to_owned(), false), crate::backend::wallet_info("demo".to_owned(), "eeff0011".to_owned(), "encrypted".to_owned(), true)]; if ::ui_lang_runtime::state_changed!(self.hub_wallets, __ice_next) { self.hub_wallets = __ice_next; self.__ice_rev[128] += 1; } }
 { let __ice_next = "demo".to_owned(); if ::ui_lang_runtime::state_changed!(self.hub_wallet_selected, __ice_next) { self.hub_wallet_selected = __ice_next; self.__ice_rev[129] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_4() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_4() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2145,7 +2106,7 @@ let task = state.__preset_task_4();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_5(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_5(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = MutationPhase::Onboarding; if ::ui_lang_runtime::state_changed!(self.mutation_phase, __ice_next) { self.mutation_phase = __ice_next; self.__ice_rev[19] += 1; self.__ice_derived.mutation_busy.take(); self.__ice_derived.hub_busy.take(); } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.onboarding_error, __ice_next) { self.onboarding_error = __ice_next; self.__ice_rev[131] += 1; self.__ice_derived.hub_busy.take(); } }
@@ -2154,11 +2115,11 @@ let task = (|| {
 { let __ice_next = "https://auth.ducktape.industries/#op=get&challenge=AQID".to_owned(); if ::ui_lang_runtime::state_changed!(self.ceremony_qr, __ice_next) { self.ceremony_qr = __ice_next; self.__ice_rev[139] += 1; } }
 { let __ice_next = "Your phone will confirm with the passkey.".to_owned(); if ::ui_lang_runtime::state_changed!(self.ceremony_detail, __ice_next) { self.ceremony_detail = __ice_next; self.__ice_rev[140] += 1; } }
 { let __ice_next = "4:58".to_owned(); if ::ui_lang_runtime::state_changed!(self.ceremony_left, __ice_next) { self.ceremony_left = __ice_next; self.__ice_rev[141] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_5() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_5() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2181,7 +2142,7 @@ let task = state.__preset_task_5();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_6(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_6(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "http://127.0.0.1:1".to_owned(); if ::ui_lang_runtime::state_changed!(self.rpc, __ice_next) { self.rpc = __ice_next; self.__ice_rev[4] += 1; } }
 { let __ice_next = "http://127.0.0.1:1".to_owned(); if ::ui_lang_runtime::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[5] += 1; } }
@@ -2194,11 +2155,11 @@ let task = (|| {
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.account_exists, __ice_next) { self.account_exists = __ice_next; self.__ice_rev[72] += 1; } }
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.account_banner_dismissed, __ice_next) { self.account_banner_dismissed = __ice_next; self.__ice_rev[79] += 1; } }
 { let __ice_next = ShellTab::Settings; if ::ui_lang_runtime::state_changed!(self.shell_tab, __ice_next) { self.shell_tab = __ice_next; self.__ice_rev[55] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_6() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_6() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2221,17 +2182,17 @@ let task = state.__preset_task_6();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_7(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_7(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = "hunter2-hunter2".to_owned(); if ::ui_lang_runtime::state_changed!(self.password, __ice_next) { self.password = __ice_next; self.__ice_rev[6] += 1; } }
 { let __ice_next = "http://127.0.0.1:1".to_owned(); if ::ui_lang_runtime::state_changed!(self.rpc, __ice_next) { self.rpc = __ice_next; self.__ice_rev[4] += 1; } }
 { let __ice_next = MutationPhase::Onboarding; if ::ui_lang_runtime::state_changed!(self.mutation_phase, __ice_next) { self.mutation_phase = __ice_next; self.__ice_rev[19] += 1; self.__ice_derived.mutation_busy.take(); self.__ice_derived.hub_busy.take(); } }
 { let __ice_next = HubStep::Networks; if ::ui_lang_runtime::state_changed!(self.hub_step, __ice_next) { self.hub_step = __ice_next; self.__ice_rev[125] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_7() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_7() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2254,16 +2215,16 @@ let task = state.__preset_task_7();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_8(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_8(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.palette_open, __ice_next) { self.palette_open = __ice_next; self.__ice_rev[104] += 1; } }
 { let __ice_next = "".to_owned(); if ::ui_lang_runtime::state_changed!(self.palette_draft, __ice_next) { self.palette_draft = __ice_next; self.__ice_rev[113] += 1; } }
 { let __ice_next = "http://127.0.0.1:1".to_owned(); if ::ui_lang_runtime::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[5] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_8() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_8() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2286,10 +2247,10 @@ let task = state.__preset_task_8();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_9(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_9(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
-{ let __ice_next = ::std::option::Option::Some(({ let __ice_call = ::ui_lang_runtime::dev::Span::extern_call("window_target", "extern/backend.ice:119"); crate::backend::window_target(::std::option::Option::None) })); if ::ui_lang_runtime::state_changed!(self.console_win, __ice_next) { self.console_win = __ice_next; self.__ice_rev[122] += 1; } }
+{ let __ice_next = ::std::option::Option::Some(({ crate::backend::window_target(::std::option::Option::None) })); if ::ui_lang_runtime::state_changed!(self.console_win, __ice_next) { self.console_win = __ice_next; self.__ice_rev[122] += 1; } }
 { let __ice_next = "http://127.0.0.1:1".to_owned(); if ::ui_lang_runtime::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[5] += 1; } }
 { let __ice_next = "demo".to_owned(); if ::ui_lang_runtime::state_changed!(self.network_name, __ice_next) { self.network_name = __ice_next; self.__ice_rev[124] += 1; } }
 { let __ice_next = 3; if ::ui_lang_runtime::state_changed!(self.bell_unread, __ice_next) { self.bell_unread = __ice_next; self.__ice_rev[106] += 1; } }
@@ -2297,11 +2258,11 @@ let task = (|| {
 { let __ice_next = "general".to_owned(); if ::ui_lang_runtime::state_changed!(self.huddle_channel_name, __ice_next) { self.huddle_channel_name = __ice_next; self.__ice_rev[144] += 1; } }
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.call_muted, __ice_next) { self.call_muted = __ice_next; self.__ice_rev[148] += 1; } }
 { let __ice_next = Appearance::Dark; if ::ui_lang_runtime::state_changed!(self.appearance, __ice_next) { self.appearance = __ice_next; self.__ice_rev[1] += 1; self.__ice_derived.dark.take(); self.__ice_derived.app_background.take(); self.__ice_derived.app_text.take(); } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_9() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_9() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2324,7 +2285,7 @@ let task = state.__preset_task_9();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_10(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_10(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = false; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.huddle_joined, __ice_next) { self.huddle_joined = __ice_next; self.__ice_rev[142] += 1; } }
@@ -2335,11 +2296,11 @@ let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.call_sharing, __ice_next) { self.call_sharing = __ice_next; self.__ice_rev[151] += 1; } }
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.call_video_live, __ice_next) { self.call_video_live = __ice_next; self.__ice_rev[152] += 1; } }
 { let __ice_next = "you".to_owned(); if ::ui_lang_runtime::state_changed!(self.huddle_stage, __ice_next) { self.huddle_stage = __ice_next; self.__ice_rev[153] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_10() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_10() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2362,15 +2323,15 @@ let task = state.__preset_task_10();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_11(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_11(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
 { let __ice_next = HubStep::Live; if ::ui_lang_runtime::state_changed!(self.hub_step, __ice_next) { self.hub_step = __ice_next; self.__ice_rev[125] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_11() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_11() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2393,7 +2354,7 @@ let task = state.__preset_task_11();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_12(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_12(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
 { let __ice_next = "http://127.0.0.1:8844".to_owned(); if ::ui_lang_runtime::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[5] += 1; } }
@@ -2402,11 +2363,11 @@ let task = (|| {
 { let __ice_next = "aa11".to_owned(); if ::ui_lang_runtime::state_changed!(self.signer_key, __ice_next) { self.signer_key = __ice_next; self.__ice_rev[17] += 1; } }
 { let __ice_next = ShellTab::Chat; if ::ui_lang_runtime::state_changed!(self.shell_tab, __ice_next) { self.shell_tab = __ice_next; self.__ice_rev[55] += 1; } }
 { let __ice_next = ::std::vec![crate::backend::live_agent_row("channel-a".to_owned(), 2, "chat:2:agent-1".to_owned(), "Chief Duck".to_owned(), "Reading the repo".to_owned())]; if ::ui_lang_runtime::state_changed!(self.live_agents, __ice_next) { self.live_agents = __ice_next; self.__ice_rev[39] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_12() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_12() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2429,7 +2390,7 @@ let task = state.__preset_task_12();
 state.__tray_sync();
 (state, task)
 }
-fn __preset_task_13(&mut self) -> ::iced::Task<__DucktapeMessage> {
+fn __preset_task_13(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
 let task = (|| {
 { let __ice_next = true; if ::ui_lang_runtime::state_changed!(self.connected, __ice_next) { self.connected = __ice_next; self.__ice_rev[8] += 1; } }
 { let __ice_next = "http://127.0.0.1:8844".to_owned(); if ::ui_lang_runtime::state_changed!(self.connected_rpc, __ice_next) { self.connected_rpc = __ice_next; self.__ice_rev[5] += 1; } }
@@ -2439,11 +2400,11 @@ let task = (|| {
 { let __ice_next = ShellTab::Settings; if ::ui_lang_runtime::state_changed!(self.shell_tab, __ice_next) { self.shell_tab = __ice_next; self.__ice_rev[55] += 1; } }
 { let __ice_next = "qr".to_owned(); if ::ui_lang_runtime::state_changed!(self.account_ceremony_phase, __ice_next) { self.account_ceremony_phase = __ice_next; self.__ice_rev[80] += 1; } }
 { let __ice_next = "otpauth://totp/demo".to_owned(); if ::ui_lang_runtime::state_changed!(self.account_ceremony_qr, __ice_next) { self.account_ceremony_qr = __ice_next; self.__ice_rev[81] += 1; } }
-::iced::Task::none()
+::ducktape_view_guest::Task::none()
 })();
 task
 }
-fn __preset_13() -> (Self, ::iced::Task<__DucktapeMessage>) {
+fn __preset_13() -> (Self, ::ducktape_view_guest::Task<__DucktapeMessage>) {
 let mut state = Self::__state();
 {
 const __ICE_TRAY_ICONS: &[::ui_lang_runtime::tray::TrayIcon] = &[::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-offline.rgba", rgba: { const __ICE_TRAY_RGBA_0: &[u8] = include_bytes!("../../assets/tray-offline.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_0.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_0 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray-unread.rgba", rgba: { const __ICE_TRAY_RGBA_1: &[u8] = include_bytes!("../../assets/tray-unread.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_1.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_1 }, width: 128u32, height: 128u32 },::ui_lang_runtime::tray::TrayIcon { path: "../../assets/tray.rgba", rgba: { const __ICE_TRAY_RGBA_2: &[u8] = include_bytes!("../../assets/tray.rgba"); const _: () = ::std::assert!(__ICE_TRAY_RGBA_2.len() == 65536, "tray icon RGBA byte length does not match width × height × 4"); __ICE_TRAY_RGBA_2 }, width: 128u32, height: 128u32 },];
@@ -2471,49 +2432,30 @@ state.__tray_sync();
 __ice_generated_items_2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f6170702e696365! {
 #[allow(unused_parens)]
 impl Ducktape {
-fn __subscription(&self) -> ::iced::Subscription<__DucktapeMessage> {
-::iced::Subscription::batch([
-#[cfg(all(target_os = "macos", not(test)))]
-self.__ice_accessibility_windows.subscription().map(|(__id, __request)| __DucktapeMessage::__AccessibilityWindowAction(__id, __request)),
-#[cfg(all(target_os = "macos", not(test)))]
-::iced::window::events().map(|(__id, __event)| __DucktapeMessage::__AccessibilityWindowEvent(__id, __event)),
-::ui_lang_runtime::tray::events().filter_map(Self::__tray_row),
-if self.connected { ::iced::Subscription::batch([::iced::Subscription::run_with(self.connected_rpc.to_owned(), |__data: &::std::string::String| crate::backend::live_events(__data.clone())).map(move |__value| __DucktapeMessage::LiveUpdated(__value)),
-]) } else { ::iced::Subscription::none() },
-if ((self.connected && self.huddle_joined) && (!(self.huddle_channel).is_empty())) { ::iced::Subscription::batch([::iced::Subscription::run_with((self.connected_rpc.to_owned(), self.huddle_channel.to_owned(),), |__data: &(::std::string::String, ::std::string::String,)| crate::call::call_session(__data.0.clone(), __data.1.clone())).map(move |__value| __DucktapeMessage::CallEvent(__value)),
-]) } else { ::iced::Subscription::none() },
-if (self.connected || self.palette_open) { ::iced::Subscription::batch([::iced::event::listen_with(|__event, __status, _| { if matches!(__status, ::iced::event::Status::Ignored) { match __event { ::iced::Event::Keyboard(__event) => { match __event { ::iced::keyboard::Event::KeyPressed { key, modified_key, physical_key, location, modifiers, text, repeat } => ::std::option::Option::Some(__IceKeyPress { key, modified_key, physical_key, location, modifiers, text: text.map(|value| value.to_string()), repeat }), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } } else { ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::GlobalKeyPressed(__value)),
-]) } else { ::iced::Subscription::none() },
-if (!(crate::backend::topmost_overlay(self.palette_open, self.bell_open, self.channel_create_open)).is_empty()) { ::iced::Subscription::batch([::iced::event::listen_with(|__event, __status, _| { if matches!(__status, ::iced::event::Status::Captured) { match __event { ::iced::Event::Keyboard(__event) => { match __event { ::iced::keyboard::Event::KeyPressed { key, modified_key, physical_key, location, modifiers, text, repeat } if matches!(key, ::iced::keyboard::Key::Named(::iced::keyboard::key::Named::Escape)) => ::std::option::Option::Some(__IceKeyPress { key, modified_key, physical_key, location, modifiers, text: text.map(|value| value.to_string()), repeat }), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } } else { ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::GlobalKeyPressed(__value)),
-]) } else { ::iced::Subscription::none() },
-::iced::event::listen_with(|__event, _, __id| { match __event { ::iced::Event::Window(__event) => { match __event { ::iced::window::Event::FileDropped(path) => ::std::option::Option::Some(path.to_string_lossy().into_owned()), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::FsFileDropped(__value)),
-::iced::event::listen_with(|__event, _, __id| { match __event { ::iced::Event::Window(__event) => { (matches!(__event, ::iced::window::Event::Closed).then_some(())).map(|_| __id) }, _ => ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::WindowWasClosed(__value)),
-::iced::event::listen_with(|__event, _, _| { match __event { ::iced::Event::Keyboard(__event) => { match __event { ::iced::keyboard::Event::ModifiersChanged(modifiers) => ::std::option::Option::Some(modifiers), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::ModifierStateChanged(__value)),
-if self.cmd_held { ::iced::Subscription::batch([::iced::event::listen_with(|__event, __status, _| { if matches!(__status, ::iced::event::Status::Ignored) { match __event { ::iced::Event::Keyboard(__event) => { match __event { ::iced::keyboard::Event::KeyPressed { key, modified_key, physical_key, location, modifiers, text, repeat } => ::std::option::Option::Some(__IceKeyPress { key, modified_key, physical_key, location, modifiers, text: text.map(|value| value.to_string()), repeat }), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } } else { ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::CommandChordPressed(__value)),
-]) } else { ::iced::Subscription::none() },
-if (self.shell_tab == ShellTab::Chat) { ::iced::Subscription::batch([::iced::event::listen_with(|__event, __status, _| { if matches!(__status, ::iced::event::Status::Ignored) { match __event { ::iced::Event::Keyboard(__event) => { match __event { ::iced::keyboard::Event::KeyPressed { key, modified_key, physical_key, location, modifiers, text, repeat } => ::std::option::Option::Some(__IceKeyPress { key, modified_key, physical_key, location, modifiers, text: text.map(|value| value.to_string()), repeat }), _ => ::std::option::Option::None } }, _ => ::std::option::Option::None } } else { ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::CopyChordPressed(__value)),
-]) } else { ::iced::Subscription::none() },
-::iced::event::listen_with(|__event, _, __id| { match __event { ::iced::Event::Window(__event) => { (matches!(__event, ::iced::window::Event::Focused).then_some(())).map(|_| __id) }, _ => ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::WindowFocused(__value)),
-::iced::event::listen_with(|__event, _, __id| { match __event { ::iced::Event::Window(__event) => { (matches!(__event, ::iced::window::Event::Unfocused).then_some(())).map(|_| __id) }, _ => ::std::option::Option::None } }).map(move |__value| __DucktapeMessage::WindowUnfocused(__value)),
-if self.connected { ::iced::Subscription::batch([::iced::Subscription::run_with(self.connected_rpc.to_owned(), |__data: &::std::string::String| crate::backend::node_status_live(__data.clone())).map(move |__value| __DucktapeMessage::NodeStatusPushed(__value)),
-]) } else { ::iced::Subscription::none() },
-if self.connected { ::iced::Subscription::batch([::iced::Subscription::run_with((self.connected_rpc.to_owned(), self.network_chain_id.to_owned(), self.connect_generation, self.signer_key.to_owned(),), |__data: &(::std::string::String, ::std::string::String, i64, ::std::string::String,)| crate::backend::chat_live_agents(__data.0.clone(), __data.1.clone(), __data.2.clone(), __data.3.clone())).map(move |__value| __DucktapeMessage::LiveAgentsEvent(__value)),
-]) } else { ::iced::Subscription::none() },
-if self.huddle_joined { ::iced::Subscription::batch([{ #[cfg(test)] let __ice_every = ::ui_lang_runtime::testing::every(::std::time::Duration::from_millis(1000)); #[cfg(not(test))] let __ice_every = ::iced::time::every(::std::time::Duration::from_millis(1000)); __ice_every }.map(move |__value| __DucktapeMessage::Tick),
-]) } else { ::iced::Subscription::none() },
-if (self.console_win != ::std::option::Option::None) { ::iced::Subscription::batch([{ #[cfg(test)] let __ice_every = ::ui_lang_runtime::testing::every(::std::time::Duration::from_millis(1000)); #[cfg(not(test))] let __ice_every = ::iced::time::every(::std::time::Duration::from_millis(1000)); __ice_every }.map(move |__value| __DucktapeMessage::WallTick),
-]) } else { ::iced::Subscription::none() },
-if (!(self.toast).is_empty()) { ::iced::Subscription::batch([{ #[cfg(test)] let __ice_every = ::ui_lang_runtime::testing::every(::std::time::Duration::from_millis(300)); #[cfg(not(test))] let __ice_every = ::iced::time::every(::std::time::Duration::from_millis(300)); __ice_every }.map(move |__value| __DucktapeMessage::ToastTick),
-]) } else { ::iced::Subscription::none() },
-])
+fn __subscription(&self) -> ducktape_view_guest::Subscription<__DucktapeMessage> {
+use ducktape_view_guest::Subscription;
+let mut subscriptions = Vec::new();
+if self.connected {
+subscriptions.push(Subscription::run_with(self.connected_rpc.clone(), |rpc: &String| crate::backend::live_events(rpc.clone())).map(__DucktapeMessage::LiveUpdated));
+subscriptions.push(Subscription::run_with(self.connected_rpc.clone(), |rpc: &String| crate::backend::node_status_live(rpc.clone())).map(__DucktapeMessage::NodeStatusPushed));
+subscriptions.push(Subscription::run_with((self.connected_rpc.clone(), self.network_chain_id.clone(), self.connect_generation, self.signer_key.clone()), |data: &(String, String, i64, String)| crate::backend::chat_live_agents(data.0.clone(), data.1.clone(), data.2, data.3.clone())).map(__DucktapeMessage::LiveAgentsEvent));
 }
+let active_call = self.connected && self.huddle_joined && !self.huddle_channel.is_empty();
+if active_call {
+subscriptions.push(Subscription::run_with((self.connected_rpc.clone(), self.huddle_channel.clone()), |data: &(String, String)| crate::call::call_session(data.0.clone(), data.1.clone())).map(__DucktapeMessage::CallEvent));
+}
+if self.huddle_joined { subscriptions.push(Subscription::run(crate::shell::seconds).map(|()| __DucktapeMessage::Tick)); }
+if self.console_win.is_some() { subscriptions.push(Subscription::run(crate::shell::seconds).map(|()| __DucktapeMessage::WallTick)); }
+Subscription::batch(subscriptions)
+}
+
 }
 }
 __ice_generated_items_2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f6170702e696365! {
 #[allow(unused_parens)]
 impl Ducktape {
 #[cfg(test)]
-fn __ice_test_mount_0(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_0(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 43, 1, "rendered view node");
 #[cfg(test)]
@@ -2534,7 +2476,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_1(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_1(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 114, 1, "rendered view node");
 #[cfg(test)]
@@ -2555,7 +2497,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_2(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_2(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 136, 1, "rendered view node");
 #[cfg(test)]
@@ -2585,7 +2527,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_3(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_3(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 173, 1, "rendered view node");
 #[cfg(test)]
@@ -2606,7 +2548,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_4(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_4(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 263, 1, "rendered view node");
 #[cfg(test)]
@@ -2627,7 +2569,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_5(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_5(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 326, 1, "rendered view node");
 #[cfg(test)]
@@ -2648,7 +2590,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_6(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_6(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 372, 1, "rendered view node");
 #[cfg(test)]
@@ -2669,7 +2611,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_8(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_8(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 418, 1, "rendered view node");
 #[cfg(test)]
@@ -2690,7 +2632,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_9(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_9(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 442, 1, "rendered view node");
 #[cfg(test)]
@@ -2711,7 +2653,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_10(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_10(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 463, 1, "rendered view node");
 #[cfg(test)]
@@ -2732,7 +2674,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_11(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_11(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 560, 1, "rendered view node");
 #[cfg(test)]
@@ -2753,7 +2695,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_13(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_13(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 610, 1, "rendered view node");
 #[cfg(test)]
@@ -2774,7 +2716,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_15(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_15(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 657, 1, "rendered view node");
 #[cfg(test)]
@@ -2795,7 +2737,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_16(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_16(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 700, 1, "rendered view node");
 #[cfg(test)]
@@ -2834,7 +2776,7 @@ antialiasing: true,
 .font(include_bytes!("../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf").as_slice())
 .presets([::iced::Preset::new("ui_offline", Self::__preset_0), ::iced::Preset::new("ui_palette_open", Self::__preset_1), ::iced::Preset::new("ui_settings", Self::__preset_2), ::iced::Preset::new("ui_component_error", Self::__preset_3), ::iced::Preset::new("ui_launch", Self::__preset_4), ::iced::Preset::new("ui_welcome_qr", Self::__preset_5), ::iced::Preset::new("ui_console_no_account", Self::__preset_6), ::iced::Preset::new("ui_pick_probe", Self::__preset_7), ::iced::Preset::new("ui_palette_overlay", Self::__preset_8), ::iced::Preset::new("ui_tray_live", Self::__preset_9), ::iced::Preset::new("ui_huddle_sharing", Self::__preset_10), ::iced::Preset::new("ui_tray_reconnect", Self::__preset_11), ::iced::Preset::new("ui_live_run_seated", Self::__preset_12), ::iced::Preset::new("ui_ceremony_on_settings", Self::__preset_13)]) }
 #[cfg(test)]
-fn __ice_test_mount_19(&self, window: ::iced::window::Id) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
+fn __ice_test_mount_19(&self, window: ::crate::shell::WindowKey) -> __IceElement<'_, __DucktapeMessage> { let __ice_palette = self.__palette(window); let __ice_app_theme = Self::__app_theme(__ice_palette);  let __ice_content: __IceElement<'_, __DucktapeMessage> = {
 #[cfg(test)]
 let __ice_render_source_location = ::ui_lang_runtime::testing::Location::new("tests/app.ice", 819, 1, "rendered view node");
 #[cfg(test)]
@@ -2864,35 +2806,35 @@ fn __ice_agent_inspect() { ::ui_lang_runtime::testing::agent_inspect(|| Ducktape
 fn __ice_view_fits_default_stack() {
 ::std::thread::Builder::new().stack_size(4 * 1024 * 1024).spawn(|| {
 let (__app, _) = Ducktape::__boot();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_0();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_1();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_2();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_3();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_4();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_5();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_6();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_7();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_8();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_9();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_10();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_11();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_12();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 let (__app, _) = Ducktape::__preset_13();
-let _ = __app.__view(::iced::window::Id::unique());
+let _ = __app.__view(::crate::shell::WindowKey::unique());
 }).unwrap().join().unwrap();
 }
 #[test]

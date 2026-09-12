@@ -1,4 +1,5 @@
 include!("ui/app.rs");
+include!("ui/native_view.rs");
 
 mod backend;
 mod call;
@@ -9,7 +10,7 @@ mod shell;
 mod view_tree;
 mod video;
 
-fn main() -> iced::Result {
+fn main() {
     install_log();
     // macOS launches a GUI with a 256-fd soft limit; the app's own stores,
     // sockets and the node it hosts hit that as a bare EMFILE. raised AFTER
@@ -32,7 +33,7 @@ fn main() -> iced::Result {
     // the desktop's own views are there before the window is: a tab's
     // first draw never finds a load on its way
     module_view::booted().joined();
-    Ducktape::run()
+    shell::run();
 }
 
 /// the app's own sink: `<DUCKTAPE_HOME or ~/.ducktape>/app.log`, rotated at

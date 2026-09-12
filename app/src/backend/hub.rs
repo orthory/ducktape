@@ -299,16 +299,16 @@ pub fn password_problem(password: &str, confirm: &str) -> String {
 /// whose window tasks are terminal — spells a conditional close. It is also
 /// the only way to reach `target=`, which demands `window-id`, not
 /// `window-id?`.
-pub fn window_target(current: Option<iced::window::Id>) -> iced::window::Id {
-    current.unwrap_or_else(iced::window::Id::unique)
+pub fn window_target(current: Option<crate::shell::WindowKey>) -> crate::shell::WindowKey {
+    current.unwrap_or_else(crate::shell::WindowKey::unique)
 }
 
 /// [`window_target`] gated on a bool: while `keep` holds, yields a fresh id
 /// (a no-op close); once it does not, names the window. How a branch-free
 /// fold spells "close the huddle window only if the huddle ended".
-pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> iced::window::Id {
+pub fn window_target_unless(keep: bool, current: Option<crate::shell::WindowKey>) -> crate::shell::WindowKey {
     if keep {
-        iced::window::Id::unique()
+        crate::shell::WindowKey::unique()
     } else {
         window_target(current)
     }
@@ -343,7 +343,7 @@ pub fn tray_open_action(network_open: bool, window_tracked: bool) -> crate::Tray
 ///
 /// Closing that window is NOT leaving, so this is the ordinary way back into a
 /// call that is still running behind your work.
-pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
+pub fn huddle_summon(huddle: Option<crate::shell::WindowKey>) -> crate::WindowSummon {
     match huddle.is_none() {
         true => crate::WindowSummon::Open,
         false => crate::WindowSummon::Raise,
@@ -358,8 +358,8 @@ pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
 /// huddle window is deliberately not a survivor: a lone call window never
 /// keeps the daemon alive after its console is gone.
 pub fn last_window_closed_exits(
-    console: Option<iced::window::Id>,
-    onboarding: Option<iced::window::Id>,
+    console: Option<crate::shell::WindowKey>,
+    onboarding: Option<crate::shell::WindowKey>,
 ) -> bool {
     let has_status_item = cfg!(target_os = "macos");
     let a_window_remains = console.is_some() || onboarding.is_some();
@@ -368,9 +368,9 @@ pub fn last_window_closed_exits(
 
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
-    current: Option<iced::window::Id>,
-    closed: iced::window::Id,
-) -> Option<iced::window::Id> {
+    current: Option<crate::shell::WindowKey>,
+    closed: crate::shell::WindowKey,
+) -> Option<crate::shell::WindowKey> {
     match current == Some(closed) {
         true => None,
         false => current,

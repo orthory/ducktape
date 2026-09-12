@@ -204,7 +204,7 @@ fn reply_notifications_wake_each_presenter_and_keep_the_answer() {
 
 /// The kernel's own runtime, on its own thread: the window thread never
 /// blocks on the node, and the app's executor is not this module's to use.
-fn runtime() -> tokio::runtime::Handle {
+pub(super) fn runtime() -> tokio::runtime::Handle {
     static HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     HANDLE
         .get_or_init(|| {

@@ -20,6 +20,8 @@ mod kernel;
 
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
+pub(crate) fn runtime() -> tokio::runtime::Handle { kernel::runtime() }
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -85,7 +87,7 @@ pub fn governance_view(
     dark: bool,
     connected: bool,
     admin: bool,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "admin": admin,
         "connected": connected,
@@ -107,7 +109,7 @@ pub fn members_view(
     dark: bool,
     connected: bool,
     admin: bool,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "admin": admin,
         "connected": connected,
@@ -135,7 +137,7 @@ pub fn agents_view(
     account: &str,
     open_run: &str,
     opened: i64,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "account": account,
         "open_run": open_run,
@@ -216,7 +218,7 @@ pub fn node_view(
     status: &str,
     data_dir: &str,
     wall_now: i64,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
@@ -243,7 +245,7 @@ pub fn explorer_view(
     connected: bool,
     head: i64,
     sync_line: &str,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
@@ -302,7 +304,7 @@ pub fn settings_view(
     account_exists: bool,
     account_busy: bool,
     account_ticket: &str,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let appearance = match appearance {
         crate::Appearance::System => "system",
         crate::Appearance::Light => "light",
@@ -402,7 +404,7 @@ pub fn forge_view(
     connected_rpc: &str,
     link: &str,
     link_tick: i64,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
@@ -442,7 +444,7 @@ pub fn pages_view(
     network_chain_id: &str,
     route_page: &str,
     route_serial: i64,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "dark": dark,
         "connected": connected,
@@ -552,7 +554,7 @@ pub fn chat_view(
     sent_serial: i64,
     pending_sends: &[crate::backend::PendingSend],
     live_agents: &[crate::backend::LiveAgentRow],
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = ChatProps {
         dark,
         connected,
@@ -734,7 +736,7 @@ pub fn files_view(
     chain: &str,
     route: &str,
     route_serial: i64,
-) -> Element<'static, ModuleViewEvent> {
+) -> ViewSpec {
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
@@ -931,9 +933,13 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 /// both hand every view over before anything draws. A block that moves the
 /// deployment ([`deployments_checked`]) reloads the view in place: the tab
 /// keeps the one it has until the replacement is ready.
-fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
-    mounted(module).lock().expect("module view lock").props = Some(props);
-    drawn(module)
+pub(crate) struct ViewSpec {
+    pub(crate) module: &'static str,
+    pub(crate) props: Vec<u8>,
+}
+
+fn module_view(module: &'static str, props: Vec<u8>) -> ViewSpec {
+    ViewSpec { module, props }
 }
 
 /// The mounted view as it stands — its current frame, or the notice for a
