@@ -1,5 +1,27 @@
 //! Native window lifetime, command routing and authentication cancellation.
 use super::*;
+
+#[test]
+fn os_duck_urls_are_received_before_launch_and_wait_for_network_identity() {
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    let registered = shell
+        .find("application.on_open_urls(")
+        .expect("OS URL handler");
+    let launched = shell.find("application.run(").expect("native launch");
+    assert!(
+        registered < launched,
+        "initial OS URL cannot race registration"
+    );
+    assert!(shell.contains("url_sender.unbounded_send(urls)"));
+    assert!(shell.contains("desktop.pending_urls.extend("));
+    assert!(shell.contains("url.starts_with(\"duck://\")"));
+    assert!(shell.contains("self.state.connected&&self.state.console_win.is_some()&&!self.state.network_chain_id.is_empty()"));
+    assert!(shell.contains("std::mem::take(&mutself.pending_urls)"));
+    assert!(shell.contains("self.dispatch(Message::OpenMessageLink(url),cx)"));
+    let route = handler_body("OpenMessageLink");
+    assert!(route.contains("resolve_duck_link("));
+    assert!(route.contains("DuckKind::ForeignNetwork"));
+}
 #[test]
 fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
     use crate::backend::last_window_closed_exits;

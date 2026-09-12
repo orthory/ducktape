@@ -56,7 +56,7 @@ fn shell_keeps_opaque_window_and_alpha_authored_content() {
     let source = rust_tokens(include_str!("../shell.rs"));
     assert!(source.contains("desktop-root"));
     assert!(!source.contains("WindowBackgroundAppearance::Blurred"));
-    assert!(source.contains("appears_transparent:true"));
+    assert!(source.contains("appears_transparent:cfg!(target_os=\"macos\")"));
     let renderer = rust_tokens(include_str!("../view_tree.rs"));
     assert!(renderer.contains("wire::Background::Color"));
     assert!(renderer.contains("let[r,g,b,a]=color.0"));
@@ -171,7 +171,7 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
 }
 #[test]
 fn no_button_wears_an_icon_glyph_as_its_string_label() {
-    assert!(design::icons::svg("search").contains("<svg"));
+    assert!(::design::icons::svg("search").contains("<svg"));
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert!(!shell.contains("label(\"⚙\")"));
     assert!(!shell.contains("label(\"✕\")"));
