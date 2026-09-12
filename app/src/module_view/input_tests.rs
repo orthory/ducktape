@@ -54,7 +54,21 @@ fn button(seat: &Arc<Mutex<Mounted>>, label: &str) -> String {
     let Slot::Ready(guest) = &locked.slot else {
         panic!("live guest")
     };
-    tests::button_key(guest, label)
+    let mut root = guest.frame.root.clone().unwrap();
+    let mut visible_label = None;
+    root.for_each_mut(&mut |node| {
+        if let wire::Node::Button {
+            key,
+            content: wire::ButtonContent::Child(child),
+            on_press: Some(_),
+            ..
+        } = node
+            && matches!(child.as_ref(), wire::Node::Text { content, .. } if content == label)
+        {
+            visible_label = Some(key.clone());
+        }
+    });
+    visible_label.unwrap_or_else(|| tests::button_key(guest, label))
 }
 fn click_before_frame(native: &mut VisualTestContext, key: String) {
     native.update(|window, cx| {
