@@ -21,7 +21,7 @@
 //! blank the cards the current one just installed.
 
 use super::*;
-use iced::futures::SinkExt as _;
+use futures::SinkExt as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -373,8 +373,8 @@ pub fn chat_live_agents(
     chain_id: String,
     generation: i64,
     signer_key: String,
-) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
-    use iced::futures::StreamExt as _;
+) -> futures::stream::BoxStream<'static, LiveAgentNotice> {
+    use futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
         let Ok(client) = rpc_client(&rpc) else {
@@ -580,7 +580,7 @@ pub fn chat_live_agents(
             watcher.handle.abort();
         }
     });
-    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+    futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     })
     .boxed()
@@ -724,7 +724,7 @@ async fn watch_live_output(
     sender: tokio::sync::mpsc::Sender<LiveAgentNotice>,
 ) {
     let rpc = taken.rpc.clone();
-    use iced::futures::StreamExt as _;
+    use futures::StreamExt as _;
     let fold = |event: &AgentChatEvent| {
         let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(row) = rows.get_mut(&dispatch) {

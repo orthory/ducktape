@@ -294,15 +294,15 @@ pub fn optional_number(value: Option<i64>) -> String {
 /// dropped socket is not a reason to blank the surface: the facts on screen
 /// were true when they were sampled, so the subscription is rebuilt and they
 /// stand until a fresher document replaces them.
-pub fn node_status_live(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeFacts> {
+pub fn node_status_live(rpc: String) -> futures::stream::BoxStream<'static, NodeFacts> {
     struct State {
         rpc: String,
         stream: Option<
-            iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>,
+            futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>,
         >,
         retry_attempt: u32,
     }
-    iced::futures::stream::unfold(
+    futures::stream::unfold(
         State {
             rpc,
             stream: None,
@@ -1197,12 +1197,12 @@ pub fn ceremony_phase(step: &CeremonyStep) -> crate::CeremonyPhase {
     }
 }
 
-type StepSender = iced::futures::channel::mpsc::Sender<CeremonyStep>;
+type StepSender = futures::channel::mpsc::Sender<CeremonyStep>;
 
 /// Hand one reading to the UI; a closed receiver means the lane was
 /// invalidated (a cancel), which ends the ceremony as an error nobody reads.
 async fn step(tx: &mut StepSender, step: CeremonyStep) -> Result<(), String> {
-    use iced::futures::SinkExt as _;
+    use futures::SinkExt as _;
     tx.send(step)
         .await
         .map_err(|_| "the ceremony was cancelled".to_string())
@@ -1271,13 +1271,13 @@ pub(crate) async fn qr_ceremony(
 /// no runtime handle is assumed), and every reading — the closing one too —
 /// travels the one channel, so the UI sees them in order. Dropping the
 /// stream (a lane invalidation) drops the body mid-await: the cancel.
-fn ceremony_stream<F, Fut>(body: F) -> iced::futures::stream::BoxStream<'static, CeremonyStep>
+fn ceremony_stream<F, Fut>(body: F) -> futures::stream::BoxStream<'static, CeremonyStep>
 where
     F: FnOnce(StepSender) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
-    use iced::futures::{SinkExt as _, StreamExt as _};
-    let (tx, rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+    use futures::{SinkExt as _, StreamExt as _};
+    let (tx, rx) = futures::channel::mpsc::channel::<CeremonyStep>(8);
     let mut closing = tx.clone();
     let driving = async move {
         let last = match body(tx).await {
@@ -1292,8 +1292,8 @@ where
         };
         let _ = closing.send(last).await;
     };
-    let driver = iced::futures::stream::once(driving).filter_map(|()| async { None });
-    iced::futures::stream::select(rx, driver).boxed()
+    let driver = futures::stream::once(driving).filter_map(|()| async { None });
+    futures::stream::select(rx, driver).boxed()
 }
 
 /// Create the account with this device's key (no touch), then register a
@@ -1304,7 +1304,7 @@ pub fn create_account_by_qr(
     password: String,
     chain_id: String,
     name: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         require_password(&password)?;
@@ -1322,7 +1322,7 @@ pub fn add_passkey_by_qr(
     password: String,
     chain_id: String,
     label: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         let label = optional_label(label)?;
@@ -1394,7 +1394,7 @@ pub fn login_by_qr(
     rpc: String,
     password: String,
     chain_id: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         require_password(&password)?;
@@ -1669,7 +1669,7 @@ mod qr_ceremony_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_qr_ceremony_shows_the_url_then_yields_the_outcome() {
         let base = fake_relay(1, ASSERTION);
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+        let (mut tx, mut rx) = futures::channel::mpsc::channel::<CeremonyStep>(8);
         let outcome = qr_ceremony(
             &base,
             authpage::Request::Get {

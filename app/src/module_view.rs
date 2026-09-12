@@ -5112,7 +5112,7 @@ pub(crate) mod tests {
         mounted.lock().unwrap().slot = Slot::Ready(Box::new(guest));
         use iced::advanced::renderer::Headless;
         use iced_test::runtime::{UserInterface, user_interface};
-        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        let mut renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
             iced::Font::DEFAULT,
             iced::Pixels(14.0),
             Some("tiny-skia"),
@@ -5300,7 +5300,7 @@ pub(crate) mod tests {
         });
         guest.inputs.adopt(guest.frame.root.as_ref().unwrap());
         guest.pending.clear();
-        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        let mut renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
             iced::Font::DEFAULT,
             iced::Pixels(14.0),
             Some("tiny-skia"),

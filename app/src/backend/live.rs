@@ -111,8 +111,8 @@ pub async fn connect(
     })
 }
 
-pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveUpdate> {
-    iced::futures::stream::unfold(
+pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdate> {
+    futures::stream::unfold(
         LiveEventState {
             rpc,
             cursors: BTreeMap::new(),

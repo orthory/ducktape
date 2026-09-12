@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use media_service::call_wire;
 use media_service::call_wire::CapturedFrame;
 use media_service::voice::FRAME_SAMPLES;
-use iced::futures::stream::BoxStream;
-use iced::futures::{SinkExt as _, StreamExt as _};
+use futures::stream::BoxStream;
+use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -164,7 +164,7 @@ async fn steer_recipients(
     rpc: String,
     channel_id: String,
     control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
-    mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
+    mut events: futures::channel::mpsc::UnboundedSender<CallEvent>,
 ) {
     let mut steered: Vec<String> = Vec::new();
     let mut ever_read = false;
@@ -229,7 +229,7 @@ async fn steer_recipients(
 /// The session stream: connect, pump, and yield state the handlers fold. The
 /// stream owns everything — see the module doc's lifecycle note.
 pub fn call_session(rpc: String, channel_id: String) -> BoxStream<'static, CallEvent> {
-    let (events_tx, events_rx) = iced::futures::channel::mpsc::unbounded();
+    let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
     tokio::spawn(run_session(rpc, channel_id, events_tx));
     Box::pin(events_rx)
 }
@@ -327,7 +327,7 @@ async fn admission(rpc: &str, channel_id: &str) -> Result<Admission, String> {
 async fn run_session(
     rpc: String,
     channel_id: String,
-    mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
+    mut events: futures::channel::mpsc::UnboundedSender<CallEvent>,
 ) {
     let _ = events.send(CallEvent::of("connecting")).await;
     let request = match admission(&rpc, &channel_id).await {

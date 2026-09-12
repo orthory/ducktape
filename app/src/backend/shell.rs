@@ -237,7 +237,7 @@ pub struct ProvisionStep {
 pub fn provision_progress(
     workspace: String,
     rpc: String,
-) -> iced::futures::stream::BoxStream<'static, ProvisionStep> {
+) -> futures::stream::BoxStream<'static, ProvisionStep> {
     struct State {
         dir: Option<PathBuf>,
         chain_id: String,
@@ -252,7 +252,7 @@ pub fn provision_progress(
         Some((chain_id, dir)) => (chain_id, Some(dir)),
         None => (workspace, None),
     };
-    Box::pin(iced::futures::stream::unfold(
+    Box::pin(futures::stream::unfold(
         State {
             dir,
             chain_id,

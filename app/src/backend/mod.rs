@@ -14,7 +14,7 @@ use ::chat::{ChatMsg, PostPolicy};
 // frames through `::node::encode_frame` — see `rpc::Signer`.
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
-use iced::futures::{FutureExt as _, StreamExt as _};
+use futures::{FutureExt as _, StreamExt as _};
 use pages::BlockKind;
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply};
 use tokio::sync::OwnedSemaphorePermit;

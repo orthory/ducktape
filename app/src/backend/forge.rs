@@ -296,7 +296,7 @@ pub async fn load_inline_pictures(
             Some((url, picture))
         }
     });
-    let pictures = iced::futures::future::join_all(fetches)
+    let pictures = futures::future::join_all(fetches)
         .await
         .into_iter()
         .flatten()

@@ -549,8 +549,8 @@ pub fn network_run_hint(row: &HubNetwork) -> String {
 
 /// Probe every known network's endpoint, emitting one reading per row as it
 /// answers. Bounded: one `/v1/status` with a short timeout per endpoint.
-pub fn probe_known_networks() -> iced::futures::stream::BoxStream<'static, HubProbe> {
-    use iced::futures::StreamExt;
+pub fn probe_known_networks() -> futures::stream::BoxStream<'static, HubProbe> {
+    use futures::StreamExt;
     let probes = known_networks().into_iter().map(move |row| async move {
         let reading = probe_endpoint(&row.endpoint).await;
         HubProbe {
@@ -559,7 +559,7 @@ pub fn probe_known_networks() -> iced::futures::stream::BoxStream<'static, HubPr
             height: reading.unwrap_or(-1),
         }
     });
-    iced::futures::stream::iter(probes)
+    futures::stream::iter(probes)
         .buffer_unordered(8)
         .boxed()
 }

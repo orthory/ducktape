@@ -445,7 +445,7 @@ pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
 /// A refusal turns the toggle back off and surfaces as "live · camera: …"
 /// through the status fold; the caller has nothing to decide.
 fn open_camera(
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) -> Option<nokhwa::Camera> {
     use nokhwa::pixel_format::RgbAFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
@@ -519,7 +519,7 @@ fn budget_format(
 /// the toggle back where the user can see it is off. The capture thread has
 /// nothing left to decide.
 fn refuse_source(
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
     message: String,
 ) {
     let _ = events.unbounded_send(crate::call::CallEvent {
@@ -655,7 +655,7 @@ impl Open {
 
 fn open_source(
     source: Source,
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) -> Open {
     match source {
         Source::Off => Open::None,
@@ -715,7 +715,7 @@ fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
 pub(crate) fn capture_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
-    events: iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) {
     let mut open = Open::None;
     let started = std::time::Instant::now();

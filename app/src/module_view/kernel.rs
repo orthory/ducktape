@@ -503,7 +503,7 @@ async fn open_topic(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
-    use iced::futures::SinkExt as _;
+    use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -539,14 +539,14 @@ async fn open_topic(
 /// subscription.
 async fn forward<S>(replies: &Replies, id: u64, mut socket: S)
 where
-    S: iced::futures::Stream<
+    S: futures::Stream<
             Item = Result<
                 tokio_tungstenite::tungstenite::Message,
                 tokio_tungstenite::tungstenite::Error,
             >,
         > + Unpin,
 {
-    use iced::futures::StreamExt as _;
+    use futures::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
     while let Some(message) = socket.next().await {
         let frame = match message {
@@ -1075,7 +1075,7 @@ mod tests {
     fn a_node_stream_forwards_every_frame_and_the_close_ends_it() {
         let replies = std::sync::Arc::new(Replies::default());
         replies.in_flight.fetch_add(1, Ordering::SeqCst);
-        let frames = iced::futures::stream::iter(vec![
+        let frames = futures::stream::iter(vec![
             Ok(Message::Text(r#"{"topic":"run-output:d4c3"}"#.to_owned())),
             Ok(Message::Ping(Vec::new())),
             Ok(Message::Binary(vec![7, 8])),
@@ -1215,7 +1215,7 @@ mod tests {
             forward(
                 &running,
                 7,
-                iced::futures::stream::pending::<
+                futures::stream::pending::<
                     Result<Message, tokio_tungstenite::tungstenite::Error>,
                 >(),
             )

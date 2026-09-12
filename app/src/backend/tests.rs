@@ -2,7 +2,7 @@ use ::chat;
 use ::node;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use iced::futures::StreamExt as _;
+use futures::StreamExt as _;
 
 use super::*;
 use crate::ShellTab;
@@ -112,7 +112,7 @@ async fn node_that_serves_its_status_once(status_body: &'static str) -> String {
 /// are. A test that asserts on `live.next()` directly is asserting on that
 /// heartbeat, not on its own submit.
 async fn next_change(
-    live: &mut iced::futures::stream::BoxStream<'static, LiveUpdate>,
+    live: &mut futures::stream::BoxStream<'static, LiveUpdate>,
 ) -> LiveUpdate {
     loop {
         let update = live.next().await.expect("live stream ended");
@@ -135,7 +135,7 @@ async fn next_change(
 /// drain the live event stream until the index has folded the block at
 /// `min_height` — the system's own commit signal, never a timed poll.
 async fn wait_for_block(
-    live: &mut iced::futures::stream::BoxStream<'static, LiveUpdate>,
+    live: &mut futures::stream::BoxStream<'static, LiveUpdate>,
     min_height: i64,
 ) {
     loop {

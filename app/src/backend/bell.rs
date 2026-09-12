@@ -577,7 +577,7 @@ async fn bell_source(
 }
 
 async fn enrich_bell(rpc: &RpcClient, items: Vec<BellItem>) -> Vec<BellPresentation> {
-    use iced::futures::{StreamExt, stream};
+    use futures::{StreamExt, stream};
     let facts = ReaderFacts::current().await;
     stream::iter(items)
         .map(|item| {
