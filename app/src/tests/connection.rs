@@ -129,7 +129,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     assert!(
         source.contains("let__ice_next=(self.query).trim().to_owned();self.sent_query=__ice_next")
     );
-    assert!(source.contains("workspace_search(") && source.contains("self.sent_query.clone()"));
+    assert!(source.contains("workspace_search(") && source.contains("self.sent_query.to_owned()"));
     let condition = branches(EXPLORER)
         .into_iter()
         .find(|(condition, _, _)| condition.contains("search_answer_stands("))
@@ -347,17 +347,60 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
             "{name} stays a dynamically loaded module view"
         );
     }
-    for source in [
-        CHAT,
-        PAGES,
-        include_str!("../../../crates/views/forge/src/ui/forge.rs"),
+    struct Components(Vec<(String, String)>);
+    impl<'ast> Visit<'ast> for Components {
+        fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+            self.0.push((
+                method.sig.ident.to_string(),
+                method
+                    .block
+                    .to_token_stream()
+                    .to_string()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect(),
+            ));
+        }
+    }
+    for (source, kit) in [
+        (
+            CHAT,
+            include_str!("../../../crates/views/chat/src/ui/kit.rs"),
+        ),
+        (
+            PAGES,
+            include_str!("../../../crates/views/pages/src/ui/kit.rs"),
+        ),
+        (
+            include_str!("../../../crates/views/forge/src/ui/forge.rs"),
+            include_str!("../../../crates/views/forge/src/ui/kit.rs"),
+        ),
     ] {
+        let mut components = Components(Vec::new());
+        components.visit_file(&syn::parse_file(source).unwrap());
+        components.visit_file(&syn::parse_file(kit).unwrap());
+        let mut bodies: Vec<_> = branches(source)
+            .into_iter()
+            .filter(|(guard, _, _)| guard.contains("!self.connected"))
+            .map(|(_, body, _)| body)
+            .collect();
+        assert!(!bodies.is_empty(), "the disconnected branch exists");
+        let mut seen = std::collections::BTreeSet::new();
+        let mut found = false;
+        while let Some(body) = bodies.pop() {
+            if body.contains("Notconnected") {
+                found = true;
+                break;
+            }
+            for (name, callee) in &components.0 {
+                if body.contains(&format!("self.{name}(")) && seen.insert(name.clone()) {
+                    bodies.push(callee.clone());
+                }
+            }
+        }
         assert!(
-            branches(source)
-                .iter()
-                .any(|(condition, body, _)| condition.contains("!self.connected")
-                    && body.contains("Notconnected")),
-            "a disconnected data view says why it cannot show a reading"
+            found,
+            "the disconnected branch reaches the shared Not connected plate"
         );
     }
 }
@@ -635,7 +678,7 @@ fn the_clear_search_button_survives_a_zero_hit_result() {
         .find(|(condition, body, _)| {
             condition.contains("search_phase")
                 && condition.contains("search_draft")
-                && body.contains("ClearSearch")
+                && body.contains("ClearChatSearch")
         })
         .expect("clear-search gate");
     assert!(control.0.contains("SearchPhase::Idle"));

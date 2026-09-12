@@ -118,5 +118,6 @@ fn the_pane_moves_only_through_the_strip() {
 #[test]
 fn the_scrollable_is_the_screens_root() {
     let source = rust_tokens(SETTINGS);
-    assert!(source.contains("Node::Scroll{key:format!(\"{}/settings-body\""));
+    assert!(source.contains("let__ice_node_scope=format!(\"{}/settings-body\""));
+    assert!(source.contains("Node::Scroll{on_scroll:"));
 }
