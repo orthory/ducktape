@@ -4190,7 +4190,7 @@ mod tests {
                 hash.size.height > tree.measured_bounds("reference").unwrap().size.height,
                 "WordOrGlyph must override a native Button's inherited nowrap"
             );
-            assert!(count.right() <= px(620.));
+            assert!(count.right() <= paragraph.left() + px(620.));
         });
         let mut nowrap = text_options(
             div(),
