@@ -5,6 +5,7 @@ mod call;
 mod composer_surface;
 mod editor;
 mod module_view;
+mod shell;
 mod view_tree;
 mod video;
 
