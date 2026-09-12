@@ -4,15 +4,6 @@ pub(crate) enum AppTheme {
     App,
     AppDark,
 }
-#[derive(Default)]
-struct __IceDerivedCache {
-    dark: ::std::cell::OnceCell<bool>,
-    app_background: ::std::cell::OnceCell<::std::string::String>,
-    app_text: ::std::cell::OnceCell<::std::string::String>,
-    has_error: ::std::cell::OnceCell<bool>,
-    mutation_busy: ::std::cell::OnceCell<bool>,
-    hub_busy: ::std::cell::OnceCell<bool>,
-}
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LiveKind {
@@ -492,7 +483,6 @@ pub struct Ducktape {
     pub(crate) huddle_stage: ::std::string::String,
     pub(crate) huddle_roster: ::std::vec::Vec<crate::backend::HuddleParticipant>,
     pub(crate) huddle_rows: ::std::vec::Vec<crate::call::HuddleTileRow>,
-    pub(crate) __ice_derived: __IceDerivedCache,
     pub(crate) __ice_secrets: crate::secret::SecretStore,
 }
 impl ::std::fmt::Debug for Ducktape {
@@ -753,45 +743,8 @@ impl ::std::fmt::Debug for __DucktapeMessage {
 }
 
 impl Ducktape {
-    fn __ice_derived_dark(&self) -> &bool {
-        self.__ice_derived
-            .dark
-            .get_or_init(|| (self.appearance == Appearance::Dark))
-    }
-    fn __ice_derived_app_background(&self) -> &::std::string::String {
-        self.__ice_derived.app_background.get_or_init(|| {
-            crate::backend::keep_str(
-                (self.appearance == Appearance::Dark),
-                ::std::convert::AsRef::as_ref(&("#1b1a16")),
-                ::std::convert::AsRef::as_ref(&("#fdfdfb")),
-            )
-        })
-    }
-    fn __ice_derived_app_text(&self) -> &::std::string::String {
-        self.__ice_derived.app_text.get_or_init(|| {
-            crate::backend::keep_str(
-                (self.appearance == Appearance::Dark),
-                ::std::convert::AsRef::as_ref(&("#e8e6df")),
-                ::std::convert::AsRef::as_ref(&("#2c2b27")),
-            )
-        })
-    }
-    fn __ice_derived_has_error(&self) -> &bool {
-        self.__ice_derived
-            .has_error
-            .get_or_init(|| (!(self.error).is_empty()))
-    }
-    fn __ice_derived_mutation_busy(&self) -> &bool {
-        self.__ice_derived
-            .mutation_busy
-            .get_or_init(|| (self.mutation_phase != MutationPhase::Idle))
-    }
-    fn __ice_derived_hub_busy(&self) -> &bool {
-        self.__ice_derived.hub_busy.get_or_init(|| {
-            ((*self.__ice_derived_mutation_busy())
-                || ((self.console_entry == ConsoleEntry::Entering)
-                    && (self.onboarding_error).is_empty()))
-        })
+    fn is_dark(&self) -> bool {
+        self.appearance == Appearance::Dark
     }
     fn __window_0() -> crate::shell::WindowKind {
         crate::shell::WindowKind::Onboarding
@@ -1014,7 +967,6 @@ impl Ducktape {
             huddle_stage: "".to_owned(),
             huddle_roster: ::std::vec::Vec::new(),
             huddle_rows: ::std::vec::Vec::new(),
-            __ice_derived: ::std::default::Default::default(),
             __ice_secrets: ::std::default::Default::default(),
         }
     }
@@ -1032,10 +984,7 @@ impl Ducktape {
             self.connected = false;
             self.loading = false;
             self.mutation_phase = MutationPhase::Idle;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.error = "".to_owned();
-            self.__ice_derived.has_error.take();
             self.shell_tab = ShellTab::Chat;
             self.channel_draft = "".to_owned();
             self.channel_create_members_only = false;
@@ -1051,8 +1000,6 @@ impl Ducktape {
             self.connected = false;
             self.loading = false;
             self.mutation_phase = MutationPhase::Idle;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.shell_tab = ShellTab::Chat;
             self.palette_open = true;
             self.palette_draft = "".to_owned();
@@ -1067,10 +1014,7 @@ impl Ducktape {
             self.connected = false;
             self.loading = false;
             self.mutation_phase = MutationPhase::Idle;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.error = "".to_owned();
-            self.__ice_derived.has_error.take();
             self.shell_tab = ShellTab::Settings;
             ::ducktape_view_guest::Task::none()
         })();
@@ -1079,7 +1023,6 @@ impl Ducktape {
     fn __preset_task_3(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
         let task = (|| {
             self.error = "Connection failed".to_owned();
-            self.__ice_derived.has_error.take();
             ::ducktape_view_guest::Task::none()
         })();
         task
@@ -1087,10 +1030,7 @@ impl Ducktape {
     fn __preset_task_4(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
         let task = (|| {
             self.mutation_phase = MutationPhase::Idle;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.onboarding_error = "".to_owned();
-            self.__ice_derived.hub_busy.take();
             self.hub_step = HubStep::Networks;
             self.hub_networks = ::std::vec::Vec::new();
             self.hub_selected = "".to_owned();
@@ -1118,10 +1058,7 @@ impl Ducktape {
     fn __preset_task_5(&mut self) -> ::ducktape_view_guest::Task<__DucktapeMessage> {
         let task = (|| {
             self.mutation_phase = MutationPhase::Onboarding;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.onboarding_error = "".to_owned();
-            self.__ice_derived.hub_busy.take();
             self.hub_step = HubStep::Account;
             self.ceremony_phase = "show_qr".to_owned();
             self.ceremony_qr = "https://auth.ducktape.industries/#op=get&challenge=AQID".to_owned();
@@ -1140,10 +1077,7 @@ impl Ducktape {
             self.connected = true;
             self.loading = false;
             self.mutation_phase = MutationPhase::Idle;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.error = "".to_owned();
-            self.__ice_derived.has_error.take();
             self.account_exists = false;
             self.account_banner_dismissed = false;
             self.shell_tab = ShellTab::Settings;
@@ -1156,8 +1090,6 @@ impl Ducktape {
             self.password = "hunter2-hunter2".to_owned();
             self.rpc = "http://127.0.0.1:1".to_owned();
             self.mutation_phase = MutationPhase::Onboarding;
-            self.__ice_derived.mutation_busy.take();
-            self.__ice_derived.hub_busy.take();
             self.hub_step = HubStep::Networks;
             ::ducktape_view_guest::Task::none()
         })();
@@ -1185,9 +1117,6 @@ impl Ducktape {
             self.huddle_channel_name = "general".to_owned();
             self.call_muted = false;
             self.appearance = Appearance::Dark;
-            self.__ice_derived.dark.take();
-            self.__ice_derived.app_background.take();
-            self.__ice_derived.app_text.take();
             ::ducktape_view_guest::Task::none()
         })();
         task

@@ -208,9 +208,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::AppearanceLoaded(mode) => (|| {
                     let _ = &mode;
                     self.appearance = mode.clone();
-                    self.__ice_derived.dark.take();
-                    self.__ice_derived.app_background.take();
-                    self.__ice_derived.app_text.take();
                     self.app_palette = AppTheme::App;
                     if (self.appearance != Appearance::Dark) {
                         return ::ducktape_view_guest::Task::none();
@@ -220,9 +217,6 @@ mod __ice_group_app_update {
                 })(),
                 __DucktapeMessage::SetAppearanceLight => (|| {
                     self.appearance = Appearance::Light;
-                    self.__ice_derived.dark.take();
-                    self.__ice_derived.app_background.take();
-                    self.__ice_derived.app_text.take();
                     self.app_palette = AppTheme::App;
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
@@ -249,9 +243,6 @@ mod __ice_group_app_update {
                 })(),
                 __DucktapeMessage::SetAppearanceDark => (|| {
                     self.appearance = Appearance::Dark;
-                    self.__ice_derived.dark.take();
-                    self.__ice_derived.app_background.take();
-                    self.__ice_derived.app_text.take();
                     self.app_palette = AppTheme::AppDark;
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
@@ -340,8 +331,6 @@ mod __ice_group_app_update {
                     self.hydration_generation = (self.hydration_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.loading = true;
                     self.connected = false;
                     self.channels = ::std::vec::Vec::new();
@@ -367,7 +356,6 @@ mod __ice_group_app_update {
                     self.page_route = "".to_owned();
                     self.palette_search_phase = SearchPhase::Idle;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.status = "Connecting…".to_owned();
                     self.bell_marking = false;
                     self.bell_error = "".to_owned();
@@ -532,11 +520,8 @@ mod __ice_group_app_update {
                     self.connected = true;
                     self.loading = false;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.hydration_retry_attempt = 0;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.members_generation = (self.members_generation + 1);
                     self.agents_open_run = "".to_owned();
                     self.agents_live = false;
@@ -803,7 +788,6 @@ mod __ice_group_app_update {
                     return match self.console_entry.clone() {
                         ConsoleEntry::Entering => (|| {
                             self.console_entry = ConsoleEntry::Idle;
-                            self.__ice_derived.hub_busy.take();
                             return {
                                 let (_, __task) = crate::shell::open(Self::__window_1());
                                 __task.map(move |value| __DucktapeMessage::ConsoleOpened(value))
@@ -811,7 +795,6 @@ mod __ice_group_app_update {
                         })(),
                         ConsoleEntry::Idle => (|| {
                             self.console_entry = ConsoleEntry::Idle;
-                            self.__ice_derived.hub_busy.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                     };
@@ -1378,10 +1361,7 @@ mod __ice_group_app_update {
                     );
                     self.mutation_phase =
                         crate::backend::mutation_phase_after_recovery(self.mutation_phase.clone());
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return ::ducktape_view_guest::Task::batch([{
                         // __ICE_SOURCE 413 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6c6966656379636c652e696365
                         crate::shell::close::<__DucktapeMessage>(
@@ -1401,7 +1381,6 @@ mod __ice_group_app_update {
                     }
                     self.status = "Sync delayed".to_owned();
                     self.error = "Live sync interrupted. Retrying…".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.hydration_retry_attempt = (self.hydration_retry_attempt + 1);
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
@@ -1511,7 +1490,6 @@ mod __ice_group_app_update {
                         self.channel_reads.clone(),
                     );
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     if (!self.connected) {
                         return ::ducktape_view_guest::Task::none();
                     }
@@ -1830,8 +1808,6 @@ mod __ice_group_app_update {
                                 __previous.abort();
                             }
                             self.mutation_phase = MutationPhase::Idle;
-                            self.__ice_derived.mutation_busy.take();
-                            self.__ice_derived.hub_busy.take();
                             self.ceremony_phase = "".to_owned();
                             self.ceremony_qr = "".to_owned();
                             self.ceremony_detail = "".to_owned();
@@ -2131,9 +2107,7 @@ mod __ice_group_app_update {
                     }
                     self.toast = "Copied node key".to_owned();
                     self.toast_age = 0;
-                    return crate::shell::clipboard::<__DucktapeMessage>(
-                        self.node_key.to_owned(),
-                    );
+                    return crate::shell::clipboard::<__DucktapeMessage>(self.node_key.to_owned());
                 })(),
                 __DucktapeMessage::MutationFailed(cause) => (|| {
                     let _ = &cause;
@@ -2148,8 +2122,6 @@ mod __ice_group_app_update {
                         cause.committed,
                     );
                     self.mutation_phase = crate::backend::mutation_failure_phase(cause.committed);
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.channel_draft = crate::backend::restore_draft(
                         self.channel_draft.to_owned(),
                         self.pending_channel.to_owned(),
@@ -2157,7 +2129,6 @@ mod __ice_group_app_update {
                     );
                     self.pending_channel = "".to_owned();
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     if (!cause.committed) {
                         return ::ducktape_view_guest::Task::none();
                     }
@@ -2204,7 +2175,6 @@ mod __ice_group_app_update {
                 })(),
                 __DucktapeMessage::DismissError => (|| {
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::ConnectFailed(cause) => (|| {
@@ -2253,13 +2223,11 @@ mod __ice_group_app_update {
                     self.loading = false;
                     self.status = "Offline".to_owned();
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     self.onboarding_error = crate::backend::keep_str(
                         (self.console_entry == ConsoleEntry::Entering),
                         ::std::convert::AsRef::as_ref(&(cause.message)),
                         ::std::convert::AsRef::as_ref(&(self.onboarding_error)),
                     );
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
                             ({
@@ -2427,7 +2395,6 @@ mod __ice_group_app_update {
                     }
                     self.forge_note_pending = "".to_owned();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::ForgeNoteFailed(scope, op, cause) => (|| {
@@ -2446,7 +2413,6 @@ mod __ice_group_app_update {
                     }
                     self.forge_note_pending = "".to_owned();
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::FilesViewEvent(event) => (|| {
@@ -2481,7 +2447,6 @@ mod __ice_group_app_update {
                         self.fs_drop_dir.to_owned(),
                         self.settings_user_key.to_owned(),
                     );
-                    self.__ice_derived.has_error.take();
                     if (!(self.error).is_empty()) {
                         return ::ducktape_view_guest::Task::none();
                     }
@@ -2512,7 +2477,6 @@ mod __ice_group_app_update {
                     let _ = &cause;
                     self.fs_dropping = false;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::AccountLoaded(next) => (|| {
@@ -2676,7 +2640,6 @@ mod __ice_group_app_update {
                     let _ = &cause;
                     self.account_busy = false;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::AccountTicketMinted(ticket) => (|| {
@@ -2739,17 +2702,14 @@ mod __ice_group_app_update {
                             self.account_ceremony_qr = "".to_owned();
                             self.account_busy = false;
                             self.error = next.detail.to_owned();
-                            self.__ice_derived.has_error.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         CeremonyPhase::ShowQr => (|| {
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         CeremonyPhase::Working => (|| {
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                     };
@@ -2806,7 +2766,6 @@ mod __ice_group_app_update {
                     self.account_ceremony_left = "".to_owned();
                     self.account_busy = false;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::OpenRunPanel(dispatch_id) => (|| {
@@ -2967,7 +2926,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::AgentStatusSet(_result) => (|| {
                     let _ = &_result;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::NodeViewEvent(event) => (|| {
@@ -3118,7 +3076,6 @@ mod __ice_group_app_update {
                                 return ::ducktape_view_guest::Task::none();
                             }
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.password = crate::module_view::event_text(
                                 ::std::borrow::Borrow::borrow(&(event)),
                                 ::std::convert::AsRef::as_ref(&("password")),
@@ -3163,7 +3120,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             return ::ducktape_view_guest::Task::perform(
                                 ({
                                     crate::backend::set_account_name(
@@ -3198,7 +3154,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             return ::ducktape_view_guest::Task::perform(
                                 ({
                                     crate::backend::create_account(
@@ -3234,7 +3189,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.account_ticket = "".to_owned();
                             return ::ducktape_view_guest::Task::perform(
                                 ({
@@ -3275,7 +3229,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             return ::ducktape_view_guest::Task::perform(
                                 ({
                                     crate::backend::join_with_ticket(
@@ -3306,7 +3259,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             return ::ducktape_view_guest::Task::perform(
                                 ({
                                     crate::backend::remove_account_key(
@@ -3337,7 +3289,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.account_ceremony_phase = "working".to_owned();
                             self.account_ceremony_detail = "Preparing the passkey…".to_owned();
                             return {
@@ -3392,7 +3343,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.account_ceremony_phase = "working".to_owned();
                             self.account_ceremony_detail = "Continue in the browser…".to_owned();
                             return {
@@ -3466,7 +3416,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.account_ceremony_phase = "working".to_owned();
                             self.account_ceremony_detail = "Continue in the browser…".to_owned();
                             return {
@@ -3517,7 +3466,6 @@ mod __ice_group_app_update {
                             }
                             self.account_busy = true;
                             self.error = "".to_owned();
-                            self.__ice_derived.has_error.take();
                             self.account_ceremony_phase = "working".to_owned();
                             self.account_ceremony_detail = "Continue in the browser…".to_owned();
                             return {
@@ -3619,7 +3567,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::SettingsUnlocked(pubkey) => (|| {
                     let _ = &pubkey;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.signer_key = pubkey.to_owned();
                     self.live_agents = ::std::vec::Vec::new();
                     ::ducktape_view_guest::Task::none()
@@ -3628,7 +3575,6 @@ mod __ice_group_app_update {
                     let _ = &cause;
                     self.password = "".to_owned();
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::CopyToClipboard(text, label) => (|| {
@@ -4217,7 +4163,6 @@ mod __ice_group_app_update {
                     self.hydration_retry_attempt = 0;
                     self.loading = true;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_generation = (self.chat_generation + 1);
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
@@ -4297,7 +4242,6 @@ mod __ice_group_app_update {
                     self.hydration_retry_attempt = 0;
                     self.loading = true;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_generation = (self.chat_generation + 1);
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
@@ -4378,7 +4322,6 @@ mod __ice_group_app_update {
                     self.hydration_retry_attempt = 0;
                     self.loading = true;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_generation = (self.chat_generation + 1);
                     return ::ducktape_view_guest::Task::perform(
                         ({
@@ -4408,12 +4351,9 @@ mod __ice_group_app_update {
                     self.hydration_generation = (self.hydration_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::Channel;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.pending_channel = (self.channel_draft).trim().to_owned();
                     self.channel_draft = "".to_owned();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_generation = (self.chat_generation + 1);
                     return ::ducktape_view_guest::Task::perform(
                         ({
@@ -4453,10 +4393,7 @@ mod __ice_group_app_update {
                     self.hydration_generation = (self.hydration_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::Huddle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::join_huddle(
@@ -4478,10 +4415,7 @@ mod __ice_group_app_update {
                 __DucktapeMessage::HuddleJoinedAck(_result) => (|| {
                     let _ = &_result;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.huddle_joined = true;
                     self.huddle_channel = self.active_channel.to_owned();
                     self.huddle_channel_name = self.active_channel_name.to_owned();
@@ -4594,7 +4528,6 @@ mod __ice_group_app_update {
                                             0,
                                         );
                                         self.error = "".to_owned();
-                                        self.__ice_derived.has_error.take();
                                         self.chat_at_tail = true;
                                         self.history_view = false;
                                         self.chat_sent_serial = (self.chat_sent_serial + 1);
@@ -4659,7 +4592,6 @@ mod __ice_group_app_update {
                                             thread_seq,
                                         );
                                         self.error = "".to_owned();
-                                        self.__ice_derived.has_error.take();
                                         return ::ducktape_view_guest::Task::perform(
                                             ({
                                                 crate::backend::send_reply(
@@ -4729,10 +4661,7 @@ mod __ice_group_app_update {
                     self.hydration_generation = (self.hydration_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::MessageEdit;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::edit_message(
@@ -4762,13 +4691,11 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::MessageSendFailed(cause) => (|| {
                     let _ = &cause;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_pending_sends = crate::backend::send_failed(
                         ::std::mem::take(&mut self.chat_pending_sends),
                         ::std::convert::AsRef::as_ref(&(cause.operation_id)),
@@ -4833,7 +4760,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::ThreadReplySendFailed(cause) => (|| {
                     let _ = &cause;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     self.chat_pending_sends = crate::backend::send_failed(
                         ::std::mem::take(&mut self.chat_pending_sends),
                         ::std::convert::AsRef::as_ref(&(cause.operation_id)),
@@ -4906,7 +4832,6 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::ChatUpdated(next) => (|| {
@@ -5004,7 +4929,6 @@ mod __ice_group_app_update {
                     );
                     self.loading = false;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return crate::shell::close::<__DucktapeMessage>(
                         ({
                             crate::backend::window_target_unless(
@@ -5023,7 +4947,6 @@ mod __ice_group_app_update {
                     self.hydration_retry_attempt = 0;
                     self.loading = false;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::ChannelCreated(next) => (|| {
@@ -5032,8 +4955,6 @@ mod __ice_group_app_update {
                     self.channel_create_open = false;
                     self.channel_create_members_only = false;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     if (next.generation != self.chat_generation) {
                         return ::ducktape_view_guest::Task::none();
                     }
@@ -5125,7 +5046,6 @@ mod __ice_group_app_update {
                         self.settings_user_key.to_owned(),
                     );
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return crate::shell::close::<__DucktapeMessage>(
                         ({
                             crate::backend::window_target_unless(
@@ -5152,7 +5072,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::LiveCancelAcked(_ok) => (|| {
                     let _ = &_ok;
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::ChatAcked(_result) => (|| {
@@ -5162,10 +5081,7 @@ mod __ice_group_app_update {
                     self.pending_channel = "".to_owned();
                     self.channel_create_open = false;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::CopyMessageLink(link) => (|| {
@@ -5179,7 +5095,10 @@ mod __ice_group_app_update {
                             ({ crate::backend::duck_echo_str(link.to_owned()) }),
                             move |result| match result {
                                 ::std::result::Result::Ok(value) => {
-                                    __DucktapeMessage::CopyToClipboard(value, __ice_run_route_145_1.clone())
+                                    __DucktapeMessage::CopyToClipboard(
+                                        value,
+                                        __ice_run_route_145_1.clone(),
+                                    )
                                 }
                                 ::std::result::Result::Err(error) => {
                                     __DucktapeMessage::ExternalUrlFailed(error)
@@ -5200,7 +5119,6 @@ mod __ice_group_app_update {
                     return match link.kind.clone() {
                         DuckKind::Unknown => (|| {
                             self.error = "this link names nothing the app can open".to_owned();
-                            self.__ice_derived.has_error.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         DuckKind::ForeignNetwork => (|| {
@@ -5208,7 +5126,6 @@ mod __ice_group_app_update {
                                 link.net.to_owned(),
                                 self.network_chain_id.to_owned(),
                             );
-                            self.__ice_derived.has_error.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         DuckKind::Web => (|| {
@@ -5796,7 +5713,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::ExternalUrlFailed(cause) => (|| {
                     let _ = &cause;
                     self.error = cause.message.to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::OnboardingOpened(id) => (|| {
@@ -5886,7 +5802,6 @@ mod __ice_group_app_update {
                     self.hub_selected = state.preselect.to_owned();
                     self.hub_step = HubStep::Networks;
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::run(
                             ({ crate::backend::probe_known_networks() }),
@@ -5978,11 +5893,8 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = pw.to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::unlock_wallet(
@@ -6004,7 +5916,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::KeyUnlocked(pubkey) => (|| {
                     let _ = &pubkey;
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.signer_key = pubkey.to_owned();
                     self.live_agents = ::std::vec::Vec::new();
                     return ::ducktape_view_guest::Task::batch([
@@ -6086,7 +5997,6 @@ mod __ice_group_app_update {
                     self.password = "".to_owned();
                     self.hub_wallet_selected = "".to_owned();
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     return (::ducktape_view_guest::Task::done(true)).map(|value| {
                         let _ = &value;
                         __DucktapeMessage::NetworkEntered
@@ -6098,11 +6008,8 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = pw.to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::create_device_key(
@@ -6123,8 +6030,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::DeviceKeyCreated(_name) => (|| {
                     let _ = &_name;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Phrase;
                     ::ducktape_view_guest::Task::none()
                 })(),
@@ -6133,7 +6038,6 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Confirm;
                     ::ducktape_view_guest::Task::none()
                 })(),
@@ -6142,7 +6046,6 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Phrase;
                     ::ducktape_view_guest::Task::none()
                 })(),
@@ -6154,10 +6057,7 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::confirm_recovery_phrase(
@@ -6179,7 +6079,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::PhraseConfirmed(pubkey) => (|| {
                     let _ = &pubkey;
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.signer_key = pubkey.to_owned();
                     self.live_agents = ::std::vec::Vec::new();
                     return ::ducktape_view_guest::Task::batch([
@@ -6257,10 +6156,7 @@ mod __ice_group_app_update {
                 __DucktapeMessage::PhraseConfirmFailed(cause) => (|| {
                     let _ = &cause;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.onboarding_error = cause.message.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::GoRestore => (|| {
@@ -6269,7 +6165,6 @@ mod __ice_group_app_update {
                     }
                     self.__ice_secrets.clear("restore_words");
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Restore;
                     ::ducktape_view_guest::Task::none()
                 })(),
@@ -6279,7 +6174,6 @@ mod __ice_group_app_update {
                     }
                     self.__ice_secrets.clear("restore_words");
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = crate::backend::hub_entry_step(self.hub_wallets.clone());
                     ::ducktape_view_guest::Task::none()
                 })(),
@@ -6294,12 +6188,9 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = pw.to_owned();
                     self.hub_wallet_selected = name.to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({
                             crate::backend::restore_user_key(
@@ -6323,7 +6214,6 @@ mod __ice_group_app_update {
                     let _ = &pubkey;
                     self.__ice_secrets.clear("restore_words");
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.signer_key = pubkey.to_owned();
                     self.live_agents = ::std::vec::Vec::new();
                     return ::ducktape_view_guest::Task::batch([
@@ -6401,11 +6291,8 @@ mod __ice_group_app_update {
                 __DucktapeMessage::LoginFailed(cause) => (|| {
                     let _ = &cause;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.password = "".to_owned();
                     self.onboarding_error = cause.message.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::PickNetwork(id) => (|| {
@@ -6432,12 +6319,9 @@ mod __ice_group_app_update {
                         self.hub_selected.to_owned(),
                     );
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = "".to_owned();
                     self.hub_wallet_selected = "".to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
                             ({ crate::backend::load_wallets(self.rpc.to_owned()) }),
@@ -6472,12 +6356,9 @@ mod __ice_group_app_update {
                     self.network_name =
                         crate::backend::network_label("".to_owned(), self.rpc.to_owned());
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = "".to_owned();
                     self.hub_wallet_selected = "".to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
                             ({ crate::backend::load_wallets(self.rpc.to_owned()) }),
@@ -6505,13 +6386,10 @@ mod __ice_group_app_update {
                     let _ = &list;
                     let door = crate::backend::wallet_door(::std::borrow::Borrow::borrow(&(list)));
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_wallets = list.wallets.clone();
                     self.hub_wallet_selected =
                         crate::backend::preselect_wallet(list.wallets.clone());
                     self.onboarding_error = list.error.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     return match door.clone() {
                         WalletDoor::Wallets => (|| {
                             self.hub_step = HubStep::Wallets;
@@ -6540,8 +6418,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::AccountProbed(next) => (|| {
                     let _ = &next;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     let probe = crate::backend::account_probe(next.exists);
                     return match probe.clone() {
                         AccountProbe::Found => (|| {
@@ -6567,10 +6443,7 @@ mod __ice_group_app_update {
                 __DucktapeMessage::AccountProbeFailed(cause) => (|| {
                     let _ = &cause;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.onboarding_error = cause.message.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::WelcomeSkip => (|| {
@@ -6578,7 +6451,6 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     return (::ducktape_view_guest::Task::done(true)).map(|value| {
                         let _ = &value;
                         __DucktapeMessage::NetworkEntered
@@ -6600,8 +6472,6 @@ mod __ice_group_app_update {
                         __previous.abort();
                     }
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.ceremony_phase = "".to_owned();
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
@@ -6616,10 +6486,7 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::run(
                             ({
@@ -6665,10 +6532,7 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::run(
                             ({
@@ -6805,8 +6669,6 @@ mod __ice_group_app_update {
                 __DucktapeMessage::WelcomeDesktopDone(_ok) => (|| {
                     let _ = &_ok;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.ceremony_phase = "".to_owned();
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
@@ -6827,8 +6689,6 @@ mod __ice_group_app_update {
                     return match phase.clone() {
                         CeremonyPhase::Done => (|| {
                             self.mutation_phase = MutationPhase::Idle;
-                            self.__ice_derived.mutation_busy.take();
-                            self.__ice_derived.hub_busy.take();
                             self.ceremony_phase = "".to_owned();
                             self.ceremony_qr = "".to_owned();
                             return (::ducktape_view_guest::Task::done(true)).map(|value| {
@@ -6838,22 +6698,17 @@ mod __ice_group_app_update {
                         })(),
                         CeremonyPhase::Failed => (|| {
                             self.mutation_phase = MutationPhase::Idle;
-                            self.__ice_derived.mutation_busy.take();
-                            self.__ice_derived.hub_busy.take();
                             self.ceremony_phase = "".to_owned();
                             self.ceremony_qr = "".to_owned();
                             self.onboarding_error = next.detail.to_owned();
-                            self.__ice_derived.hub_busy.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         CeremonyPhase::ShowQr => (|| {
                             self.onboarding_error = "".to_owned();
-                            self.__ice_derived.hub_busy.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                         CeremonyPhase::Working => (|| {
                             self.onboarding_error = "".to_owned();
-                            self.__ice_derived.hub_busy.take();
                             ::ducktape_view_guest::Task::none()
                         })(),
                     };
@@ -6861,14 +6716,11 @@ mod __ice_group_app_update {
                 __DucktapeMessage::WelcomeFailed(cause) => (|| {
                     let _ = &cause;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.ceremony_phase = "".to_owned();
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
                     self.ceremony_left = "".to_owned();
                     self.onboarding_error = cause.message.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::NetworkEntered => (|| {
@@ -6887,8 +6739,6 @@ mod __ice_group_app_update {
                         __previous.abort();
                     }
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.ceremony_phase = "".to_owned();
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
@@ -6939,9 +6789,7 @@ mod __ice_group_app_update {
                     self.loading = true;
                     self.status = "Connecting…".to_owned();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.connected_rpc = self.rpc.to_owned();
                     self.network_chain_id = "".to_owned();
                     self.network_name = crate::backend::network_label(
@@ -6952,8 +6800,6 @@ mod __ice_group_app_update {
                     self.connect_generation = (self.connect_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.channels = ::std::vec::Vec::new();
                     self.rooms = ::std::vec::Vec::new();
                     self.dm_rows = ::std::vec::Vec::new();
@@ -6999,7 +6845,6 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.console_entry = ConsoleEntry::Entering;
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 486 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f6f6e626f617264696e672e696365
@@ -7100,7 +6945,6 @@ mod __ice_group_app_update {
                     self.__ice_secrets.clear("join_invite");
                     self.hub_step = HubStep::Join;
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::GoNetworks => (|| {
@@ -7131,8 +6975,6 @@ mod __ice_group_app_update {
                         __previous.abort();
                     }
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.ceremony_phase = "".to_owned();
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
@@ -7140,7 +6982,6 @@ mod __ice_group_app_update {
                     self.__ice_secrets.clear("restore_words");
                     self.__ice_secrets.clear("join_invite");
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = "".to_owned();
                     self.hub_wallets = ::std::vec::Vec::new();
                     self.hub_wallet_selected = "".to_owned();
@@ -7175,10 +7016,7 @@ mod __ice_group_app_update {
                         return ::ducktape_view_guest::Task::none();
                     }
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return ::ducktape_view_guest::Task::perform(
                         ({ crate::backend::join_network(self.__ice_secrets.read("join_invite")) }),
                         |result| match result {
@@ -7195,15 +7033,12 @@ mod __ice_group_app_update {
                     let _ = &init;
                     self.__ice_secrets.clear("join_invite");
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.onboarding_name = init.chain_id.to_owned();
                     self.rpc = init.rpc.to_owned();
                     self.invite_link = "".to_owned();
                     self.provision_steps = ::std::vec::Vec::new();
                     self.provision_index = 0;
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Provisioning;
                     return {
                         let __task = ::ducktape_view_guest::Task::run(
@@ -7266,7 +7101,6 @@ mod __ice_group_app_update {
                     let _ = &blob;
                     self.invite_link = blob.to_owned();
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::CopyOnboardingInvite => (|| {
@@ -7288,12 +7122,9 @@ mod __ice_group_app_update {
                         self.rpc.to_owned(),
                     );
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.password = "".to_owned();
                     self.hub_wallet_selected = "".to_owned();
                     self.mutation_phase = MutationPhase::Onboarding;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     return {
                         let __task = ::ducktape_view_guest::Task::perform(
                             ({ crate::backend::load_wallets(self.rpc.to_owned()) }),
@@ -7320,10 +7151,7 @@ mod __ice_group_app_update {
                 __DucktapeMessage::OnboardingFailed(cause) => (|| {
                     let _ = &cause;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.onboarding_error = cause.message.to_owned();
-                    self.__ice_derived.hub_busy.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::SwitchNetwork => (|| {
@@ -7454,7 +7282,6 @@ mod __ice_group_app_update {
                     self.ceremony_qr = "".to_owned();
                     self.ceremony_detail = "".to_owned();
                     self.onboarding_error = "".to_owned();
-                    self.__ice_derived.hub_busy.take();
                     self.hub_step = HubStep::Account;
                     return ::ducktape_view_guest::Task::batch([
                         {
@@ -7607,8 +7434,6 @@ mod __ice_group_app_update {
                     self.hydration_generation = (self.hydration_generation + 1);
                     self.hydration_retry_attempt = 0;
                     self.mutation_phase = MutationPhase::Huddle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.call_status = "".to_owned();
                     self.call_muted = false;
                     self.call_camera = false;
@@ -7622,7 +7447,6 @@ mod __ice_group_app_update {
                         self.call_muted,
                     );
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     return ::ducktape_view_guest::Task::batch([
                         {
                             // __ICE_SOURCE 147 1 2f686f6d652f656464792f6465762f6475636b746170652f6475636b746170652f2e636f6465782f776f726b74726565732f677075692d6b69742d6d6967726174696f6e2f6170702f7372632f75692f68616e646c6572732f687564646c652e696365
@@ -7661,10 +7485,7 @@ mod __ice_group_app_update {
                     self.huddle_channel_name = "".to_owned();
                     self.huddle_joined_at = 0;
                     self.mutation_phase = MutationPhase::Idle;
-                    self.__ice_derived.mutation_busy.take();
-                    self.__ice_derived.hub_busy.take();
                     self.error = "".to_owned();
-                    self.__ice_derived.has_error.take();
                     ::ducktape_view_guest::Task::none()
                 })(),
                 __DucktapeMessage::__SecretTyped(slot, text) => {

@@ -169,6 +169,21 @@ fn app_and_wasm_guests_do_not_resolve_the_ice_toolchain_or_iced_runtime() {
     }
 }
 #[test]
+fn view_theme_follows_the_current_appearance_without_cache_invalidation() {
+    let mut state = Ducktape::__state();
+    for (appearance, dark) in [
+        (Appearance::Dark, true),
+        (Appearance::Light, false),
+        (Appearance::Dark, true),
+        (Appearance::System, false),
+    ] {
+        state.appearance = appearance;
+        let (spec, _) = state.native_view();
+        let props: serde_json::Value = serde_json::from_slice(&spec.props).unwrap();
+        assert_eq!(props["dark"], dark);
+    }
+}
+#[test]
 fn every_current_row_marker_rests_on_one_selection_token() {
     let tree = rust_tokens(include_str!("../view_tree.rs"));
     assert!(tree.contains("wire::Face"));

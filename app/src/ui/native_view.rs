@@ -8,7 +8,7 @@ impl Ducktape {
         match self.shell_tab {
             ShellTab::Chat => (
                 crate::module_view::chat_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     &self.connected_rpc,
                     &self.network_name,
@@ -44,7 +44,7 @@ impl Ducktape {
             ),
             ShellTab::Pages => (
                 crate::module_view::pages_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     &self.network_chain_id,
                     &self.page_route,
@@ -54,7 +54,7 @@ impl Ducktape {
             ),
             ShellTab::Forge => (
                 crate::module_view::forge_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     &self.network_name,
                     &self.account_bio,
@@ -68,7 +68,7 @@ impl Ducktape {
             ),
             ShellTab::Agents => (
                 crate::module_view::agents_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     &self.account_number,
                     &self.agents_open_run,
@@ -78,7 +78,7 @@ impl Ducktape {
             ),
             ShellTab::Files => (
                 crate::module_view::files_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     &self.network_chain_id,
                     &self.fs_route,
@@ -88,7 +88,7 @@ impl Ducktape {
             ),
             ShellTab::Explorer => (
                 crate::module_view::explorer_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     self.block_height,
                     &crate::backend::sync_label(
@@ -101,7 +101,7 @@ impl Ducktape {
             ),
             ShellTab::Node => (
                 crate::module_view::node_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     crate::backend::members_is_admin(&self.members_rows),
                     &crate::backend::member_tier(&self.members_rows),
@@ -113,7 +113,7 @@ impl Ducktape {
             ),
             ShellTab::Members => (
                 crate::module_view::members_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     crate::backend::members_is_admin(&self.members_rows),
                 ),
@@ -121,7 +121,7 @@ impl Ducktape {
             ),
             ShellTab::Governance => (
                 crate::module_view::governance_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     crate::backend::members_is_admin(&self.members_rows),
                 ),
@@ -129,7 +129,7 @@ impl Ducktape {
             ),
             ShellTab::Settings => (
                 crate::module_view::settings_view(
-                    *self.__ice_derived_dark(),
+                    self.is_dark(),
                     self.connected,
                     self.loading,
                     &self.status,
