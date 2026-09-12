@@ -252,6 +252,14 @@ struct Field {
 pub(crate) struct NativePresentation {
     inputs: HashMap<String, InputPresentation>,
     editors: HashMap<String, wire::editor_document::EditorDocumentRef>,
+    scrolls: HashMap<String, ScrollPresentation>,
+}
+
+struct ScrollPresentation {
+    direction: wire::ScrollDirection,
+    anchors: (wire::ScrollAnchor, wire::ScrollAnchor),
+    offset: Point<Pixels>,
+    rows: Option<Vec<String>>,
 }
 
 struct InputPresentation {
@@ -300,8 +308,18 @@ impl ViewTree {
         height: Option<wire::Length>,
         background: Option<wire::Rgba>,
         border: Option<wire::Border>,
+        restored: Option<ScrollPresentation>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let restored = restored
+            .filter(|saved| {
+                saved.rows.as_ref().is_some_and(|keys| {
+                    keys.iter()
+                        .map(String::as_str)
+                        .eq(rows.iter().map(|row| row.key.as_str()))
+                })
+            })
+            .map(|saved| saved.offset);
         let list = self
             .lists
             .entry(key.to_owned())
@@ -444,6 +462,13 @@ impl ViewTree {
                         .first()
                         .map_or(44., |row| row.estimated_height + row.gap);
                     list.state.clone().with_uniform_item_height(px(estimate));
+                    if let Some(offset) = restored {
+                        let maximum = list.state.max_offset_for_scrollbar();
+                        list.state.set_offset_from_scrollbar(point(
+                            px(0.),
+                            offset.y.clamp(-maximum.y, px(0.)),
+                        ));
+                    }
                     cx.notify();
                 });
             },
@@ -927,7 +952,36 @@ impl ViewTree {
             })
             .collect();
         let mut editors = HashMap::new();
+        let mut scrolls = HashMap::new();
         self.root.clone().for_each_mut(&mut |node| {
+            if let wire::Node::Scroll {
+                key,
+                direction,
+                anchor_x,
+                anchor_y,
+                ..
+            } = node
+            {
+                let offset = self
+                    .lists
+                    .get(key)
+                    .map(|list| list.state.scroll_px_offset_for_scrollbar())
+                    .or_else(|| self.scrolls.get(key).map(ScrollHandle::offset));
+                if let Some(offset) = offset {
+                    scrolls.insert(
+                        key.clone(),
+                        ScrollPresentation {
+                            direction: *direction,
+                            anchors: (*anchor_x, *anchor_y),
+                            offset,
+                            rows: self
+                                .lists
+                                .get(key)
+                                .map(|list| list.rows.iter().map(|row| row.key.clone()).collect()),
+                        },
+                    );
+                }
+            }
             if let wire::Node::Editor { key, document, .. } = node {
                 let focused = self
                     .editors
@@ -938,7 +992,11 @@ impl ViewTree {
                 }
             }
         });
-        NativePresentation { inputs, editors }
+        NativePresentation {
+            inputs,
+            editors,
+            scrolls,
+        }
     }
 
     pub(crate) fn with_presentation(mut self, presentation: NativePresentation) -> Self {
@@ -1287,6 +1345,9 @@ impl ViewTree {
                 border,
                 ..
             } => {
+                let restored = self.presentation.scrolls.remove(key).filter(|saved| {
+                    saved.direction == *direction && saved.anchors == (*anchor_x, *anchor_y)
+                });
                 if *direction == wire::ScrollDirection::Vertical {
                     if let Some(rows) = virtual_rows(content) {
                         return self.virtual_scroll(
@@ -1299,6 +1360,7 @@ impl ViewTree {
                             *height,
                             *background,
                             *border,
+                            restored,
                             cx,
                         );
                     }
@@ -1328,6 +1390,7 @@ impl ViewTree {
                         let offset = handle.offset();
                         let _ = weak.update(cx, |this, cx| {
                             let previous = this.scroll_positions.get(&route).copied();
+                            let restored = restored.as_ref().filter(|saved| previous.is_none() && saved.rows.is_none());
                             let mut next = offset;
                             for (position, maximum, previous, anchor) in [
                                 (
@@ -1355,6 +1418,9 @@ impl ViewTree {
                                         if offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
                                     }
                                 }
+                            }
+                            if let Some(saved) = restored {
+                                next = point(saved.offset.x.clamp(-maximum.x, px(0.)), saved.offset.y.clamp(-maximum.y, px(0.)));
                             }
                             if next != offset {
                                 handle.set_offset(next);

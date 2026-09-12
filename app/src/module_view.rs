@@ -5101,6 +5101,25 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(-f32::from(offset.y), expected);
         }
+        for reordered in [false, true] {
+            let saved = native.update(|window, cx| view.read(cx).presentation(window, cx));
+            let mut replacement = root.clone();
+            if reordered {
+                replacement.for_each_mut(&mut |node| {
+                    if let wire::Node::KeyedColumn { keys: Some(keys), .. } = node {
+                        keys.reverse();
+                    }
+                });
+            }
+            let window = cx.open_window(gpui::size(gpui::px(300.), gpui::px(220.)), |_, _| {
+                crate::view_tree::ViewTree::new(replacement).with_presentation(saved)
+            });
+            let fresh = window.root(cx).unwrap();
+            let mut fresh_window = VisualTestContext::from_window(window.into(), cx);
+            fresh_window.update(|window, cx| window.render_frame(cx));
+            let offset = fresh.read_with(&fresh_window, |view, _| view.scroll_offset("list")).unwrap();
+            assert_eq!(-f32::from(offset.y), if reordered { 0. } else { 90. }, "scroll restoration requires the same ordered row keys");
+        }
     }
 
     #[gpui_kit::test]
