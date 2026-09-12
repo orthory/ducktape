@@ -183,7 +183,7 @@ impl Desktop {
         match cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| {
                 let observer = cx.observe(&model, |_, _, cx| cx.notify());
-                DesktopWindow { model, kind, module: None, route: None, _observer: observer }
+                DesktopWindow { model, kind, module: None, route: None, inputs: HashMap::new(), input_step: None, qr: None, _observer: observer }
             });
             cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
         }) {
@@ -232,10 +232,197 @@ struct DesktopWindow {
     kind: WindowKind,
     module: Option<(&'static str, Entity<crate::module_view::NativeModuleView>)>,
     route: Option<gpui_kit::Subscription>,
+    inputs: HashMap<&'static str, NativeInput>,
+    input_step: Option<crate::HubStep>,
+    qr: Option<(String, Entity<crate::view_tree::ViewTree>)>,
     _observer: gpui_kit::Subscription,
 }
 
+struct NativeInput {
+    state: Entity<gpui_kit::component::input::InputState>,
+    subscription: gpui_kit::Subscription,
+}
+
 impl DesktopWindow {
+    fn value(&self, key: &'static str, cx: &gpui_kit::App) -> String {
+        self.inputs.get(key).map(|input| input.state.read(cx).value().to_string()).unwrap_or_default()
+    }
+
+    fn input(&mut self, key: &'static str, placeholder: &'static str, masked: bool, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::input::{Input, InputEvent, InputState};
+        if !self.inputs.contains_key(key) {
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).masked(masked));
+            let model = self.model.clone();
+            let subscription = cx.subscribe(&state, move |_, input, event, cx| {
+                let InputEvent::Change = event else { return; };
+                let secret_slot = matches!(key, "restore_words" | "join_invite");
+                if secret_slot {
+                    let text = input.read(cx).value().to_string();
+                    model.update(cx, |model, cx| model.dispatch(Message::__SecretTyped(key.into(), text), cx));
+                }
+                cx.notify();
+            });
+            self.inputs.insert(key, NativeInput { state, subscription });
+        }
+        Input::new(&self.inputs[key].state).into_any_element()
+    }
+
+    fn action(&self, key: impl Into<gpui_kit::ElementId>, label: impl Into<gpui_kit::SharedString>, message: Message, disabled: bool) -> gpui_kit::component::button::Button {
+        use gpui_kit::component::Disableable as _;
+        let model = self.model.clone();
+        gpui_kit::component::button::Button::new(key).label(label).disabled(disabled)
+            .on_click(move |_, _, cx| model.update(cx, |model, cx| model.dispatch(message.clone(), cx)))
+    }
+
+    fn submit(&self, key: &'static str, label: &'static str, disabled: bool, message: impl Fn(&Self, &gpui_kit::App) -> Message + 'static, cx: &mut Context<Self>) -> gpui_kit::component::button::Button {
+        use gpui_kit::component::Disableable as _;
+        gpui_kit::component::button::Button::new(key).label(label).disabled(disabled)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let message = message(this, cx);
+                this.model.update(cx, |model, cx| model.dispatch(message, cx));
+            }))
+    }
+
+    fn onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::*;
+        use crate::HubStep;
+        let state = &self.model.read(cx).state;
+        let step = state.hub_step;
+        let busy = state.mutation_phase != crate::MutationPhase::Idle;
+        let error = state.onboarding_error.clone();
+        let step_changed = self.input_step != Some(step);
+        if step_changed {
+            for (_, input) in std::mem::take(&mut self.inputs) {
+                drop(input.subscription);
+                input.state.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            self.input_step = Some(step);
+        }
+        let mut body = div().flex().flex_col().gap_3().w_full();
+        body = match step {
+            HubStep::Loading => body.child("Opening your workspace…"),
+            HubStep::Wallets => {
+                let state = &self.model.read(cx).state;
+                let selected = state.hub_wallet_selected.clone();
+                let wallets = state.hub_wallets.clone();
+                body = body.child("Choose a wallet");
+                for wallet in wallets {
+                    body = body.child(self.action(format!("wallet/{}", wallet.name), format!("{} · {}", wallet.name, wallet.state), Message::PickWallet(wallet.name), busy));
+                }
+                if !selected.is_empty() {
+                    body = body.child(self.input("unlock", "Wallet password", true, window, cx))
+                        .child(self.submit("unlock-submit", "Unlock", busy, |this, cx| Message::UnlockSubmit(this.value("unlock", cx)), cx));
+                }
+                body.child(self.action("wallet-restore", "Restore a wallet", Message::GoRestore, busy))
+                    .child(self.action("wallet-create", "Create a wallet", Message::LoginSkip, busy))
+                    .child(self.action("wallet-networks", "Networks", Message::GoNetworks, busy))
+            }
+            HubStep::Password => {
+                body = body.child("Protect your wallet")
+                    .child(self.input("password", "Password", true, window, cx))
+                    .child(self.input("password-confirm", "Confirm password", true, window, cx));
+                let problem = crate::backend::password_problem(&self.value("password", cx), &self.value("password-confirm", cx));
+                let invalid = busy || !problem.is_empty();
+                body.child(problem).child(self.submit("password-submit", "Create wallet", invalid, |this, cx| Message::PasswordSubmit(this.value("password", cx)), cx))
+                    .child(self.action("password-back", "Back", Message::GoLogin, busy))
+            }
+            HubStep::Phrase => {
+                body = body.child("Write down your recovery phrase").child("Keep it private. This phrase can restore your wallet.");
+                for row in crate::backend::phrase_rows() {
+                    body = body.child(div().flex().justify_between()
+                        .child(format!("{} {}", row.left_number, row.left_word))
+                        .child(format!("{} {}", row.right_number, row.right_word)));
+                }
+                body.child(self.action("phrase-saved", "I wrote it down", Message::PhraseWrittenDown, busy))
+            }
+            HubStep::Confirm => body.child(crate::backend::recovery_prompt())
+                .child(self.input("phrase-answer", "Requested words, separated by spaces", true, window, cx))
+                .child(self.submit("phrase-confirm", "Confirm recovery phrase", busy, |this, cx| Message::ConfirmPhraseSubmit(this.value("phrase-answer", cx)), cx))
+                .child(self.action("phrase-again", "Show phrase again", Message::ShowPhraseAgain, busy)),
+            HubStep::Restore => body.child("Restore your wallet")
+                .child(self.input("restore-name", "Wallet name", false, window, cx))
+                .child(self.input("restore_words", "Recovery phrase", true, window, cx))
+                .child(self.input("restore-password", "New password", true, window, cx))
+                .child(self.submit("restore-submit", "Restore", busy, |this, cx| Message::RestoreSubmit(this.value("restore-name", cx), this.value("restore-password", cx)), cx))
+                .child(self.action("restore-back", "Back", Message::GoLogin, busy)),
+            HubStep::Networks => {
+                let state = &self.model.read(cx).state;
+                let networks = state.hub_networks.clone();
+                let selected = state.hub_selected.clone();
+                body = body.child("Choose a network");
+                for network in networks {
+                    let label = match (network.probed, network.live) {
+                        (false, _) => format!("{} · checking", network.name),
+                        (true, true) => format!("{} · block {}", network.name, network.height),
+                        (true, false) => format!("{} · offline", network.name),
+                    };
+                    body = body.child(div().flex().gap_2()
+                        .child(self.action(format!("network/{}", network.id), label, Message::PickNetwork(network.id.clone()), busy))
+                        .child(self.action(format!("forget/{}", network.id), "Forget", Message::ForgetNetworkSubmit(network.id), busy)));
+                }
+                let no_selection = busy || selected.is_empty();
+                body.child(self.action("network-open", "Open network", Message::OpenNetworkSubmit, no_selection))
+                    .child(self.input("remote", "Remote node address", false, window, cx))
+                    .child(self.submit("remote-connect", "Connect", busy, |this, cx| Message::ConnectRemoteSubmit(this.value("remote", cx)), cx))
+                    .child(self.action("network-join", "Join with invitation", Message::GoJoin, busy))
+            }
+            HubStep::Join => body.child("Join a network")
+                .child(self.input("join_invite", "Invitation", true, window, cx))
+                .child(self.action("join-submit", "Join", Message::JoinNetworkSubmit, busy))
+                .child(self.action("join-back", "Back", Message::GoNetworks, busy)),
+            HubStep::Provisioning => {
+                for step in &self.model.read(cx).state.provision_steps {
+                    body = body.child(format!("{} · {}", step.label, step.state));
+                }
+                body
+            }
+            HubStep::Live => body.child("Your network is ready")
+                .child(self.action("copy-invite", "Copy invitation", Message::CopyOnboardingInvite, busy))
+                .child(self.action("enter-console", "Open Ducktape", Message::EnterConsole, busy)),
+            HubStep::Account => {
+                let state = &self.model.read(cx).state;
+                let detail = state.ceremony_detail.clone();
+                let left = state.ceremony_left.clone();
+                let payload = state.ceremony_qr.clone();
+                body = body.child("Your account").child(detail).child(left);
+                if !payload.is_empty() {
+                    let changed = self.qr.as_ref().is_none_or(|(current, _)| current != &payload);
+                    if changed {
+                        let node = ui_lang_wire::Node::Qr { key: "account-qr".into(), code: ui_lang_wire::Qr {
+                            payload: Some(payload.as_bytes().to_vec()), size: Some(ui_lang_wire::QrSize::Total(220.0)), ..Default::default()
+                        }};
+                        self.qr = Some((payload, cx.new(|_| crate::view_tree::ViewTree::new(node))));
+                    }
+                    body = body.child(self.qr.as_ref().expect("account QR").1.clone());
+                }
+                body.child(self.input("account-name", "Account name", false, window, cx))
+                    .child(self.submit("account-create", "Create account", busy, |this, cx| Message::WelcomeCreateSubmit(this.value("account-name", cx)), cx))
+                    .child(self.action("account-login", "Sign in", Message::WelcomeLoginSubmit, busy))
+                    .child(self.action("account-desktop", "Use this device", Message::WelcomeDesktop, busy))
+                    .child(self.action("account-skip", "Continue without account", Message::WelcomeSkip, busy))
+                    .child(self.action("account-cancel", "Cancel", Message::WelcomeCancel, false))
+            }
+        };
+        div().size_full().flex().flex_col().p_6().gap_4()
+            .child(div().text_xl().child("Ducktape"))
+            .child(body).child(div().text_color(rgb(0xb42318)).child(error)).into_any_element()
+    }
+
+    fn huddle(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::*;
+        let state = &self.model.read(cx).state;
+        let mute = if state.call_muted { "Unmute" } else { "Mute" };
+        let camera = if state.call_camera { "Stop camera" } else { "Camera" };
+        let screen = if state.call_sharing { "Stop sharing" } else { "Share screen" };
+        div().size_full().flex().flex_col().gap_3().p_3()
+            .child(state.huddle_channel_name.clone()).child(state.call_status.clone())
+            .child(self.action("huddle-mute", mute, Message::ToggleCallMute, false))
+            .child(self.action("huddle-camera", camera, Message::ToggleCallCamera, false))
+            .child(self.action("huddle-screen", screen, Message::ToggleCallScreen, false))
+            .child(self.action("huddle-channel", "Go to channel", Message::HuddleGoChannel, false))
+            .child(self.action("huddle-leave", "Leave huddle", Message::LeaveHuddleHere, false)).into_any_element()
+    }
+
     fn console(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::*;
         let (spec, route) = self.model.read(cx).state.native_view();
@@ -262,11 +449,11 @@ impl DesktopWindow {
 }
 
 impl Render for DesktopWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.kind {
             WindowKind::Console => self.console(cx),
-            WindowKind::Onboarding => gpui_kit::div().p_6().child(self.model.read(cx).state.onboarding_error.clone()).into_any_element(),
-            WindowKind::Huddle => gpui_kit::div().p_6().child(self.model.read(cx).state.huddle_channel_name.clone()).into_any_element(),
+            WindowKind::Onboarding => self.onboarding(window, cx),
+            WindowKind::Huddle => self.huddle(cx),
         }
     }
 }
