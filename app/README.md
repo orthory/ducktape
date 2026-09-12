@@ -39,6 +39,21 @@ directory into `Ducktape.app` as resources linked beside the executable, and the
 it first. A tab whose view is not
 staged says so in its place.
 
+Deployed views follow the module registry's active deployment hash on block
+events. The host fetches and verifies a candidate, compiles it away from the
+window thread, then snapshots the seated guest and restores that state into
+the candidate. Installation rechecks the seated instance and snapshot tick.
+The chain and existing view keep running during preparation; a rejected
+candidate leaves the seated view in place. Input routes belong to the seated
+instance, not to an in-progress load attempt. Matching native input values,
+selections and focus can survive installation without retaining old callbacks.
+
+`ducktape module update` accepts `--view` and `--assets` alongside the module
+component and optional index. A deployment is a complete set: omitting its
+view or index removes that part on activation, rather than keeping an older
+copy. See [`../docs/records/architecture/wasm-module-authoring.md`](../docs/records/architecture/wasm-module-authoring.md)
+for module packaging and registry operations.
+
 A view owns its state, receives session and domain props (`<module>.props`,
 one JSON item per change), and emits a wire tree rendered by native gpui-kit
 controls. It can emit intents (`governance.vote`, `members.propose`, …) to
