@@ -1,7 +1,6 @@
 use super::*;
 
-/// A selected loader call. Ice task-flow transforms may read only their input,
-/// so the optional carries every argument the chosen effect needs.
+/// A selected loader call with every argument the chosen effect needs.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LoadRequest {
     pub rpc: String,
@@ -408,8 +407,7 @@ pub fn send_failed(sends: Vec<PendingSend>, id: &str, committed: bool) -> Vec<Pe
     }
 }
 
-/// One channel row with the unread decision already attached. Ice externs take
-/// lists by value, so a view-time lookup cloned the unread list once per row.
+/// One channel row with the unread decision already attached.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSidebarRow {
     pub channel: ChatChannel,
@@ -620,4 +618,3 @@ fn operator_token_for(origin: &str) -> Option<String> {
     let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
-

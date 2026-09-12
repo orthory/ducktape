@@ -53,9 +53,7 @@ pub struct WalletInfo {
     pub active: bool,
 }
 
-/// A row, built. Ice reads extern structs but cannot construct one, so the
-/// wallet-list test's preset needs this to seed rows the way `optimistic_message`
-/// seeds chat ones.
+/// Build a wallet row for launch-window fixtures.
 pub fn wallet_info(name: String, pubkey: String, state: String, active: bool) -> WalletInfo {
     WalletInfo {
         name,
@@ -65,8 +63,7 @@ pub fn wallet_info(name: String, pubkey: String, state: String, active: bool) ->
     }
 }
 
-/// A keystore's answer, built — the test seam for the door a network pick
-/// opens, which Ice cannot construct itself.
+/// Build a keystore answer for network-picker fixtures.
 pub fn wallet_list(wallets: Vec<WalletInfo>, error: String, keystore: bool) -> WalletList {
     WalletList {
         wallets,
@@ -699,8 +696,8 @@ struct MintedPhrase {
     asked: [usize; 3],
 }
 
-/// One row of the phrase screen's two-column grid. Ice cannot index a list,
-/// so the pairing (`1`/`13`, `2`/`14`, …) is done here — twelve rows fit the
+/// One row of the phrase screen's two-column grid. Pairing (`1`/`13`,
+/// `2`/`14`, …) yields twelve rows that fit the
 /// launch window without a scroll, twenty-four do not.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PhraseRow {
@@ -755,8 +752,7 @@ pub fn phrase_rows_of(words: &str) -> Vec<PhraseRow> {
         .collect()
 }
 
-/// "5, 12 and 20" — the positions, in the sentence the two screens name them
-/// in. Ice cannot concatenate, so both sentences are built here.
+/// "5, 12 and 20" — the positions named by both ceremony screens.
 fn asked_label(asked: &[usize; 3]) -> String {
     format!("{}, {} and {}", asked[0], asked[1], asked[2])
 }

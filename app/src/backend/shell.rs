@@ -191,8 +191,7 @@ pub async fn join_network(blob: crate::secret::Secret) -> Result<WorkspaceInit, 
 /// so a network nobody is serving has nothing useful to hand out anyway.
 ///
 /// The app takes no TTL: it mints the ONE default every other door mints
-/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`). Ice cannot read a Rust
-/// constant, so the constant is applied here rather than passed from a handler.
+/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`).
 pub async fn mint_invite(workspace: String) -> Result<String, AppError> {
     let minted: Result<String, String> = async {
         let endpoint = workspace_rpc(&workspace)?;
@@ -409,10 +408,7 @@ pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String 
     host.to_string()
 }
 
-// THE STATUS ITEM'S WORDS. Ice has no string concatenation, so every tray text
-// that joins a count or a name to a label is spelled here, beside the
-// titlebar's. A row's text is also what a test chooses it by, so each verb
-// below is a contract with `tests/app.ice`.
+// Shared status-item labels, alongside the titlebar labels.
 
 /// The count beside the menu-bar icon: nothing at all while the bell is empty.
 pub fn tray_badge(unread: i64) -> String {

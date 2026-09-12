@@ -24,7 +24,7 @@ pub struct PaletteSearchData {
 
 /// The command palette's per-keystroke search: one debounced call covering
 /// chat and pages together. Typing a word used to issue two RPC round trips
-/// per keystroke. The Ice `replace` lane owns cancellation and stale delivery;
+/// per keystroke. The palette task lane owns cancellation and stale delivery;
 /// dropping a superseded task during this sleep prevents its RPCs from firing.
 pub async fn palette_search(rpc: String, text: String) -> Result<PaletteSearchData, AppError> {
     tokio::time::sleep(Duration::from_millis(250)).await;

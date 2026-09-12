@@ -74,11 +74,9 @@ pub fn command_chord(
 /// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
 /// Each guest paints its own scrim and dismisses its own layers — a key the
 /// kernel contract carries no door for. What is enumerated here is what rides
-/// EVERY tab, which is why `slot palette` and `slot bell` sit OUTSIDE the
-/// `match tab` in `components/shell.ice`.
+/// EVERY tab: the native shell renders the palette and bell outside the tab.
 //
-// One argument per layer: the Ice extern surface is flat, and the reading must
-// see every layer at once to name the topmost.
+// Inspect every shell layer together to name the topmost.
 pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open: bool) -> String {
     if palette_open {
         return "palette".into();

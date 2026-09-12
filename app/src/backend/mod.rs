@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
-// splices. re-exported here because the Ice externs resolve `crate::backend`.
+// splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
     CHAT_HOT_WINDOW_LIMIT, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReader,
     MentionCandidates, NameDirectory, author_display, chat_message, mark_message_groups,

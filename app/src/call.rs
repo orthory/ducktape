@@ -34,7 +34,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// One call-session event, flattened for the Ice route: `kind` picks the arm
+/// One call-session event: `kind` picks the arm
 /// (`connecting` | `live` | `refused` | `closed` | `error` | `peer`),
 /// `message` carries refusal/error prose, the rest is a peer beacon.
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
