@@ -92,12 +92,7 @@ impl ExplorerView {
                             251.0 / 255.0,
                             1.000000,
                         ]),
-                        ::ducktape_view_guest::wire::Rgba([
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            1.000000,
-                        ]),
+                        ::ducktape_view_guest::wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
                         ::ducktape_view_guest::wire::Rgba([
                             44.0 / 255.0,
                             43.0 / 255.0,
@@ -128,12 +123,7 @@ impl ExplorerView {
                             40.0 / 255.0,
                             1.000000,
                         ]),
-                        ::ducktape_view_guest::wire::Rgba([
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            1.000000,
-                        ]),
+                        ::ducktape_view_guest::wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
                         ::ducktape_view_guest::wire::Rgba([
                             236.0 / 255.0,
                             235.0 / 255.0,
@@ -146,12 +136,7 @@ impl ExplorerView {
                             168.0 / 255.0,
                             1.000000,
                         ]),
-                        ::ducktape_view_guest::wire::Rgba([
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            1.000000,
-                        ]),
+                        ::ducktape_view_guest::wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
                         ::ducktape_view_guest::wire::Rgba([
                             94.0 / 255.0,
                             92.0 / 255.0,
@@ -176,12 +161,7 @@ impl ExplorerView {
                             60.0 / 255.0,
                             1.000000,
                         ]),
-                        ::ducktape_view_guest::wire::Rgba([
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            1.000000,
-                        ]),
+                        ::ducktape_view_guest::wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
                         ::ducktape_view_guest::wire::Rgba([
                             249.0 / 255.0,
                             241.0 / 255.0,
@@ -200,12 +180,7 @@ impl ExplorerView {
                             76.0 / 255.0,
                             1.000000,
                         ]),
-                        ::ducktape_view_guest::wire::Rgba([
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            255.0 / 255.0,
-                            1.000000,
-                        ]),
+                        ::ducktape_view_guest::wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
                         ::ducktape_view_guest::wire::Rgba([
                             253.0 / 255.0,
                             244.0 / 255.0,
