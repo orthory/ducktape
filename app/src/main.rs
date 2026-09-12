@@ -5,7 +5,7 @@ mod call;
 mod composer_surface;
 mod editor;
 mod module_view;
-mod view_host;
+mod view_tree;
 mod video;
 
 fn main() -> iced::Result {

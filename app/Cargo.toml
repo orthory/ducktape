@@ -26,8 +26,6 @@ ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev 
 
 [dependencies]
 gpui-kit = "=0.6.1"
-view-protocol = { path = "../crates/views/support/protocol" }
-wasmparser = "0.251"
 futures.workspace = true
 pulldown-cmark = "0.12.2"
 # the program-account module: the Agents editor provisions a new agent's

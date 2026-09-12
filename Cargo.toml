@@ -200,7 +200,7 @@ members = [
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 # The shared design crate belongs to the views workspace so Cargo gives
 # its guest dependency a checkout-independent package identity.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design", "crates/views/support/protocol", "crates/views/support/guest"]
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design"]
 
 [workspace.package]
 edition = "2024"
