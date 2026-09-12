@@ -69,8 +69,10 @@ impl Element for RichParagraph {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.content.prepaint(window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        // Register the containing hitbox before link hitboxes, so selectable
+        // paragraph geometry cannot cover its own interactive spans.
+        self.content.prepaint(window, cx);
         self.handle.register(
             gpui_kit::base::TextSelectionRegistration::new(hitbox, bounds).with_text_bounds(
                 self.layouts
@@ -2285,25 +2287,36 @@ impl ViewTree {
         selection.handle.set_fallback_copy_text(canonical, cx);
         let handle = selection.handle.clone();
         let mut content = text_options(
-            dimensions(
-                div().flex().flex_row().items_baseline(),
-                *width,
-                options.height,
-            ),
+            dimensions(div().flex().flex_col(), *width, options.height),
             *font,
             *align_x,
             options,
         );
-        if options.wrapping != Some(wire::Wrapping::None) {
-            content = content.flex_wrap();
-        }
-        content = horizontal_align(content, *align_x);
         if let Some(size) = size {
             content = content.text_size(px(*size));
         }
         if let Some(color) = color {
             content = content.text_color(rgba(*color));
         }
+        let base_size = size
+            .map(px)
+            .unwrap_or_else(|| window.text_style().font_size.to_pixels(window.rem_size()));
+        let line_height = match options.line_height {
+            Some(wire::LineHeight::Absolute(height)) => px(height),
+            Some(wire::LineHeight::Relative(height)) => base_size * height,
+            None => window
+                .text_style()
+                .line_height
+                .to_pixels(base_size.into(), window.rem_size()),
+        };
+        let native_row = || {
+            let mut row = div().flex().flex_row().items_baseline().min_h(line_height);
+            if options.wrapping != Some(wire::Wrapping::None) {
+                row = row.flex_wrap();
+            }
+            horizontal_align(row, *align_x)
+        };
+        let mut row = native_row();
         let mut layouts = Vec::new();
         let selections = std::rc::Rc::new(std::cell::RefCell::new(Vec::<
             Option<std::ops::Range<usize>>,
@@ -2372,24 +2385,35 @@ impl ViewTree {
                 if let (Some(handler), Some(link)) = (on_link, &span.link) {
                     let handler = *handler;
                     let link = link.clone();
-                    painted = painted
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(wire::Event::Input {
-                                handler,
-                                text: link.clone(),
-                            });
-                        }));
+                    painted =
+                        painted
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                if gpui_kit::base::TextSelection::has_selection(window, cx) {
+                                    return;
+                                }
+                                cx.emit(wire::Event::Input {
+                                    handler,
+                                    text: link.clone(),
+                                });
+                            }));
                 }
                 let newline = fragment.contains('\n');
                 if newline {
                     // Explicit source line breaks remain real measured text, not
                     // injected spaces in the selection/copy representation.
-                    painted = painted.w_full().h(px(0.));
+                    // One native row per explicit source line preserves empty
+                    // lines too. The newline participates in copy, not sizing.
+                    painted = painted.w(px(0.)).h(px(0.));
+                    row = row.child(painted);
+                    content = content.child(row);
+                    row = native_row();
+                    continue;
                 }
-                content = content.child(painted);
+                row = row.child(painted);
             }
         }
+        content = content.child(row);
         RichParagraph {
             id: key.clone().into(),
             content: content.into_any_element(),
