@@ -4,7 +4,11 @@ use syn::visit::Visit;
 
 pub(super) const CHAT: &str = include_str!("../../../crates/views/chat/src/ui/chat.rs");
 const PAGES: &str = include_str!("../../../crates/views/pages/src/ui/pages.rs");
-const EXPLORER: &str = include_str!("../../../crates/views/explorer/src/lib.rs");
+const EXPLORER: &str = concat!(
+    include_str!("../../../crates/views/explorer/src/lib.rs"),
+    "\n",
+    include_str!("../../../crates/views/explorer/src/presentation.rs"),
+);
 
 pub(super) fn branches(source: &str) -> Vec<(String, String, usize)> {
     // Deep authored widget trees exceed the test harness's small thread stack.
@@ -33,6 +37,13 @@ fn branches_on_stack(source: &str) -> Vec<(String, String, usize)> {
             .collect()
     }
     impl<'ast> Visit<'ast> for Branches {
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if node.mac.path.is_ident("vec") {
+                let tokens = &node.mac.tokens;
+                let array: syn::Expr = syn::parse2(quote::quote!([#tokens])).expect("vec items");
+                self.visit_expr(&array);
+            }
+        }
         fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
             self.rows.push((
                 tokens(&branch.cond),
@@ -52,140 +63,83 @@ fn branches_on_stack(source: &str) -> Vec<(String, String, usize)> {
     visitor.rows
 }
 
-/// THE ZERO-HIT PLATE SPEAKS FOR A QUERY, AND A BOOL COULD NOT CARRY ONE —
-/// page search is enter-to-submit with no `change=` route, so a keystroke runs
-/// no handler and only `trim(draft) == query` can retire the plate (the full
-/// rationale lives on the plate arm in the Pages guest). The query's
-/// lifetime is the pages view's own state now; what the app still pins is the
-/// SHAPE of the arm that reads it, on both surfaces that render a page hit.
+fn view_method(source: &str, name: &str) -> String {
+    let file = syn::parse_file(source).expect("view Rust");
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(item),
+            _ => None,
+        })
+        .flat_map(|item| &item.items)
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == name => Some(
+                method
+                    .block
+                    .to_token_stream()
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing view method {name}"))
+}
+
+// A submitted answer belongs to its captured query, not the current draft.
+// The guest's wire tests cover clearing an empty answer with no selected page.
 #[test]
 fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
-    let branches = branches(PAGES);
-    let (condition, plate, _) = branches
-        .iter()
-        .find(|(condition, _, _)| condition.contains("search_answer_stands("))
-        .expect("standing-query plate");
-    for field in [
-        "connected",
-        "page_search_hits",
-        "page_search_query",
-        "page_search_draft",
-        "page_searching",
-    ] {
-        assert!(
-            condition.contains(field),
-            "{field} participates in the plate guard"
-        );
-    }
-    assert!(plate.contains("EmptyPlate@"));
-    assert!(
-        rust_tokens(include_str!("../../../crates/views/pages/src/ui/kit.rs"))
-            .contains("Nopagesmatched")
-    );
-    assert!(
-        plate.contains("Background::Color"),
-        "the plate paints a background over the document"
-    );
+    let pane = view_method(PAGES, "document_pane");
+    assert!(pane.contains("letsearch_ready=self.connected&&crate::host::search_answer_stands(&self.page_search_query,&self.page_search_draft,self.page_searching,);"));
+    assert!(pane.contains("ifsearch_ready{children.push(self.search_panel());}"));
+    let panel = view_method(PAGES, "search_panel");
+    assert!(panel.contains("ifself.page_search_hits.is_empty()"));
+    assert!(panel.contains("Nomatchingpages"));
+    assert!(panel.contains("Message::ClearPageSearch"));
 }
 
-/// THE PLATE MUST HAVE A SEAT IN THE STATE THAT MOST NEEDS IT, AND IT MUST SIT
-/// ON TOP. Nested inside `connected && !empty(active_page)` — where the whole
-/// document header including the search input lives — the panel had no answer
-/// for its one real arrival with no page open: `live_resynced` moving
-/// `active_page` to "" under a STANDING query. Nested, that state showed "No
-/// page selected" and said nothing about the query; the × is gone with the
-/// header there, so picking a page would be the only exit. Hoisted to a
-/// sibling layer it must be declared AFTER the document arm: a stack paints in
-/// declaration order, first at the bottom, so an earlier position puts the
-/// opaque card UNDER the document it is supposed to cover.
 #[test]
 fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
-    let branches = branches(PAGES);
-    let plate = branches
-        .iter()
-        .position(|(condition, _, _)| condition.contains("search_answer_stands("))
-        .unwrap();
-    let depth = branches[plate].2;
-    let document = branches
-        .iter()
-        .enumerate()
-        .find(|(_, (condition, body, at))| {
-            *at == depth && condition.contains("active_page") && body.contains("Node::Editor")
-        })
-        .map(|(index, _)| index)
-        .expect("document sibling");
-    let hits = branches
-        .iter()
-        .enumerate()
-        .find(|(_, (condition, body, at))| {
-            *at == depth
-                && condition.contains("page_search_hits")
-                && !condition.contains("search_answer_stands")
-                && body.contains("PageSearchResult@")
-        })
-        .map(|(index, _)| index)
-        .expect("result sibling");
+    let pane = view_method(PAGES, "document_pane");
+    let surface = pane
+        .find("letmutchildren=vec![surface]")
+        .expect("document bottom layer");
+    let search = pane
+        .find("children.push(self.search_panel())")
+        .expect("search layer");
+    assert!(surface < search);
+    let panel = view_method(PAGES, "search_panel");
     assert!(
-        document < plate && document < hits,
-        "search layers paint above the document"
+        panel.contains("overlay("),
+        "search uses the native opaque overlay"
     );
-    assert!(branches[hits].1.contains("Background::Color"));
+    assert!(
+        panel.contains("Message::ClearPageSearch"),
+        "overlay can dismiss itself"
+    );
 }
 
-/// THE EXPLORER'S PLATE SPEAKS FOR THE QUERY IT WAS SENT — the same class the
-/// pages plate above was fixed for, on the last surface that still keyed its
-/// zero-hit sentence on the LIVE draft. Workspace search is enter-to-submit and
-/// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
-/// runs no handler at all: only `trim(query) == sent_query` can retire the
-/// plate, and the captured string is the only thing that can carry the
-/// comparison. The Explorer is a module-owned view on the kernel contract, so
-/// the capture, the send and the arm are all the guest's.
 #[test]
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     let source = rust_tokens(EXPLORER);
     assert!(source.contains("self.sent_query=(self.query).trim().to_owned()"));
-    assert!(source.contains("workspace_search(") && source.contains("self.sent_query.to_owned()"));
-    let condition = branches(EXPLORER)
-        .into_iter()
-        .find(|(condition, _, _)| condition.contains("search_answer_stands("))
-        .unwrap()
-        .0;
-    for field in [
-        "connected",
-        "hits",
-        "partial",
-        "sent_query",
-        "query",
-        "searching",
-    ] {
-        assert!(condition.contains(field));
-    }
+    assert!(source.contains("host::workspace_search(self.sent_query.clone(),self.search_serial)"));
+    let panel = view_method(EXPLORER, "search_results");
+    assert!(panel.contains("letempty_answer=hits.is_empty()&&self.partial.is_empty()&&host::search_answer_stands(&self.sent_query,&self.query,self.searching);"));
+    assert!(panel.contains("ifempty_answer{"));
     assert!(source.contains("self.sent_query=\"\".to_owned()"));
 }
 
-/// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
-/// own copy of the same conjunct arm, and a fourth surface would have grown a
-/// fourth; the arithmetic lives in one place now, and the three arms call it.
 #[test]
 fn one_predicate_decides_whether_a_search_answer_still_stands() {
-    // The answer speaks for the string it was sent for — trimmed, because that
-    // is what was sent.
     assert!(backend::search_answer_stands("zzz", "  zzz  ", false));
-    // ONE MORE CHARACTER AND IT DOES NOT. No handler ran; only this comparison
-    // can tell.
     assert!(!backend::search_answer_stands("zzz", "zzzq", false));
-    // A ROUND TRIP IS NOT AN ANSWER — the submit's own search is still out.
     assert!(!backend::search_answer_stands("zzz", "zzz", true));
-    // AND AN EMPTY QUERY IS NO ANSWER AT ALL, which is what every dismissal
-    // leaves behind: an emptied box must not match an emptied query.
     assert!(!backend::search_answer_stands("", "", false));
-
     for source in [PAGES, CHAT, EXPLORER] {
-        assert!(
-            branches(source)
-                .iter()
-                .any(|(condition, _, _)| condition.contains("search_answer_stands("))
-        );
+        assert!(rust_tokens(source).contains("search_answer_stands("));
     }
 }
 
@@ -542,7 +496,6 @@ fn check_disconnected_registers() {
         include_str!("../../../crates/views/forge/src/ui/forge.rs"),
         include_str!("../../../crates/views/forge/src/ui/components.rs"),
         include_str!("../../../crates/views/forge/src/ui/kit.rs"),
-        include_str!("../../../crates/views/forge/src/ui/icon.rs"),
     ] {
         methods.visit_file(&syn::parse_file(source).unwrap());
     }
