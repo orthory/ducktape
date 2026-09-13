@@ -14,14 +14,6 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn chars(&self) -> usize {
-        self.0.chars().count()
-    }
 }
 
 impl std::fmt::Debug for Secret {
@@ -46,14 +38,6 @@ impl SecretStore {
 
     pub fn clear(&mut self, slot: &'static str) {
         self.slots.remove(slot);
-    }
-
-    pub fn is_empty(&self, slot: &'static str) -> bool {
-        self.text(slot).is_empty()
-    }
-
-    pub fn chars(&self, slot: &'static str) -> usize {
-        self.text(slot).chars().count()
     }
 
     pub fn read(&self, slot: &'static str) -> Secret {
@@ -86,13 +70,9 @@ mod tests {
     #[test]
     fn a_store_answers_facts_and_hands_over_content() {
         let mut store = SecretStore::default();
-        assert!(store.is_empty("phrase"));
-        assert_eq!(store.chars("phrase"), 0);
         assert_eq!(store.text("phrase"), "");
 
         store.set("phrase", "abandon about".to_owned());
-        assert!(!store.is_empty("phrase"));
-        assert_eq!(store.chars("phrase"), 13);
         assert_eq!(store.read("phrase").expose(), "abandon about");
         assert!(!format!("{store:?}").contains("abandon"));
 
@@ -101,7 +81,6 @@ mod tests {
         assert_eq!(store.read("phrase").expose(), "abandon about");
 
         store.clear("phrase");
-        assert!(store.is_empty("phrase"));
         assert_eq!(store.text("phrase"), "");
         assert!(store.read("phrase").expose().is_empty());
     }
@@ -112,15 +91,7 @@ mod tests {
         store.set("phrase", "words".to_owned());
         store.set("passphrase", "extra".to_owned());
         store.clear("phrase");
-        assert!(store.is_empty("phrase"));
+        assert!(store.text("phrase").is_empty());
         assert_eq!(store.text("passphrase"), "extra");
-    }
-
-    #[test]
-    fn characters_are_counted_rather_than_bytes() {
-        let mut store = SecretStore::default();
-        store.set("phrase", "pässwörd".to_owned());
-        assert_eq!(store.chars("phrase"), 8);
-        assert_eq!(store.read("phrase").chars(), 8);
     }
 }
