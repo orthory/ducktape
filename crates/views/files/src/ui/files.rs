@@ -1,6 +1,9 @@
 use super::*;
 impl super::FilesView {
     pub(super) fn files_screen(&self, use_scope: String) -> wire::Node {
+        if !self.connected {
+            return self.disconnected(format!("{use_scope}/disconnected"));
+        }
         let _component_owner = ::ducktape_view_guest::slots::component(
             "FilesScreen",
             &use_scope,

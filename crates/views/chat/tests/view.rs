@@ -274,6 +274,21 @@ fn a_connected_view_reads_its_own_room() {
     });
 }
 
+#[test]
+fn disconnect_hides_retained_rooms_messages_and_composer() {
+    on_a_deep_stack(|| {
+        let (frame, _, props) = connected_room_with(&session(true), roots());
+        assert!(has_text(&frame, "general"));
+        let frame = tick_native(vec![item(props, &encoded(&session(false)))]);
+        assert!(has_text(&frame, "Not connected"));
+        assert!(!has_text(&frame, "general"));
+        assert!(!has_text(&frame, "# ops · Unread"));
+        let mut mounted = Vec::new();
+        surfaces(frame.root.as_ref().unwrap(), &mut mounted);
+        assert!(mounted.is_empty(), "no disconnected composer offers a send");
+    });
+}
+
 /// A chat block re-reads the room through the live subscription.
 #[test]
 fn a_live_hit_reads_the_room_again() {

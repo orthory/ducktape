@@ -159,6 +159,9 @@ impl super::ChatView {
         )
     }
     pub(super) fn chat_screen(&self, use_scope: String) -> wire::Node {
+        if !self.connected {
+            return self.disconnected(format!("{use_scope}/disconnected"));
+        }
         let _component_owner =
             ::ducktape_view_guest::slots::component("ChatScreen", &use_scope, false);
         {

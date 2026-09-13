@@ -26,7 +26,7 @@ impl FilesView {
         if !self.notice.is_empty() {
             children.push(native::text("FilesView/notice", self.notice.clone()));
         }
-        if self.omitted > 0 {
+        if self.connected && self.omitted > 0 {
             children.push(native::row(
                 "FilesView/omissions",
                 [

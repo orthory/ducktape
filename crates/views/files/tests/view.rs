@@ -233,6 +233,17 @@ fn a_connected_view_lists_its_own_directory() {
     assert!(has_text(&frame, "first commit"), "{:?}", texts(&frame));
 }
 
+#[test]
+fn disconnect_hides_retained_listing_and_write_controls() {
+    let (frame, held) = connected_with_listing();
+    assert!(has_text(&frame, "README.md"));
+    let frame = tick_native(vec![item(held.session, &session(false))]);
+    assert!(has_text(&frame, "Not connected"));
+    for stale in ["README.md", "1 file · 1 dir", "+ Folder", "+ File"] {
+        assert!(!has_text(&frame, stale), "disconnected claim: {stale}");
+    }
+}
+
 /// Opening a directory reads THAT directory, and the rows on hand go silent
 /// until its own listing lands — a tally of the directory you left, printed
 /// under the one you opened, is wrong in every word.
