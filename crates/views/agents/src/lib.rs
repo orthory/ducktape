@@ -71,7 +71,7 @@ impl AgentsView {
                 "agents/summary",
                 match self.panel.as_str() {
                     "runs" => host::runs_summary(&self.runs),
-                    _ => host::agents_summary(&self.rows),
+                    _ => host::agents_summary(self.connected, &self.rows),
                 },
             ));
             for (panel, label) in [("registry", "Registry"), ("runs", "Runs")] {
@@ -481,7 +481,7 @@ impl AgentsView {
                         Some(Message::SetSkillAlways(value))
                     }))),
                     style: Default::default(),
-                    options: Default::default(),
+                    width: Some(Length::Fill),
                 },
                 action(
                     "agents/add-skill",
@@ -508,7 +508,6 @@ impl AgentsView {
         kit::column("agents/editor-content", items)
     }
 }
-#[allow(dead_code)]
 pub struct AgentsView {
     pub(crate) rows: Vec<crate::host::AgentRow>,
     pub(crate) runs: Vec<crate::host::RunRow>,
@@ -586,7 +585,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl AgentsView {
     fn state() -> Self {
         Self {
@@ -638,16 +636,14 @@ impl AgentsView {
                 name: String::from("AgentsView"),
                 fields: vec![
                     (String::from("rows"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.rows).iter()
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self.rows.iter()
                     .map(| item | ::ducktape_view_guest::wire::SnapshotValue::Record {
                     name : String::from("AgentRow"), fields :
                     ::std::vec![(String::from("id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).id))), (String::from("name"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).name))), (String::from("initials"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).initials))), (String::from("capability"),
+                    (item).name))), (String::from("capability"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).capability))), (String::from("status"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
@@ -656,9 +652,9 @@ impl AgentsView {
                     (item).owner_handle))), (String::from("controller"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).controller))), (String::from("live"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (item).live))),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool((item).live)),
                     (String::from("skills"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& (item).skills)
+                    ::ducktape_view_guest::wire::SnapshotValue::List((item).skills
                     .iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("AgentSkill"), fields :
@@ -669,9 +665,9 @@ impl AgentsView {
                     (item).source_prefix))), (String::from("source_snapshot"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).source_snapshot))), (String::from("always"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (item)
-                    .always)))] }).collect()))] }).collect())), (String::from("runs"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.runs).iter()
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool((item)
+                    .always))] }).collect()))] }).collect())), (String::from("runs"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self.runs.iter()
                     .map(| item | ::ducktape_view_guest::wire::SnapshotValue::Record {
                     name : String::from("RunRow"), fields :
                     ::std::vec![(String::from("run_id"),
@@ -691,27 +687,27 @@ impl AgentsView {
                     (item).dispatched))), (String::from("settled"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).settled))), (String::from("attempt"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item)
-                    .attempt))), (String::from("holder"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64((item)
+                    .attempt)), (String::from("holder"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).holder))), (String::from("actions"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item)
-                    .actions))), (String::from("degraded"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (item)
-                    .degraded))), (String::from("reason"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64((item)
+                    .actions)), (String::from("degraded"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool((item)
+                    .degraded)), (String::from("reason"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).reason))), (String::from("output_ref"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).output_ref))), (String::from("pr_number"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item)
-                    .pr_number)))] }).collect())), (String::from("journal"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64((item)
+                    .pr_number))] }).collect())), (String::from("journal"),
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("RunJournal"), fields :
                     ::std::vec![(String::from("dispatch_id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.journal).dispatch_id))), (String::from("entries"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& (& self.journal)
-                    .entries).iter().map(| item |
+                    self.journal.dispatch_id))), (String::from("entries"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self.journal
+                    .entries.iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("JournalEntry"), fields :
                     ::std::vec![(String::from("height"),
@@ -723,7 +719,7 @@ impl AgentsView {
                     (item).summary))), (String::from("status"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).status))), (String::from("targets"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& (item).targets)
+                    ::ducktape_view_guest::wire::SnapshotValue::List((item).targets
                     .iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("RunLink"), fields :
@@ -737,8 +733,8 @@ impl AgentsView {
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).url)))] }).collect()))] }).collect())),
                     (String::from("links"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& (& self.journal)
-                    .links).iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self.journal
+                    .links.iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("RunLink"), fields :
                     ::std::vec![(String::from("relation"),
@@ -753,103 +749,103 @@ impl AgentsView {
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("LiveRun"), fields :
                     ::std::vec![(String::from("present"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (& self.live)
-                    .present))), (String::from("status"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self.live
+                    .present)), (String::from("status"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.live).status))), (String::from("activity"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& (& self.live)
-                    .activity).iter().map(| item |
+                    self.live.status))), (String::from("activity"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self.live
+                    .activity.iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("LiveActivity"), fields :
                     ::std::vec![(String::from("label"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).label))), (String::from("done"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (item).done)))]
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool((item).done))]
                     }).collect())), (String::from("answer_preview"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.live).answer_preview)))] }), (String::from("panel"),
+                    self.live.answer_preview)))] }), (String::from("panel"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.panel))), (String::from("open_run"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.open_run))), (String::from("journal_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .journal_width))), (String::from("editor_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .editor_width))), (String::from("viewport_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .viewport_width))), (String::from("expanded_receipt"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(self
+                    .journal_width)), (String::from("editor_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(self
+                    .editor_width)), (String::from("viewport_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(self
+                    .viewport_width)), (String::from("expanded_receipt"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.expanded_receipt))), (String::from("open_row"),
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("RunRow"), fields : ::std::vec![(String::from("run_id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).run_id))), (String::from("dispatch_id"),
+                    self.open_row.run_id))), (String::from("dispatch_id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).dispatch_id))), (String::from("agent_id"),
+                    self.open_row.dispatch_id))), (String::from("agent_id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).agent_id))), (String::from("agent_name"),
+                    self.open_row.agent_id))), (String::from("agent_name"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).agent_name))), (String::from("origin"),
+                    self.open_row.agent_name))), (String::from("origin"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).origin))), (String::from("state"),
+                    self.open_row.origin))), (String::from("state"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).state))), (String::from("dispatched"),
+                    self.open_row.state))), (String::from("dispatched"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).dispatched))), (String::from("settled"),
+                    self.open_row.dispatched))), (String::from("settled"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).settled))), (String::from("attempt"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
-                    .open_row).attempt))), (String::from("holder"),
+                    self.open_row.settled))), (String::from("attempt"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self
+                    .open_row.attempt)), (String::from("holder"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).holder))), (String::from("actions"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
-                    .open_row).actions))), (String::from("degraded"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (& self
-                    .open_row).degraded))), (String::from("reason"),
+                    self.open_row.holder))), (String::from("actions"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self
+                    .open_row.actions)), (String::from("degraded"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .open_row.degraded)), (String::from("reason"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).reason))), (String::from("output_ref"),
+                    self.open_row.reason))), (String::from("output_ref"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.open_row).output_ref))), (String::from("pr_number"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
-                    .open_row).pr_number)))] }), (String::from("opened"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self.opened))),
+                    self.open_row.output_ref))), (String::from("pr_number"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self
+                    .open_row.pr_number))] }), (String::from("opened"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self.opened)),
                     (String::from("capabilities"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self
-                    .capabilities).iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self
+                    .capabilities.iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(item)))
                     .collect())), (String::from("account"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.account))), (String::from("committed"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .committed))), (String::from("seeded"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self.seeded))),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self
+                    .committed)), (String::from("seeded"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self.seeded)),
                     (String::from("connected"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .connected))), (String::from("connection_serial"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .connection_serial))), (String::from("answered"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .answered))), (String::from("host_error"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .connected)), (String::from("connection_serial"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(self
+                    .connection_serial)), (String::from("answered"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .answered)), (String::from("host_error"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.host_error))), (String::from("selected"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.selected))), (String::from("creating"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .creating))), (String::from("can_edit"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .can_edit))), (String::from("selected_status"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .creating)), (String::from("can_edit"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .can_edit)), (String::from("selected_status"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.selected_status))), (String::from("draft_id"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.draft_id))), (String::from("draft_name"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.draft_name))), (String::from("draft_capability"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Option((& self
-                    .draft_capability).as_ref().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::Option(self
+                    .draft_capability.as_ref().map(| item |
                     Box::new(::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(item)))))),
                     (String::from("draft_skills"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self
-                    .draft_skills).iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::List(self
+                    .draft_skills.iter().map(| item |
                     ::ducktape_view_guest::wire::SnapshotValue::Record { name :
                     String::from("AgentSkill"), fields :
                     ::std::vec![(String::from("name"),
@@ -859,17 +855,17 @@ impl AgentsView {
                     (item).source_prefix))), (String::from("source_snapshot"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     (item).source_snapshot))), (String::from("always"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& (item)
-                    .always)))] }).collect())), (String::from("skill_name"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool((item)
+                    .always))] }).collect())), (String::from("skill_name"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.skill_name))), (String::from("skill_prefix"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.skill_prefix))), (String::from("skill_snapshot"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.skill_snapshot))), (String::from("skill_always"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .skill_always))), (String::from("sent"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self.sent)))
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self
+                    .skill_always)), (String::from("sent"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(self.sent))
                 ],
             },
         }
@@ -883,8 +879,8 @@ impl AgentsView {
         let value = snapshot.state;
         ((|| {
             let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name: name,
-                fields: fields,
+                name,
+                fields,
             } = value else {
                 return None;
             };
@@ -902,12 +898,12 @@ impl AgentsView {
                         .into_iter()
                         .map(|item| (|| {
                             let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: name,
-                                fields: fields,
+                                name,
+                                fields,
                             } = item else {
                                 return None;
                             };
-                            if name != "AgentRow" || fields.len() != 9 {
+                            if name != "AgentRow" || fields.len() != 8 {
                                 return None;
                             }
                             let mut fields = fields.into_iter();
@@ -917,10 +913,6 @@ impl AgentsView {
                             }
                             let (name, field_1) = fields.next()?;
                             if name != "name" {
-                                return None;
-                            }
-                            let (name, field_2) = fields.next()?;
-                            if name != "initials" {
                                 return None;
                             }
                             let (name, field_3) = fields.next()?;
@@ -955,12 +947,6 @@ impl AgentsView {
                                     _ => None,
                                 })?,
                                 name: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                initials: (match field_2 {
                                     ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
                                         Some(item)
                                     }
@@ -1002,8 +988,8 @@ impl AgentsView {
                                             .into_iter()
                                             .map(|item| (|| {
                                                 let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name: name,
-                                                    fields: fields,
+                                                    name,
+                                                    fields,
                                                 } = item else {
                                                     return None;
                                                 };
@@ -1074,8 +1060,8 @@ impl AgentsView {
                         .into_iter()
                         .map(|item| (|| {
                             let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: name,
-                                fields: fields,
+                                name,
+                                fields,
                             } = item else {
                                 return None;
                             };
@@ -1246,8 +1232,8 @@ impl AgentsView {
             }
             let journal: crate::host::RunJournal = ((|| {
                 let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
+                    name,
+                    fields,
                 } = value else {
                     return None;
                 };
@@ -1280,8 +1266,8 @@ impl AgentsView {
                                 .into_iter()
                                 .map(|item| (|| {
                                     let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name: name,
-                                        fields: fields,
+                                        name,
+                                        fields,
                                     } = item else {
                                         return None;
                                     };
@@ -1340,8 +1326,8 @@ impl AgentsView {
                                                     .into_iter()
                                                     .map(|item| (|| {
                                                         let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                            name: name,
-                                                            fields: fields,
+                                                            name,
+                                                            fields,
                                                         } = item else {
                                                             return None;
                                                         };
@@ -1408,8 +1394,8 @@ impl AgentsView {
                                 .into_iter()
                                 .map(|item| (|| {
                                     let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name: name,
-                                        fields: fields,
+                                        name,
+                                        fields,
                                     } = item else {
                                         return None;
                                     };
@@ -1472,8 +1458,8 @@ impl AgentsView {
             }
             let live: crate::host::LiveRun = ((|| {
                 let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
+                    name,
+                    fields,
                 } = value else {
                     return None;
                 };
@@ -1516,8 +1502,8 @@ impl AgentsView {
                                 .into_iter()
                                 .map(|item| (|| {
                                     let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name: name,
-                                        fields: fields,
+                                        name,
+                                        fields,
                                     } = item else {
                                         return None;
                                     };
@@ -1620,8 +1606,8 @@ impl AgentsView {
             }
             let open_row: crate::host::RunRow = ((|| {
                 let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
+                    name,
+                    fields,
                 } = value else {
                     return None;
                 };
@@ -1939,8 +1925,8 @@ impl AgentsView {
                         .into_iter()
                         .map(|item| (|| {
                             let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: name,
-                                fields: fields,
+                                name,
+                                fields,
                             } = item else {
                                 return None;
                             };
@@ -2036,76 +2022,67 @@ impl AgentsView {
                 _ => None,
             })?;
             Some(Self {
-                rows: rows,
-                runs: runs,
-                journal: journal,
-                live: live,
-                panel: panel,
-                open_run: open_run,
-                journal_width: journal_width,
-                editor_width: editor_width,
-                viewport_width: viewport_width,
-                expanded_receipt: expanded_receipt,
-                open_row: open_row,
-                opened: opened,
-                capabilities: capabilities,
-                account: account,
-                committed: committed,
-                seeded: seeded,
-                connected: connected,
-                connection_serial: connection_serial,
-                answered: answered,
-                host_error: host_error,
-                selected: selected,
-                creating: creating,
-                can_edit: can_edit,
-                selected_status: selected_status,
-                draft_id: draft_id,
-                draft_name: draft_name,
-                draft_capability: draft_capability,
-                draft_skills: draft_skills,
-                skill_name: skill_name,
-                skill_prefix: skill_prefix,
-                skill_snapshot: skill_snapshot,
-                skill_always: skill_always,
-                sent: sent,
+                rows,
+                runs,
+                journal,
+                live,
+                panel,
+                open_run,
+                journal_width,
+                editor_width,
+                viewport_width,
+                expanded_receipt,
+                open_row,
+                opened,
+                capabilities,
+                account,
+                committed,
+                seeded,
+                connected,
+                connection_serial,
+                answered,
+                host_error,
+                selected,
+                creating,
+                can_edit,
+                selected_status,
+                draft_id,
+                draft_name,
+                draft_capability,
+                draft_skills,
+                skill_name,
+                skill_prefix,
+                skill_snapshot,
+                skill_always,
+                sent,
             })
         })())
             .ok_or_else(|| String::from("snapshot state mismatch"))
     }
 }
-#[allow(unused_parens)]
 impl AgentsView {
     fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
+        let run_open = self.connected && !self.open_run.is_empty();
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([crate::host::register(
-                    self.connection_serial,
-                )
-                .map(move |value| Message::RegisterArrived(value))])
+                host::register(self.connection_serial).map(Message::RegisterArrived)
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (!(self.open_run).is_empty())) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::run_journal(
-                    self.open_run.to_owned(),
-                    self.connection_serial,
-                )
-                .map(move |value| Message::JournalArrived(value))])
+            if run_open {
+                host::run_journal(self.open_run.to_owned(), self.connection_serial)
+                    .map(Message::JournalArrived)
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (!(self.open_run).is_empty())) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::live_run(
-                    self.open_run.to_owned(),
-                    self.connection_serial,
-                )
-                .map(move |value| Message::LiveArrived(value))])
+            if run_open {
+                host::live_run(self.open_run.to_owned(), self.connection_serial)
+                    .map(Message::LiveArrived)
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }
@@ -2114,19 +2091,39 @@ mod tests {
     use super::*;
     #[test]
     fn view_fits_default_stack() {
-        ::std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let (app, _) = AgentsView::boot();
-                let _ = app.view();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        let (app, _) = AgentsView::boot();
+        let _ = app.view();
+    }
+
+    #[test]
+    fn snapshot_preserves_editor_and_journal_state() {
+        let (mut app, _) = AgentsView::boot();
+        app.selected = "reviewer".into();
+        app.draft_name = "Reviewer 한글".into();
+        app.draft_capability = Some("review".into());
+        app.draft_skills = vec![host::AgentSkill {
+            name: "review".into(),
+            source_prefix: "/shared/skills/review".into(),
+            source_snapshot: "pinned".into(),
+            always: true,
+        }];
+        app.rows.push(host::AgentRow {
+            id: "reviewer".into(),
+            name: "Reviewer 한글".into(),
+            capability: "review".into(),
+            skills: app.draft_skills.clone(),
+            ..Default::default()
+        });
+        app.open_run = "dispatch".into();
+        app.expanded_receipt = "dispatch".into();
+        app.journal_width = 480.;
+        app.editor_width = 470.;
+        let bytes = app.snapshot().unwrap();
+        let restored = AgentsView::restore(&bytes).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), bytes);
     }
 }
 impl AgentsView {
-    #[allow(clippy::assign_op_pattern)]
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
         match message {
             Message::JournalResized(dx, _dy) => self.on_journal_resized(dx, _dy),
@@ -2165,7 +2162,7 @@ impl AgentsView {
             {
                 self.journal_width = crate::host::journal_width_after_delta(
                     self.journal_width,
-                    (-dx),
+                    -dx,
                     self.viewport_width,
                 );
             }
@@ -2177,7 +2174,7 @@ impl AgentsView {
             {
                 self.editor_width = crate::host::editor_width_after_delta(
                     self.editor_width,
-                    (-dx),
+                    -dx,
                     self.viewport_width,
                 );
             }
@@ -2208,7 +2205,7 @@ impl AgentsView {
         {
             {
                 self.expanded_receipt = crate::host::pick_str(
-                    (self.expanded_receipt != value),
+                    self.expanded_receipt != value,
                     ::std::convert::AsRef::as_ref(&(value)),
                     ::std::convert::AsRef::as_ref(&("")),
                 );
@@ -2224,7 +2221,7 @@ impl AgentsView {
             {
                 self.host_error = item.error.to_owned();
             }
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
@@ -2250,7 +2247,7 @@ impl AgentsView {
                     ::std::convert::AsRef::as_ref(&(self.open_run)),
                 );
             }
-            let door_pressed = ((next.opened != self.opened) && (!(next.open_run).is_empty()));
+            let door_pressed = (next.opened != self.opened) && (!(next.open_run).is_empty());
             {
                 self.opened = next.opened;
             }
@@ -2288,7 +2285,7 @@ impl AgentsView {
             {
                 self.answered = true;
             }
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             {
@@ -2307,9 +2304,9 @@ impl AgentsView {
                 );
             }
             {
-                self.sent = (crate::host::badge(crate::host::working_agents(
+                self.sent = crate::host::badge(crate::host::working_agents(
                     ::std::convert::AsRef::as_ref(&(self.rows)),
-                )));
+                ));
             }
             let consumed = crate::host::drafts_consumed(
                 self.committed,
@@ -2323,13 +2320,13 @@ impl AgentsView {
             }
             {
                 self.selected = crate::host::pick_str(
-                    (consumed && self.creating),
+                    consumed && self.creating,
                     ::std::convert::AsRef::as_ref(&(self.draft_id)),
                     ::std::convert::AsRef::as_ref(&(self.selected)),
                 );
             }
             {
-                self.creating = (self.creating && (!consumed));
+                self.creating = self.creating && (!consumed);
             }
             let row = crate::host::row_named(
                 ::std::convert::AsRef::as_ref(&(self.rows)),
@@ -2377,7 +2374,7 @@ impl AgentsView {
             {
                 self.host_error = item.error.to_owned();
             }
-            if ((!(item.error).is_empty()) || (item.journal.dispatch_id != self.open_run)) {
+            if (!(item.error).is_empty()) || (item.journal.dispatch_id != self.open_run) {
                 return ::ducktape_view_guest::Task::none();
             }
             {
@@ -2402,11 +2399,11 @@ impl AgentsView {
             {
                 self.host_error = item.error.to_owned();
             }
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             {
-                self.committed = (self.committed + 1);
+                self.committed += 1;
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2473,7 +2470,7 @@ impl AgentsView {
                 self.creating = true;
             }
             {
-                self.can_edit = (self.connected && (!(self.account).is_empty()));
+                self.can_edit = self.connected && (!(self.account).is_empty());
             }
             {
                 self.draft_id = "".to_owned();
@@ -2660,8 +2657,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.sent =
-                    (crate::host::status(::std::convert::AsRef::as_ref(&(agent_id)), paused));
+                self.sent = crate::host::status(::std::convert::AsRef::as_ref(&(agent_id)), paused);
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2669,7 +2665,7 @@ impl AgentsView {
     fn on_submit_save(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.sent = (crate::host::save(
+                self.sent = crate::host::save(
                     ::std::convert::AsRef::as_ref(&(self.selected)),
                     ::std::convert::AsRef::as_ref(&(self.draft_name)),
                     ::std::convert::AsRef::as_ref(
@@ -2678,7 +2674,7 @@ impl AgentsView {
                         ))),
                     ),
                     ::std::convert::AsRef::as_ref(&(self.draft_skills)),
-                ));
+                );
             }
             ::ducktape_view_guest::Task::none()
         }
