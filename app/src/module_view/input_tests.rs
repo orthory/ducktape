@@ -114,7 +114,26 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
         (&["Manage reactions"][..], "🦆", true),
     ] {
         let seat = seated(opened);
-        let (_, mut native) = open(cx);
+        let (view, mut native) = open(cx);
+        let focus = if reacted { "reaction" } else { "action" };
+        native.update(|window, cx| {
+            let content = view.read(cx).content.clone().unwrap();
+            content.update(cx, |tree, cx| {
+                let reply = tree
+                    .execute_widget_command(
+                        wire::WidgetCommand::Focused {
+                            target: format!("ChatView/chat/message-{focus}-focus"),
+                        },
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                assert!(
+                    wire::decode::<bool>(&reply).unwrap(),
+                    "guest menu requests real native focus"
+                );
+            });
+        });
         let key = button(&seat, label);
         native.update(|window, _| {
             assert!(
