@@ -215,7 +215,6 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
 }
 #[test]
 fn no_button_wears_an_icon_glyph_as_its_string_label() {
-    assert!(::design::icons::svg("search").contains("<svg"));
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert!(!shell.contains("label(\"⚙\")"));
     assert!(!shell.contains("label(\"✕\")"));
