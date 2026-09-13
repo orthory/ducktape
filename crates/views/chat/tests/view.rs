@@ -415,8 +415,8 @@ fn edited_annotations_reach_author_continuation_and_thread_rows() {
             + node.children().iter().map(annotations).sum::<usize>()
     }
     on_a_deep_stack(|| {
-        let mut first = row(1, "first edited"); first["edited"] = true.into();
-        let mut second = row(2, "second edited"); second["edited"] = true.into(); second["reply_count"] = 1.into();
+        let mut first = row(1, "first edited"); first["rev"] = 1.into();
+        let mut second = row(2, "second edited"); second["rev"] = 1.into(); second["reply_count"] = 1.into();
         let window = serde_json::json!({"roots":{"roots":[first,second.clone()],"has_more":false}}).to_string().into_bytes();
         let (frame, _) = connected_room_reading(window);
         assert_eq!(annotations(node_ending(&frame, "/message-stream")), 2);
@@ -424,7 +424,7 @@ fn edited_annotations_reach_author_continuation_and_thread_rows() {
         // A thread remains independently annotated when its root and a reply
         // share the same author, just like adjacent timeline messages.
         let read = request(&frame, "rpc.view").id;
-        let mut third = reply(3, "edited reply", 2); third["edited"] = true.into();
+        let mut third = reply(3, "edited reply", 2); third["rev"] = 1.into();
         let page = serde_json::json!({"thread":{"root":second,"replies":[third],"has_more":false,"next_reply_seq":null}}).to_string();
         let frame = tick_native(vec![answer(read, page.as_bytes())]);
         assert_eq!(annotations(node_ending(&frame, "/thread-stream")), 2);
