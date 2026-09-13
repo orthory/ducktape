@@ -614,8 +614,8 @@ impl Ducktape {
     fn on_set_appearance_light(&mut self) -> Task<AppMessage> {
         self.appearance = Appearance::Light;
         let pending_task = Task::perform(
-            crate::backend::save_appearance(self.appearance.clone()),
-            |value| AppMessage::AppearanceSaved(value),
+            crate::backend::save_appearance(self.appearance),
+            AppMessage::AppearanceSaved,
         );
         self.appearance_save_generation = self.appearance_save_generation.wrapping_add(1);
         let request_generation = self.appearance_save_generation;
@@ -633,8 +633,8 @@ impl Ducktape {
     fn on_set_appearance_dark(&mut self) -> Task<AppMessage> {
         self.appearance = Appearance::Dark;
         let pending_task = Task::perform(
-            crate::backend::save_appearance(self.appearance.clone()),
-            |value| AppMessage::AppearanceSaved(value),
+            crate::backend::save_appearance(self.appearance),
+            AppMessage::AppearanceSaved,
         );
         self.appearance_save_generation = self.appearance_save_generation.wrapping_add(1);
         let request_generation = self.appearance_save_generation;
@@ -691,7 +691,7 @@ impl Ducktape {
         if let Some(previous_handle) = self.live_resync_task.take() {
             previous_handle.abort();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Idle;
         self.loading = true;
@@ -743,7 +743,7 @@ impl Ducktape {
         self.bell_unread = 0;
         self.bell_read_through = 0;
         self.bell_clear_through = 0;
-        self.connect_generation = self.connect_generation + 1;
+        self.connect_generation += 1;
         let pending_task = Task::perform(
             crate::backend::connect(
                 self.connected_rpc.to_owned(),
@@ -773,8 +773,8 @@ impl Ducktape {
         self.rpc = next.rpc.to_owned();
         self.connected_rpc = next.rpc.to_owned();
         self.network_name = crate::backend::network_label(
-            self.network_chain_id.to_owned(),
-            self.connected_rpc.to_owned(),
+            &self.network_chain_id,
+            &self.connected_rpc,
         );
         self.status = next.status.to_owned();
         self.block_height = next.height;
@@ -846,12 +846,12 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.hydration_retry_attempt = 0;
         self.error = "".to_owned();
-        self.members_generation = self.members_generation + 1;
+        self.members_generation += 1;
         self.agents_open_run = "".to_owned();
         self.agents_live = false;
-        self.account_generation = self.account_generation + 1;
-        self.settings_generation = self.settings_generation + 1;
-        self.dm_peers_generation = self.dm_peers_generation + 1;
+        self.account_generation += 1;
+        self.settings_generation += 1;
+        self.dm_peers_generation += 1;
         Task::batch([
             {
                 let pending_task = Task::perform(
@@ -1007,17 +1007,17 @@ impl Ducktape {
             },
             crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
                 self.huddle_joined,
-                self.huddle_win.clone(),
+                self.huddle_win,
             )),
             Task::done(AppMessage::ConsoleEntryAnswered),
         ])
     }
     fn on_console_entry_answered(&mut self) -> Task<AppMessage> {
-        match self.console_entry.clone() {
+        match self.console_entry {
             ConsoleEntry::Entering => {
                 self.console_entry = ConsoleEntry::Idle;
                 let (_, pending_task) = crate::shell::open(crate::shell::WindowKind::Console);
-                pending_task.map(move |value| AppMessage::ConsoleOpened(value))
+                pending_task.map(AppMessage::ConsoleOpened)
             }
             ConsoleEntry::Idle => {
                 self.console_entry = ConsoleEntry::Idle;
@@ -1031,7 +1031,7 @@ impl Ducktape {
             crate::backend::keep_i64(next.height >= 0, next.height, self.block_height);
         self.views_live_serial =
             crate::module_view::view_block_hit(self.block_height, self.views_live_serial);
-        match next.kind.clone() {
+        match next.kind {
             LiveKind::Retry => {
                 {
                     return Task::none();
@@ -1045,7 +1045,7 @@ impl Ducktape {
                 Task::none()
             }
             LiveKind::Ready => {
-                self.hydration_generation = self.hydration_generation + 1;
+                self.hydration_generation += 1;
                 self.hydration_retry_attempt = 0;
                 let pending_task = Task::perform(
                     crate::backend::live_resync_load(
@@ -1107,7 +1107,7 @@ impl Ducktape {
                 if !folded_chat.refresh_chat {
                     return Task::none();
                 }
-                self.hydration_generation = self.hydration_generation + 1;
+                self.hydration_generation += 1;
                 self.hydration_retry_attempt = 0;
                 let pending_task = Task::perform(
                     crate::backend::live_resync_load(
@@ -1222,7 +1222,7 @@ impl Ducktape {
                     crate::module_view::view_live_hit(&(next.module), self.views_live_serial);
                 self.members_generation = crate::backend::keep_i64(
                     crate::backend::plane_live_hit(
-                        next.kind.clone(),
+                        next.kind,
                         next.module.to_owned(),
                         "valset".to_owned(),
                     ),
@@ -1231,7 +1231,7 @@ impl Ducktape {
                 );
                 self.account_generation = crate::backend::keep_i64(
                     crate::backend::plane_live_hit(
-                        next.kind.clone(),
+                        next.kind,
                         next.module.to_owned(),
                         "identity".to_owned(),
                     ),
@@ -1240,7 +1240,7 @@ impl Ducktape {
                 );
                 self.dm_peers_generation = crate::backend::keep_i64(
                     crate::backend::plane_live_hit(
-                        next.kind.clone(),
+                        next.kind,
                         next.module.to_owned(),
                         "identity".to_owned(),
                     ),
@@ -1250,7 +1250,7 @@ impl Ducktape {
                 Task::batch([
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
-                            next.kind.clone(),
+                            next.kind,
                             next.module.to_owned(),
                             "valset".to_owned(),
                         ),
@@ -1262,7 +1262,7 @@ impl Ducktape {
                     .map(AppMessage::MembersLoadSelected),
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
-                            next.kind.clone(),
+                            next.kind,
                             next.module.to_owned(),
                             "identity".to_owned(),
                         ),
@@ -1274,7 +1274,7 @@ impl Ducktape {
                     .map(AppMessage::AccountLoadSelected),
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
-                            next.kind.clone(),
+                            next.kind,
                             next.module.to_owned(),
                             "identity".to_owned(),
                         ),
@@ -1286,7 +1286,7 @@ impl Ducktape {
                     .map(AppMessage::DmPeersLoadSelected),
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
-                            next.kind.clone(),
+                            next.kind,
                             next.module.to_owned(),
                             "identity".to_owned(),
                         ),
@@ -1304,7 +1304,7 @@ impl Ducktape {
                 if !next.load_chat {
                     return Task::none();
                 }
-                self.hydration_generation = self.hydration_generation + 1;
+                self.hydration_generation += 1;
                 self.hydration_retry_attempt = 0;
                 let pending_task = Task::perform(
                     crate::backend::live_resync_load(
@@ -1427,7 +1427,7 @@ impl Ducktape {
         let resync_tail_channel = crate::backend::keep_str(
             (!self.history_view) && (self.shell_tab == ShellTab::Chat),
             &self.active_channel,
-            (""),
+            "" ,
         );
         self.unread_boundary = crate::backend::frozen_unread_boundary(
             self.channel_reads.clone(),
@@ -1452,11 +1452,11 @@ impl Ducktape {
             self.channel_reads.clone(),
         );
         self.mutation_phase =
-            crate::backend::mutation_phase_after_recovery(self.mutation_phase.clone());
+            crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
             self.huddle_joined,
-            self.huddle_win.clone(),
+            self.huddle_win,
         ))
     }
     fn on_live_resync_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -1465,7 +1465,7 @@ impl Ducktape {
         }
         self.status = "Sync delayed".to_owned();
         self.error = "Live sync interrupted. Retrying…".to_owned();
-        self.hydration_retry_attempt = self.hydration_retry_attempt + 1;
+        self.hydration_retry_attempt += 1;
         let pending_task = Task::perform(
             crate::backend::live_resync_load(
                 self.connected_rpc.to_owned(),
@@ -1514,11 +1514,11 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.shell_tab = next.clone();
+        self.shell_tab = next;
         let chat_tab_channel = crate::backend::keep_str(
             (self.shell_tab == ShellTab::Chat) && (!self.history_view),
             &self.active_channel,
-            (""),
+            "" ,
         );
         let chat_tab_arrivals =
             crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned())
@@ -1556,8 +1556,8 @@ impl Ducktape {
         if (self.shell_tab == ShellTab::Chat) || (self.shell_tab == ShellTab::Pages) {
             return Task::none();
         }
-        self.members_generation = self.members_generation + 1;
-        self.account_generation = self.account_generation + 1;
+        self.members_generation += 1;
+        self.account_generation += 1;
         self.settings_generation = crate::backend::keep_i64(
             self.shell_tab == ShellTab::Settings,
             self.settings_generation + 1,
@@ -1565,7 +1565,7 @@ impl Ducktape {
         );
         Task::batch([
             Task::done(crate::backend::load_request(
-                crate::backend::tab_reads_plane(self.shell_tab.clone(), "members".to_owned()),
+                crate::backend::tab_reads_plane(self.shell_tab, "members".to_owned()),
                 self.connected_rpc.to_owned(),
                 "".to_owned(),
                 self.members_generation,
@@ -1581,7 +1581,7 @@ impl Ducktape {
             .and_then(Task::done)
             .map(AppMessage::SettingsLoadSelected),
             Task::done(crate::backend::load_request(
-                crate::backend::tab_reads_plane(self.shell_tab.clone(), "account".to_owned()),
+                crate::backend::tab_reads_plane(self.shell_tab, "account".to_owned()),
                 self.connected_rpc.to_owned(),
                 "".to_owned(),
                 self.account_generation,
@@ -1716,7 +1716,7 @@ impl Ducktape {
         if obsolete_request {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         let pending_task = Task::perform(
             crate::backend::live_resync_load(
@@ -1746,7 +1746,7 @@ impl Ducktape {
         })
     }
     fn on_tick(&mut self) -> Task<AppMessage> {
-        self.huddle_now = self.huddle_now + 1;
+        self.huddle_now += 1;
         Task::none()
     }
     fn on_wall_tick(&mut self) -> Task<AppMessage> {
@@ -1758,14 +1758,14 @@ impl Ducktape {
             (self.onboarding_win == Some(id)) && (self.hub_step == HubStep::Account);
         let closed_account = self.console_win == Some(id);
         let retirement = crate::backend::ceremony_retirement(closed_welcome, closed_account);
-        self.onboarding_win = crate::backend::without_window(self.onboarding_win.clone(), id);
-        self.console_win = crate::backend::without_window(self.console_win.clone(), id);
-        self.huddle_win = crate::backend::without_window(self.huddle_win.clone(), id);
+        self.onboarding_win = crate::backend::without_window(self.onboarding_win, id);
+        self.console_win = crate::backend::without_window(self.console_win, id);
+        self.huddle_win = crate::backend::without_window(self.huddle_win, id);
         let leaving = crate::backend::last_window_closed_exits(
-            self.console_win.clone(),
-            self.onboarding_win.clone(),
+            self.console_win,
+            self.onboarding_win,
         );
-        match retirement.clone() {
+        match retirement {
             CeremonyRetirement::Welcome => {
                 self.welcome_qr_auth_generation = self.welcome_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.welcome_qr_auth_task.take() {
@@ -1815,20 +1815,20 @@ impl Ducktape {
         }
     }
     fn on_tray_open(&mut self) -> Task<AppMessage> {
-        let window_tracked = (self.console_win != None) || (self.onboarding_win != None);
+        let window_tracked = self.console_win.is_some() || self.onboarding_win.is_some();
         let opening = crate::backend::tray_open_action(self.connected, window_tracked);
-        match opening.clone() {
+        match opening {
             TrayOpen::Launch => {
                 let (_, pending_task) = crate::shell::open(crate::shell::WindowKind::Onboarding);
-                pending_task.map(move |value| AppMessage::OnboardingOpened(value))
+                pending_task.map(AppMessage::OnboardingOpened)
             }
             TrayOpen::Console => Task::done(AppMessage::NetworkEntered),
             TrayOpen::Raise => Task::batch([
                 crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                    self.console_win.clone(),
+                    self.console_win,
                 )),
                 crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                    self.onboarding_win.clone(),
+                    self.onboarding_win,
                 )),
             ]),
         }
@@ -1859,7 +1859,7 @@ impl Ducktape {
     }
     fn on_close_launch_window(&mut self) -> Task<AppMessage> {
         crate::shell::close::<AppMessage>(crate::backend::window_target(
-            self.onboarding_win.clone(),
+            self.onboarding_win,
         ))
     }
     fn on_window_focused(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
@@ -1867,12 +1867,12 @@ impl Ducktape {
         crate::backend::note_window_focus(true).discard()
     }
     fn on_window_unfocused(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
-        self.focused_win = crate::backend::without_window(self.focused_win.clone(), id);
+        self.focused_win = crate::backend::without_window(self.focused_win, id);
         crate::backend::note_window_focus(self.focused_win.is_some()).discard()
     }
     fn on_command_chord_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
         let chord = crate::backend::command_chord(event.key.clone(), event.modifiers);
-        match chord.clone() {
+        match chord {
             CommandChord::Quit => {
                 self.welcome_qr_auth_generation = self.welcome_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.welcome_qr_auth_task.take() {
@@ -1895,7 +1895,7 @@ impl Ducktape {
                 crate::shell::quit::<AppMessage>()
             }
             CommandChord::CloseWindow => crate::shell::close::<AppMessage>(
-                crate::backend::window_target(self.focused_win.clone()),
+                crate::backend::window_target(self.focused_win),
             ),
             CommandChord::Ignored => {
                 {
@@ -1906,64 +1906,64 @@ impl Ducktape {
         }
     }
     fn on_tray_open_bell(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         self.bell_open = true;
-        crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win.clone()))
+        crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win))
     }
     fn on_tray_go_chat(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             Task::done(AppMessage::SelectShellTab(ShellTab::Chat)),
         ])
     }
     fn on_tray_go_pages(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             Task::done(AppMessage::SelectShellTab(ShellTab::Pages)),
         ])
     }
     fn on_tray_go_node(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             Task::done(AppMessage::SelectShellTab(ShellTab::Node)),
         ])
     }
     fn on_tray_go_settings(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             Task::done(AppMessage::SelectShellTab(ShellTab::Settings)),
         ])
     }
     fn on_tray_reconnect(&mut self) -> Task<AppMessage> {
-        if self.console_win == None {
+        if self.console_win.is_none() {
             return Task::none();
         }
         Task::done(AppMessage::Reconnect)
     }
     fn on_tray_copy_node_key(&mut self) -> Task<AppMessage> {
-        if (self.console_win == None) || (self.node_key).is_empty() {
+        if self.console_win.is_none() || (self.node_key).is_empty() {
             return Task::none();
         }
         self.toast = "Copied node key".to_owned();
@@ -1973,12 +1973,12 @@ impl Ducktape {
     fn on_mutation_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
         self.chat_edit_seq = crate::backend::message_seq_after_failure(
             self.chat_edit_seq,
-            self.mutation_phase.clone(),
+            self.mutation_phase,
             cause.committed,
         );
         self.chat_edit_rev = crate::backend::message_seq_after_failure(
             self.chat_edit_rev,
-            self.mutation_phase.clone(),
+            self.mutation_phase,
             cause.committed,
         );
         self.mutation_phase = crate::backend::mutation_failure_phase(cause.committed);
@@ -1992,7 +1992,7 @@ impl Ducktape {
         if !cause.committed {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         let pending_task = Task::perform(
             crate::backend::live_resync_load(
@@ -2029,7 +2029,7 @@ impl Ducktape {
         if cause.generation != self.connect_generation {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.bell_marking = false;
         self.bell_error = "".to_owned();
         self.bell_head_generation = self.bell_head_generation.wrapping_add(1);
@@ -2053,8 +2053,8 @@ impl Ducktape {
         self.bell_unread = 0;
         self.bell_read_through = 0;
         self.bell_clear_through = 0;
-        self.connect_generation = self.connect_generation + 1;
-        self.hydration_retry_attempt = self.hydration_retry_attempt + 1;
+        self.connect_generation += 1;
+        self.hydration_retry_attempt += 1;
         self.loading = false;
         self.status = "Offline".to_owned();
         self.error = cause.message.to_owned();
@@ -2091,22 +2091,22 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         match crate::module_view::forge_intent(&(event)) {
             ForgeIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), ("url")),
+                crate::module_view::event_text(&(event), "url" ),
             )),
             ForgeIntent::Composer => {
-                let scope = crate::module_view::event_text(&(event), ("scope"));
+                let scope = crate::module_view::event_text(&(event), "scope" );
                 let submitted_scope = scope.to_owned();
                 Task::done(AppMessage::ForgeComposerEvent(
                     submitted_scope.clone(),
-                    crate::module_view::event_text(&(event), ("body")),
+                    crate::module_view::event_text(&(event), "body" ),
                 ))
             }
             ForgeIntent::Copy => {
-                self.toast = crate::module_view::event_text(&(event), ("label"));
+                self.toast = crate::module_view::event_text(&(event), "label" );
                 self.toast_age = 0;
                 crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
                     &(event),
-                    ("text"),
+                    "text" ,
                 ))
             }
         }
@@ -2184,7 +2184,7 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         self.fs_drop_dir = crate::backend::keep_str(
             event.kind == "at",
-            &(crate::module_view::event_text(&(event), ("path"))),
+            &(crate::module_view::event_text(&(event), "path" )),
             &self.fs_drop_dir,
         );
         if event.kind != "open_link" {
@@ -2192,7 +2192,7 @@ impl Ducktape {
         }
         Task::done(AppMessage::OpenMessageLink(crate::module_view::event_text(
             &(event),
-            ("url"),
+            "url" ,
         )))
     }
     fn on_fs_file_dropped(&mut self, path: String) -> Task<AppMessage> {
@@ -2317,7 +2317,7 @@ impl Ducktape {
     }
     fn on_account_renamed(&mut self, _result: bool) -> Task<AppMessage> {
         self.account_busy = false;
-        self.account_generation = self.account_generation + 1;
+        self.account_generation += 1;
         let pending_task = Task::perform(
             crate::backend::load_account(self.connected_rpc.to_owned(), self.account_generation),
             |result| match result {
@@ -2357,12 +2357,12 @@ impl Ducktape {
         self.account_ceremony_qr = next.qr.to_owned();
         self.account_ceremony_detail = next.detail.to_owned();
         self.account_ceremony_left = next.left.to_owned();
-        match phase.clone() {
+        match phase {
             CeremonyPhase::Done => {
                 self.account_ceremony_phase = "".to_owned();
                 self.account_ceremony_qr = "".to_owned();
                 self.account_busy = false;
-                self.account_generation = self.account_generation + 1;
+                self.account_generation += 1;
                 let pending_task = Task::perform(
                     crate::backend::load_account(
                         self.connected_rpc.to_owned(),
@@ -2410,7 +2410,7 @@ impl Ducktape {
         self.account_ceremony_left = "".to_owned();
         self.account_busy = false;
         self.account_ticket = "".to_owned();
-        self.account_generation = self.account_generation + 1;
+        self.account_generation += 1;
         let pending_task = Task::perform(
             crate::backend::load_account(self.connected_rpc.to_owned(), self.account_generation),
             |result| match result {
@@ -2456,7 +2456,7 @@ impl Ducktape {
         self.account_ceremony_left = "".to_owned();
         self.shell_tab = ShellTab::Agents;
         self.agents_open_run = dispatch_id.to_owned();
-        self.agents_opened = self.agents_opened + 1;
+        self.agents_opened += 1;
         Task::none()
     }
     fn on_governance_view_event(
@@ -2466,7 +2466,7 @@ impl Ducktape {
         if event.kind != "badge" {
             return Task::none();
         }
-        self.gov_open = crate::module_view::event_int(&(event), ("count"));
+        self.gov_open = crate::module_view::event_int(&(event), "count" );
         Task::none()
     }
     fn on_members_view_event(
@@ -2476,9 +2476,9 @@ impl Ducktape {
         if (!self.connected) || (event.kind != "copy") {
             return Task::none();
         }
-        self.toast = crate::module_view::event_text(&(event), ("label"));
+        self.toast = crate::module_view::event_text(&(event), "label" );
         self.toast_age = 0;
-        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), ("text")))
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text" ))
     }
     fn on_members_loaded(&mut self, next: crate::backend::MembersData) -> Task<AppMessage> {
         if next.generation != self.members_generation {
@@ -2528,7 +2528,7 @@ impl Ducktape {
         }
         match crate::module_view::agents_intent(&(event)) {
             AgentsIntent::Badge => {
-                self.agents_live = crate::module_view::event_int(&(event), ("count")) > 0;
+                self.agents_live = crate::module_view::event_int(&(event), "count" ) > 0;
                 Task::none()
             }
             AgentsIntent::Register => Task::perform(
@@ -2544,10 +2544,10 @@ impl Ducktape {
                 },
             ),
             AgentsIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), ("dispatch_id")),
+                crate::module_view::event_text(&(event), "dispatch_id" ),
             )),
             AgentsIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), ("url")),
+                crate::module_view::event_text(&(event), "url" ),
             )),
         }
     }
@@ -2562,9 +2562,9 @@ impl Ducktape {
         if event.kind != "copy" {
             return Task::none();
         }
-        self.toast = crate::module_view::event_text(&(event), ("label"));
+        self.toast = crate::module_view::event_text(&(event), "label" );
         self.toast_age = 0;
-        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), ("text")))
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text" ))
     }
     fn on_node_facts_loaded(&mut self, next: crate::backend::NodeFacts) -> Task<AppMessage> {
         self.node_key = next.public_key.to_owned();
@@ -2572,16 +2572,16 @@ impl Ducktape {
         self.node_root_hash = next.root_hash.to_owned();
         self.network_chain_id = next.chain_id.to_owned();
         self.network_name = crate::backend::network_label(
-            self.network_chain_id.to_owned(),
-            self.connected_rpc.to_owned(),
+            &self.network_chain_id,
+            &self.connected_rpc,
         );
         self.node_last_finalized = next.last_finalized_at;
         self.node_checkpoint = next.checkpoint_height;
         self.node_height = next.height;
-        self.node_view_label = crate::backend::optional_number(next.view.clone());
-        self.node_quorum_label = crate::backend::optional_number(next.quorum.clone());
+        self.node_view_label = crate::backend::optional_number(next.view);
+        self.node_quorum_label = crate::backend::optional_number(next.quorum);
         self.node_reachable_label =
-            crate::backend::optional_number(next.reachable_validators.clone());
+            crate::backend::optional_number(next.reachable_validators);
         self.node_phase = next.phase.to_owned();
         self.node_phase_since = next.phase_since;
         self.node_sync_target = next.sync_target;
@@ -2605,16 +2605,16 @@ impl Ducktape {
         self.node_root_hash = next.root_hash.to_owned();
         self.network_chain_id = next.chain_id.to_owned();
         self.network_name = crate::backend::network_label(
-            self.network_chain_id.to_owned(),
-            self.connected_rpc.to_owned(),
+            &self.network_chain_id,
+            &self.connected_rpc,
         );
         self.node_last_finalized = next.last_finalized_at;
         self.node_checkpoint = next.checkpoint_height;
         self.node_height = next.height;
-        self.node_view_label = crate::backend::optional_number(next.view.clone());
-        self.node_quorum_label = crate::backend::optional_number(next.quorum.clone());
+        self.node_view_label = crate::backend::optional_number(next.view);
+        self.node_quorum_label = crate::backend::optional_number(next.quorum);
         self.node_reachable_label =
-            crate::backend::optional_number(next.reachable_validators.clone());
+            crate::backend::optional_number(next.reachable_validators);
         self.node_phase = next.phase.to_owned();
         self.node_phase_since = next.phase_since;
         self.node_sync_target = next.sync_target;
@@ -2658,12 +2658,12 @@ impl Ducktape {
             SettingsIntent::SwitchNetwork => Task::done(AppMessage::SwitchNetwork),
             SettingsIntent::Unlock => {
                 if (self.mutation_phase != MutationPhase::Idle)
-                    || (crate::module_view::event_text(&(event), ("password"))).is_empty()
+                    || (crate::module_view::event_text(&(event), "password" )).is_empty()
                 {
                     return Task::none();
                 }
                 self.error = "".to_owned();
-                self.password = crate::module_view::event_text(&(event), ("password"));
+                self.password = crate::module_view::event_text(&(event), "password" );
                 Task::perform(
                     crate::backend::unlock_user_key(
                         self.connected_rpc.to_owned(),
@@ -2684,7 +2684,7 @@ impl Ducktape {
             }
             SettingsIntent::Rename => {
                 if (((!self.connected) || (!self.account_exists)) || self.account_busy)
-                    || (crate::module_view::event_text(&(event), ("name"))).is_empty()
+                    || (crate::module_view::event_text(&(event), "name" )).is_empty()
                 {
                     return Task::none();
                 }
@@ -2694,7 +2694,7 @@ impl Ducktape {
                     crate::backend::set_account_name(
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
-                        crate::module_view::event_text(&(event), ("name")),
+                        crate::module_view::event_text(&(event), "name" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountRenamed(value),
@@ -2705,7 +2705,7 @@ impl Ducktape {
             SettingsIntent::Create => {
                 if ((((!self.connected) || self.account_exists) || self.account_busy)
                     || (self.password).is_empty())
-                    || (crate::module_view::event_text(&(event), ("name"))).is_empty()
+                    || (crate::module_view::event_text(&(event), "name" )).is_empty()
                 {
                     return Task::none();
                 }
@@ -2715,7 +2715,7 @@ impl Ducktape {
                     crate::backend::create_account(
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
-                        crate::module_view::event_text(&(event), ("name")),
+                        crate::module_view::event_text(&(event), "name" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountChanged(value),
@@ -2726,7 +2726,7 @@ impl Ducktape {
             SettingsIntent::KeyAdd => {
                 if ((((!self.connected) || (!self.account_exists)) || self.account_busy)
                     || (self.password).is_empty())
-                    || (crate::module_view::event_text(&(event), ("pubkey"))).is_empty()
+                    || (crate::module_view::event_text(&(event), "pubkey" )).is_empty()
                 {
                     return Task::none();
                 }
@@ -2738,8 +2738,8 @@ impl Ducktape {
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
                         self.network_chain_id.to_owned(),
-                        crate::module_view::event_text(&(event), ("pubkey")),
-                        crate::module_view::event_text(&(event), ("label")),
+                        crate::module_view::event_text(&(event), "pubkey" ),
+                        crate::module_view::event_text(&(event), "label" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountTicketMinted(value),
@@ -2749,7 +2749,7 @@ impl Ducktape {
             }
             SettingsIntent::Join => {
                 if (((!self.connected) || self.account_busy) || (self.password).is_empty())
-                    || (crate::module_view::event_text(&(event), ("ticket"))).is_empty()
+                    || (crate::module_view::event_text(&(event), "ticket" )).is_empty()
                 {
                     return Task::none();
                 }
@@ -2759,7 +2759,7 @@ impl Ducktape {
                     crate::backend::join_with_ticket(
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
-                        crate::module_view::event_text(&(event), ("ticket")),
+                        crate::module_view::event_text(&(event), "ticket" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountChanged(value),
@@ -2779,7 +2779,7 @@ impl Ducktape {
                     crate::backend::remove_account_key(
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
-                        crate::module_view::event_text(&(event), ("pubkey")),
+                        crate::module_view::event_text(&(event), "pubkey" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountChanged(value),
@@ -2802,9 +2802,9 @@ impl Ducktape {
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
                         self.network_chain_id.to_owned(),
-                        crate::module_view::event_text(&(event), ("label")),
+                        crate::module_view::event_text(&(event), "label" ),
                     ),
-                    |value| AppMessage::AccountCeremonyStepped(value),
+                    AppMessage::AccountCeremonyStepped,
                 );
                 self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
                 let request_generation = self.account_qr_auth_generation;
@@ -2843,7 +2843,7 @@ impl Ducktape {
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
                         self.network_chain_id.to_owned(),
-                        crate::module_view::event_text(&(event), ("label")),
+                        crate::module_view::event_text(&(event), "label" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountChanged(value),
@@ -2896,7 +2896,7 @@ impl Ducktape {
                         self.connected_rpc.to_owned(),
                         self.password.to_owned(),
                         self.network_chain_id.to_owned(),
-                        crate::module_view::event_text(&(event), ("label")),
+                        crate::module_view::event_text(&(event), "label" ),
                     ),
                     |result| match result {
                         Ok(value) => AppMessage::AccountChanged(value),
@@ -2954,20 +2954,20 @@ impl Ducktape {
                 })
             }
             SettingsIntent::Copy => {
-                self.toast = crate::module_view::event_text(&(event), ("label"));
+                self.toast = crate::module_view::event_text(&(event), "label" );
                 self.toast_age = 0;
                 crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
                     &(event),
-                    ("text"),
+                    "text" ,
                 ))
             }
             SettingsIntent::Light => Task::done(AppMessage::SetAppearanceLight),
             SettingsIntent::Dark => Task::done(AppMessage::SetAppearanceDark),
             SettingsIntent::Notifications => {
-                self.desktop_notifications = crate::module_view::event_flag(&(event), ("enabled"));
+                self.desktop_notifications = crate::module_view::event_flag(&(event), "enabled" );
                 let pending_task = Task::perform(
                     crate::backend::save_desktop_notifications(self.desktop_notifications),
-                    |value| AppMessage::DesktopNotificationsSaved(value),
+                    AppMessage::DesktopNotificationsSaved,
                 );
                 self.notifications_save_generation =
                     self.notifications_save_generation.wrapping_add(1);
@@ -3007,7 +3007,7 @@ impl Ducktape {
         Task::none()
     }
     fn on_toast_tick(&mut self) -> Task<AppMessage> {
-        self.toast_age = self.toast_age + 1;
+        self.toast_age += 1;
         if self.toast_age < 9 {
             return Task::none();
         }
@@ -3022,9 +3022,9 @@ impl Ducktape {
         if event.kind != "copy" {
             return Task::none();
         }
-        self.toast = crate::module_view::event_text(&(event), ("label"));
+        self.toast = crate::module_view::event_text(&(event), "label" );
         self.toast_age = 0;
-        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), ("text")))
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text" ))
     }
     fn on_close_palette(&mut self) -> Task<AppMessage> {
         self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
@@ -3254,7 +3254,7 @@ impl Ducktape {
             return Task::none();
         }
         self.bell_open = false;
-        match context.target.clone() {
+        match context.target {
             BellTarget::Run => Task::done(AppMessage::OpenRunPanel(context.object.to_owned())),
             BellTarget::Page => {
                 let pending_task = {
@@ -3419,7 +3419,7 @@ impl Ducktape {
                 self.channel_members.clone(),
                 self.settings_user_key.to_owned(),
             )),
-            (""),
+            "" ,
         );
         self.palette_open = false;
         self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
@@ -3436,11 +3436,11 @@ impl Ducktape {
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
         self.shell_tab = ShellTab::Chat;
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
         self.error = "".to_owned();
-        self.chat_generation = self.chat_generation + 1;
+        self.chat_generation += 1;
         let pending_task = Task::perform(
             crate::backend::load_channel_window(
                 self.connected_rpc.to_owned(),
@@ -3497,13 +3497,13 @@ impl Ducktape {
                 self.channel_members.clone(),
                 self.settings_user_key.to_owned(),
             )),
-            (""),
+            "" ,
         );
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
         self.error = "".to_owned();
-        self.chat_generation = self.chat_generation + 1;
+        self.chat_generation += 1;
         let pending_task = Task::perform(
             crate::backend::load_channel_window(
                 self.connected_rpc.to_owned(),
@@ -3559,11 +3559,11 @@ impl Ducktape {
         self.active_channel_members_only = next_channel.members_only;
         self.channel_members = Vec::new();
         self.post_refusal = "".to_owned();
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
         self.error = "".to_owned();
-        self.chat_generation = self.chat_generation + 1;
+        self.chat_generation += 1;
         Task::perform(
             crate::backend::open_dm(
                 self.connected_rpc.to_owned(),
@@ -3583,13 +3583,13 @@ impl Ducktape {
         {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Channel;
         self.pending_channel = (self.channel_draft).trim().to_owned();
         self.channel_draft = "".to_owned();
         self.error = "".to_owned();
-        self.chat_generation = self.chat_generation + 1;
+        self.chat_generation += 1;
         Task::perform(
             crate::backend::create_channel(
                 self.connected_rpc.to_owned(),
@@ -3619,7 +3619,7 @@ impl Ducktape {
         {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Huddle;
         self.error = "".to_owned();
@@ -3642,7 +3642,7 @@ impl Ducktape {
         self.huddle_channel = self.active_channel.to_owned();
         self.huddle_channel_name = self.active_channel_name.to_owned();
         self.huddle_joined_at = self.huddle_now;
-        self.chat_generation = self.chat_generation + 1;
+        self.chat_generation += 1;
         Task::batch([Task::done(AppMessage::ShowHuddle), {
             let pending_task = Task::perform(
                 crate::backend::load_channel_window(
@@ -3692,7 +3692,7 @@ impl Ducktape {
         pending_id: String,
         scope: String,
     ) -> Task<AppMessage> {
-        match kind.clone() {
+        match kind {
             ComposerKind::Message => {
                 match crate::backend::submit_verdict(
                     self.loading,
@@ -3708,7 +3708,7 @@ impl Ducktape {
                         Task::none()
                     }
                     SubmitVerdict::Admitted => {
-                        self.hydration_generation = self.hydration_generation + 1;
+                        self.hydration_generation += 1;
                         self.hydration_retry_attempt = 0;
                         self.chat_pending_sends = crate::backend::send_pending(
                             ::std::mem::take(&mut self.chat_pending_sends),
@@ -3719,7 +3719,7 @@ impl Ducktape {
                         self.error = "".to_owned();
                         self.chat_at_tail = true;
                         self.history_view = false;
-                        self.chat_sent_serial = self.chat_sent_serial + 1;
+                        self.chat_sent_serial += 1;
                         Task::perform(
                             crate::backend::send_message(
                                 self.connected_rpc.to_owned(),
@@ -3756,7 +3756,7 @@ impl Ducktape {
                         Task::none()
                     }
                     SubmitVerdict::Admitted => {
-                        self.hydration_generation = self.hydration_generation + 1;
+                        self.hydration_generation += 1;
                         self.hydration_retry_attempt = 0;
                         self.chat_pending_sends = crate::backend::send_pending(
                             ::std::mem::take(&mut self.chat_pending_sends),
@@ -3820,7 +3820,7 @@ impl Ducktape {
         {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::MessageEdit;
         self.error = "".to_owned();
@@ -3868,7 +3868,7 @@ impl Ducktape {
         if (self.active_channel != cause.scope_id) || (!cause.committed) {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         let pending_task = Task::perform(
             crate::backend::live_resync_load(
@@ -3919,7 +3919,7 @@ impl Ducktape {
         if (self.active_channel != cause.scope_id) || (!cause.committed) {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         let pending_task = Task::perform(
             crate::backend::live_resync_load(
@@ -4039,14 +4039,14 @@ impl Ducktape {
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
             self.huddle_joined,
-            self.huddle_win.clone(),
+            self.huddle_win,
         ))
     }
     fn on_chat_load_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
         if cause.generation != self.chat_generation {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = false;
         self.error = cause.message.to_owned();
@@ -4135,7 +4135,7 @@ impl Ducktape {
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
             self.huddle_joined,
-            self.huddle_win.clone(),
+            self.huddle_win,
         ))
     }
     fn on_live_agents_event(&mut self, next: crate::backend::LiveAgentNotice) -> Task<AppMessage> {
@@ -4180,7 +4180,7 @@ impl Ducktape {
         }
         let link =
             crate::backend::resolve_duck_link(url.to_owned(), self.network_chain_id.to_owned());
-        match link.kind.clone() {
+        match link.kind {
             DuckKind::Unknown => {
                 self.error = "this link names nothing the app can open".to_owned();
                 Task::none()
@@ -4207,7 +4207,7 @@ impl Ducktape {
             DuckKind::Run => Task::done(AppMessage::OpenRunPanel(link.dispatch.to_owned())),
             DuckKind::Files => {
                 self.fs_route = link.path.to_owned();
-                self.fs_route_serial = self.fs_route_serial + 1;
+                self.fs_route_serial += 1;
                 self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.account_qr_auth_task.take() {
                     previous_handle.abort();
@@ -4227,7 +4227,7 @@ impl Ducktape {
             }
             DuckKind::ForgeRepo => {
                 self.forge_link = url.to_owned();
-                self.forge_link_tick = self.forge_link_tick + 1;
+                self.forge_link_tick += 1;
                 self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.account_qr_auth_task.take() {
                     previous_handle.abort();
@@ -4247,7 +4247,7 @@ impl Ducktape {
             }
             DuckKind::ForgeItem => {
                 self.forge_link = url.to_owned();
-                self.forge_link_tick = self.forge_link_tick + 1;
+                self.forge_link_tick += 1;
                 self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.account_qr_auth_task.take() {
                     previous_handle.abort();
@@ -4267,7 +4267,7 @@ impl Ducktape {
             }
             DuckKind::ForgeBlob => {
                 self.forge_link = url.to_owned();
-                self.forge_link_tick = self.forge_link_tick + 1;
+                self.forge_link_tick += 1;
                 self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
                 if let Some(previous_handle) = self.account_qr_auth_task.take() {
                     previous_handle.abort();
@@ -4348,7 +4348,7 @@ impl Ducktape {
         if self.shell_tab != ShellTab::Chat {
             return Task::none();
         }
-        self.chat_copy_chord_serial = self.chat_copy_chord_serial + 1;
+        self.chat_copy_chord_serial += 1;
         Task::none()
     }
     fn on_chat_view_event(
@@ -4357,60 +4357,60 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         match crate::module_view::chat_intent(&(event)) {
             ChatIntent::OpenHit => {
-                let target_seq = crate::module_view::event_int(&(event), ("target_seq"));
+                let target_seq = crate::module_view::event_int(&(event), "target_seq" );
                 let target_sequence = target_seq;
                 Task::done(AppMessage::OpenChatSearchHit(
-                    crate::module_view::event_text(&(event), ("channel")),
+                    crate::module_view::event_text(&(event), "channel" ),
                     target_sequence,
                 ))
             }
             ChatIntent::ToggleCreate => Task::done(AppMessage::ToggleChannelCreate),
             ChatIntent::ChooseChannel => Task::done(AppMessage::ChooseChannel(
-                crate::module_view::event_text(&(event), ("id")),
+                crate::module_view::event_text(&(event), "id" ),
             )),
             ChatIntent::ChooseDm => Task::done(AppMessage::ChooseDm(
-                crate::module_view::event_text(&(event), ("key")),
+                crate::module_view::event_text(&(event), "key" ),
             )),
             ChatIntent::ShowHuddle => Task::done(AppMessage::ShowHuddle),
             ChatIntent::LeaveHuddle => Task::done(AppMessage::LeaveHuddleHere),
             ChatIntent::JoinHuddle => Task::done(AppMessage::JoinHuddleSubmit),
             ChatIntent::Scrolled => {
-                let absolute_y = crate::module_view::event_num(&(event), ("absolute_y"));
-                let relative_x = crate::module_view::event_num(&(event), ("relative_x"));
-                let relative_y = crate::module_view::event_num(&(event), ("relative_y"));
+                let absolute_y = crate::module_view::event_num(&(event), "absolute_y" );
+                let relative_x = crate::module_view::event_num(&(event), "relative_x" );
+                let relative_y = crate::module_view::event_num(&(event), "relative_y" );
                 let pointer_absolute_y = absolute_y;
                 let pointer_relative_x = relative_x;
                 let pointer_relative_y = relative_y;
                 Task::done(AppMessage::ChatScrolled(
-                    crate::module_view::event_num(&(event), ("absolute_x")),
+                    crate::module_view::event_num(&(event), "absolute_x" ),
                     pointer_absolute_y,
                     pointer_relative_x,
                     pointer_relative_y,
                 ))
             }
             ChatIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), ("url")),
+                crate::module_view::event_text(&(event), "url" ),
             )),
             ChatIntent::Copy => {
-                let label = crate::module_view::event_text(&(event), ("label"));
+                let label = crate::module_view::event_text(&(event), "label" );
                 let clipboard_label = label.to_owned();
                 Task::done(AppMessage::CopyToClipboard(
-                    crate::module_view::event_text(&(event), ("text")),
+                    crate::module_view::event_text(&(event), "text" ),
                     clipboard_label.clone(),
                 ))
             }
             ChatIntent::CopyLink => Task::done(AppMessage::CopyMessageLink(
-                crate::module_view::event_text(&(event), ("link")),
+                crate::module_view::event_text(&(event), "link" ),
             )),
             ChatIntent::BeginEdit => {
-                let body = crate::module_view::event_text(&(event), ("body"));
-                let seq = crate::module_view::event_int(&(event), ("seq"));
-                let rev = crate::module_view::event_int(&(event), ("rev"));
+                let body = crate::module_view::event_text(&(event), "body" );
+                let seq = crate::module_view::event_int(&(event), "seq" );
+                let rev = crate::module_view::event_int(&(event), "rev" );
                 let edit_body = body.to_owned();
                 let edit_sequence = seq;
                 let edit_revision = rev;
                 Task::done(AppMessage::ChatBeginEdit(
-                    crate::module_view::event_text(&(event), ("scope")),
+                    crate::module_view::event_text(&(event), "scope" ),
                     edit_body.clone(),
                     edit_sequence,
                     edit_revision,
@@ -4420,7 +4420,7 @@ impl Ducktape {
                 crate::backend::cancel_agent_run(
                     self.connected_rpc.to_owned(),
                     self.password.to_owned(),
-                    crate::module_view::event_text(&(event), ("run_id")),
+                    crate::module_view::event_text(&(event), "run_id" ),
                 ),
                 |result| match result {
                     Ok(value) => AppMessage::LiveCancelAcked(value),
@@ -4428,18 +4428,18 @@ impl Ducktape {
                 },
             ),
             ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), ("dispatch_id")),
+                crate::module_view::event_text(&(event), "dispatch_id" ),
             )),
             ChatIntent::Composer => {
                 let kind = crate::module_view::chat_event_kind(&(event));
-                let id = crate::module_view::event_text(&(event), ("id"));
-                let scope = crate::module_view::event_text(&(event), ("scope"));
-                let reaction_kind = kind.clone();
+                let id = crate::module_view::event_text(&(event), "id" );
+                let scope = crate::module_view::event_text(&(event), "scope" );
+                let reaction_kind = kind;
                 let reaction_id = id.to_owned();
                 let reaction_scope = scope.to_owned();
                 Task::done(AppMessage::ComposerSubmitted(
                     reaction_kind,
-                    crate::module_view::event_text(&(event), ("body")),
+                    crate::module_view::event_text(&(event), "body" ),
                     reaction_id.clone(),
                     reaction_scope.clone(),
                 ))
@@ -4452,14 +4452,14 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         match crate::module_view::pages_intent(&(event)) {
             PagesIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), ("link")),
+                crate::module_view::event_text(&(event), "link" ),
             )),
             PagesIntent::Copy => {
-                self.toast = crate::module_view::event_text(&(event), ("label"));
+                self.toast = crate::module_view::event_text(&(event), "label" );
                 self.toast_age = 0;
                 crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
                     &(event),
-                    ("text"),
+                    "text" ,
                 ))
             }
         }
@@ -4471,7 +4471,7 @@ impl Ducktape {
         self.palette_open = false;
         self.shell_tab = ShellTab::Pages;
         self.page_route = page_id.to_owned();
-        self.page_route_serial = self.page_route_serial + 1;
+        self.page_route_serial += 1;
         Task::none()
     }
     fn on_external_url_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
@@ -4943,7 +4943,7 @@ impl Ducktape {
             return Task::none();
         }
         self.rpc = crate::backend::canonical_endpoint(endpoint.to_owned());
-        self.network_name = crate::backend::network_label("".to_owned(), self.rpc.to_owned());
+        self.network_name = crate::backend::network_label("", &self.rpc);
         self.onboarding_error = "".to_owned();
         self.password = "".to_owned();
         self.hub_wallet_selected = "".to_owned();
@@ -4971,7 +4971,7 @@ impl Ducktape {
         self.hub_wallets = list.wallets.clone();
         self.hub_wallet_selected = crate::backend::preselect_wallet(list.wallets.clone());
         self.onboarding_error = list.error.to_owned();
-        match door.clone() {
+        match door {
             WalletDoor::Wallets => {
                 self.hub_step = HubStep::Wallets;
                 Task::none()
@@ -4981,7 +4981,7 @@ impl Ducktape {
                 Task::none()
             }
             WalletDoor::Unreached => {
-                self.hub_step = self.hub_step.clone();
+                self.hub_step = self.hub_step;
                 Task::none()
             }
         }
@@ -4997,12 +4997,12 @@ impl Ducktape {
     fn on_account_probed(&mut self, next: crate::backend::AccountData) -> Task<AppMessage> {
         self.mutation_phase = MutationPhase::Idle;
         let probe = crate::backend::account_probe(next.exists);
-        match probe.clone() {
+        match probe {
             AccountProbe::Found => Task::done(AppMessage::NetworkEntered),
             AccountProbe::Missing => {
                 self.network_name = crate::backend::network_label(
-                    self.hub_chain_id.to_owned(),
-                    self.rpc.to_owned(),
+                    &self.hub_chain_id,
+                    &self.rpc,
                 );
                 self.ceremony_phase = "".to_owned();
                 self.ceremony_qr = "".to_owned();
@@ -5059,7 +5059,7 @@ impl Ducktape {
                 self.hub_chain_id.to_owned(),
                 name.to_owned(),
             ),
-            |value| AppMessage::CeremonyStepped(value),
+            AppMessage::CeremonyStepped,
         );
         self.welcome_qr_auth_generation = self.welcome_qr_auth_generation.wrapping_add(1);
         let request_generation = self.welcome_qr_auth_generation;
@@ -5092,7 +5092,7 @@ impl Ducktape {
                 self.password.to_owned(),
                 self.hub_chain_id.to_owned(),
             ),
-            |value| AppMessage::CeremonyStepped(value),
+            AppMessage::CeremonyStepped,
         );
         self.welcome_qr_auth_generation = self.welcome_qr_auth_generation.wrapping_add(1);
         let request_generation = self.welcome_qr_auth_generation;
@@ -5125,7 +5125,7 @@ impl Ducktape {
         self.ceremony_qr = "".to_owned();
         self.ceremony_detail = "Continue in the browser…".to_owned();
         let door = crate::backend::welcome_door(&self.welcome_name_draft);
-        match door.clone() {
+        match door {
             WelcomeDoor::Create => {
                 let pending_task = Task::perform(
                     crate::backend::register_passkey(
@@ -5196,7 +5196,7 @@ impl Ducktape {
         self.ceremony_qr = next.qr.to_owned();
         self.ceremony_detail = next.detail.to_owned();
         self.ceremony_left = next.left.to_owned();
-        match phase.clone() {
+        match phase {
             CeremonyPhase::Done => {
                 self.mutation_phase = MutationPhase::Idle;
                 self.ceremony_phase = "".to_owned();
@@ -5278,11 +5278,11 @@ impl Ducktape {
         self.connected_rpc = self.rpc.to_owned();
         self.network_chain_id = "".to_owned();
         self.network_name = crate::backend::network_label(
-            self.network_chain_id.to_owned(),
-            self.connected_rpc.to_owned(),
+            &self.network_chain_id,
+            &self.connected_rpc,
         );
-        self.hydration_generation = self.hydration_generation + 1;
-        self.connect_generation = self.connect_generation + 1;
+        self.hydration_generation += 1;
+        self.connect_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Idle;
         self.channels = Vec::new();
@@ -5365,7 +5365,7 @@ impl Ducktape {
     fn on_console_opened(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         self.console_win = Some(id);
         crate::shell::close::<AppMessage>(crate::backend::window_target(
-            self.onboarding_win.clone(),
+            self.onboarding_win,
         ))
     }
     fn on_forget_network_submit(&mut self, id: String) -> Task<AppMessage> {
@@ -5473,7 +5473,7 @@ impl Ducktape {
         self.hub_step = HubStep::Provisioning;
         let pending_task = Task::run(
             crate::backend::provision_progress(init.chain_id.to_owned(), init.rpc.to_owned()),
-            |value| AppMessage::ProvisionStepped(value),
+            AppMessage::ProvisionStepped,
         );
         self.provision_progress_generation = self.provision_progress_generation.wrapping_add(1);
         let request_generation = self.provision_progress_generation;
@@ -5531,7 +5531,7 @@ impl Ducktape {
             return Task::none();
         }
         self.network_name =
-            crate::backend::network_label(self.onboarding_name.to_owned(), self.rpc.to_owned());
+            crate::backend::network_label(&self.onboarding_name, &self.rpc);
         self.onboarding_error = "".to_owned();
         self.password = "".to_owned();
         self.hub_wallet_selected = "".to_owned();
@@ -5576,7 +5576,7 @@ impl Ducktape {
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
         let (_, pending_task) = crate::shell::open(crate::shell::WindowKind::Onboarding);
-        pending_task.map(move |value| AppMessage::OnboardingReopened(value))
+        pending_task.map(AppMessage::OnboardingReopened)
     }
     fn on_onboarding_reopened(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         self.onboarding_win = Some(id);
@@ -5588,10 +5588,10 @@ impl Ducktape {
         self.live_agents = Vec::new();
         Task::batch([
             crate::shell::close::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             crate::shell::close::<AppMessage>(crate::backend::window_target(
-                self.huddle_win.clone(),
+                self.huddle_win,
             )),
             (Task::perform(crate::backend::lock_signer(), |value| value)).discard::<AppMessage>(),
             {
@@ -5636,7 +5636,7 @@ impl Ducktape {
         self.rpc = self.connected_rpc.to_owned();
         self.hub_chain_id = self.network_chain_id.to_owned();
         let (_, pending_task) = crate::shell::open(crate::shell::WindowKind::Onboarding);
-        pending_task.map(move |value| AppMessage::WelcomeReopened(value))
+        pending_task.map(AppMessage::WelcomeReopened)
     }
     fn on_welcome_reopened(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         self.onboarding_win = Some(id);
@@ -5647,10 +5647,10 @@ impl Ducktape {
         self.hub_step = HubStep::Account;
         Task::batch([
             crate::shell::close::<AppMessage>(crate::backend::window_target(
-                self.console_win.clone(),
+                self.console_win,
             )),
             crate::shell::close::<AppMessage>(crate::backend::window_target(
-                self.huddle_win.clone(),
+                self.huddle_win,
             )),
         ])
     }
@@ -5718,14 +5718,14 @@ impl Ducktape {
         Task::none()
     }
     fn on_show_huddle(&mut self) -> Task<AppMessage> {
-        let summon = crate::backend::huddle_summon(self.huddle_win.clone());
-        match summon.clone() {
+        let summon = crate::backend::huddle_summon(self.huddle_win);
+        match summon {
             WindowSummon::Open => {
                 let (_, pending_task) = crate::shell::open(crate::shell::WindowKind::Huddle);
-                pending_task.map(move |value| AppMessage::HuddleOpened(value))
+                pending_task.map(AppMessage::HuddleOpened)
             }
             WindowSummon::Raise => crate::shell::raise::<AppMessage>(
-                crate::backend::window_target(self.huddle_win.clone()),
+                crate::backend::window_target(self.huddle_win),
             ),
         }
     }
@@ -5761,7 +5761,7 @@ impl Ducktape {
         {
             return Task::none();
         }
-        self.hydration_generation = self.hydration_generation + 1;
+        self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Huddle;
         self.call_status = "".to_owned();
@@ -5779,7 +5779,7 @@ impl Ducktape {
         self.error = "".to_owned();
         Task::batch([
             crate::shell::close::<AppMessage>(crate::backend::window_target(
-                self.huddle_win.clone(),
+                self.huddle_win,
             )),
             Task::perform(
                 crate::backend::leave_huddle(

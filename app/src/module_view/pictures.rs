@@ -48,9 +48,8 @@ impl Pictures {
             wire::Node::Image { hash, data, .. } | wire::Node::ImageViewer { hash, data, .. } => {
                 if data.is_none() { *data = self.raster.get(hash).cloned(); }
             }
-            wire::Node::Svg { hash, bytes, .. } => {
-                if bytes.is_none() { *bytes = self.vector.get(hash).cloned(); }
-            }
+            wire::Node::Svg { hash, bytes, .. }
+                if bytes.is_none() => { *bytes = self.vector.get(hash).cloned(); }
             _ => {}
         });
     }

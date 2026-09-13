@@ -394,7 +394,6 @@ fn classify_channel(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
     }
 }
 
-use super::AppError;
 
 #[cfg(test)]
 mod tests {

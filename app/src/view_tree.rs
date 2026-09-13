@@ -1496,8 +1496,8 @@ impl ViewTree {
                 let restored = self.presentation.scrolls.remove(key).filter(|saved| {
                     saved.direction == *direction && saved.anchors == (*anchor_x, *anchor_y)
                 });
-                if *direction == wire::ScrollDirection::Vertical {
-                    if let Some(rows) = virtual_rows(content) {
+                if *direction == wire::ScrollDirection::Vertical
+                    && let Some(rows) = virtual_rows(content) {
                         return self.virtual_scroll(
                             key,
                             rows,
@@ -1512,7 +1512,6 @@ impl ViewTree {
                             cx,
                         );
                     }
-                }
                 let handle = self.scrolls.entry(key.clone()).or_default().clone();
                 let element = decoration(
                     dimensions(div().relative(), *width, *height),
@@ -1561,11 +1560,9 @@ impl ViewTree {
                                     previous.is_none() && anchor == wire::ScrollAnchor::End;
                                 if initialize_end || (follow && at_end) {
                                     *position = -maximum;
-                                } else if anchor == wire::ScrollAnchor::Keep {
-                                    if let Some((offset,old_maximum)) = previous {
-                                        if offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
-                                    }
-                                }
+                                } else if anchor == wire::ScrollAnchor::Keep
+                                    && let Some((offset,old_maximum)) = previous
+                                        && offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
                             }
                             if let Some(saved) = restored {
                                 next = point(saved.offset.x.clamp(-maximum.x, px(0.)), saved.offset.y.clamp(-maximum.y, px(0.)));
@@ -1577,8 +1574,8 @@ impl ViewTree {
                             let changed = previous
                                 .is_none_or(|(offset, max)| offset != next || max != maximum);
                             this.scroll_positions.insert(route.clone(), (next, maximum));
-                            if changed {
-                                if let Some(handler) = handler {
+                            if changed
+                                && let Some(handler) = handler {
                                     let distance = |offset:Pixels,maximum:Pixels,anchor:wire::ScrollAnchor| match anchor {
                                         wire::ScrollAnchor::End => f32::from(maximum+offset), _=>-f32::from(offset),
                                     };
@@ -1594,7 +1591,6 @@ impl ViewTree {
                                         relative_y,
                                     });
                                 }
-                            }
                         });
                     },
                 )
@@ -1761,11 +1757,10 @@ impl ViewTree {
                             }
                             let _ = releasing.update(cx, |this, cx| {
                                 let was_dragging = this.drags.remove(&release_key).is_some();
-                                if was_dragging {
-                                    if let Some(message) = release {
+                                if was_dragging
+                                    && let Some(message) = release {
                                         cx.emit(wire::Event::Message(message));
                                     }
-                                }
                             });
                         });
                     },
@@ -1888,11 +1883,10 @@ impl ViewTree {
                             };
                             if !visible {
                                 sensor.pending = None;
-                                if sensor.size.take().is_some() {
-                                    if let Some(message) = sensor.on_hide {
+                                if sensor.size.take().is_some()
+                                    && let Some(message) = sensor.on_hide {
                                         cx.emit(wire::Event::Message(message));
                                     }
-                                }
                                 return;
                             }
                             let unchanged = sensor.size == Some(bounds.size);
@@ -2044,15 +2038,14 @@ impl ViewTree {
                 if let Some(base) = children.first() {
                     element = element.child(self.node(base, window, cx));
                 }
-                if reveal {
-                    if let Some(child) = children.get(1) {
+                if reveal
+                    && let Some(child) = children.get(1) {
                         let mut layer = div().absolute().inset_0().rounded(px(*radius));
                         if let Some(color) = tint {
                             layer = layer.bg(rgba(*color));
                         }
                         element = element.child(layer.child(self.node(child, window, cx)));
                     }
-                }
                 element
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         match hovered {
@@ -3416,11 +3409,10 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
                         estimated_height: 44.,
                     }],
                 };
-                if index + 1 < children.len() {
-                    if let Some(last) = part.last_mut() {
+                if index + 1 < children.len()
+                    && let Some(last) = part.last_mut() {
                         last.gap += spacing.unwrap_or_default();
                     }
-                }
                 rows.extend(part);
             }
             found.then(|| wrap_virtual_rows(node, rows))

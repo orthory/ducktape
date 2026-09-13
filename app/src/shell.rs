@@ -146,7 +146,7 @@ impl Desktop {
         // may construct effects which spawn immediately, before their first poll.
         let runtime = crate::module_view::runtime();
         let _runtime = runtime.enter();
-        let appearance = self.state.appearance.clone();
+        let appearance = self.state.appearance;
         let task = self.state.update(message);
         if appearance != self.state.appearance {
             self.sync_appearance(cx);
