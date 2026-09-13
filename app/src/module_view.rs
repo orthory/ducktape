@@ -1485,8 +1485,11 @@ pub(crate) mod canary {
         };
         if let Some(mut root) = root {
             root.for_each_mut(&mut |node| {
-                if let super::wire::Node::Text { content, .. } = node {
-                    texts.push(content.clone());
+                match node {
+                    wire::Node::Text { content, .. }
+                    | wire::Node::Button { content: wire::ButtonContent::Label(content), .. } => texts.push(content.clone()),
+                    wire::Node::RichText { spans, .. } => texts.push(spans.iter().map(|span| span.content.as_str()).collect()),
+                    _ => {}
                 }
             });
         }
@@ -3148,8 +3151,11 @@ pub(crate) mod tests {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut texts = Vec::new();
         root.for_each_mut(&mut |node| {
-            if let wire::Node::Text { content, .. } = node {
-                texts.push(content.clone());
+            match node {
+                wire::Node::Text { content, .. }
+                | wire::Node::Button { content: wire::ButtonContent::Label(content), .. } => texts.push(content.clone()),
+                wire::Node::RichText { spans, .. } => texts.push(spans.iter().map(|span| span.content.as_str()).collect()),
+                _ => {}
             }
         });
         texts
@@ -5402,6 +5408,19 @@ pub(crate) mod tests {
         let mut measured = |width: f32| {
             let mut guest = Guest::load_from("pages", &path).unwrap();
             settle_documents(&mut guest, &props);
+            let mut sidebar_width = None;
+            let mut divider_width = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| match node {
+                wire::Node::Container { key, width: Some(wire::Length::Fixed(value)), .. }
+                    if key.ends_with("/page-list") => sidebar_width = Some(*value),
+                wire::Node::ResizeHandle { key, content, .. } if key.ends_with("/sidebar-divider") => {
+                    if let wire::Node::Space { width: Some(wire::Length::Fixed(value)), .. } = content.as_ref() {
+                        divider_width = Some(*value);
+                    }
+                }
+                _ => {}
+            });
+            let pane_width = width - sidebar_width.expect("authored sidebar") - divider_width.expect("authored divider");
             // Install the event bridge before mounting the guest, as the real
             // NativeModuleView does. Otherwise its first Sensor::on_show is lost.
             let (view, mut native) = native_tree(
@@ -5451,7 +5470,7 @@ pub(crate) mod tests {
                 });
                 assert_eq!(
                     published_width,
-                    Some(688.),
+                    Some(pane_width - 340. - 32.),
                     "the measured pane must reach the guest before native layout"
                 );
             }
@@ -5461,7 +5480,7 @@ pub(crate) mod tests {
                     .expect("pane sensor");
                 assert_eq!(
                     f32::from(pane.size.width),
-                    width - 240.,
+                    pane_width,
                     "pane must exclude the fixed sidebar"
                 );
                 assert!(
@@ -5482,7 +5501,7 @@ pub(crate) mod tests {
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
-            1060. - 340. - 32. - 62.
+            1066. - 340. - 32. - 62.
         );
         assert_eq!(f32::from(squeeze_card.size.width), 338.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);

@@ -124,7 +124,7 @@ fn a_capture_draws_the_module_it_names() {
     assert_eq!(seated_hash("governance"), Some(governance.hash()));
     assert_eq!(seated_hash("chat"), Some(chat.hash()));
     assert_ne!(a, b);
-    assert!(texts("chat").iter().any(|text| text.contains("CHANNELS")));
+    assert!(texts("chat").iter().any(|text| text == "Channels"));
 }
 #[test]
 fn the_canary_captures_every_transition_of_a_deployment() {

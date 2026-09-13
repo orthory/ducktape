@@ -9,7 +9,6 @@ mod huddle_live;
 mod messages;
 mod rooms;
 mod sends;
-mod settings;
 mod shell;
 mod stream;
 mod window_lifecycle;
