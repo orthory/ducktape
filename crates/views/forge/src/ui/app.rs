@@ -1,11 +1,9 @@
 use ducktape_view_guest::{kit as native, wire};
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Act {
     Review,
     Merge,
 }
-#[allow(dead_code)]
 pub struct ForgeView {
     pub(crate) connected: bool,
     pub(crate) dark: bool,
@@ -132,7 +130,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl ForgeView {
     fn state() -> Self {
         Self {
@@ -2616,7 +2613,6 @@ impl ForgeView {
             .ok_or_else(|| String::from("snapshot state mismatch"))
     }
 }
-#[allow(unused_parens)]
 impl ForgeView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([

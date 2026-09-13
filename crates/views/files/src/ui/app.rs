@@ -7,7 +7,6 @@ struct DerivedCache {
     draft_parked: ::std::cell::OnceCell<bool>,
     edit_context: ::std::cell::OnceCell<String>,
 }
-#[allow(dead_code)]
 pub(crate) struct FilesScreenState {
     history_open: bool,
 }
@@ -16,29 +15,6 @@ impl ::std::default::Default for FilesScreenState {
         Self { history_open: false }
     }
 }
-#[cfg(test)]
-#[allow(non_camel_case_types, dead_code)]
-#[derive(Clone)]
-pub(crate) struct FilesScreenStateSnapshot {
-    pub(crate) history_open: bool,
-}
-#[cfg(test)]
-#[allow(dead_code)]
-impl FilesView {
-    pub(crate) fn test_state_files_screen(
-        &self,
-        scope: &str,
-    ) -> Option<FilesScreenStateSnapshot> {
-        let view = |state: &FilesScreenState| FilesScreenStateSnapshot {
-            history_open: state.history_open.clone(),
-        };
-        self.files_screen_states.get(scope).map(view)
-    }
-    pub(crate) fn test_message_files_screen_fs_toggle_history(scope: String) -> Message {
-        Message::FilesScreenFsToggleHistory(scope)
-    }
-}
-#[allow(dead_code)]
 pub struct FilesView {
     pub(crate) connected: bool,
     pub(crate) dark: bool,
@@ -82,7 +58,7 @@ pub struct FilesView {
     pub(crate) tree_width: f64,
     pub(crate) preview_pane_height: f64,
     pub(crate) object_width: f64,
-    pub(crate) derived: DerivedCache,
+    derived: DerivedCache,
     pub(crate) preview_text_revision: u64,
     pub(crate) files_screen_states: ::std::collections::HashMap<
         String,
@@ -132,7 +108,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl FilesView {
     #[must_use]
     fn derived_refusal(&self) -> &String {
@@ -146,21 +121,21 @@ impl FilesView {
         self.derived
             .loading
             .get_or_init(|| {
-                ((self.acting || self.saving) || (self.connected && (!self.listed)))
+                (self.acting || self.saving) || (self.connected && (!self.listed)) 
             })
     }
     fn derived_draft_here(&self) -> &bool {
         self.derived
             .draft_here
             .get_or_init(|| {
-                ((self.editing && (self.draft_path == self.preview_path))
-                    && (self.draft_chain == self.chain))
+                (self.editing && (self.draft_path == self.preview_path))
+                    && (self.draft_chain == self.chain) 
             })
     }
     fn derived_draft_parked(&self) -> &bool {
         self.derived
             .draft_parked
-            .get_or_init(|| (self.editing && (!(*self.derived_draft_here()))))
+            .get_or_init(|| self.editing && (!(*self.derived_draft_here())) )
     }
     fn derived_edit_context(&self) -> &String {
         self.derived
@@ -175,7 +150,6 @@ impl FilesView {
             })
     }
 }
-#[allow(unused_parens)]
 impl FilesView {
     fn state() -> Self {
         Self {
@@ -1153,7 +1127,6 @@ impl FilesView {
             .ok_or_else(|| String::from("snapshot state mismatch"))
     }
 }
-#[allow(unused_parens)]
 impl FilesView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
@@ -1166,7 +1139,7 @@ impl FilesView {
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (!(self.preview_path).is_empty())) {
+            if self.connected && (!(self.preview_path).is_empty())  {
                 ::ducktape_view_guest::Subscription::batch([
                     crate::host::preview(self.generation, self.preview_path.to_owned())
                         .map(move |value| Message::PreviewArrived(value)),
@@ -1174,7 +1147,7 @@ impl FilesView {
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (!(self.diff_from).is_empty())) {
+            if self.connected && (!(self.diff_from).is_empty())  {
                 ::ducktape_view_guest::Subscription::batch([
                     crate::host::diff(self.generation, self.diff_from.to_owned())
                         .map(move |value| Message::DiffArrived(value)),

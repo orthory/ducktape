@@ -1,12 +1,10 @@
 use ducktape_view_guest::{kit as native, wire};
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SearchPhase {
     Idle,
     Searching,
     Done,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MessageAction {
     Toolbar,
@@ -15,39 +13,33 @@ pub(crate) enum MessageAction {
     Editing,
     Delete,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum CopySurface {
+pub enum CopySurface {
     Nowhere,
     Timeline,
     Thread,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RowPlate {
     Plain,
     Selected,
     Ranged,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RoomMove {
     Stayed,
     Moved,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SearchOutcome {
     Answered,
     Refused,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LandingThread {
     Absent,
     Seated,
 }
-#[allow(dead_code)]
 pub(crate) struct ChatScreenState {
     message_action_focus: String,
     chat_pointer_y: f64,
@@ -66,59 +58,6 @@ impl ::std::default::Default for ChatScreenState {
         }
     }
 }
-#[cfg(test)]
-#[allow(non_camel_case_types, dead_code)]
-#[derive(Clone)]
-pub(crate) struct ChatScreenStateSnapshot {
-    pub(crate) message_action_focus: String,
-    pub(crate) chat_pointer_y: f64,
-    pub(crate) chat_height: f64,
-    pub(crate) thread_pointer_y: f64,
-    pub(crate) thread_height: f64,
-}
-#[cfg(test)]
-#[allow(dead_code)]
-impl ChatView {
-    pub(crate) fn test_state_chat_screen(&self, scope: &str) -> Option<ChatScreenStateSnapshot> {
-        let view = |state: &ChatScreenState| ChatScreenStateSnapshot {
-            message_action_focus: state.message_action_focus.clone(),
-            chat_pointer_y: state.chat_pointer_y.clone(),
-            chat_height: state.chat_height.clone(),
-            thread_pointer_y: state.thread_pointer_y.clone(),
-            thread_height: state.thread_height.clone(),
-        };
-        self.chat_screen_states.get(scope).map(view)
-    }
-    pub(crate) fn test_message_chat_screen_chat_pointer_pressed(
-        scope: String,
-        p0: f64,
-        p1: f64,
-    ) -> Message {
-        Message::ChatScreenChatPointerPressed(scope, p0, p1)
-    }
-    pub(crate) fn test_message_chat_screen_chat_resized(
-        scope: String,
-        p0: f64,
-        p1: f64,
-    ) -> Message {
-        Message::ChatScreenChatResized(scope, p0, p1)
-    }
-    pub(crate) fn test_message_chat_screen_thread_pointer_pressed(
-        scope: String,
-        p0: f64,
-        p1: f64,
-    ) -> Message {
-        Message::ChatScreenThreadPointerPressed(scope, p0, p1)
-    }
-    pub(crate) fn test_message_chat_screen_thread_resized(
-        scope: String,
-        p0: f64,
-        p1: f64,
-    ) -> Message {
-        Message::ChatScreenThreadResized(scope, p0, p1)
-    }
-}
-#[allow(dead_code)]
 pub struct ChatView {
     pub(crate) endpoint: String,
     pub(crate) network_name: String,
@@ -289,7 +228,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl ChatView {
     fn state() -> Self {
         Self {
@@ -4306,7 +4244,6 @@ impl ChatView {
             .ok_or_else(|| String::from("snapshot state mismatch"))
     }
 }
-#[allow(unused_parens)]
 impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
@@ -4319,7 +4256,7 @@ impl ChatView {
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (self.active_thread_seq > 0)) {
+            if self.connected && (self.active_thread_seq > 0)  {
                 ::ducktape_view_guest::Subscription::batch([crate::host::thread(
                     self.thread_key.clone(),
                 )
@@ -4327,7 +4264,7 @@ impl ChatView {
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if (self.connected && (!(self.search_query).is_empty())) {
+            if self.connected && (!(self.search_query).is_empty())  {
                 ::ducktape_view_guest::Subscription::batch([crate::host::search(
                     self.search_key.clone(),
                 )

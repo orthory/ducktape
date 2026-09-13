@@ -9,7 +9,7 @@ pub mod host;
 #[path = "ui/app.rs"]
 mod app;
 pub(crate) use app::*;
-pub use app::{ChatView, Message};
+pub use app::{ChatView, CopySurface, Message};
 
 ducktape_view_guest::export_app!(
     ChatView,
