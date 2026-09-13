@@ -32,7 +32,7 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
 #[test]
 fn the_message_line_is_one_rich_text_paragraph() {
     for source in [
-        include_str!("../../../crates/views/chat/src/ui/chat.rs"),
+        include_str!("../../../crates/views/chat/src/ui/kit.rs"),
         include_str!("../../../crates/views/forge/src/ui/kit.rs"),
     ] {
         let source = rust_tokens(source);
