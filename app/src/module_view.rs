@@ -1474,6 +1474,7 @@ pub(crate) mod canary {
 
     /// Every text in the view's tree, or none where no tree is drawn yet.
     pub(crate) fn texts(module: &'static str) -> Vec<String> {
+        use super::wire;
         let mut texts = Vec::new();
         let root = match &super::mounted(module)
             .lock()
