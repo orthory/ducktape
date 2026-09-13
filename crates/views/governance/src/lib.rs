@@ -460,6 +460,31 @@ impl GovernanceView {
 mod tests {
     use super::*;
     #[test]
+    fn disconnected_view_hides_retained_proposals_and_actions() {
+        let (mut view, _) = GovernanceView::boot();
+        view.rows.push(host::ProposalRow {
+            id: "stale-proposal".into(),
+            open: true,
+            ..Default::default()
+        });
+        let mut tree = view.view();
+        tree.for_each_mut(&mut |node| {
+            assert!(!node.key().is_some_and(|key| key.contains("stale-proposal")));
+            assert!(!matches!(
+                node,
+                ducktape_view_guest::wire::Node::Button {
+                    on_press: Some(_),
+                    ..
+                }
+            ));
+        });
+        assert_eq!(
+            view.rows.len(),
+            1,
+            "disconnect does not discard snapshot state"
+        );
+    }
+    #[test]
     fn snapshot_preserves_proposals_without_theme_bookkeeping() {
         let (mut view, _) = GovernanceView::boot();
         view.rows.push(host::ProposalRow {

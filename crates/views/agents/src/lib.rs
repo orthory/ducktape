@@ -2090,6 +2090,36 @@ impl AgentsView {
 mod tests {
     use super::*;
     #[test]
+    fn disconnected_view_hides_retained_registry_editor_and_runs() {
+        let (mut view, _) = AgentsView::boot();
+        view.rows.push(host::AgentRow {
+            id: "stale-agent".into(),
+            ..Default::default()
+        });
+        view.selected = "stale-agent".into();
+        view.creating = true;
+        view.can_edit = true;
+        view.account = "7".into();
+        view.open_run = "stale-run".into();
+        for pane in ["registry", "runs"] {
+            view.panel = pane.into();
+            let mut tree = view.view();
+            tree.for_each_mut(&mut |node| {
+                assert!(!node.key().is_some_and(|key| key.contains("stale-agent")
+                    || key.ends_with("/editor")
+                    || key.ends_with("/journal")));
+                assert!(!matches!(
+                    node,
+                    Node::Button {
+                        on_press: Some(_),
+                        ..
+                    }
+                ));
+            });
+        }
+        assert_eq!(view.rows.len(), 1);
+    }
+    #[test]
     fn view_fits_default_stack() {
         let (app, _) = AgentsView::boot();
         let _ = app.view();

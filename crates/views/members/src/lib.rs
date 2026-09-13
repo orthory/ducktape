@@ -514,6 +514,27 @@ impl MembersView {
 mod tests {
     use super::*;
     #[test]
+    fn disconnected_view_hides_retained_members_and_actions() {
+        let (mut view, _) = MembersView::boot();
+        view.selected = "stale-member".into();
+        view.rows.push(host::MemberRow {
+            key: "stale-member".into(),
+            ..Default::default()
+        });
+        let mut tree = view.view();
+        tree.for_each_mut(&mut |node| {
+            assert!(!node.key().is_some_and(|key| key.contains("stale-member")));
+            assert!(!matches!(
+                node,
+                ducktape_view_guest::wire::Node::Button {
+                    on_press: Some(_),
+                    ..
+                }
+            ));
+        });
+        assert_eq!(view.rows.len(), 1);
+    }
+    #[test]
     fn snapshot_preserves_member_selection_filter_and_width() {
         let (mut view, _) = MembersView::boot();
         view.filter = MembersFilter::Agents;

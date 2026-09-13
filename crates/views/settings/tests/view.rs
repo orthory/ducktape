@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
-use settings_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
 use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
+use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
+use settings_view::{boot_native, tick_native};
 
 const SEAT: &str = "8c4fa211";
 
@@ -96,9 +96,7 @@ fn status() -> Vec<u8> {
 }
 
 fn seats(name: &str, keys: &[[u8; 4]]) -> Vec<u8> {
-    serde_json::json!({ name: keys })
-        .to_string()
-        .into_bytes()
+    serde_json::json!({ name: keys }).to_string().into_bytes()
 }
 
 fn agents() -> Vec<u8> {
@@ -246,6 +244,74 @@ fn an_unconnected_view_asks_the_kernel_for_nothing() {
         "nothing to read with no node: {:?}",
         frame.requests
     );
+}
+
+#[test]
+fn disconnect_hides_retained_account_and_network_claims_without_losing_drafts() {
+    let (frame, props, _) = connected(&facts(), 2);
+    let frame = tick_native(press(&frame, "Account"));
+    let frame = tick_native(type_into(&frame, "rename account…", "kept draft"));
+    assert!(has_text(&frame, "ACCOUNT KEYS"));
+    let offline = Session {
+        connected: false,
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&offline))]);
+    assert!(has_text(&frame, "Not connected"));
+    for hidden in [
+        "duck",
+        "42",
+        "ACCOUNT KEYS",
+        "Rename",
+        "Mint ticket",
+        "Remove",
+    ] {
+        assert!(
+            !has_text(&frame, hidden),
+            "stale {hidden}: {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "Network"));
+    assert!(has_text(&frame, "Not connected"));
+    assert!(!has_text(&frame, "Connected"));
+    assert!(!has_text(&frame, "Members"));
+    assert!(!button_disabled(&frame, "Reconnect"));
+    let frame = tick_native(vec![item(props, &encoded(&facts()))]);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(
+        !button_disabled(&frame, "Rename"),
+        "the draft survives disconnect"
+    );
+    let frame = tick_native(press(&frame, "Rename"));
+    assert_eq!(
+        serde_json::from_slice::<Name>(&request(&frame, "settings.rename").payload)
+            .unwrap()
+            .name,
+        "kept draft"
+    );
+}
+
+#[test]
+fn copy_actions_send_complete_account_number_and_ticket() {
+    let number = "18446744073709551615";
+    let ticket = "fixture-ticket-with-a-long-capability-that-must-not-be-truncated";
+    let session = Session {
+        account_number: number.into(),
+        account_ticket: ticket.into(),
+        ..facts()
+    };
+    let (frame, _, _) = connected(&session, 2);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(has_text(&frame, number));
+    let frame = tick_native(press(&frame, "Copy number"));
+    let copied: settings_view::host::Copy =
+        serde_json::from_slice(&request(&frame, "settings.copy").payload).unwrap();
+    assert_eq!(copied.text, number);
+    let frame = tick_native(press(&frame, "Copy ticket"));
+    let copied: settings_view::host::Copy =
+        serde_json::from_slice(&request(&frame, "settings.copy").payload).unwrap();
+    assert_eq!(copied.text, ticket);
 }
 
 /// A valset block re-reads the standing; an identity block re-reads the key

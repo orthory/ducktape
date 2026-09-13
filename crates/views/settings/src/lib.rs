@@ -1172,6 +1172,9 @@ impl SettingsView {
         }
     }
     fn on_account_rename_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             if (self.account_busy || ((self.account_name_draft).trim().to_owned()).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
@@ -1188,6 +1191,9 @@ impl SettingsView {
         }
     }
     fn on_account_create_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             if ((self.account_busy || (!self.unlocked))
                 || ((self.account_create_draft).trim().to_owned()).is_empty())
@@ -1203,6 +1209,9 @@ impl SettingsView {
         }
     }
     fn on_account_key_add_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             if ((self.account_busy || (!self.unlocked))
                 || ((self.account_key_draft).trim().to_owned()).is_empty())
@@ -1221,6 +1230,9 @@ impl SettingsView {
         }
     }
     fn on_account_key_join_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             if ((self.account_busy || (!self.unlocked))
                 || ((self.account_join_draft).trim().to_owned()).is_empty())
@@ -1236,6 +1248,9 @@ impl SettingsView {
         }
     }
     fn on_account_key_remove(&mut self, pubkey: String) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             if self.account_busy || !self.unlocked || self.account_key_rows.len() <= 1 {
                 return ::ducktape_view_guest::Task::none();
@@ -1247,6 +1262,9 @@ impl SettingsView {
         }
     }
     fn on_account_passkey_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             {
                 self.sent = crate::host::add_passkey(::std::convert::AsRef::as_ref(
@@ -1257,6 +1275,9 @@ impl SettingsView {
         }
     }
     fn on_account_passkey_desktop(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             {
                 self.sent = crate::host::add_passkey_here(::std::convert::AsRef::as_ref(
@@ -1275,6 +1296,9 @@ impl SettingsView {
         }
     }
     fn on_account_wallet_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             {
                 self.sent = crate::host::link_wallet(::std::convert::AsRef::as_ref(
@@ -1285,6 +1309,9 @@ impl SettingsView {
         }
     }
     fn on_account_login_submit(&mut self) -> ::ducktape_view_guest::Task<Message> {
+        if !self.connected {
+            return ducktape_view_guest::Task::none();
+        }
         {
             {
                 self.sent = crate::host::login();
@@ -1568,6 +1595,26 @@ impl SettingsView {
     }
     fn network_settings(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::kit;
+        if !self.connected {
+            return kit::column(
+                "settings/disconnected-network",
+                [
+                    kit::heading("settings/disconnected", "Not connected"),
+                    settings_action(
+                        "settings/reconnect",
+                        "Reconnect",
+                        Message::Reconnect,
+                        !self.loading && (!self.busy || self.recovering),
+                    ),
+                    settings_action(
+                        "settings/switch",
+                        "Switch network",
+                        Message::SwitchNetwork,
+                        !self.busy,
+                    ),
+                ],
+            );
+        }
         kit::column(
             "settings/network",
             [
@@ -1616,6 +1663,18 @@ impl SettingsView {
     }
     fn account_settings(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
+        if !self.connected {
+            return kit::column(
+                "settings/disconnected-account",
+                [
+                    kit::heading("settings/account-offline", "Not connected"),
+                    kit::text(
+                        "settings/account-connect-help",
+                        "Reconnect to read or change your account on this network.",
+                    ),
+                ],
+            );
+        }
         let available = !self.account_busy && self.unlocked;
         let mut content = vec![
             kit::heading("settings/identity-title", "YOUR IDENTITY"),
