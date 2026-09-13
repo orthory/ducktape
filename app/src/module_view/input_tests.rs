@@ -130,7 +130,11 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
                     .unwrap();
                 assert!(
                     wire::decode::<bool>(&reply).unwrap(),
-                    "guest menu requests real native focus"
+                    "guest {focus} menu requests real native focus; queued commands: {:?}",
+                    match &seat.lock().unwrap().slot {
+                        Slot::Ready(guest) => guest.widget_commands.clone(),
+                        Slot::Failed(_) | Slot::Loading | Slot::Empty => Vec::new(),
+                    }
                 );
             });
         });
@@ -327,6 +331,11 @@ fn thread_width(seat: &Arc<Mutex<Mounted>>) -> f32 {
     let mut width = None;
     root.for_each_mut(&mut |node| {
         if let wire::Node::Container {
+            key,
+            width: Some(wire::Length::Fixed(value)),
+            ..
+        }
+        | wire::Node::Linear {
             key,
             width: Some(wire::Length::Fixed(value)),
             ..
