@@ -65,7 +65,11 @@ impl PagesView {
                     kit::text(format!("{key}/meta"), &thread.meta),
                     action(
                         format!("{key}/resolve"),
-                        if thread.resolved { "Reopen" } else { "Resolve" },
+                        if thread.resolved {
+                            "Reopen"
+                        } else {
+                            "Resolve thread"
+                        },
                         Message::ResolveThreadSubmit(thread.id.clone(), !thread.resolved),
                         !disabled,
                         ButtonPreset::Text,
@@ -88,18 +92,25 @@ impl PagesView {
         }
         let toggle = crate::host::reply_toggle_label(thread, expanded);
         if !toggle.is_empty() {
-            rows.push(action(
-                format!("{key}/replies"),
-                toggle,
-                Message::ToggleThreadReplies(thread.id.clone()),
-                !disabled,
-                ButtonPreset::Text,
+            rows.push(named(
+                action(
+                    format!("{key}/replies"),
+                    toggle,
+                    Message::ToggleThreadReplies(thread.id.clone()),
+                    !disabled,
+                    ButtonPreset::Text,
+                ),
+                if expanded {
+                    "Fewer replies"
+                } else {
+                    "Show every reply"
+                },
             ));
         }
         if replying {
             rows.push(input(
                 format!("{PAGE_KEY}/thread-reply({})", thread.id),
-                "Write a reply…",
+                "Reply…",
                 &self.reply_draft,
                 Message::ReplyDraftChanged,
                 Some(Message::PostThreadReply(thread.id.clone())),
@@ -107,7 +118,7 @@ impl PagesView {
             ));
             rows.push(action(
                 format!("{key}/submit"),
-                "Reply",
+                "Post reply",
                 Message::PostThreadReply(thread.id.clone()),
                 !disabled && !self.reply_draft.trim().is_empty(),
                 ButtonPreset::Primary,
@@ -115,7 +126,7 @@ impl PagesView {
         } else if !thread.resolved {
             rows.push(action(
                 format!("{key}/reply"),
-                "Reply",
+                "Reply to this thread",
                 Message::SelectReplyThread(thread.id.clone()),
                 !disabled,
                 ButtonPreset::Text,

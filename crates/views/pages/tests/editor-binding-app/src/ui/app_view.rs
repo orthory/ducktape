@@ -1,177 +1,58 @@
 impl PagesEditorFixture {
-    pub(crate) fn view(&self) -> wire::Node {
-        let palette = self.palette();
-        {
-            let mut children: Vec<wire::Node> = Vec::new();
-            children.push({
-                let node_scope = format!("{}/document", "PagesEditorFixture");
-                {
-                    let editor = &(self.document);
-                    let (document, on_document) = editor.document(
-                        ("app:document").to_owned(),
-                        Message::DocumentUpdated
-                            as fn(::ducktape_view_guest::EditorDocumentUpdate) -> Message,
-                    );
-                    wire::Node::Editor {
-                        options: Box::new(wire::EditorOptions {
-                            binding: Some(Box::new(
-                                crate::editor_binding::keys(
-                                    self.history.clone(),
-                                    self.menu.clone(),
-                                )
-                                .register(
-                                    move |value| Message::Committed(value),
-                                    Message::DocumentTransaction,
-                                ),
-                            )),
-                            presentation: {
-                                let presentation = crate::presentation::paint(
-                                    editor.state_view(),
-                                    self.menu.clone(),
-                                    self.paint_dark,
-                                    self.commented.clone(),
-                                    true,
-                                );
-                                presentation
-                                    .validate(editor.state_view().text)
-                                    .expect("invalid editor presentation");
-                                Some(Box::new(presentation))
-                            },
-                            size: None,
-                            padding: None,
-                            line_height: None,
-                            wrapping: None,
-                            font: None,
-                            style: wire::InputStyle {
-                                active: ::std::default::Default::default(),
-                                hovered: None,
-                                focused: None,
-                                focused_hovered: None,
-                                disabled: None,
-                                ..::std::default::Default::default()
-                            },
-                        }),
-                        key: node_scope.clone(),
-                        placeholder: String::new(),
-                        document,
-                        on_document,
-                        editable: true,
-                        width: Some((640.0) as f32),
-                        height: None,
-                        min_height: Some((240.0) as f32),
-                        max_height: Some((240.0) as f32),
-                    }
-                }
-            });
-            if (64000 > (((self.document).text()).len() as i64)) {
-                children.push({
-                    let node_scope = format!("{}/echo", "PagesEditorFixture");
-                    wire::Node::Text {
-                        options: wire::TextOptions {
-                            height: None,
-                            align_y: None,
-                            line_height: None,
-                            shaping: None,
-                            wrapping: None,
-                            tracking: 0.0f32,
-                            font: None,
-                        },
-                        key: node_scope.clone(),
-                        size: None,
-                        color: None,
-                        font: wire::Font {
-                            monospace: false,
-                            weight: wire::Weight::Normal,
-                        },
-                        width: None,
-                        align_x: None,
-                        content: ((self.document).text()).to_string(),
-                    }
-                });
-            }
-            children.push({
-                let node_scope = format!("{}/formatting-notice", "PagesEditorFixture");
-                wire::Node::Text {
-                    options: wire::TextOptions {
-                        height: None,
-                        align_y: None,
-                        line_height: None,
-                        shaping: None,
-                        wrapping: None,
-                        tracking: 0.0f32,
-                        font: None,
-                    },
-                    key: node_scope.clone(),
-                    size: None,
-                    color: None,
-                    font: wire::Font {
-                        monospace: false,
-                        weight: wire::Weight::Normal,
-                    },
-                    width: None,
-                    align_x: None,
-                    content: self.formatting_notice.to_owned(),
-                }
-            });
-            children.push({
-                let node_scope = format!("{}/load-error", "PagesEditorFixture");
-                wire::Node::Text {
-                    options: wire::TextOptions {
-                        height: None,
-                        align_y: None,
-                        line_height: None,
-                        shaping: None,
-                        wrapping: None,
-                        tracking: 0.0f32,
-                        font: None,
-                    },
-                    key: node_scope.clone(),
-                    size: None,
-                    color: None,
-                    font: wire::Font {
-                        monospace: false,
-                        weight: wire::Weight::Normal,
-                    },
-                    width: None,
-                    align_x: None,
-                    content: self.load_error.to_owned(),
-                }
-            });
-            children.push(wire::Node::Button {
-                checked: None,
-                expanded: None,
-                description: None,
-                key: format!("{}/@button:81", "PagesEditorFixture"),
-                content: wire::ButtonContent::Label(String::from("Load document")),
-                label: None,
-                on_press: Some(::ducktape_view_guest::slots::message(Message::Load)),
-                width: None,
-                height: None,
-                padding: None,
-                style: wire::ButtonStyle {
-                    preset: wire::ButtonPreset::Primary,
-                    recipe: None,
-                    active: wire::Face::default(),
-                    hovered: None,
-                    pressed: None,
-                    disabled: None,
-                },
-            });
-            wire::Node::Linear {
-                max_width: None,
-                clip: false,
-                key: format!("{}/@layout:69", "PagesEditorFixture"),
-                wrap: None,
-                axis: wire::Axis::Column,
-                spacing: Some((8.0) as f32),
-                padding: None,
-                width: Some(wire::Length::Fixed((640.0) as f32)),
-                height: None,
-                align: None,
-                background: None,
-                border: None,
-                children,
-            }
+    fn view(&self) -> wire::Node {
+        use ducktape_view_guest::{kit, slots};
+        let (document, on_document) = self
+            .document
+            .document("app:document".into(), Message::DocumentUpdated);
+        let presentation = crate::presentation::paint(
+            self.document.state_view(),
+            self.menu.clone(),
+            self.paint_dark,
+            self.commented.clone(),
+            true,
+        );
+        presentation
+            .validate(self.document.state_view().text)
+            .expect("invalid editor presentation");
+        let mut children = vec![wire::Node::Editor {
+            key: "PagesEditorFixture/document".into(),
+            placeholder: String::new(),
+            document,
+            on_document,
+            editable: true,
+            width: Some(640.),
+            height: None,
+            min_height: Some(240.),
+            max_height: Some(240.),
+            options: Box::new(wire::EditorOptions {
+                binding: Some(Box::new(
+                    crate::editor_binding::keys(self.history.clone(), self.menu.clone())
+                        .register(Message::Committed, Message::DocumentTransaction),
+                )),
+                presentation: Some(Box::new(presentation)),
+                ..Default::default()
+            }),
+        }];
+        if self.document.text().len() < 64000 {
+            children.push(kit::text("PagesEditorFixture/echo", self.document.text()));
         }
+        children.extend([
+            kit::text(
+                "PagesEditorFixture/formatting-notice",
+                &self.formatting_notice,
+            ),
+            kit::text("PagesEditorFixture/load-error", &self.load_error),
+            kit::button(
+                "PagesEditorFixture/load",
+                "Load document",
+                Some(slots::message(Message::Load)),
+                wire::ButtonPreset::Primary,
+            ),
+        ]);
+        kit::sized(
+            kit::column("PagesEditorFixture/layout", children),
+            Some(wire::Length::Fixed(640.)),
+            None,
+        )
     }
 }

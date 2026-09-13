@@ -26,13 +26,17 @@ impl PagesView {
             body.push(self.document_toolbar());
         }
         body.push(measured(
-            "pages/document-pane",
+            "PagesView/root/pages/pane-measure",
             self.document_pane(),
             Message::PagesPaneResized,
         ));
         let mut main = fill(kit::column("pages/main", body));
         if self.page_delete_armed {
             main = Node::Stack {
+                padding: None,
+                background: None,
+                border: None,
+                clip: false,
                 key: "pages/delete-stack".into(),
                 width: Some(Length::Fill),
                 height: Some(Length::Fill),
@@ -51,10 +55,8 @@ impl PagesView {
             kit::row(
                 "pages/sidebar/header",
                 [
-                    kit::heading(
-                        "pages/sidebar/title",
-                        format!("Pages · {}", self.pages.len()),
-                    ),
+                    kit::heading("pages/sidebar/title", "Pages"),
+                    kit::text("pages/sidebar/count", self.pages.len().to_string()),
                     action(
                         "pages/sidebar/new",
                         if self.page_create_open {
@@ -73,7 +75,7 @@ impl PagesView {
         if self.page_create_open {
             rows.push(input(
                 format!("{PAGE_KEY}/new-page"),
-                "Page title",
+                "New page",
                 &self.page_draft,
                 Message::PageDraftChanged,
                 Some(Message::CreatePageSubmit),
@@ -129,12 +131,23 @@ impl PagesView {
                 ButtonPreset::Text,
             ));
         }
-        controls.push(action(
-            "pages/toolbar/comments",
-            format!("Comments · {}", self.thread_total),
-            Message::ToggleBlockComments,
-            !self.unavailable(),
-            ButtonPreset::Secondary,
+        controls.push(named(
+            kit::button_child(
+                "pages/toolbar/comments",
+                kit::row(
+                    "pages/toolbar/comments-label",
+                    [
+                        kit::text("pages/toolbar/comments-text", "Comments"),
+                        kit::text(
+                            "pages/toolbar/comments-count",
+                            self.thread_total.to_string(),
+                        ),
+                    ],
+                ),
+                (!self.unavailable()).then(|| slots::message(Message::ToggleBlockComments)),
+                ButtonPreset::Secondary,
+            ),
+            "Comments",
         ));
         controls.push(action(
             "pages/toolbar/link",
@@ -163,7 +176,7 @@ impl PagesView {
         let surface = if !self.connected {
             fill(empty_state(
                 "pages/disconnected",
-                "Pages",
+                "Not connected",
                 "Connect to a network to read and edit pages.",
             ))
         } else if self.active_page.is_empty() {
@@ -231,6 +244,10 @@ impl PagesView {
             ));
         }
         Node::Stack {
+            padding: None,
+            background: None,
+            border: None,
+            clip: false,
             key: "pages/document/stack".into(),
             width: Some(Length::Fill),
             height: Some(Length::Fill),
@@ -402,7 +419,7 @@ impl PagesView {
         if !self.scope_pinned && !self.scope_target.is_empty() {
             header.push(action(
                 "pages/comments/widen",
-                "All comments",
+                "All comments on this page",
                 Message::WidenCommentScope,
                 true,
                 ButtonPreset::Text,
@@ -433,12 +450,15 @@ impl PagesView {
         }
         for group in groups {
             if self.scope_target.is_empty() && !group.anchor.is_empty() {
-                threads.push(action(
-                    format!("pages/comments/scope/{}", group.target),
-                    &group.anchor,
-                    Message::NarrowCommentScope(group.target.clone()),
-                    !disabled,
-                    ButtonPreset::Text,
+                threads.push(named(
+                    action(
+                        format!("pages/comments/scope/{}", group.target),
+                        &group.anchor,
+                        Message::NarrowCommentScope(group.target.clone()),
+                        !disabled,
+                        ButtonPreset::Text,
+                    ),
+                    "Comments on this block",
                 ));
             }
             threads.extend(
@@ -449,12 +469,15 @@ impl PagesView {
             );
         }
         if !resolved.is_empty() {
-            threads.push(action(
-                "pages/comments/resolved",
-                crate::host::resolved_label(&resolved),
-                Message::ToggleResolvedComments,
-                true,
-                ButtonPreset::Text,
+            threads.push(named(
+                action(
+                    "pages/comments/resolved",
+                    crate::host::resolved_label(&resolved),
+                    Message::ToggleResolvedComments,
+                    true,
+                    ButtonPreset::Text,
+                ),
+                "Resolved threads",
             ));
             if self.resolved_open {
                 threads.extend(resolved.iter().map(|row| self.comment_thread(&row.thread)));
@@ -478,7 +501,7 @@ impl PagesView {
                 ),
                 input(
                     format!("{PAGE_KEY}/page-comment({})", self.active_page),
-                    "Write a comment…",
+                    "Start a thread…",
                     &self.block_comment_draft,
                     Message::CommentDraftChanged,
                     Some(Message::PostBlockCommentSubmit),
@@ -486,7 +509,7 @@ impl PagesView {
                 ),
                 action(
                     "pages/comments/submit",
-                    "Comment",
+                    "Post",
                     Message::PostBlockCommentSubmit,
                     !disabled && !self.block_comment_draft.trim().is_empty(),
                     ButtonPreset::Primary,
@@ -498,7 +521,7 @@ impl PagesView {
                 as f32;
         let mut card = kit::sized(
             kit::padded(
-                kit::container("pages/comments/card", body),
+                kit::container("PagesView/root/pages/comments-card", body),
                 wire::Edges::all(12.),
             ),
             Some(Length::Fixed(

@@ -1,362 +1,119 @@
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-}
 use ducktape_view_guest::{Subscription, Task, wire};
-#[derive(Clone, Copy)]
-struct Palette {
-    name: &'static str,
-    colors: [wire::Rgba; 4],
-}
-#[allow(dead_code)]
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PagesEditorFixture {
-    pub(crate) formatting_notice: String,
-    pub(crate) document: ::ducktape_view_guest::Editor,
-    pub(crate) history: crate::editor_binding::HistoryState,
-    pub(crate) menu: crate::editor_binding::MenuState,
-    pub(crate) source: crate::fixture_source::DocumentSource,
-    pub(crate) installed_source: Vec<u8>,
-    pub(crate) load_error: String,
-    pub(crate) paint_dark: bool,
-    pub(crate) commented: Vec<i64>,
+    formatting_notice: String,
+    #[serde(with = "document_snapshot")]
+    document: ducktape_view_guest::Editor,
+    history: crate::editor_binding::HistoryState,
+    menu: crate::editor_binding::MenuState,
+    source: crate::fixture_source::DocumentSource,
+    installed_source: Vec<u8>,
+    load_error: String,
+    paint_dark: bool,
+    commented: Vec<i64>,
 }
-impl ::std::fmt::Debug for PagesEditorFixture {
-    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PagesEditorFixture")
+
+impl std::fmt::Debug for PagesEditorFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PagesEditorFixture")
     }
 }
+
 #[derive(Clone)]
 pub enum Message {
     Load,
     DocumentArrived(crate::fixture_source::DocumentItem),
     Committed(crate::editor_binding::EditorUpdate),
-    DocumentUpdated(::ducktape_view_guest::EditorDocumentUpdate),
-    DocumentTransaction(::ducktape_view_guest::EditorTransaction<Message>),
+    DocumentUpdated(ducktape_view_guest::EditorDocumentUpdate),
+    DocumentTransaction(ducktape_view_guest::EditorTransaction<Message>),
 }
-impl ::std::fmt::Debug for Message {
-    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Message")
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Message")
     }
 }
-#[allow(unused_parens)]
+
 impl PagesEditorFixture {
-    fn palette(&self) -> Palette {
-        Palette {
-            name: "app",
-            colors: [
-                wire::Rgba([1.0, 1.0, 1.0, 1.000000]),
-                wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]),
-                wire::Rgba([1.0, 0.0 / 255.0, 0.0 / 255.0, 1.000000]),
-                wire::Rgba([1.0, 0.0 / 255.0, 1.0, 1.000000]),
-            ],
-        }
-    }
-}
-#[allow(unused_parens)]
-impl PagesEditorFixture {
-    fn initial_state() -> Self {
-        Self {
-            formatting_notice: "".to_owned(),
-            document: ::ducktape_view_guest::Editor::new("- 한글".to_owned()),
-            history: crate::editor_binding::initial_history(),
-            menu: crate::editor_binding::initial_menu(),
-            source: crate::fixture_source::empty_source(),
-            installed_source: ::std::vec![],
-            load_error: "".to_owned(),
-            paint_dark: false,
-            commented: Vec::new(),
-        }
-    }
-    pub(crate) fn boot() -> (Self, Task<Message>) {
-        (Self::initial_state(), Task::none())
-    }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "d58bf2b798ab09bc7584235aa6d369a976f67b3396fb454eef1417f7f456836b";
-    pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        wire::Snapshot {
-            schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: wire::SnapshotValue::Record {
-                name: String::from("PagesEditorFixture"),
-                fields: vec![
-                    (
-                        String::from("formatting_notice"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.formatting_notice),
-                        ),
-                    ),
-                    (
-                        String::from("document"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes(
-                            (&self.document).snapshot(),
-                        ),
-                    ),
-                    (
-                        String::from("history"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("HistoryState"),
-                            fields: ::std::vec![(
-                                String::from("snapshot"),
-                                ::ducktape_view_guest::wire::SnapshotValue::Bytes(
-                                    (&(&self.history).snapshot).clone()
-                                )
-                            )],
-                        },
-                    ),
-                    (
-                        String::from("menu"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("MenuState"),
-                            fields: ::std::vec![(
-                                String::from("snapshot"),
-                                ::ducktape_view_guest::wire::SnapshotValue::Bytes(
-                                    (&(&self.menu).snapshot).clone()
-                                )
-                            )],
-                        },
-                    ),
-                    (
-                        String::from("source"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("DocumentSource"),
-                            fields: ::std::vec![(
-                                String::from("reference"),
-                                ::ducktape_view_guest::wire::SnapshotValue::Bytes(
-                                    (&(&self.source).reference).clone()
-                                )
-                            )],
-                        },
-                    ),
-                    (
-                        String::from("installed_source"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes(
-                            (&self.installed_source).clone(),
-                        ),
-                    ),
-                    (
-                        String::from("load_error"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.load_error),
-                        ),
-                    ),
-                    (
-                        String::from("paint_dark"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.paint_dark)),
-                    ),
-                    (
-                        String::from("commented"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.commented)
-                                .iter()
-                                .map(|item| {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(*(item))
-                                })
-                                .collect(),
-                        ),
-                    ),
-                ],
+    const SNAPSHOT_SCHEMA: &'static str =
+        "9892d966d395d7a36d84bf74ccb9098e147486b1bf3f865c0eeb35fd5a2d1961";
+    fn boot() -> (Self, Task<Message>) {
+        (
+            Self {
+                formatting_notice: String::new(),
+                document: ducktape_view_guest::Editor::new("- 한글"),
+                history: crate::editor_binding::initial_history(),
+                menu: crate::editor_binding::initial_menu(),
+                source: crate::fixture_source::empty_source(),
+                installed_source: Vec::new(),
+                load_error: String::new(),
+                paint_dark: false,
+                commented: Vec::new(),
             },
+            Task::none(),
+        )
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        wire::Snapshot {
+            schema: Self::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(self)),
         }
         .encode()
     }
-    pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
+
+    fn restore(bytes: &[u8]) -> Result<Self, String> {
         let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
-            return Err(String::from("snapshot schema mismatch"));
+            return Err("invalid fixture snapshot schema".into());
         }
-        let value = snapshot.state;
-        ((|| {
-            let wire::SnapshotValue::Record {
-                name: name,
-                fields: fields,
-            } = value
-            else {
-                return None;
-            };
-            if name != "PagesEditorFixture" || fields.len() != 9 {
-                return None;
-            }
-            let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "formatting_notice" {
-                return None;
-            }
-            let formatting_notice: String = (match value {
-                wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "document" {
-                return None;
-            }
-            let document: ::ducktape_view_guest::Editor = (match value {
-                wire::SnapshotValue::Bytes(bytes) => ::ducktape_view_guest::Editor::restore(&bytes),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "history" {
-                return None;
-            }
-            let history: crate::editor_binding::HistoryState = ((|| {
-                let wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "HistoryState" || fields.len() != 1 {
-                    return None;
-                }
-                let mut fields = fields.into_iter();
-                let (name, field_0) = fields.next()?;
-                if name != "snapshot" {
-                    return None;
-                }
-                Some(crate::editor_binding::HistoryState {
-                    snapshot: (match field_0 {
-                        wire::SnapshotValue::Bytes(item) => Some(item),
-                        _ => None,
-                    })?,
-                })
-            })())?;
-            let (name, value) = fields.next()?;
-            if name != "menu" {
-                return None;
-            }
-            let menu: crate::editor_binding::MenuState = ((|| {
-                let wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "MenuState" || fields.len() != 1 {
-                    return None;
-                }
-                let mut fields = fields.into_iter();
-                let (name, field_0) = fields.next()?;
-                if name != "snapshot" {
-                    return None;
-                }
-                Some(crate::editor_binding::MenuState {
-                    snapshot: (match field_0 {
-                        wire::SnapshotValue::Bytes(item) => Some(item),
-                        _ => None,
-                    })?,
-                })
-            })())?;
-            let (name, value) = fields.next()?;
-            if name != "source" {
-                return None;
-            }
-            let source: crate::fixture_source::DocumentSource = ((|| {
-                let wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "DocumentSource" || fields.len() != 1 {
-                    return None;
-                }
-                let mut fields = fields.into_iter();
-                let (name, field_0) = fields.next()?;
-                if name != "reference" {
-                    return None;
-                }
-                Some(crate::fixture_source::DocumentSource {
-                    reference: (match field_0 {
-                        wire::SnapshotValue::Bytes(item) => Some(item),
-                        _ => None,
-                    })?,
-                })
-            })())?;
-            let (name, value) = fields.next()?;
-            if name != "installed_source" {
-                return None;
-            }
-            let installed_source: Vec<u8> = (match value {
-                wire::SnapshotValue::Bytes(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "load_error" {
-                return None;
-            }
-            let load_error: String = (match value {
-                wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "paint_dark" {
-                return None;
-            }
-            let paint_dark: bool = (match value {
-                wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "commented" {
-                return None;
-            }
-            let commented: Vec<i64> = (match value {
-                wire::SnapshotValue::List(items) => items
-                    .into_iter()
-                    .map(|item| match item {
-                        wire::SnapshotValue::I64(item) => Some(item),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>(),
-                _ => None,
-            })?;
-            Some(Self {
-                formatting_notice,
-                document,
-                history,
-                menu,
-                source,
-                installed_source,
-                load_error,
-                paint_dark,
-                commented,
-            })
-        })())
-        .ok_or_else(|| String::from("snapshot state mismatch"))
+        let wire::SnapshotValue::Bytes(state) = snapshot.state else {
+            return Err("invalid fixture snapshot".into());
+        };
+        wire::decode(&state)
     }
-}
-#[allow(unused_parens)]
-impl PagesEditorFixture {
+
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            if ((!(self.source.reference).is_empty())
-                && (self.source.reference != self.installed_source))
-            {
-                Subscription::batch([crate::fixture_source::document_source(self.source.clone())
-                    .map(move |value| Message::DocumentArrived(value))])
-            } else {
-                Subscription::none()
-            },
-        ])
+        let needs_source =
+            !self.source.reference.is_empty() && self.source.reference != self.installed_source;
+        if needs_source {
+            crate::fixture_source::document_source(self.source.clone())
+                .map(Message::DocumentArrived)
+        } else {
+            Subscription::none()
+        }
     }
 }
+
+mod document_snapshot {
+    use serde::{Deserialize, Serialize};
+    pub fn serialize<S: serde::Serializer>(
+        editor: &ducktape_view_guest::Editor,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        editor.snapshot().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ducktape_view_guest::Editor, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        ducktape_view_guest::Editor::restore(&bytes)
+            .ok_or_else(|| serde::de::Error::custom("invalid editor snapshot"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn view_fits_default_stack() {
-        ::std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let (app, _) = PagesEditorFixture::boot();
-                let _ = app.view();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+    fn view_and_snapshot_keep_fixture_document() {
+        let (app, _) = PagesEditorFixture::boot();
+        let _ = app.view();
+        let snapshot = app.snapshot().unwrap();
+        let restored = PagesEditorFixture::restore(&snapshot).unwrap();
+        assert_eq!(restored.document.text(), "- 한글");
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
 }
 include!("app_update.rs");

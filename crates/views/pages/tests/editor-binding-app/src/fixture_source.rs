@@ -3,7 +3,7 @@ use ducktape_view_guest::{host, wire};
 use futures::{StreamExt, future};
 use wire::editor_document::{EditorTransfer, EditorTransferReceiver};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DocumentSource {
     pub reference: Vec<u8>,
 }

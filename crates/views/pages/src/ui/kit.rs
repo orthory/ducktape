@@ -3,6 +3,14 @@ use wire::{ButtonPreset, Length, Node};
 
 const PAGE_KEY: &str = "PagesView/root/pages";
 
+fn named(mut node: Node, name: &str) -> Node {
+    let Node::Button { label, .. } = &mut node else {
+        unreachable!("named action")
+    };
+    *label = Some(name.into());
+    node
+}
+
 fn action(
     key: impl Into<String>,
     label: impl Into<String>,
@@ -78,7 +86,7 @@ fn overlay(
     Node::Overlay {
         key: key.into(),
         padding: 24.,
-        backdrop: Default::default(),
+        backdrop: wire::Rgba([0.; 4]),
         align_x,
         align_y,
         on_dismiss: Some(slots::message(dismiss)),

@@ -205,9 +205,11 @@ impl PagesView {
         (Self::initial_state(), Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    const SNAPSHOT_SCHEMA: &'static str =
+        "a8e6006820699ce3ada3eec58c7aa178e96d4b16c4d5476a8246c97381857e71";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
-            schema: "pages".into(),
+            schema: Self::SNAPSHOT_SCHEMA.into(),
             state: wire::SnapshotValue::Bytes(wire::encode(self)),
         }
         .encode()
@@ -218,7 +220,7 @@ impl PagesView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Pages snapshot".into());
         };
-        if snapshot.schema != "pages" {
+        if snapshot.schema != Self::SNAPSHOT_SCHEMA {
             return Err("invalid Pages snapshot schema".into());
         }
         wire::decode(&state)
@@ -308,7 +310,7 @@ impl PagesView {
             } else {
                 Subscription::none()
             },
-            if (self.connected && (!(self.page_search_query).is_empty())) {
+            if self.connected && (!(self.page_search_query).is_empty()) {
                 Subscription::batch([crate::host::search(
                     self.page_search_query.to_owned(),
                     self.page_search_serial,
@@ -319,14 +321,14 @@ impl PagesView {
             },
             crate::host::acts().map(move |value| Message::ActDone(value)),
             crate::host::saves().map(move |value| Message::SaveDone(value)),
-            if ((((self.connected && (!self.loading)) && (!self.busy))
+            if (((self.connected && (!self.loading)) && (!self.busy))
                 && (!(self.active_page).is_empty()))
-                && (self.active_page == self.buffer_page))
+                && (self.active_page == self.buffer_page)
             {
                 Subscription::batch([::ducktape_view_guest::every(
                     ::std::time::Duration::from_millis(900),
                 )
-                .map(move |value| Message::PageAutosaveTick)])
+                .map(move |_value| Message::PageAutosaveTick)])
             } else {
                 Subscription::none()
             },
