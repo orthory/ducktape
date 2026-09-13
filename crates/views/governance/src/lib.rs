@@ -10,16 +10,7 @@
 //! the key and the password never cross: a guest that sees no key cannot
 //! leak one.
 pub mod host;
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
-
-#[allow(dead_code)]
 pub struct GovernanceView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) rows: Vec<crate::host::ProposalRow>,
     pub(crate) voting: String,
     pub(crate) admin: bool,
@@ -47,12 +38,10 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-
 #[allow(unused_parens)]
 impl GovernanceView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             rows: Vec::new(),
             voting: "".to_owned(),
             admin: false,
@@ -67,30 +56,6 @@ impl GovernanceView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    #[allow(clippy::too_many_arguments)]
-    fn restore_state(
-        active_palette: AppTheme,
-        rows: Vec<crate::host::ProposalRow>,
-        voting: String,
-        admin: bool,
-        connected: bool,
-        connection_serial: i64,
-        answered: bool,
-        host_error: String,
-        badge_sent: bool,
-    ) -> Self {
-        Self {
-            active_palette: active_palette,
-            rows: rows,
-            voting: voting,
-            admin: admin,
-            connected: connected,
-            connection_serial: connection_serial,
-            answered: answered,
-            host_error: host_error,
-            badge_sent: badge_sent,
-        }
-    }
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "7c12db27b05b027805b40f4d493f95bcbf83f7b71fb9a350d90ef241043cbc72";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -99,27 +64,6 @@ impl GovernanceView {
             state: ::ducktape_view_guest::wire::SnapshotValue::Record {
                 name: String::from("GovernanceView"),
                 fields: vec![
-                    (
-                        String::from("active_palette"),
-                        match &self.active_palette {
-                            AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: String::from("AppTheme"),
-                                fields: vec![(
-                                    String::from("app"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                )],
-                            },
-                            AppTheme::AppDark => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("AppTheme"),
-                                    fields: vec![(
-                                        String::from("app_dark"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                        },
-                    ),
                     (
                         String::from("rows"),
                         ::ducktape_view_guest::wire::SnapshotValue::List(
@@ -264,36 +208,10 @@ impl GovernanceView {
             else {
                 return None;
             };
-            if name != "GovernanceView" || fields.len() != 9 {
+            if name != "GovernanceView" || fields.len() != 8 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(AppTheme::App),
-                    "app_dark" => {
-                        matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "rows" {
                 return None;
@@ -507,17 +425,16 @@ impl GovernanceView {
                 ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
-            Some(Self::restore_state(
-                active_palette,
-                rows,
-                voting,
-                admin,
-                connected,
-                connection_serial,
-                answered,
-                host_error,
-                badge_sent,
-            ))
+            Some(Self {
+                rows: rows,
+                voting: voting,
+                admin: admin,
+                connected: connected,
+                connection_serial: connection_serial,
+                answered: answered,
+                host_error: host_error,
+                badge_sent: badge_sent,
+            })
         })())
         .ok_or_else(|| String::from("snapshot state mismatch"))
     }
@@ -543,6 +460,22 @@ impl GovernanceView {
 mod tests {
     use super::*;
     #[test]
+    fn snapshot_preserves_proposals_without_theme_bookkeeping() {
+        let (mut view, _) = GovernanceView::boot();
+        view.rows.push(host::ProposalRow {
+            id: "proposal".into(),
+            approvals: 2,
+            required_yes: 3,
+            open: true,
+            ..Default::default()
+        });
+        view.connected = true;
+        let bytes = view.snapshot().unwrap();
+        let restored = GovernanceView::restore(&bytes).unwrap();
+        assert_eq!(restored.rows, view.rows);
+        assert_eq!(restored.snapshot().unwrap(), bytes);
+    }
+    #[test]
     fn view_fits_default_stack() {
         ::std::thread::Builder::new()
             .stack_size(4 * 1024 * 1024)
@@ -555,7 +488,6 @@ mod tests {
             .unwrap();
     }
 }
-
 impl GovernanceView {
     #[allow(clippy::assign_op_pattern)]
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
@@ -584,11 +516,6 @@ impl GovernanceView {
             );
             self.admin = next.admin;
             self.connected = next.connected;
-            self.active_palette = AppTheme::App;
-            if (!next.dark) {
-                return ::ducktape_view_guest::Task::none();
-            }
-            self.active_palette = AppTheme::AppDark;
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -641,7 +568,6 @@ impl GovernanceView {
         }
     }
 }
-
 impl GovernanceView {
     pub(crate) fn view(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
@@ -670,7 +596,13 @@ impl GovernanceView {
             );
         }
         if !self.admin {
-            content.push(kit::text("governance/standing", "Approval votes are cast by this network's validators, and this node does not hold validator standing."));
+            content
+                .push(
+                    kit::text(
+                        "governance/standing",
+                        "Approval votes are cast by this network's validators, and this node does not hold validator standing.",
+                    ),
+                );
             content.push(kit::text(
                 "governance/read-help",
                 "You can still read every proposal and follow its tally while it runs.",
@@ -720,7 +652,6 @@ impl GovernanceView {
             ),
         )
     }
-
     fn proposal(&self, proposal: &host::ProposalRow) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
         let key = format!("governance/proposal/{}", proposal.id);
@@ -788,7 +719,6 @@ impl GovernanceView {
         kit::padded(kit::column(key, content), wire::Edges::all(12.))
     }
 }
-
 ducktape_view_guest::export_app!(
     GovernanceView,
     "Approvals",

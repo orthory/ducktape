@@ -3,18 +3,6 @@
 //! theme, a rename, a minted ticket, the signing seat — leaves as an intent
 //! the app signs.
 pub mod host;
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
-
-#[derive(Default)]
-struct DerivedCache {
-    account_keys: ::std::cell::OnceCell<i64>,
-}
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsPane {
     General,
@@ -22,7 +10,6 @@ pub(crate) enum SettingsPane {
     Account,
     Security,
 }
-#[allow(dead_code)]
 pub(crate) struct SettingsScreenState {
     key_pw: String,
     settings_pane: SettingsPane,
@@ -35,9 +22,7 @@ impl ::std::default::Default for SettingsScreenState {
         }
     }
 }
-#[allow(dead_code)]
 pub struct SettingsView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) connected: bool,
     pub(crate) loading: bool,
     pub(crate) status: String,
@@ -74,7 +59,6 @@ pub struct SettingsView {
     pub(crate) account_join_draft: String,
     pub(crate) host_error: String,
     pub(crate) sent: bool,
-    pub(crate) derived: DerivedCache,
     pub(crate) settings_screen_states: ::std::collections::HashMap<String, SettingsScreenState>,
     pub(crate) settings_screen_initial: SettingsScreenState,
 }
@@ -122,19 +106,8 @@ impl ::std::fmt::Debug for Message {
 }
 #[allow(unused_parens)]
 impl SettingsView {
-    #[must_use]
-    fn derived_account_keys(&self) -> &i64 {
-        self.derived
-            .account_keys
-            .get_or_init(|| ((self.account_key_rows).len() as i64))
-    }
-}
-
-#[allow(unused_parens)]
-impl SettingsView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             connected: false,
             loading: false,
             status: "".to_owned(),
@@ -171,7 +144,6 @@ impl SettingsView {
             account_join_draft: "".to_owned(),
             host_error: "".to_owned(),
             sent: false,
-            derived: ::std::default::Default::default(),
             settings_screen_states: ::std::collections::HashMap::new(),
             settings_screen_initial: ::std::default::Default::default(),
         }
@@ -180,91 +152,6 @@ impl SettingsView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    #[allow(clippy::too_many_arguments)]
-    fn restore_state(
-        active_palette: AppTheme,
-        connected: bool,
-        loading: bool,
-        status: String,
-        busy: bool,
-        recovering: bool,
-        appearance: String,
-        desktop_notifications: bool,
-        unlocked: bool,
-        seat_key: String,
-        account_name: String,
-        network_name: String,
-        connected_rpc: String,
-        account_ceremony_phase: String,
-        account_ceremony_qr: String,
-        account_ceremony_detail: String,
-        account_ceremony_left: String,
-        settings_key_state: String,
-        settings_key_path: String,
-        account_number: String,
-        account_exists: bool,
-        account_busy: bool,
-        account_ticket: String,
-        connection_serial: i64,
-        tier: String,
-        admin: bool,
-        members_line: String,
-        members_answered: bool,
-        account_key_rows: Vec<crate::host::AccountKeyRow>,
-        renaming_to: String,
-        account_name_draft: String,
-        account_create_draft: String,
-        account_key_draft: String,
-        account_key_label_draft: String,
-        account_join_draft: String,
-        host_error: String,
-        sent: bool,
-        settings_screen_states: ::std::collections::HashMap<String, SettingsScreenState>,
-        settings_screen_initial: SettingsScreenState,
-    ) -> Self {
-        Self {
-            active_palette: active_palette,
-            connected: connected,
-            loading: loading,
-            status: status,
-            busy: busy,
-            recovering: recovering,
-            appearance: appearance,
-            desktop_notifications: desktop_notifications,
-            unlocked: unlocked,
-            seat_key: seat_key,
-            account_name: account_name,
-            network_name: network_name,
-            connected_rpc: connected_rpc,
-            account_ceremony_phase: account_ceremony_phase,
-            account_ceremony_qr: account_ceremony_qr,
-            account_ceremony_detail: account_ceremony_detail,
-            account_ceremony_left: account_ceremony_left,
-            settings_key_state: settings_key_state,
-            settings_key_path: settings_key_path,
-            account_number: account_number,
-            account_exists: account_exists,
-            account_busy: account_busy,
-            account_ticket: account_ticket,
-            connection_serial: connection_serial,
-            tier: tier,
-            admin: admin,
-            members_line: members_line,
-            members_answered: members_answered,
-            account_key_rows: account_key_rows,
-            renaming_to: renaming_to,
-            account_name_draft: account_name_draft,
-            account_create_draft: account_create_draft,
-            account_key_draft: account_key_draft,
-            account_key_label_draft: account_key_label_draft,
-            account_join_draft: account_join_draft,
-            host_error: host_error,
-            sent: sent,
-            derived: ::std::default::Default::default(),
-            settings_screen_states: settings_screen_states,
-            settings_screen_initial: settings_screen_initial,
-        }
-    }
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "f8c4c32da46fa9482206b251b5b9979dfe6115d847f004e01847b0543779d57c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -273,14 +160,6 @@ impl SettingsView {
             state: ::ducktape_view_guest::wire::SnapshotValue::Record {
                 name: String::from("SettingsView"),
                 fields: vec![
-                    (String::from("active_palette"), match & self.active_palette {
-                    AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name : String::from("AppTheme"), fields : vec![(String::from("app"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit)] },
-                    AppTheme::AppDark =>
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("AppTheme"), fields : vec![(String::from("app_dark"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit)] } }),
                     (String::from("connected"),
                     ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
                     .connected))), (String::from("loading"),
@@ -435,36 +314,10 @@ impl SettingsView {
             else {
                 return None;
             };
-            if name != "SettingsView" || fields.len() != 39 {
+            if name != "SettingsView" || fields.len() != 38 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(AppTheme::App),
-                    "app_dark" => {
-                        matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "connected" {
                 return None;
@@ -956,47 +809,46 @@ impl SettingsView {
                     settings_pane: settings_pane,
                 })
             })())?;
-            Some(Self::restore_state(
-                active_palette,
-                connected,
-                loading,
-                status,
-                busy,
-                recovering,
-                appearance,
-                desktop_notifications,
-                unlocked,
-                seat_key,
-                account_name,
-                network_name,
-                connected_rpc,
-                account_ceremony_phase,
-                account_ceremony_qr,
-                account_ceremony_detail,
-                account_ceremony_left,
-                settings_key_state,
-                settings_key_path,
-                account_number,
-                account_exists,
-                account_busy,
-                account_ticket,
-                connection_serial,
-                tier,
-                admin,
-                members_line,
-                members_answered,
-                account_key_rows,
-                renaming_to,
-                account_name_draft,
-                account_create_draft,
-                account_key_draft,
-                account_key_label_draft,
-                account_join_draft,
-                host_error,
-                sent,
-                settings_screen_states,
-                settings_screen_initial,
-            ))
+            Some(Self {
+                connected: connected,
+                loading: loading,
+                status: status,
+                busy: busy,
+                recovering: recovering,
+                appearance: appearance,
+                desktop_notifications: desktop_notifications,
+                unlocked: unlocked,
+                seat_key: seat_key,
+                account_name: account_name,
+                network_name: network_name,
+                connected_rpc: connected_rpc,
+                account_ceremony_phase: account_ceremony_phase,
+                account_ceremony_qr: account_ceremony_qr,
+                account_ceremony_detail: account_ceremony_detail,
+                account_ceremony_left: account_ceremony_left,
+                settings_key_state: settings_key_state,
+                settings_key_path: settings_key_path,
+                account_number: account_number,
+                account_exists: account_exists,
+                account_busy: account_busy,
+                account_ticket: account_ticket,
+                connection_serial: connection_serial,
+                tier: tier,
+                admin: admin,
+                members_line: members_line,
+                members_answered: members_answered,
+                account_key_rows: account_key_rows,
+                renaming_to: renaming_to,
+                account_name_draft: account_name_draft,
+                account_create_draft: account_create_draft,
+                account_key_draft: account_key_draft,
+                account_key_label_draft: account_key_label_draft,
+                account_join_draft: account_join_draft,
+                host_error: host_error,
+                sent: sent,
+                settings_screen_states: settings_screen_states,
+                settings_screen_initial: settings_screen_initial,
+            })
         })())
         .ok_or_else(|| String::from("snapshot state mismatch"))
     }
@@ -1029,6 +881,28 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_account_drafts_and_selected_settings_pane() {
+        let (mut view, _) = SettingsView::boot();
+        view.account_name_draft = "새 이름".into();
+        view.account_key_draft = "aabb".into();
+        view.settings_screen_states.insert(
+            SETTINGS_SCOPE.into(),
+            SettingsScreenState {
+                key_pw: String::new(),
+                settings_pane: SettingsPane::Account,
+            },
+        );
+        let bytes = view.snapshot().unwrap();
+        let restored = SettingsView::restore(&bytes).unwrap();
+        assert_eq!(restored.account_name_draft, "새 이름");
+        assert_eq!(restored.account_key_draft, "aabb");
+        assert_eq!(
+            restored.settings_screen_states[SETTINGS_SCOPE].settings_pane,
+            SettingsPane::Account
+        );
+        assert_eq!(restored.snapshot().unwrap(), bytes);
+    }
     #[test]
     fn view_fits_default_stack() {
         ::std::thread::Builder::new()
@@ -1206,15 +1080,8 @@ impl SettingsView {
                     ::std::convert::AsRef::as_ref(&(self.account_key_label_draft)),
                 );
             }
-            {
-                self.active_palette = AppTheme::App;
-            }
-            if (!next.dark) {
-                return ::ducktape_view_guest::Task::none();
-            }
-            {
-                self.active_palette = AppTheme::AppDark;
-            }
+            {}
+            {}
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -1257,7 +1124,6 @@ impl SettingsView {
             }
             {
                 self.account_key_rows = item.rows.clone();
-                self.derived.account_keys.take();
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -1371,7 +1237,7 @@ impl SettingsView {
     }
     fn on_account_key_remove(&mut self, pubkey: String) -> ::ducktape_view_guest::Task<Message> {
         {
-            if ((self.account_busy || (!self.unlocked)) || ((*self.derived_account_keys()) <= 1)) {
+            if self.account_busy || !self.unlocked || self.account_key_rows.len() <= 1 {
                 return ::ducktape_view_guest::Task::none();
             }
             {
@@ -1559,9 +1425,7 @@ impl SettingsView {
         }
     }
 }
-
 const SETTINGS_SCOPE: &str = "SettingsView/root/settings";
-
 fn settings_action(
     key: impl Into<String>,
     label: &str,
@@ -1576,7 +1440,6 @@ fn settings_action(
         wire::ButtonPreset::Secondary,
     )
 }
-
 fn settings_input(
     key: &str,
     placeholder: &str,
@@ -1592,7 +1455,6 @@ fn settings_input(
         None,
     )
 }
-
 impl SettingsView {
     pub(crate) fn view(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
@@ -1641,7 +1503,6 @@ impl SettingsView {
             ),
         )
     }
-
     fn general_settings(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
         let choices = [
@@ -1705,7 +1566,6 @@ impl SettingsView {
             ],
         )
     }
-
     fn network_settings(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::kit;
         kit::column(
@@ -1754,7 +1614,6 @@ impl SettingsView {
             ],
         )
     }
-
     fn account_settings(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
         let available = !self.account_busy && self.unlocked;
@@ -1965,7 +1824,6 @@ impl SettingsView {
         }
         kit::column("settings/account", content)
     }
-
     fn security_settings(&self, state: &SettingsScreenState) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
         let mut content = vec![
@@ -2012,7 +1870,6 @@ impl SettingsView {
         kit::column("settings/security", content)
     }
 }
-
 ducktape_view_guest::export_app!(
     SettingsView,
     "Settings",

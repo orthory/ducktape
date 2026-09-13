@@ -16,9 +16,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use ducktape_view_guest::host;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ducktape_view_guest::host;
 
 /// How far back the op feed is scanned for a settled proposal's execute
 /// height.
@@ -436,33 +436,9 @@ pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
     rows.iter().filter(|row| !row.open).cloned().collect()
 }
 
-/// One seat per REQUIRED signature, filled for each approval already in —
-/// the quorum dots. Capped so a large threshold does not overflow the card.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct QuorumSeat {
-    pub filled: bool,
-}
-
-pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
-    let seats = required.clamp(0, 12) as usize;
-    (0..seats)
-        .map(|seat| QuorumSeat {
-            filled: (seat as i64) < approvals,
-        })
-        .collect()
-}
-
 /// `3 / 4` — the tally, one mono run.
 pub fn tally_label(approvals: i64, required: i64) -> String {
     format!("{approvals} / {required}")
-}
-
-/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
-pub fn tally_tone(approvals: i64, required: i64) -> String {
-    match approvals >= required.saturating_sub(1) {
-        true => "near".into(),
-        false => "far".into(),
-    }
 }
 
 /// `3 approvals · 1 more for quorum`, or `quorum met`.
@@ -475,23 +451,11 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     format!("{have} · {remaining} more for quorum")
 }
 
-/// The approve button leans forward at the last vote: `Approve →`.
+/// The approval action distinguishes the last vote needed for quorum.
 pub fn approve_label(approvals: i64, required: i64) -> String {
     match approvals + 1 >= required {
         true => "Approve →".into(),
         false => "Approve".into(),
-    }
-}
-
-/// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: &str) -> String {
-    let access = matches!(
-        action,
-        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
-    );
-    match access {
-        true => "access".into(),
-        false => "neutral".into(),
     }
 }
 

@@ -10,14 +10,6 @@
 //! The endpoint, the key and the password never cross: a guest that sees no
 //! key cannot leak one.
 pub mod host;
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MembersFilter {
     All,
@@ -25,9 +17,7 @@ pub(crate) enum MembersFilter {
     Agents,
     Validators,
 }
-#[allow(dead_code)]
 pub struct MembersView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) rows: Vec<crate::host::MemberRow>,
     pub(crate) admin: bool,
     pub(crate) connected: bool,
@@ -65,12 +55,10 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-
 #[allow(unused_parens)]
 impl MembersView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             rows: Vec::new(),
             admin: false,
             connected: false,
@@ -90,40 +78,6 @@ impl MembersView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    #[allow(clippy::too_many_arguments)]
-    fn restore_state(
-        active_palette: AppTheme,
-        rows: Vec<crate::host::MemberRow>,
-        admin: bool,
-        connected: bool,
-        connection_serial: i64,
-        answered: bool,
-        host_error: String,
-        filter: MembersFilter,
-        selected: String,
-        height: i64,
-        acting: String,
-        sent: bool,
-        viewport_width: f64,
-        member_width: f64,
-    ) -> Self {
-        Self {
-            active_palette: active_palette,
-            rows: rows,
-            admin: admin,
-            connected: connected,
-            connection_serial: connection_serial,
-            answered: answered,
-            host_error: host_error,
-            filter: filter,
-            selected: selected,
-            height: height,
-            acting: acting,
-            sent: sent,
-            viewport_width: viewport_width,
-            member_width: member_width,
-        }
-    }
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "c5b4c71dda09d5a068e1b5197b676ac214130791d9b62a6629ac8f67428df93e";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -132,27 +86,6 @@ impl MembersView {
             state: ::ducktape_view_guest::wire::SnapshotValue::Record {
                 name: String::from("MembersView"),
                 fields: vec![
-                    (
-                        String::from("active_palette"),
-                        match &self.active_palette {
-                            AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: String::from("AppTheme"),
-                                fields: vec![(
-                                    String::from("app"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                )],
-                            },
-                            AppTheme::AppDark => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("AppTheme"),
-                                    fields: vec![(
-                                        String::from("app_dark"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                        },
-                    ),
                     (
                         String::from("rows"),
                         ::ducktape_view_guest::wire::SnapshotValue::List(
@@ -318,36 +251,10 @@ impl MembersView {
             else {
                 return None;
             };
-            if name != "MembersView" || fields.len() != 14 {
+            if name != "MembersView" || fields.len() != 13 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(AppTheme::App),
-                    "app_dark" => {
-                        matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "rows" {
                 return None;
@@ -567,22 +474,21 @@ impl MembersView {
                 }
                 _ => None,
             })?;
-            Some(Self::restore_state(
-                active_palette,
-                rows,
-                admin,
-                connected,
-                connection_serial,
-                answered,
-                host_error,
-                filter,
-                selected,
-                height,
-                acting,
-                sent,
-                viewport_width,
-                member_width,
-            ))
+            Some(Self {
+                rows: rows,
+                admin: admin,
+                connected: connected,
+                connection_serial: connection_serial,
+                answered: answered,
+                host_error: host_error,
+                filter: filter,
+                selected: selected,
+                height: height,
+                acting: acting,
+                sent: sent,
+                viewport_width: viewport_width,
+                member_width: member_width,
+            })
         })())
         .ok_or_else(|| String::from("snapshot state mismatch"))
     }
@@ -607,6 +513,19 @@ impl MembersView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_member_selection_filter_and_width() {
+        let (mut view, _) = MembersView::boot();
+        view.filter = MembersFilter::Agents;
+        view.selected = "reviewer".into();
+        view.member_width = 360.;
+        let bytes = view.snapshot().unwrap();
+        let restored = MembersView::restore(&bytes).unwrap();
+        assert_eq!(restored.filter, MembersFilter::Agents);
+        assert_eq!(restored.selected, "reviewer");
+        assert_eq!(restored.member_width, 360.);
+        assert_eq!(restored.snapshot().unwrap(), bytes);
+    }
     #[test]
     fn view_fits_default_stack() {
         ::std::thread::Builder::new()
@@ -653,11 +572,6 @@ impl MembersView {
             );
             self.admin = next.admin;
             self.connected = next.connected;
-            self.active_palette = AppTheme::App;
-            if (!next.dark) {
-                return ::ducktape_view_guest::Task::none();
-            }
-            self.active_palette = AppTheme::AppDark;
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -760,7 +674,6 @@ impl MembersView {
         }
     }
 }
-
 impl MembersView {
     pub(crate) fn view(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
@@ -831,7 +744,13 @@ impl MembersView {
             ));
             let members = host::filter_members(&self.rows, self.filter);
             if members.is_empty() && self.answered {
-                roster.push(kit::text("members/empty", "No members here yet — validators, residents and registered agents appear as they join."));
+                roster
+                    .push(
+                        kit::text(
+                            "members/empty",
+                            "No members here yet — validators, residents and registered agents appear as they join.",
+                        ),
+                    );
             }
             for member in members {
                 let key = format!("members/row/{}", member.key);
@@ -916,7 +835,6 @@ impl MembersView {
             )),
         }
     }
-
     fn member_record(&self, member: &host::MemberRow) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
         let key = format!("members/record/{}", member.key);
@@ -1025,7 +943,6 @@ impl MembersView {
         kit::padded(kit::column(key, details), wire::Edges::all(16.))
     }
 }
-
 ducktape_view_guest::export_app!(
     MembersView,
     "Members",

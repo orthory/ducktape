@@ -20,9 +20,9 @@
 
 use std::fmt::Write as _;
 
+use ducktape_view_guest::host;
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ducktape_view_guest::host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostError {
@@ -551,24 +551,6 @@ fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
     let bytes = serde_json::to_vec(payload).expect("an intent encodes");
     host::notify(operation, &bytes);
     true
-}
-
-// The desktop app's own readings (app/src/backend), repeated here because the
-// view is its own crate: the wire carries the words, not the functions.
-
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
-}
-
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
 }
 
 /// The draft as it stands, or nothing once the read it targeted moved.

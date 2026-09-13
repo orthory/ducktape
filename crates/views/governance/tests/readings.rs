@@ -3,8 +3,7 @@
 
 use governance_view::host::{
     ProposalRow, approve_label, fold_proposals, fold_settle_heights, gov_action_detail,
-    proposal_kind_tone, proposals_summary, quorum_dots, tagged_name, tally_label, tally_note,
-    tally_tone, yes_needed,
+    proposals_summary, tagged_name, tally_label, tally_note, yes_needed,
 };
 
 fn proposal(open: bool) -> ProposalRow {
@@ -31,25 +30,14 @@ fn the_subtitle_is_silent_over_an_empty_register() {
 }
 
 #[test]
-fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
+fn quorum_tally_counts_the_frozen_rule_not_the_electorate() {
     // three of the four REQUIRED signatures are in, inside a six-node pool.
-    let dots = quorum_dots(3, 4);
-    assert_eq!(dots.len(), 4);
-    assert_eq!(dots.iter().filter(|seat| seat.filled).count(), 3);
     assert_eq!(tally_label(3, 4), "3 / 4");
-    assert_eq!(tally_tone(3, 4), "near");
-    assert_eq!(tally_tone(1, 4), "far");
     assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
     assert_eq!(tally_note(4, 4), "quorum met");
     assert_eq!(approve_label(3, 4), "Approve →");
     assert_eq!(approve_label(1, 4), "Approve");
-}
-
-#[test]
-fn an_access_class_action_wears_the_brand_pair() {
-    assert_eq!(proposal_kind_tone("add_validator"), "access");
-    assert_eq!(proposal_kind_tone("signal"), "neutral");
 }
 
 #[test]
