@@ -51,7 +51,6 @@ pub struct FilesView {
     pub(crate) preview_pane_height: f64,
     pub(crate) object_width: f64,
     derived: DerivedCache,
-    pub(crate) preview_text_revision: u64,
     pub(crate) history_open: bool,
 }
 impl ::std::fmt::Debug for FilesView {
@@ -176,7 +175,6 @@ impl FilesView {
             preview_pane_height: 300.0,
             object_width: 306.0,
             derived: ::std::default::Default::default(),
-            preview_text_revision: ::ducktape_view_guest::rev::seed(),
             history_open: false,
         }
     }
@@ -1267,7 +1265,6 @@ impl FilesView {
                 preview_pane_height: preview_pane_height,
                 object_width: object_width,
                 derived: ::std::default::Default::default(),
-                preview_text_revision: ::ducktape_view_guest::rev::seed(),
                 history_open,
             })
         })())
@@ -1312,6 +1309,28 @@ impl FilesView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_unsaved_document_and_browser_state() {
+        let (mut app, _) = FilesView::boot();
+        app.history_open = true;
+        app.chain = "chain-a".into();
+        app.editing = true;
+        app.draft_chain = app.chain.clone();
+        app.draft_path = "/shared/draft.md".into();
+        app.draft_base = "base".into();
+        app.draft_id = 42;
+        app.draft = ducktape_view_guest::Editor::new("unsaved 한글\nsecond line");
+        app.tree_width = 245.;
+        app.object_width = 355.;
+        app.preview_pane_height = 288.;
+        let bytes = app.snapshot().unwrap();
+        let restored = FilesView::restore(&bytes).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), bytes);
+        assert_eq!(restored.draft.text(), "unsaved 한글\nsecond line");
+        assert!(restored.history_open);
+        assert_eq!(restored.draft_path, "/shared/draft.md");
+        assert_eq!((restored.tree_width, restored.object_width, restored.preview_pane_height), (245., 355., 288.));
+    }
     #[test]
     fn a_captured_save_refuses_after_its_network_moves() {
         let (mut app, _) = FilesView::boot();

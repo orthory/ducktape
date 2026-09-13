@@ -171,7 +171,6 @@ impl super::FilesView {
             let next = "".to_owned();
             if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
                 self.preview_display_text = next;
-                self.preview_text_revision += 1;
             }
         }
         self.preview_clipped = false;
@@ -239,7 +238,6 @@ impl super::FilesView {
             let next = item.display_text.to_owned();
             if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
                 self.preview_display_text = next;
-                self.preview_text_revision += 1;
             }
         }
         self.preview_clipped = item.clipped;
@@ -350,7 +348,6 @@ impl super::FilesView {
             let next = "".to_owned();
             if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
                 self.preview_display_text = next;
-                self.preview_text_revision += 1;
             }
         }
         self.preview_picture = false;
@@ -389,7 +386,6 @@ impl super::FilesView {
             let next = "".to_owned();
             if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
                 self.preview_display_text = next;
-                self.preview_text_revision += 1;
             }
         }
         self.preview_clipped = false;
