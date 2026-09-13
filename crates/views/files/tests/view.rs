@@ -145,7 +145,7 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
     let frame = with_preview(&frame, "hello");
     let fixed = |frame: &Frame, suffix: &str, vertical: bool| {
         let (width, height) = match node_ending(frame, suffix) {
-            Node::Container { width, height, .. } | Node::Linear { width, height, .. } => {
+            Node::Container { width, height, .. } | Node::Linear { width, height, .. } | Node::Scroll { width, height, .. } => {
                 (width, height)
             }
             node => panic!("fixed pane {suffix}: {node:?}"),
@@ -202,7 +202,7 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
         mouse::Cursor::ResizingHorizontally,
     );
     assert_eq!(
-        fixed(&frame, "/object-panel/root", false),
+        fixed(&frame, "/object-panel", false),
         Some(Length::Fixed(366.0))
     );
 }
