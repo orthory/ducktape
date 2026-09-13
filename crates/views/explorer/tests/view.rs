@@ -4,10 +4,12 @@
 //! workspace search over `rpc.query` / `rpc.view`. A copy is the one act that
 //! still leaves as an intent.
 
+use ducktape_view_guest::testing::{
+    answer, has_text, item, press, refuse, submit, texts, type_into,
+};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use explorer_view::host::{Copy, Session};
 use explorer_view::{boot_native, tick_native};
-use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, submit, texts, type_into};
-use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 
 fn node_ending(frame: &Frame, suffix: &str) -> Node {
     fn find(node: &Node, suffix: &str) -> Option<Node> {
@@ -246,8 +248,7 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
 
     let mut events = Vec::new();
     for request in &frame.requests {
-        let ask: serde_json::Value =
-            serde_json::from_slice(&request.payload).unwrap_or_default();
+        let ask: serde_json::Value = serde_json::from_slice(&request.payload).unwrap_or_default();
         let reply = match ask["target"].as_str().unwrap_or_default() {
             "chat" => serde_json::json!({ "hits": [{
                 "channel_id": "general", "seq": 12, "author": "user:48cedb0d1122",
@@ -288,7 +289,9 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
     );
     for chip in ["Messages", "Pages", "Code", "Tasks", "Runs"] {
         assert!(
-            chips.iter().any(|text| text == chip),
+            chips
+                .iter()
+                .any(|text| text.starts_with(&format!("{chip} ("))),
             "missing the {chip} chip in {chips:?}"
         );
     }
@@ -296,7 +299,10 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
     // clearing drops the answer and the sentence with it
     let frame = tick_native(press(&frame, "Clear workspace search"));
     assert!(
-        !has_text(&frame, "Files did not answer — these results are incomplete."),
+        !has_text(
+            &frame,
+            "Files did not answer — these results are incomplete."
+        ),
         "{:?}",
         texts(&frame)
     );

@@ -5,8 +5,8 @@ use gpui_kit::MouseUpEvent;
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
-    Disableable,
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    Disableable, Selectable,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
 };
@@ -1536,6 +1536,7 @@ impl ViewTree {
                 key,
                 content,
                 label,
+                checked,
                 on_press,
                 width,
                 height,
@@ -1543,9 +1544,9 @@ impl ViewTree {
                 style,
                 ..
             } => {
-                let mut button =
-                    button_style(Button::new(key.clone()), style, on_press.is_none(), cx)
-                        .disabled(on_press.is_none());
+                let mut button = button_style(Button::new(key.clone()), style.preset)
+                    .disabled(on_press.is_none())
+                    .selected(checked.unwrap_or(false));
                 button = match content {
                     wire::ButtonContent::Label(text) => button.label(text.clone()),
                     wire::ButtonContent::Child(child) => {
@@ -2216,6 +2217,14 @@ impl ViewTree {
                     element = element.child(shade).child(
                         layer.child(
                             div()
+                                .bg(gpui_kit::component::Theme::global(cx)
+                                    .color_tokens()
+                                    .popover)
+                                .text_color(
+                                    gpui_kit::component::Theme::global(cx)
+                                        .color_tokens()
+                                        .popover_foreground,
+                                )
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(self.node(modal, window, cx)),
                         ),
@@ -3455,8 +3464,8 @@ fn decoration<T: Styled>(
     element
 }
 
-fn button_style(mut button: Button, style: &wire::ButtonStyle, disabled: bool, cx: &App) -> Button {
-    button = match style.preset {
+fn button_style(button: Button, preset: wire::ButtonPreset) -> Button {
+    match preset {
         wire::ButtonPreset::Primary => button.primary(),
         wire::ButtonPreset::Secondary => button.secondary(),
         wire::ButtonPreset::Success => button.success(),
@@ -3465,71 +3474,6 @@ fn button_style(mut button: Button, style: &wire::ButtonStyle, disabled: bool, c
         wire::ButtonPreset::Text => button.text(),
         wire::ButtonPreset::Background => button.secondary(),
         wire::ButtonPreset::Subtle => button.ghost(),
-    };
-    let base = style
-        .recipe
-        .as_ref()
-        .map_or(wire::Face::default(), |recipe| recipe.base);
-    let active = face_over(base, style.active);
-    let face = match disabled {
-        true => face_over(active, style.disabled.unwrap_or_default()),
-        false => active,
-    };
-    let hover = face_over(face, style.hovered.unwrap_or_default());
-    let pressed = face_over(hover, style.pressed.unwrap_or_default());
-    let custom = style.recipe.is_some() || face.background.is_some() || face.text.is_some();
-    if custom {
-        let mut variant = ButtonCustomVariant::new(cx);
-        if let Some(color) = face.background {
-            variant = variant.color(rgba(color));
-        }
-        if let Some(color) = face.text {
-            variant = variant.foreground(rgba(color));
-        }
-        if let Some(color) = hover.background {
-            variant = variant.hover(rgba(color));
-        }
-        if let Some(color) = pressed.background {
-            variant = variant.active(rgba(color));
-        }
-        if let Some(recipe) = &style.recipe {
-            if let Some(color) = recipe.hover_background {
-                variant = variant.hover(rgba(color));
-            }
-            if let Some(color) = recipe.pressed_background {
-                variant = variant.active(rgba(color));
-            }
-            if let Some(size) = recipe.text_size {
-                button = button.text_size(px(size));
-            }
-            if let Some(line_height) = recipe.line_height {
-                button = button.line_height(relative(line_height));
-            }
-            if let Some(font) = &recipe.font {
-                button = button.font_weight(font_weight(font.weight));
-            }
-            if disabled {
-                if let Some(color) = recipe.disabled_background {
-                    variant = variant.color(rgba(color));
-                }
-                if let Some(color) = recipe.disabled_text {
-                    variant = variant.foreground(rgba(color));
-                }
-                if let Some(opacity) = recipe.disabled_opacity {
-                    button = button.opacity(opacity);
-                }
-            }
-        }
-        button = button.custom(variant);
-    }
-    decoration(button, None, face.border)
-}
-
-fn face_over(base: wire::Face, next: wire::Face) -> wire::Face {
-    wire::Face {
-        background: next.background.or(base.background),
-        text: next.text.or(base.text),
-        border: next.border.or(base.border),
     }
 }
 

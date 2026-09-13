@@ -30,6 +30,7 @@ pub use editor_binding::{
 pub use editor_documents::EditorDocumentUpdate;
 pub mod events;
 pub mod keyboard;
+pub mod kit;
 mod memo;
 pub mod mouse;
 pub use memo::{invalidate_component, memo_lazy};

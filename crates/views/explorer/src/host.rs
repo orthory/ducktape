@@ -14,10 +14,10 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 
+use ducktape_view_guest::host;
 use futures::{StreamExt, future::join_all, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ducktape_view_guest::host;
 
 /// How many recent blocks the ledger reads. The window the screen has always
 /// shown.
@@ -388,7 +388,10 @@ impl Leg {
 
 /// The answer to one query, run once per `(query, serial)` — the serial moves
 /// on every submit, so asking the same thing twice really asks twice.
-pub fn workspace_search(query: String, serial: i64) -> ducktape_view_guest::Subscription<SearchItem> {
+pub fn workspace_search(
+    query: String,
+    serial: i64,
+) -> ducktape_view_guest::Subscription<SearchItem> {
     ducktape_view_guest::Subscription::run_with((query, serial), |key| {
         stream::once(run_search(key.0.clone()))
     })
@@ -798,10 +801,6 @@ pub fn copy(text: &str, label: &str) -> bool {
 }
 
 // ---------- the readings ----------
-
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
 
 /// The ops of the selected block (0 selects nothing).
 pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {

@@ -11,8 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 futures.workspace = true
-# the product icon set, as bytes the wire carries
-design = { path = "../support/design" }
 serde.workspace = true
 serde_json.workspace = true
 ducktape-view-guest.workspace = true
