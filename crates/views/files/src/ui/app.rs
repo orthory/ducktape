@@ -1163,6 +1163,34 @@ impl FilesView {
 mod tests {
     use super::*;
     #[test]
+    fn a_captured_save_refuses_after_its_network_moves() {
+        let (mut app, _) = FilesView::boot();
+        app.connected = true;
+        app.listed = true;
+        app.chain = "chain-a".into();
+        app.preview_path = "/shared/a.md".into();
+        app.preview_base = "base-a".into();
+        app.editing = true;
+        app.draft_chain = app.chain.clone();
+        app.draft_path = app.preview_path.clone();
+        app.draft_base = app.preview_base.clone();
+        app.draft = ducktape_view_guest::Editor::new("unsaved A — 한글".into());
+        let save = Message::SaveEdit(app.derived_edit_context().clone());
+        let _ = app.update(Message::SessionArrived(crate::host::SessionItem {
+            next: crate::host::Session { connected: true, chain: "chain-b".into(), ..Default::default() },
+            ..Default::default()
+        }));
+        // Message IDs belong to a frame; admission tests retain the actual
+        // domain command rather than replaying an ID against another table.
+        let _ = app.update(save);
+        assert!(!app.sent);
+        assert!(!app.saving);
+        assert_eq!(app.draft.text(), "unsaved A — 한글");
+        assert_eq!(app.draft_chain, "chain-a");
+        assert_eq!(app.draft_path, "/shared/a.md");
+        assert_eq!(app.draft_base, "base-a");
+    }
+    #[test]
     fn view_fits_default_stack() {
         ::std::thread::Builder::new()
             .stack_size(4 * 1024 * 1024)

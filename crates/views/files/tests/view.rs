@@ -483,7 +483,6 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         .expect("the editor");
     let (editing, before) = read_draft(&editing);
     let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
-    let queued_save = press(&editing, "Save");
 
     // the network moves under the draft
     let frame = tick_native(vec![item(
@@ -498,13 +497,12 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         .unwrap(),
     )]);
     assert!(has_text(&frame, "Unsaved changes to:"), "{:?}", texts(&frame));
-    let frame = tick_native(queued_save);
     assert!(
         !frame
             .requests
             .iter()
             .any(|request| request.kind == "op.submit"),
-        "a parked draft never submits: {:?}",
+        "parking a draft never submits: {:?}",
         frame.requests
     );
 
