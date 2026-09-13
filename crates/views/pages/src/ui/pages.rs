@@ -449,7 +449,10 @@ impl PagesView {
             ));
         }
         for group in groups {
-            if self.scope_target.is_empty() && !group.anchor.is_empty() {
+            let block_anchor = self.scope_target.is_empty()
+                && group.target != self.active_page
+                && !group.anchor.is_empty();
+            if block_anchor {
                 threads.push(named(
                     action(
                         format!("pages/comments/scope/{}", group.target),

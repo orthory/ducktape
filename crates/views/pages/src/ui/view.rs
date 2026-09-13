@@ -248,6 +248,12 @@ mod document_snapshot {
 
 impl PagesView {
     fn subscription(&self) -> Subscription<Message> {
+        let search_active = self.connected && !self.page_search_query.is_empty();
+        let autosave_ready = self.connected
+            && !self.loading
+            && !self.busy
+            && !self.active_page.is_empty()
+            && self.active_page == self.buffer_page;
         Subscription::batch([
             ::ducktape_view_guest::mouse::observe(Subscription::filter_events(
                 |event| match event {
@@ -300,35 +306,24 @@ impl PagesView {
                     ..Default::default()
                 },
             ),
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
-                Subscription::batch([crate::host::register(
-                    self.active_page.to_owned(),
-                    self.register_serial,
-                )
-                .map(move |value| Message::RegisterArrived(value))])
+                crate::host::register(self.active_page.to_owned(), self.register_serial)
+                    .map(Message::RegisterArrived)
             } else {
                 Subscription::none()
             },
-            if self.connected && (!(self.page_search_query).is_empty()) {
-                Subscription::batch([crate::host::search(
-                    self.page_search_query.to_owned(),
-                    self.page_search_serial,
-                )
-                .map(move |value| Message::SearchArrived(value))])
+            if search_active {
+                crate::host::search(self.page_search_query.to_owned(), self.page_search_serial)
+                    .map(Message::SearchArrived)
             } else {
                 Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
-            crate::host::saves().map(move |value| Message::SaveDone(value)),
-            if (((self.connected && (!self.loading)) && (!self.busy))
-                && (!(self.active_page).is_empty()))
-                && (self.active_page == self.buffer_page)
-            {
-                Subscription::batch([::ducktape_view_guest::every(
-                    ::std::time::Duration::from_millis(900),
-                )
-                .map(move |_value| Message::PageAutosaveTick)])
+            crate::host::acts().map(Message::ActDone),
+            crate::host::saves().map(Message::SaveDone),
+            if autosave_ready {
+                ducktape_view_guest::every(::std::time::Duration::from_millis(900))
+                    .map(|_| Message::PageAutosaveTick)
             } else {
                 Subscription::none()
             },
