@@ -534,6 +534,29 @@ mod tests {
         });
         assert!(found);
     }
+
+    #[test]
+    fn an_empty_search_answer_never_describes_an_unsubmitted_draft() {
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.page_search_query = "missing".into();
+        app.page_search_draft = "  missing  ".into();
+        let empty_answer = |app: &PagesView| {
+            let mut found = false;
+            app.view().for_each_mut(&mut |node| {
+                if let Node::Text { content, .. } = node {
+                    found |= content == "No matching pages";
+                }
+            });
+            found
+        };
+        assert!(empty_answer(&app));
+        app.page_search_draft = "different".into();
+        assert!(!empty_answer(&app));
+        app.page_search_draft = "missing".into();
+        app.page_searching = true;
+        assert!(!empty_answer(&app), "pending is not an empty answer");
+    }
 }
 include!("app_update.rs");
 include!("app_view.rs");
