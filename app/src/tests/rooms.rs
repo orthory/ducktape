@@ -205,34 +205,6 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     assert!(app.active_dm_peer.is_empty());
 }
 
-/// THE DM HEADER IS THE ROW'S FLEXIBLE CHILD, exactly as the channel title is.
-///
-/// Cross-axis centering does not allocate remaining row width, so the header's
-/// right-hand cluster — the huddle control and
-/// the ⋯ that is the only mouse route to Channel details — sits at the right
-/// edge only while some child takes the row's slack. The channel arm has a
-/// `box w=fill clip=true` around its title for exactly this; the DM arm mounted
-/// `DmHeader` bare, so ⋯ packed against the peer's name and moved with its
-/// length, and a long name pushed the huddle control and ⋯ past the pane's clip.
-///
-/// It also branches on the resolved NAME, not the key: `dm_peer_named` answers
-/// a roster miss with the blank peer while the key stays set, so branching on
-/// the key drew an empty plate with no name — never the fall-through to the
-/// derived two-party title that three comments promise. ONE discriminant for
-/// the whole surface: the thread rail draws the same room's breadcrumb, and a
-/// rail still reading the KEY would print that room without its `#` while the
-/// header above it printed one — two readings of one room, on screen together.
-#[test]
-fn the_dm_header_takes_the_slack_the_channel_title_would() {
-    let chat = rust_tokens(super::connection::CHAT);
-    let (_, header) = chat.split_once("DmHeader").expect("peer header mount");
-    assert!(
-        header.contains("Length::Fill"),
-        "the peer header takes available width"
-    );
-    assert!(chat.contains("active_dm_peer") && chat.contains("active_channel_name"));
-}
-
 // Entering a (possibly different) network through the doors' landing clears
 // every reading and draft of the previous one — and the in-flight huddle —
 // while the KEY password survives: it unlocks this device's user.key, not an
@@ -752,14 +724,6 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
 
 #[test]
 fn unread_indicators_are_wired_client_local_only() {
-    let chat = rust_tokens(super::connection::CHAT);
-    assert!(chat.contains("room.unread"));
-    assert!(chat.contains("unread_boundary") && chat.contains("unread_marker_seq"));
-    assert!(
-        !chat.contains("first_unread_seq("),
-        "the frame reads the prepared marker"
-    );
-    assert!(chat.contains("\"NEW\""));
     let connected = handler_body("WorkspaceConnected");
     assert!(connected.contains("initial_channel_reads("));
     let updated = handler_body("ChatUpdated");
@@ -771,7 +735,6 @@ fn unread_indicators_are_wired_client_local_only() {
     let live = rust_tokens(include_str!("../backend/live.rs"));
     assert!(live.contains("letreads_live_tail=!history_view&&chat_visible"));
     assert!(live.contains("ifreads_live_tail"));
-    assert!(!chat.contains("read_cursor("));
 }
 
 /// A DM RECORD IS A NETWORK-VISIBLE CHANNEL ROW, so a DM between two OTHER

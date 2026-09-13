@@ -80,7 +80,6 @@ impl super::ChatView {
             Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
             Message::ChannelNameDraftChanged(value) => self.on_channel_name_draft_changed(value),
             Message::MemberKeyDraftChanged(value) => self.on_member_key_draft_changed(value),
-            Message::Ignore => self.on_ignore(),
         }
     }
     fn on_sidebar_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
@@ -1269,9 +1268,6 @@ impl super::ChatView {
     }
     fn on_member_key_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
         self.member_key_draft = value;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_ignore(&mut self) -> ducktape_view_guest::Task<Message> {
         ::ducktape_view_guest::Task::none()
     }
 }

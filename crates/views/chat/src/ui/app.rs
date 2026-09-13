@@ -194,7 +194,6 @@ pub enum Message {
     SearchDraftChanged(String),
     ChannelNameDraftChanged(String),
     MemberKeyDraftChanged(String),
-    Ignore,
 }
 impl ::std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -374,6 +373,144 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_composition_retains_timeline_identity_unread_and_action_admission() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.active_channel_name = "Room".into();
+        state.unread_boundary = 1;
+        state.unread_marker_seq = 2;
+        state.rooms = vec![crate::host::ChatSidebarRow {
+            channel: crate::host::ChatChannel {
+                id: "room".into(),
+                name: "Room".into(),
+                ..Default::default()
+            },
+            unread: true,
+        }];
+        state.messages = vec![
+            crate::host::ChatMessage {
+                seq: 1,
+                view_key: 11,
+                ..Default::default()
+            },
+            crate::host::ChatMessage {
+                seq: 2,
+                view_key: 22,
+                ..Default::default()
+            },
+            crate::host::ChatMessage {
+                seq: -1,
+                view_key: -1,
+                pending: true,
+                ..Default::default()
+            },
+            crate::host::ChatMessage {
+                seq: 3,
+                view_key: 33,
+                deleted: true,
+                ..Default::default()
+            },
+        ];
+        let mut tree = state.view();
+        let mut scrolls = 0;
+        let mut rows = 0;
+        let mut unread = 0;
+        let mut threads = 0;
+        let mut reactions = 0;
+        let mut menus = 0;
+        let mut unread_rooms = 0;
+        tree.for_each_mut(&mut |node| match node {
+            wire::Node::Scroll {
+                key,
+                virtual_rows,
+                anchor_y,
+                ..
+            } if key.ends_with("/message-stream") => {
+                assert!(*virtual_rows);
+                assert_eq!(*anchor_y, wire::ScrollAnchor::End);
+                scrolls += 1;
+            }
+            wire::Node::KeyedColumn {
+                key,
+                keys,
+                virtual_row,
+                ..
+            } if key.ends_with("/message-stream/rows") => {
+                assert_eq!(
+                    keys.as_ref().unwrap(),
+                    &[11, 22, -1, 33].map(wire::ListKey::Integer)
+                );
+                assert!(virtual_row.is_some_and(|height| height > 0.));
+                rows += 1;
+            }
+            wire::Node::Text { content, .. } if content == "New messages" => unread += 1,
+            wire::Node::Button {
+                label: Some(label),
+                content,
+                on_press,
+                key,
+                ..
+            } => {
+                if matches!(content, wire::ButtonContent::Label(text) if text.contains("Unread")) {
+                    unread_rooms += 1;
+                }
+                if ["Open thread", "React with 👍", "More message actions"]
+                    .contains(&label.as_str())
+                {
+                    assert!(on_press.is_some());
+                    assert!(!key.contains("/message/-1/") && !key.contains("/message/33/"));
+                    match label.as_str() {
+                        "Open thread" => threads += 1,
+                        "React with 👍" => reactions += 1,
+                        _ => menus += 1,
+                    }
+                }
+            }
+            _ => {}
+        });
+        assert_eq!(
+            (scrolls, rows, unread, threads, reactions, menus),
+            (1, 1, 1, 2, 2, 2)
+        );
+        assert_eq!(unread_rooms, 1);
+    }
+
+    #[test]
+    fn dm_header_fills_the_title_slot_and_menus_focus_real_content() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.active_dm_peer = "peer".into();
+        state.active_dm = crate::host::DmPeer {
+            name: "Peer".into(),
+            ..Default::default()
+        };
+        state.selected_message_seq = 1;
+        let mut tree = state.view();
+        let mut headers = 0;
+        let mut menus = 0;
+        tree.for_each_mut(&mut |node| match node {
+            wire::Node::Linear { key, width, .. } if key.ends_with("/dm-header") => {
+                assert_eq!(*width, Some(wire::Length::Fill));
+                headers += 1;
+            }
+            wire::Node::Linear { key, children, .. } if key.ends_with("/message-action-focus") => {
+                assert!(!children.is_empty());
+                menus += 1;
+            }
+            wire::Node::Input { key, .. } => assert!(!key.ends_with("-focus")),
+            _ => {}
+        });
+        assert_eq!((headers, menus), (1, 1));
+        state.active_dm.name.clear();
+        let mut tree = state.view();
+        tree.for_each_mut(&mut |node| {
+            assert!(!node.key().is_some_and(|key| key.ends_with("/dm-header")))
+        });
+    }
+
     #[test]
     fn snapshot_preserves_drafts_selection_and_subscription_identity() {
         let mut state = ChatView::state();

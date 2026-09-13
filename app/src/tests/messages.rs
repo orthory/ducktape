@@ -1,23 +1,7 @@
 use super::*;
 
 #[test]
-fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
-    let chat = rust_tokens(super::connection::CHAT);
-    assert!(chat.contains("Node::KeyedColumn") && chat.contains("virtual_row:"));
-    assert!(
-        chat.contains("virtual_row:Some(44.0f32)"),
-        "the wire supplies a bounded row estimate"
-    );
-    assert!(chat.contains("anchor_y:") && chat.contains("ScrollAnchor::End"));
-    assert!(
-        chat.contains("message.view_key"),
-        "prepend and confirmation must preserve row identity"
-    );
-    assert!(
-        chat.contains("copy_anchor_seq")
-            && chat.contains("copy_head_seq")
-            && chat.contains("copy_surface")
-    );
+fn the_native_message_list_preserves_measurements_by_identity() {
     let native = rust_tokens(include_str!("../view_tree.rs"));
     assert!(
         native.contains("gpui_kit::list("),

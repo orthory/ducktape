@@ -74,18 +74,6 @@ fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
     );
 }
 #[test]
-fn message_action_toolbar_retains_named_actions_and_admission_guards() {
-    let chat = rust_tokens(super::connection::CHAT);
-    assert!(chat.contains("wire::Node::Hover"));
-    // Native kit geometry is authoritative; the actionable label and state
-    // guards remain the behavioral contract, not an old toolbar pixel size.
-    assert!(chat.contains("Reactwith👍"));
-    assert!(chat.contains("OpenMessageReactions("));
-    assert!(chat.contains("message.deleted"));
-    assert!(chat.contains("message.pending"));
-    assert!(chat.contains("description:"));
-}
-#[test]
 fn compact_controls_share_a_single_geometry_and_type_scale() {
     let design = include_str!("../../../crates/views/support/design/src/lib.rs");
     assert!(design.contains("Geist"));

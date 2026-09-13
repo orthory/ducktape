@@ -165,13 +165,18 @@ impl ChatView {
     }
     fn room(&self, key: &str) -> wire::Node {
         let mut header = Vec::new();
-        if self.active_dm_peer.is_empty() {
-            header.push(native::heading(
-                format!("{key}/room-name"),
-                &self.active_channel_name,
+        if self.active_dm.name.is_empty() {
+            header.push(native::sized(
+                native::heading(format!("{key}/room-name"), &self.active_channel_name),
+                Some(wire::Length::Fill),
+                None,
             ));
         } else {
-            header.push(self.direct_message_header(format!("{key}/dm-header")));
+            header.push(native::sized(
+                self.direct_message_header(format!("{key}/dm-header")),
+                Some(wire::Length::Fill),
+                None,
+            ));
         }
         if self.active_channel_archived {
             header.push(self.archived_badge(format!("{key}/archived")));
@@ -373,6 +378,14 @@ impl ChatView {
             };
             let [reaction, more] = actions;
             if !message.pending && !message.deleted {
+                if !thread && message.reply_count == 0 {
+                    children.push(action(
+                        format!("{scope}/thread"),
+                        "Open thread",
+                        Message::OpenThreadFor(message.seq),
+                        false,
+                    ));
+                }
                 children.push(action(
                     format!("{scope}/thumbs-up"),
                     "React with 👍",
@@ -661,14 +674,7 @@ impl ChatView {
             MessageAction::Delete => "delete-focus",
             _ => "action-focus",
         };
-        let mut children = vec![field(
-            format!("{key}/{prefix}{focus}"),
-            "Message action focus",
-            "",
-            |_| Message::Ignore,
-            None,
-            false,
-        )];
+        let mut children = Vec::new();
         match mode {
             MessageAction::Toolbar | MessageAction::More => {
                 let reaction = if thread {
@@ -782,6 +788,6 @@ impl ChatView {
             close,
             self.busy && mode == MessageAction::Editing,
         ));
-        native::column(format!("{key}/{prefix}menu"), children)
+        native::column(format!("{key}/{prefix}{focus}"), children)
     }
 }

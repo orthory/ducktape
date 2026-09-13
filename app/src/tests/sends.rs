@@ -96,16 +96,6 @@ fn sends_in_flight_are_independent_and_never_erase_the_next_draft() {
         channel_id: "general".into(),
     }));
     assert!(app.chat_pending_sends.is_empty());
-
-    let chat = rust_tokens(include_str!("../../../crates/views/chat/src/ui/chat.rs"));
-    assert!(
-        chat.contains("message.view_key"),
-        "optimistic confirmations retain their row identity"
-    );
-    assert!(
-        chat.contains("message.id"),
-        "selection follows identity, not a changing confirmation sequence"
-    );
 }
 
 /// The bodies the app is still holding for the view to paint, in order.
