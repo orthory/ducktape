@@ -1,10 +1,4 @@
 use ducktape_view_guest::Task;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LiveKind {
     Retry,
@@ -272,7 +266,6 @@ pub struct Ducktape {
     pub(crate) welcome_desktop_auth_task: Option<::ducktape_view_guest::task::Handle>,
     pub(crate) provision_progress_generation: u64,
     pub(crate) provision_progress_task: Option<::ducktape_view_guest::task::Handle>,
-    pub(crate) app_palette: AppTheme,
     pub(crate) appearance: Appearance,
     pub(crate) desktop_notifications: bool,
     pub(crate) wall_now: i64,
@@ -308,9 +301,6 @@ pub struct Ducktape {
     pub(crate) chat_land_seq: i64,
     pub(crate) chat_edit_seq: i64,
     pub(crate) chat_edit_rev: i64,
-    pub(crate) composer_stashed: bool,
-    pub(crate) composer_roster_set: bool,
-    pub(crate) composer_seeded: bool,
     pub(crate) live_agents: Vec<crate::backend::LiveAgentRow>,
     pub(crate) chat_sent_serial: i64,
     pub(crate) chat_pending_sends: Vec<crate::backend::PendingSend>,
@@ -491,7 +481,6 @@ pub(crate) enum AppMessage {
     CloseLaunchWindow,
     WindowFocused(crate::shell::WindowKey),
     WindowUnfocused(crate::shell::WindowKey),
-    WindowFocusNoted,
     CommandChordPressed(crate::shell::KeyPress),
     TrayOpenBell,
     TrayGoChat,
@@ -584,7 +573,6 @@ pub(crate) enum AppMessage {
     ChatViewEvent(crate::module_view::ModuleViewEvent),
     PagesViewEvent(crate::module_view::ModuleViewEvent),
     OpenPageSearchHit(String, String),
-    ExternalUrlOpened(bool),
     ExternalUrlFailed(crate::backend::AppError),
     OnboardingOpened(crate::shell::WindowKey),
     HubBooted(crate::backend::HubState),
@@ -657,7 +645,6 @@ impl ::std::fmt::Debug for AppMessage {
         formatter.write_str("AppMessage")
     }
 }
-
 impl Ducktape {
     fn is_dark(&self) -> bool {
         self.appearance == Appearance::Dark
@@ -718,10 +705,9 @@ impl Ducktape {
             welcome_desktop_auth_task: None,
             provision_progress_generation: 0,
             provision_progress_task: None,
-            app_palette: AppTheme::App,
             appearance: Appearance::System,
             desktop_notifications: true,
-            wall_now: ({ crate::backend::current_wall_seconds() }),
+            wall_now: (crate::backend::current_wall_seconds()),
             rpc: "".to_owned(),
             connected_rpc: "".to_owned(),
             password: "".to_owned(),
@@ -754,9 +740,6 @@ impl Ducktape {
             chat_land_seq: 0,
             chat_edit_seq: 0,
             chat_edit_rev: 0,
-            composer_stashed: false,
-            composer_roster_set: false,
-            composer_seeded: false,
             live_agents: Vec::new(),
             chat_sent_serial: 0,
             chat_pending_sends: Vec::new(),
@@ -881,7 +864,6 @@ impl Ducktape {
         let (_, task) = crate::shell::open(crate::shell::WindowKind::Onboarding);
         task.map(AppMessage::OnboardingOpened)
     }
-
     pub(crate) fn subscriptions(&self) -> ducktape_view_guest::Subscription<AppMessage> {
         use ducktape_view_guest::Subscription;
         let mut subscriptions = Vec::new();
@@ -952,7 +934,6 @@ impl Ducktape {
     #[cfg(test)]
     pub(crate) fn fixture_offline_chat() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.rpc = "".to_owned();
         state.status = "Offline".to_owned();
         state.connected = false;
@@ -964,13 +945,11 @@ impl Ducktape {
         state.channel_create_members_only = false;
         state.palette_open = false;
         state.palette_draft = "".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_offline_palette() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.status = "Offline".to_owned();
         state.connected = false;
         state.loading = false;
@@ -978,13 +957,11 @@ impl Ducktape {
         state.shell_tab = ShellTab::Chat;
         state.palette_open = true;
         state.palette_draft = "".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_offline_settings() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.rpc = "".to_owned();
         state.status = "Offline".to_owned();
         state.connected = false;
@@ -992,21 +969,17 @@ impl Ducktape {
         state.mutation_phase = MutationPhase::Idle;
         state.error = "".to_owned();
         state.shell_tab = ShellTab::Settings;
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_connection_error() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.error = "Connection failed".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_wallet_picker() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.mutation_phase = MutationPhase::Idle;
         state.onboarding_error = "".to_owned();
         state.hub_step = HubStep::Networks;
@@ -1029,13 +1002,11 @@ impl Ducktape {
             ),
         ];
         state.hub_wallet_selected = "demo".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_phone_login() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.mutation_phase = MutationPhase::Onboarding;
         state.onboarding_error = "".to_owned();
         state.hub_step = HubStep::Account;
@@ -1043,13 +1014,11 @@ impl Ducktape {
         state.ceremony_qr = "https://auth.ducktape.industries/#op=get&challenge=AQID".to_owned();
         state.ceremony_detail = "Your phone will confirm with the passkey.".to_owned();
         state.ceremony_left = "4:58".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_unregistered_account() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.rpc = "http://127.0.0.1:1".to_owned();
         state.connected_rpc = "http://127.0.0.1:1".to_owned();
         state.password = "hunter2-hunter2".to_owned();
@@ -1061,36 +1030,30 @@ impl Ducktape {
         state.account_exists = false;
         state.account_banner_dismissed = false;
         state.shell_tab = ShellTab::Settings;
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_network_join() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.password = "hunter2-hunter2".to_owned();
         state.rpc = "http://127.0.0.1:1".to_owned();
         state.mutation_phase = MutationPhase::Onboarding;
         state.hub_step = HubStep::Networks;
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_connected_palette() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.palette_open = true;
         state.palette_draft = "".to_owned();
         state.connected_rpc = "http://127.0.0.1:1".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_active_huddle_shell() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.connected = true;
-        state.console_win = Some({ crate::backend::window_target(None) });
+        state.console_win = Some(crate::backend::window_target(None));
         state.connected_rpc = "http://127.0.0.1:1".to_owned();
         state.network_name = "demo".to_owned();
         state.bell_unread = 3;
@@ -1098,13 +1061,11 @@ impl Ducktape {
         state.huddle_channel_name = "general".to_owned();
         state.call_muted = false;
         state.appearance = Appearance::Dark;
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_sharing_huddle() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.connected = false;
         state.huddle_joined = true;
         state.huddle_channel_name = "eng".to_owned();
@@ -1114,22 +1075,18 @@ impl Ducktape {
         state.call_sharing = true;
         state.call_video_live = true;
         state.huddle_stage = "you".to_owned();
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_ready_network() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.connected = true;
         state.hub_step = HubStep::Live;
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_live_agent_session() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.connected = true;
         state.connected_rpc = "http://127.0.0.1:8844".to_owned();
         state.network_chain_id = "testnet#abcd".to_owned();
@@ -1143,13 +1100,11 @@ impl Ducktape {
             "Chief Duck".to_owned(),
             "Reading the repo".to_owned(),
         )];
-
         (state, Task::none())
     }
     #[cfg(test)]
     pub(crate) fn fixture_account_ceremony() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
-
         state.connected = true;
         state.connected_rpc = "http://127.0.0.1:8844".to_owned();
         state.network_chain_id = "testnet#abcd".to_owned();
@@ -1158,7 +1113,6 @@ impl Ducktape {
         state.shell_tab = ShellTab::Settings;
         state.account_ceremony_phase = "qr".to_owned();
         state.account_ceremony_qr = "otpauth://totp/demo".to_owned();
-
         (state, Task::none())
     }
 }
@@ -1177,6 +1131,28 @@ mod state_tests {
                 tasks.push(state.update(message).into_stream());
             }
         }
+    }
+    #[test]
+    fn only_the_current_appearance_load_can_change_the_theme() {
+        let mut state = Ducktape::initial_state();
+        state.appearance = Appearance::System;
+        state.appearance_load_generation = 2;
+        dispatch(
+            &mut state,
+            AppMessage::AppearanceLoadReply(
+                1,
+                Box::new(AppMessage::AppearanceLoaded(Appearance::Dark)),
+            ),
+        );
+        assert_eq!(state.appearance, Appearance::System);
+        dispatch(
+            &mut state,
+            AppMessage::AppearanceLoadReply(
+                2,
+                Box::new(AppMessage::AppearanceLoaded(Appearance::Dark)),
+            ),
+        );
+        assert_eq!(state.appearance, Appearance::Dark);
     }
     #[test]
     fn an_unlock_in_place_drops_the_previous_keys_live_rows() {

@@ -394,15 +394,6 @@ fn classify_channel(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
     }
 }
 
-/// Hand a classified link field to an asynchronous navigation reply.
-pub async fn duck_echo_str(value: String) -> Result<String, AppError> {
-    Ok(value)
-}
-
-pub async fn duck_echo_f64(value: f64) -> Result<f64, AppError> {
-    Ok(value)
-}
-
 use super::AppError;
 
 #[cfg(test)]
