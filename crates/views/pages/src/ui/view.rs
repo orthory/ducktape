@@ -457,6 +457,39 @@ mod tests {
             .join()
             .unwrap();
     }
+
+    #[test]
+    fn disconnected_composition_does_not_expose_stale_pages_search_or_counts() {
+        let (mut app, _) = PagesView::boot();
+        app.pages = vec![crate::host::PageItem {
+            id: "stale-page".into(),
+            title: "Stale page title".into(),
+            ..Default::default()
+        }];
+        app.page_search_draft = "stale".into();
+        app.page_search_query = "stale".into();
+        app.page_search_hits = vec![crate::host::PageSearchHit {
+            page_title: "Stale search title".into(),
+            ..Default::default()
+        }];
+        let mut content = Vec::new();
+        let mut keys = Vec::new();
+        app.view().for_each_mut(&mut |node| {
+            if let Some(key) = node.key() {
+                keys.push(key.to_string());
+            }
+            if let Node::Text { content: text, .. } = node {
+                content.push(text.clone());
+            }
+        });
+        assert!(content.contains(&"Not connected".into()));
+        assert!(
+            !keys
+                .iter()
+                .any(|key| key == "pages/sidebar/count" || key == "pages/search/results")
+        );
+        assert!(!content.iter().any(|text| text.starts_with("Stale")));
+    }
 }
 include!("app_update.rs");
 include!("app_view.rs");

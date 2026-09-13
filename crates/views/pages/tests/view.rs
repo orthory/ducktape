@@ -3,12 +3,15 @@
 //! threads for itself through `rpc.view`, re-reads them on every `rpc.live`
 //! hit, and every act leaves as `op.submit` carrying the pages message.
 
+use ducktape_view_guest::testing::{
+    answer, find, has_text, item, measure, press, texts, type_into,
+};
+use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 use pages_view::host::{
-    PageCommentThread, PageCommentThreadRow, Session, comment_post_target, sidebar_width_after_delta,
+    PageCommentThread, PageCommentThreadRow, Session, comment_post_target,
+    sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
-use ducktape_view_guest::testing::{answer, find, has_text, item, measure, press, texts, type_into};
-use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 
 /// The first editor in the tree, depth first.
 fn find_editor(node: &Node) -> Option<&Node> {
@@ -484,6 +487,31 @@ fn a_stale_thread_id_names_no_target() {
     assert_eq!(comment_post_target(&rows, "t-block", "alpha"), "alpha-1");
     assert_eq!(comment_post_target(&rows, "", "alpha"), "alpha");
     assert_eq!(comment_post_target(&rows, "t-gone", "alpha"), "");
+}
+
+#[test]
+fn the_sidebar_drag_round_trips_through_the_wire_handler() {
+    let (frame, _) = connected_with_register();
+    let Some(Node::ResizeHandle {
+        on_drag: Some(handler),
+        ..
+    }) = find(&frame, "PagesView/root/pages/sidebar-divider")
+    else {
+        panic!("sidebar divider");
+    };
+    let next = tick_native(vec![Event::Drag {
+        handler: *handler,
+        dx: 35.,
+        dy: 0.,
+    }]);
+    let Some(Node::Container {
+        width: Some(Length::Fixed(width)),
+        ..
+    }) = find(&next, "PagesView/root/pages/page-list")
+    else {
+        panic!("sidebar width");
+    };
+    assert_eq!(*width, 265.);
 }
 
 /// The screen after the pane sensor reports `width`: the card is placed against

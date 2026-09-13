@@ -9,8 +9,8 @@ impl PagesView {
             key: format!("{PAGE_KEY}/sidebar-divider"),
             on_press: None,
             on_release: None,
-            on_drag: Some(slots::handler(Box::new(|(x, y): (f32, f32)| {
-                Some(Message::SidebarResized(x.into(), y.into()))
+            on_drag: Some(slots::handler(Box::new(|(x, y): (f64, f64)| {
+                Some(Message::SidebarResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
             content: Box::new(Node::Space {
@@ -31,7 +31,7 @@ impl PagesView {
             Message::PagesPaneResized,
         ));
         let mut main = fill(kit::column("pages/main", body));
-        if self.page_delete_armed {
+        if self.connected && self.page_delete_armed {
             main = Node::Stack {
                 padding: None,
                 background: None,
@@ -51,6 +51,12 @@ impl PagesView {
     }
 
     fn sidebar(&self) -> Node {
+        if !self.connected {
+            return fill(kit::column(
+                "pages/sidebar",
+                [kit::heading("pages/sidebar/title", "Pages")],
+            ));
+        }
         let mut rows = vec![kit::padded(
             kit::row(
                 "pages/sidebar/header",
@@ -197,11 +203,12 @@ impl PagesView {
             self.document_surface()
         };
         let mut children = vec![surface];
-        let search_ready = crate::host::search_answer_stands(
-            &self.page_search_query,
-            &self.page_search_draft,
-            self.page_searching,
-        );
+        let search_ready = self.connected
+            && crate::host::search_answer_stands(
+                &self.page_search_query,
+                &self.page_search_draft,
+                self.page_searching,
+            );
         if search_ready && !self.page_search_hits.is_empty() {
             children.push(kit::scroll(
                 "pages/search/scroll",
@@ -221,7 +228,7 @@ impl PagesView {
         if self.connected && !self.active_page.is_empty() && self.block_comments_open {
             children.push(self.comments_layer());
         }
-        if self.page_menu_open {
+        if self.connected && self.page_menu_open {
             let menu = kit::padded(
                 kit::container(
                     "pages/menu/card",
