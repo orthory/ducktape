@@ -122,19 +122,9 @@ impl super::FilesView {
             ::std::convert::AsRef::as_ref(&(next.route)),
             ::std::convert::AsRef::as_ref(&("")),
         );
-        return match crate::host::tone_of(next.dark) {
-            Tone::Light => (|| {
-                self.active_palette = AppTheme::App;
-                return (::ducktape_view_guest::Task::done(landing.to_owned()))
-                    .map(|value| Message::RouteTo(value));
-            })(),
-            Tone::Dark => (|| {
-                self.active_palette = AppTheme::AppDark;
-                return (::ducktape_view_guest::Task::done(landing.to_owned()))
-                    .map(|value| Message::RouteTo(value));
-            })(),
-        };
+        ducktape_view_guest::Task::done(Message::RouteTo(landing))
     }
+
     fn on_route_to(&mut self, target: String) -> ducktape_view_guest::Task<Message> {
         if (target).is_empty() {
             return ::ducktape_view_guest::Task::none();

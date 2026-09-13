@@ -2085,13 +2085,6 @@ pub(crate) fn surface_name(surface: crate::CopySurface) -> String {
     .to_owned()
 }
 
-pub(crate) fn tone_of(dark: bool) -> crate::Tone {
-    if dark {
-        crate::Tone::Dark
-    } else {
-        crate::Tone::Light
-    }
-}
 
 pub fn no_dm_peer() -> DmPeer {
     DmPeer::default()

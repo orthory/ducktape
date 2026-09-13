@@ -1,10 +1,4 @@
 use ducktape_view_guest::{kit as native, wire};
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
 #[derive(Default)]
 struct DerivedCache {
     refusal: ::std::cell::OnceCell<String>,
@@ -12,12 +6,6 @@ struct DerivedCache {
     draft_here: ::std::cell::OnceCell<bool>,
     draft_parked: ::std::cell::OnceCell<bool>,
     edit_context: ::std::cell::OnceCell<String>,
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Tone {
-    Light,
-    Dark,
 }
 #[allow(dead_code)]
 pub(crate) struct FilesScreenState {
@@ -52,7 +40,6 @@ impl FilesView {
 }
 #[allow(dead_code)]
 pub struct FilesView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) connected: bool,
     pub(crate) dark: bool,
     pub(crate) chain: String,
@@ -192,7 +179,6 @@ impl FilesView {
 impl FilesView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             connected: false,
             dark: false,
             chain: "".to_owned(),
@@ -252,14 +238,6 @@ impl FilesView {
             state: wire::SnapshotValue::Record {
                 name: String::from("FilesView"),
                 fields: vec![
-                    (String::from("active_palette"), match & self.active_palette {
-                    AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name : String::from("AppTheme"), fields : vec![(String::from("app"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit,)], },
-                    AppTheme::AppDark => {
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("AppTheme"), fields : vec![(String::from("app_dark"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit,)], } } },),
                     (String::from("connected"),
                     ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
                     .connected)),), (String::from("dark"),
@@ -436,38 +414,10 @@ impl FilesView {
             let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
-            if name != "FilesView" || fields.len() != 45 {
+            if name != "FilesView" || fields.len() != 44 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let wire::SnapshotValue::Record { name, fields } = value else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => {
-                        matches!(
-                            payload, ::ducktape_view_guest::wire::SnapshotValue::Unit
-                        )
-                            .then_some(AppTheme::App)
-                    }
-                    "app_dark" => {
-                        matches!(
-                            payload, ::ducktape_view_guest::wire::SnapshotValue::Unit
-                        )
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "connected" {
                 return None;
@@ -1152,7 +1102,6 @@ impl FilesView {
                 })
             })())?;
             Some(Self {
-                active_palette: active_palette,
                 connected: connected,
                 dark: dark,
                 chain: chain,

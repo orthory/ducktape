@@ -514,9 +514,7 @@ impl super::FilesView {
                         lazy_key = format!("{}/@lazy:511", use_scope);
                         ::ducktape_view_guest::memo_lazy((self.preview_display_text
                         .to_owned(), self.preview_path.to_owned(), self.dark, self
-                        .preview_text_revision, node_scope.to_owned(), match self
-                        .active_palette { AppTheme::App => "app", AppTheme::AppDark =>
-                        "app-dark", },), move | dependency | { let _preview_text : String
+                        .preview_text_revision, node_scope.to_owned(), (),), move | dependency | { let _preview_text : String
                         = dependency.0.clone(); let _preview_path : String = dependency.1
                         .clone(); let dark : bool = dependency.2.clone(); let lazy_scope
                         = dependency.4.clone(); let cached_doc : String = self
@@ -562,9 +560,7 @@ impl super::FilesView {
                         lazy_key = format!("{}/@lazy:514", use_scope);
                         ::ducktape_view_guest::memo_lazy((self.preview_display_text
                         .to_owned(), self.preview_path.to_owned(), self.dark, self
-                        .preview_text_revision, node_scope.to_owned(), match self
-                        .active_palette { AppTheme::App => "app", AppTheme::AppDark =>
-                        "app-dark", },), move | dependency | { let _preview_text : String
+                        .preview_text_revision, node_scope.to_owned(), (),), move | dependency | { let _preview_text : String
                         = dependency.0.clone(); let preview_path : String = dependency.1
                         .clone(); let dark : bool = dependency.2.clone(); let lazy_scope
                         = dependency.4.clone(); let cached_source : String = self

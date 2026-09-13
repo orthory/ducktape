@@ -883,8 +883,7 @@ impl super::ChatView {
                 ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
                 .unread_boundary, self.unread_marker_seq, self.selected_message_seq, self
                 .copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .timeline_revision, node_scope.to_owned(), match self.active_palette {
-                AppTheme::App => "app", AppTheme::AppDark => "app-dark", },), move |
+                .timeline_revision, node_scope.to_owned(), (),), move |
                 dependency | { let _active_channel : String = dependency.0.clone(); let
                 unread_boundary : i64 = dependency.1.clone(); let unread_marker_seq : i64
                 = dependency.2.clone(); let selected_message_seq : i64 = dependency.3
@@ -2374,8 +2373,7 @@ impl super::ChatView {
                 = format!("{}/@lazy:96", key_recon);
                 ::ducktape_view_guest::memo_lazy((message.clone(), copy_anchor_seq,
                 copy_head_seq, copy_surface.clone(), format!("{}/key({})",
-                message_timeline_scope_3465, key) .to_owned(), match self.active_palette
-                { AppTheme::App => "app", AppTheme::AppDark => "app-dark", },), move |
+                message_timeline_scope_3465, key) .to_owned(), (),), move |
                 dependency | { let cached_message : crate ::host::ChatMessage =
                 dependency.0.clone(); let copy_anchor_seq : i64 = dependency.1.clone();
                 let copy_head_seq : i64 = dependency.2.clone(); let copy_surface :
@@ -4888,9 +4886,7 @@ impl super::ChatView {
                 ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
                 .active_thread_seq, self.thread_target_seq, self.thread_selected_seq,
                 self.copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .thread_messages_revision, node_scope.to_owned(), match self
-                .active_palette { AppTheme::App => "app", AppTheme::AppDark =>
-                "app-dark", },), move | dependency | { let _active_channel : String =
+                .thread_messages_revision, node_scope.to_owned(), (),), move | dependency | { let _active_channel : String =
                 dependency.0.clone(); let active_thread_seq : i64 = dependency.1.clone();
                 let thread_target_seq : i64 = dependency.2.clone(); let
                 thread_selected_seq : i64 = dependency.3.clone(); let copy_anchor_seq :

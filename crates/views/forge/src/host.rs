@@ -1691,14 +1691,6 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     }
 }
 
-/// The appearance as the word the handler matches on.
-pub(crate) fn appearance_of(dark: bool) -> crate::Appearance {
-    if dark {
-        crate::Appearance::Dark
-    } else {
-        crate::Appearance::Light
-    }
-}
 
 // ---------- the patch, painted ----------
 

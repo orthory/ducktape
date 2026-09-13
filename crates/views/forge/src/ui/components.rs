@@ -686,8 +686,7 @@ impl super::ForgeView {
                 format!("{}/@lazy:1023", use_scope);
                 ::ducktape_view_guest::memo_lazy((self.file_text.to_owned(), self
                 .file_path.to_owned(), self.dark, self.file_text_revision, node_scope
-                .to_owned(), match self.active_palette { AppTheme::App => "app",
-                AppTheme::AppDark => "app-dark", },), move | dependency | { let
+                .to_owned(), (),), move | dependency | { let
                 _file_text : String = dependency.0.clone(); let file_path : String =
                 dependency.1.clone(); let dark : bool = dependency.2.clone(); let
                 lazy_scope = dependency.4.clone(); let cached_doc : String = self
@@ -737,8 +736,7 @@ impl super::ForgeView {
                 format!("{}/@lazy:1056", use_scope);
                 ::ducktape_view_guest::memo_lazy((self.file_text.to_owned(), self
                 .file_path.to_owned(), self.dark, self.file_text_revision, node_scope
-                .to_owned(), match self.active_palette { AppTheme::App => "app",
-                AppTheme::AppDark => "app-dark", },), move | dependency | { let
+                .to_owned(), (),), move | dependency | { let
                 _file_text : String = dependency.0.clone(); let file_path : String =
                 dependency.1.clone(); let dark : bool = dependency.2.clone(); let
                 lazy_scope = dependency.4.clone(); let cached_source : String = self

@@ -1,12 +1,6 @@
 use ducktape_view_guest::{kit as native, wire};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SearchPhase {
     Idle,
     Searching,
@@ -34,12 +28,6 @@ pub(crate) enum RowPlate {
     Plain,
     Selected,
     Ranged,
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Tone {
-    Light,
-    Dark,
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,7 +120,6 @@ impl ChatView {
 }
 #[allow(dead_code)]
 pub struct ChatView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) endpoint: String,
     pub(crate) network_name: String,
     pub(crate) network_chain_id: String,
@@ -235,7 +222,6 @@ pub enum Message {
     ThreadResized(f64, f64),
     ChatViewportChanged(f64, f64),
     SessionArrived(crate::host::SessionItem),
-    ToneChanged(bool),
     SessionSettled(bool),
     SnapStream(bool),
     RevealStream(i64),
@@ -307,7 +293,6 @@ impl ::std::fmt::Debug for Message {
 impl ChatView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             endpoint: "".to_owned(),
             network_name: "".to_owned(),
             network_chain_id: "".to_owned(),
@@ -421,14 +406,6 @@ impl ChatView {
             state: wire::SnapshotValue::Record {
                 name: String::from("ChatView"),
                 fields: vec![
-                    (String::from("active_palette"), match & self.active_palette {
-                    AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name : String::from("AppTheme"), fields : vec![(String::from("app"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit)] },
-                    AppTheme::AppDark =>
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("AppTheme"), fields : vec![(String::from("app_dark"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Unit)] } }),
                     (String::from("endpoint"),
                     ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
                     self.endpoint))), (String::from("network_name"),
@@ -1210,38 +1187,10 @@ impl ChatView {
             let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
-            if name != "ChatView" || fields.len() != 88 {
+            if name != "ChatView" || fields.len() != 87 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let wire::SnapshotValue::Record { name, fields } = value else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => {
-                        matches!(
-                            payload, ::ducktape_view_guest::wire::SnapshotValue::Unit
-                        )
-                            .then_some(AppTheme::App)
-                    }
-                    "app_dark" => {
-                        matches!(
-                            payload, ::ducktape_view_guest::wire::SnapshotValue::Unit
-                        )
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "endpoint" {
                 return None;
@@ -4263,7 +4212,6 @@ impl ChatView {
                 })
             })())?;
             Some(Self {
-                active_palette: active_palette,
                 endpoint: endpoint,
                 network_name: network_name,
                 network_chain_id: network_chain_id,

@@ -9,7 +9,6 @@ impl super::ChatView {
                 self.on_chat_viewport_changed(width, _height)
             }
             Message::SessionArrived(item) => self.on_session_arrived(item),
-            Message::ToneChanged(dark) => self.on_tone_changed(dark),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
             Message::RevealStream(target_key) => self.on_reveal_stream(target_key),
@@ -218,20 +217,7 @@ impl super::ChatView {
                 .map(|value| Message::SessionSettled(value)),
             (::ducktape_view_guest::Task::done(sent_now)).map(|value| Message::SnapStream(value)),
             (::ducktape_view_guest::Task::done(chord_now)).map(|value| Message::CopyChord(value)),
-            (::ducktape_view_guest::Task::done(next.dark)).map(|value| Message::ToneChanged(value)),
         ]);
-    }
-    fn on_tone_changed(&mut self, dark: bool) -> ducktape_view_guest::Task<Message> {
-        return match crate::host::tone_of(dark) {
-            Tone::Light => {
-                self.active_palette = AppTheme::App;
-                ::ducktape_view_guest::Task::none()
-            }
-            Tone::Dark => {
-                self.active_palette = AppTheme::AppDark;
-                ::ducktape_view_guest::Task::none()
-            }
-        };
     }
     fn on_session_settled(&mut self, moved_room: bool) -> ducktape_view_guest::Task<Message> {
         return match crate::host::room_move(moved_room) {

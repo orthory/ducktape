@@ -60,25 +60,9 @@ impl super::ForgeView {
         self.connected_rpc = next.connected_rpc.to_owned();
         let routed = next.link_tick != self.link_tick;
         self.link_tick = next.link_tick;
-        return match crate::host::appearance_of(next.dark) {
-            Appearance::Light => (|| {
-                self.active_palette = AppTheme::App;
-                return (::ducktape_view_guest::Task::done(crate::host::routed_link(
-                    routed,
-                    ::std::convert::AsRef::as_ref(&(next.link)),
-                )))
-                .map(|value| Message::ForgeLandLink(value));
-            })(),
-            Appearance::Dark => (|| {
-                self.active_palette = AppTheme::AppDark;
-                return (::ducktape_view_guest::Task::done(crate::host::routed_link(
-                    routed,
-                    ::std::convert::AsRef::as_ref(&(next.link)),
-                )))
-                .map(|value| Message::ForgeLandLink(value));
-            })(),
-        };
+        ducktape_view_guest::Task::done(Message::ForgeLandLink(crate::host::routed_link(routed, &next.link)))
     }
+
     fn on_forge_land_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
         if (url).is_empty() {
             return ::ducktape_view_guest::Task::none();

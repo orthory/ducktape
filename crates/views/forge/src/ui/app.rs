@@ -1,25 +1,12 @@
 use ducktape_view_guest::{kit as native, wire};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppTheme {
-    App,
-    AppDark,
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Appearance {
-    Light,
-    Dark,
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Act {
     Review,
     Merge,
 }
 #[allow(dead_code)]
 pub struct ForgeView {
-    pub(crate) active_palette: AppTheme,
     pub(crate) connected: bool,
     pub(crate) dark: bool,
     pub(crate) org: String,
@@ -149,7 +136,6 @@ impl ::std::fmt::Debug for Message {
 impl ForgeView {
     fn state() -> Self {
         Self {
-            active_palette: AppTheme::App,
             connected: false,
             dark: false,
             org: "".to_owned(),
@@ -243,12 +229,6 @@ impl ForgeView {
             state: wire::SnapshotValue::Record {
                 name: String::from("ForgeView"),
                 fields: vec![
-                    (String::from("active_palette"), match & self.active_palette {
-                    AppTheme::App => wire::SnapshotValue::Record { name :
-                    String::from("AppTheme"), fields : vec![(String::from("app"),
-                    wire::SnapshotValue::Unit)] }, AppTheme::AppDark =>
-                    wire::SnapshotValue::Record { name : String::from("AppTheme"), fields
-                    : vec![(String::from("app_dark"), wire::SnapshotValue::Unit)] } }),
                     (String::from("connected"), wire::SnapshotValue::Bool(* (& self
                     .connected))), (String::from("dark"), wire::SnapshotValue::Bool(* (&
                     self.dark))), (String::from("org"),
@@ -660,34 +640,10 @@ impl ForgeView {
             let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
-            if name != "ForgeView" || fields.len() != 80 {
+            if name != "ForgeView" || fields.len() != 79 {
                 return None;
             }
             let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "active_palette" {
-                return None;
-            }
-            let active_palette: AppTheme = ((|| {
-                let wire::SnapshotValue::Record { name, fields } = value else {
-                    return None;
-                };
-                if name != "AppTheme" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "app" => {
-                        matches!(payload, wire::SnapshotValue::Unit)
-                            .then_some(AppTheme::App)
-                    }
-                    "app_dark" => {
-                        matches!(payload, wire::SnapshotValue::Unit)
-                            .then_some(AppTheme::AppDark)
-                    }
-                    _ => None,
-                }
-            })())?;
             let (name, value) = fields.next()?;
             if name != "connected" {
                 return None;
@@ -2575,7 +2531,6 @@ impl ForgeView {
                 _ => None,
             })?;
             Some(Self {
-                active_palette: active_palette,
                 connected: connected,
                 dark: dark,
                 org: org,

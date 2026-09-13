@@ -1329,10 +1329,7 @@ impl super::ForgeView {
                                                                             message.seq,
                                                                             message.render_rev,
                                                                             format!("{}/key({})", node_scope, key).to_owned(),
-                                                                            match self.active_palette {
-                                                                                AppTheme::App => "app",
-                                                                                AppTheme::AppDark => "app-dark",
-                                                                            },
+                                                                            (),
                                                                         ),
                                                                         move |dependency| {
                                                                             let lazy_scope = dependency.2.clone();

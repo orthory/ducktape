@@ -77,14 +77,6 @@ pub struct Session {
     pub route_serial: i64,
 }
 
-/// Which palette the app's `dark` names. A handler branches on an enum only,
-/// and [`Session`]'s route work has to happen after that branch.
-pub(crate) fn tone_of(dark: bool) -> crate::Tone {
-    match dark {
-        true => crate::Tone::Dark,
-        false => crate::Tone::Light,
-    }
-}
 
 /// One item of the session subscription: the facts, or why not.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
