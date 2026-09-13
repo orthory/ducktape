@@ -1174,7 +1174,7 @@ mod tests {
         app.draft_chain = app.chain.clone();
         app.draft_path = app.preview_path.clone();
         app.draft_base = app.preview_base.clone();
-        app.draft = ducktape_view_guest::Editor::new("unsaved A — 한글".into());
+        app.draft = ducktape_view_guest::Editor::new("unsaved A — 한글");
         let save = Message::SaveEdit(app.derived_edit_context().clone());
         let _ = app.update(Message::SessionArrived(crate::host::SessionItem {
             next: crate::host::Session { connected: true, chain: "chain-b".into(), ..Default::default() },
