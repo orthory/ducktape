@@ -863,30 +863,10 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
     Some((frame.width, frame.height, frame.handle.clone()))
 }
 
-/// The height that gives `width` the frame's own aspect. No frame yet is no
-/// stage: zero, so the panel reserves nothing for a picture that may never
-/// arrive (a sharer whose first frame is still crossing).
-fn stage_height(peer: &str, width: f32) -> f32 {
-    stage_frame(peer).map_or(0.0, |(frame_width, frame_height, _)| {
-        width * frame_height as f32 / frame_width.max(1) as f32
-    })
-}
-
 /// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
 /// into rows on the strip's width.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-fn tile_count(staged: &str) -> usize {
-    let store = store().lock().expect("video store");
-    let peers = store
-        .peers
-        .keys()
-        .filter(|node| node.as_str() != staged)
-        .count();
-    let previewing = store.preview.is_some() && staged != SELF_STAGE;
-    peers + usize::from(previewing)
-}
-
 /// Peers in stable key order, the local preview last — the same order the
 /// row-based strip always drew, minus whatever the stage is showing whole.
 /// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
@@ -910,20 +890,6 @@ fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, Arc<RenderImage>)> {
         tiles.push((preview.width, preview.height, preview.handle.clone()));
     }
     tiles
-}
-
-fn grid_columns(width: f32) -> usize {
-    ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP))
-        .floor()
-        .max(1.0) as usize
-}
-
-fn grid_height(count: usize, columns: usize) -> f32 {
-    if count == 0 {
-        return 0.0;
-    }
-    let rows = count.div_ceil(columns);
-    rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
 }
 
 #[cfg(test)]
@@ -1082,25 +1048,23 @@ mod tests {
         };
         // "" is "nothing is staged" — the strip's ordinary reading.
         reset();
-        assert_eq!(tile_count(""), 0);
+        assert!(tiles_snapshot("").is_empty());
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tile_count(""), 1);
+        assert_eq!(tiles_snapshot("").len(), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
         assert_ne!(first, preview_id().expect("preview"));
 
-        // The staged frame is the local preview under the sentinel, and its
-        // height carries the frame's aspect — a 2:1 frame in a 100px column is
-        // 50px tall, never a 4:3 plate's crop.
+        // The staged frame preserves the original dimensions for native
+        // image aspect layout, rather than the tile's fixed crop.
         store_preview(vec![0xff; 8], 2, 1);
         assert!(stage_frame(SELF_STAGE).is_some());
-        assert_eq!(stage_height(SELF_STAGE, 100.0), 50.0);
+        let (width, height, _) = stage_frame(SELF_STAGE).unwrap();
+        assert_eq!((width, height), (2, 1));
         assert!(stage_frame("a-peer-nobody-sent").is_none());
-        assert_eq!(stage_height("a-peer-nobody-sent", 100.0), 0.0);
         // ...and what the stage shows whole, the strip leaves out, so a
         // desktop is not also a cropped plate beside itself.
-        assert_eq!(tile_count(SELF_STAGE), 0);
         assert!(tiles_snapshot(SELF_STAGE).is_empty());
         assert_eq!(tiles_snapshot("").len(), 1);
 
@@ -1150,16 +1114,5 @@ mod tests {
         reset();
         assert!(preview_id().is_none());
         assert_eq!(source(), Source::Off);
-    }
-
-    /// The strip's whole layout contract: columns floor on width and never
-    /// hit zero, height is rows of fixed plates — count in, size out.
-    #[test]
-    fn the_grid_wraps_on_width_and_sizes_by_count() {
-        assert_eq!(grid_columns(300.0), 2);
-        assert_eq!(grid_columns(100.0), 1);
-        assert_eq!(grid_height(0, 2), 0.0);
-        assert_eq!(grid_height(1, 2), TILE_HEIGHT);
-        assert_eq!(grid_height(3, 2), 2.0 * TILE_HEIGHT + TILE_GAP);
     }
 }
