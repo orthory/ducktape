@@ -48,6 +48,7 @@ pub enum Message {
     BindQuery(String),
 }
 impl ExplorerView {
+    const SNAPSHOT_SCHEMA: &'static str = "04bc00e53f87dcbc66dc6576ac584618a68be12e5374d05e961f49caebcbc5b9";
     fn state() -> Self {
         Self {
             connected: false,
@@ -77,10 +78,23 @@ impl ExplorerView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|error| error.to_string())
+        use ducktape_view_guest::wire;
+        wire::Snapshot {
+            schema: Self::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(self)),
+        }
+        .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        use ducktape_view_guest::wire;
+        let snapshot = wire::Snapshot::decode(bytes)?;
+        if snapshot.schema != Self::SNAPSHOT_SCHEMA {
+            return Err("invalid explorer snapshot schema".into());
+        }
+        let wire::SnapshotValue::Bytes(state) = snapshot.state else {
+            return Err("invalid explorer snapshot state".into());
+        };
+        wire::decode(&state)
     }
 }
 
@@ -103,6 +117,18 @@ impl ExplorerView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_uses_the_host_envelope_and_rejects_invalid_state() {
+        use ducktape_view_guest::wire;
+        let (app, _) = ExplorerView::boot();
+        let mut envelope = wire::Snapshot::decode(&app.snapshot().unwrap()).unwrap();
+        assert_eq!(envelope.schema, ExplorerView::SNAPSHOT_SCHEMA);
+        envelope.schema = "0".repeat(64);
+        assert!(ExplorerView::restore(&envelope.encode().unwrap()).is_err());
+        envelope.schema = ExplorerView::SNAPSHOT_SCHEMA.into();
+        envelope.state = wire::SnapshotValue::Bytes(vec![255]);
+        assert!(ExplorerView::restore(&envelope.encode().unwrap()).is_err());
+    }
     #[test]
     fn snapshot_preserves_draft_selection_and_search_results() {
         let (mut app, _) = ExplorerView::boot();

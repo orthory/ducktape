@@ -58,6 +58,7 @@ pub enum Message {
     CopyToClipboard(String, String),
 }
 impl NodeView {
+    const SNAPSHOT_SCHEMA: &'static str = "c583cbb8bd8239885328e6a8867ee2664df8988d5294320887eba1b21855671e";
     fn state() -> Self {
         Self {
             node_data_dir: "".to_owned(),
@@ -85,10 +86,23 @@ impl NodeView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|error| error.to_string())
+        use ducktape_view_guest::wire;
+        wire::Snapshot {
+            schema: Self::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(self)),
+        }
+        .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        use ducktape_view_guest::wire;
+        let snapshot = wire::Snapshot::decode(bytes)?;
+        if snapshot.schema != Self::SNAPSHOT_SCHEMA {
+            return Err("invalid node snapshot schema".into());
+        }
+        let wire::SnapshotValue::Bytes(state) = snapshot.state else {
+            return Err("invalid node snapshot state".into());
+        };
+        wire::decode(&state)
     }
 }
 
@@ -115,6 +129,18 @@ impl NodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_uses_the_host_envelope_and_rejects_invalid_state() {
+        use ducktape_view_guest::wire;
+        let (app, _) = NodeView::boot();
+        let mut envelope = wire::Snapshot::decode(&app.snapshot().unwrap()).unwrap();
+        assert_eq!(envelope.schema, NodeView::SNAPSHOT_SCHEMA);
+        envelope.schema = "0".repeat(64);
+        assert!(NodeView::restore(&envelope.encode().unwrap()).is_err());
+        envelope.schema = NodeView::SNAPSHOT_SCHEMA.into();
+        envelope.state = wire::SnapshotValue::Bytes(vec![255]);
+        assert!(NodeView::restore(&envelope.encode().unwrap()).is_err());
+    }
     #[test]
     fn snapshot_preserves_activity_filters_and_the_log_ring() {
         let (mut app, _) = NodeView::boot();
