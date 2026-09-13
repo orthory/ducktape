@@ -6598,9 +6598,7 @@ impl super::ChatView {
                 format!("{}/@lazy:165", key_recon);
                 ::ducktape_view_guest::memo_lazy((thread_message.clone(),
                 copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                format!("{}/key({})", thread_timeline_scope_4354, key) .to_owned(), match
-                self.active_palette { AppTheme::App => "app", AppTheme::AppDark =>
-                "app-dark", },), move | dependency | { let cached_reply : crate
+                format!("{}/key({})", thread_timeline_scope_4354, key) .to_owned(), (),), move | dependency | { let cached_reply : crate
                 ::host::ChatMessage = dependency.0.clone(); let copy_anchor_seq : i64 =
                 dependency.1.clone(); let copy_head_seq : i64 = dependency.2.clone(); let
                 copy_surface : CopySurface = dependency.3.clone(); let lazy_scope =
