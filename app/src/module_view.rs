@@ -321,6 +321,7 @@ pub fn settings_view(
 /// Construct an intent without mounting a view. The `kind` is the
 /// same string the guest emits, so a scenario names the act and not an enum the
 /// intent mapping could drift from.
+#[cfg(test)]
 pub fn view_event(kind: String, detail: String) -> ModuleViewEvent {
     ModuleViewEvent { kind, detail }
 }

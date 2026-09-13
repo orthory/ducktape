@@ -7,7 +7,6 @@ use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
 };
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder;
 use std::sync::{
     Mutex, OnceLock,

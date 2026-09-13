@@ -1032,18 +1032,8 @@ impl Ducktape {
         self.views_live_serial =
             crate::module_view::view_block_hit(self.block_height, self.views_live_serial);
         match next.kind {
-            LiveKind::Retry => {
-                {
-                    return Task::none();
-                }
-                Task::none()
-            }
-            LiveKind::Tip => {
-                {
-                    return Task::none();
-                }
-                Task::none()
-            }
+            LiveKind::Retry => Task::none(),
+            LiveKind::Tip => Task::none(),
             LiveKind::Ready => {
                 self.hydration_generation += 1;
                 self.hydration_retry_attempt = 0;
@@ -1897,12 +1887,7 @@ impl Ducktape {
             CommandChord::CloseWindow => crate::shell::close::<AppMessage>(
                 crate::backend::window_target(self.focused_win),
             ),
-            CommandChord::Ignored => {
-                {
-                    return Task::none();
-                }
-                Task::none()
-            }
+            CommandChord::Ignored => Task::none(),
         }
     }
     fn on_tray_open_bell(&mut self) -> Task<AppMessage> {
@@ -3287,12 +3272,7 @@ impl Ducktape {
                 &(context),
                 self.network_chain_id.to_owned(),
             ))),
-            BellTarget::Unavailable => {
-                {
-                    return Task::none();
-                }
-                Task::none()
-            }
+            BellTarget::Unavailable => Task::none(),
         }
     }
     fn on_global_key_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
@@ -4980,10 +4960,7 @@ impl Ducktape {
                 self.hub_step = HubStep::Password;
                 Task::none()
             }
-            WalletDoor::Unreached => {
-                self.hub_step = self.hub_step;
-                Task::none()
-            }
+            WalletDoor::Unreached => Task::none(),
         }
     }
     fn on_chain_named(&mut self, id: String) -> Task<AppMessage> {

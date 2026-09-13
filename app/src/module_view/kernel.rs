@@ -138,6 +138,7 @@ impl Replies {
     }
 
     /// Whether a query or a submit is still on its way.
+    #[cfg(test)]
     pub(super) fn any_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) > 0
     }
