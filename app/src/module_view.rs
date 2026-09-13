@@ -3852,7 +3852,7 @@ pub(crate) mod tests {
         let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
-        for expected in ["testnet", "general", "ops"] {
+        for expected in ["testnet", "# general", "# ops · Unread"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
@@ -3862,7 +3862,7 @@ pub(crate) mod tests {
 
         guest
             .pending
-            .push(wire::Event::Message(button_message(&guest, "ops")));
+            .push(wire::Event::Message(button_message(&guest, "# ops · Unread")));
         guest.redraw(&props);
         assert_eq!(
             std::mem::take(&mut guest.intents),
@@ -5398,8 +5398,7 @@ pub(crate) mod tests {
     /// the document's own text column, in a gap the editor holds open for it.
     ///
     /// The native measurement canvas reports the usable content box. The
-    /// comment card's one-pixel borders are outside that box; its authored
-    /// 340-pixel outer width therefore leaves 338 pixels for the content.
+    /// comment card uses its native surface without guest-painted borders.
     #[gpui_kit::test]
     fn pages_comments_answer_the_pane_they_open_in(cx: &mut TestAppContext) {
         let _turn = blocking_connection_turn();
@@ -5498,18 +5497,18 @@ pub(crate) mod tests {
         };
         let (beside_editor, beside_card) = measured(1500.);
         assert_eq!(f32::from(beside_editor.size.width), 704.);
-        assert_eq!(f32::from(beside_card.size.width), 338.);
+        assert_eq!(f32::from(beside_card.size.width), 340.);
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
             1066. - 340. - 32. - 62.
         );
-        assert_eq!(f32::from(squeeze_card.size.width), 338.);
+        assert_eq!(f32::from(squeeze_card.size.width), 340.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);
         let (inline_editor, inline_card) = measured(1100.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
         assert_eq!(
-            inline_card.size.width + gpui::px(2.),
+            inline_card.size.width,
             inline_editor.size.width
         );
     }
@@ -5744,7 +5743,7 @@ pub(crate) mod tests {
             "governance" => (session_props(), "prop-1"),
             "files" => (files_facts(), "README.md"),
             "pages" => (pages_facts(), "Alpha"),
-            "chat" => (chat_facts(), "general"),
+            "chat" => (chat_facts(), "# general"),
             // forge reads its whole screen off the node; what the session
             // alone paints is the network it is reading
             _ => (forge_facts(), "duckhouse"),
