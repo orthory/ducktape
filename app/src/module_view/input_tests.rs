@@ -110,7 +110,7 @@ fn click_before_frame(native: &mut VisualTestContext, key: String) {
 fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();
     for (opened, label, reacted) in [
-        (&["More message actions"][..], "Manage reactions", false),
+        (&["More message actions"][..], "Add reaction", false),
         (&["Manage reactions"][..], "🦆", true),
     ] {
         let seat = seated(opened);
@@ -119,7 +119,8 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
         native.update(|window, _| {
             assert!(
                 window.find(key.clone()).visible(),
-                "native popup is visible"
+                "native popup {label:?} at {key:?} is visible: {:?}",
+                window.find(key.clone()).bounds()
             )
         });
         {
@@ -333,7 +334,7 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it(cx: &mut TestApp
         root.for_each_mut(&mut |node| {
             if node
                 .key()
-                .is_some_and(|key| key.ends_with("/thread-divider"))
+                .is_some_and(|key| key.ends_with("/thread-resize"))
             {
                 key = node.key().map(str::to_owned);
             }
