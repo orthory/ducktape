@@ -39,19 +39,6 @@ pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
     update
 }
 
-/// The artifact's line icon as SVG bytes for a renderer-neutral wire image.
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-/// The titlebar's extra left padding. On macOS the window is drawn with a
-/// hidden title and a transparent, full-size content view , so the
-/// three traffic lights overlay the content's top-left ~70px — the chain chip
-/// must start past them. Zero on every other platform.
-pub fn titlebar_inset() -> f64 {
-    if cfg!(target_os = "macos") { 68.0 } else { 0.0 }
-}
-
 pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",

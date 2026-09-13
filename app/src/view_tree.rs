@@ -2044,11 +2044,11 @@ impl ViewTree {
                         .relative()
                         .bg(gpui_kit::component::Theme::global(cx)
                             .color_tokens()
-                            .popover)
+                            .surface)
                         .text_color(
                             gpui_kit::component::Theme::global(cx)
                                 .color_tokens()
-                                .popover_foreground,
+                                .surface_foreground,
                         )
                         .left(px(x.evaluate(geometry)))
                         .top(px(y.evaluate(geometry))),
@@ -2227,11 +2227,11 @@ impl ViewTree {
                             div()
                                 .bg(gpui_kit::component::Theme::global(cx)
                                     .color_tokens()
-                                    .popover)
+                                    .surface)
                                 .text_color(
                                     gpui_kit::component::Theme::global(cx)
                                         .color_tokens()
-                                        .popover_foreground,
+                                        .surface_foreground,
                                 )
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(self.node(modal, window, cx)),

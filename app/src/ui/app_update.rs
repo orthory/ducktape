@@ -302,9 +302,7 @@ impl Ducktape {
             AppMessage::LeaveHuddleHere => self.on_leave_huddle_here(),
             AppMessage::HuddleLeft(_result) => self.on_huddle_left(_result),
             AppMessage::SecretTyped(slot, text) => self.on_secret_typed(slot, text),
-            AppMessage::WelcomeNameChanged(value) => self.on_welcome_name_changed(value),
             AppMessage::ChannelDraftChanged(value) => self.on_channel_draft_changed(value),
-            AppMessage::PaletteDraftChanged(value) => self.on_palette_draft_changed(value),
         }
     }
     fn on_appearance_save_reply(
@@ -6651,16 +6649,8 @@ impl Ducktape {
         }
         Task::none()
     }
-    fn on_welcome_name_changed(&mut self, value: String) -> Task<AppMessage> {
-        self.welcome_name_draft = value;
-        Task::none()
-    }
     fn on_channel_draft_changed(&mut self, value: String) -> Task<AppMessage> {
         self.channel_draft = value;
-        Task::none()
-    }
-    fn on_palette_draft_changed(&mut self, value: String) -> Task<AppMessage> {
-        self.palette_draft = value;
         Task::none()
     }
 }

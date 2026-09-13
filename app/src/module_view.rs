@@ -72,8 +72,6 @@ const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
 /// transport recoverable: nothing is suppressed for good, only spaced out.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
-/// How often a tab polls for a component still loading on its thread.
-const LOAD_POLL: Duration = Duration::from_millis(50);
 
 // ---------- the Approvals seat ----------
 
@@ -163,13 +161,6 @@ pub fn event_flag(event: &ModuleViewEvent, field: &str) -> bool {
 
 fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
     serde_json::from_str(&event.detail).ok()
-}
-
-/// The number in one field of an intent's detail, 0 when absent or not one.
-pub fn event_number(event: &ModuleViewEvent, field: &str) -> i64 {
-    detail(event)
-        .and_then(|detail| detail.get(field)?.as_i64())
-        .unwrap_or_default()
 }
 
 /// The integer under `field` in an intent's JSON detail; 0 when absent.
@@ -627,19 +618,6 @@ fn live_agents_within(
     }
     kept.sort_by_key(|hint| hint.anchor_seq);
     kept
-}
-
-/// The head of `text` that fits `budget`, cut on a char boundary, and
-/// whether anything was cut.
-fn head_within(text: &str, budget: usize) -> (&str, bool) {
-    if text.len() <= budget {
-        return (text, false);
-    }
-    let mut end = budget;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&text[..end], true)
 }
 
 /// The act a chat intent names. The door ([`intents_of`]) refuses every kind
@@ -1620,10 +1598,6 @@ fn artifact_asset<'a>(
 ) -> Option<&'a [u8]> {
     assets.get(path).map(Vec::as_slice)
 }
-
-/// How many distinct missing asset paths a deployment's view is told
-/// about: past this a guest asking a new path every frame is one line.
-const MAX_MISSING_ASSETS: usize = 32;
 
 fn hex_short(hash: &[u8; 32]) -> String {
     hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
@@ -5662,16 +5636,6 @@ pub(crate) mod tests {
             live_agents: live_agents_within(live, room, LIVE_AGENT_TEXT_BUDGET),
         };
         Some(serde_json::to_vec(&props).expect("props encode"))
-    }
-
-    /// `head_within` never cuts inside a char. It is the last of the host's
-    /// text budgets: every stream it used to clip is a view's own read now.
-    #[test]
-    fn the_text_head_holds_its_budget() {
-        assert_eq!(head_within("abc", 3), ("abc", false));
-        // "한" is 3 bytes: a 4-byte budget cuts before the second char
-        assert_eq!(head_within("한글", 4), ("한", true));
-        assert_eq!(head_within("한글", 6), ("한글", false));
     }
 
     /// One pending run of `agent`, anchored at seq 2 of `room`.

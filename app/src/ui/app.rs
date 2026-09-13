@@ -40,21 +40,6 @@ pub(crate) enum ComposerKind {
     ThreadEdit,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum MessageAction {
-    Toolbar,
-    More,
-    Reactions,
-    Editing,
-    Delete,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ForgePhase {
-    Idle,
-    Loading,
-    Ready,
-    Failed,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HubStep {
     Loading,
     Password,
@@ -89,18 +74,6 @@ pub(crate) enum TrayOpen {
 pub(crate) enum ConsoleEntry {
     Idle,
     Entering,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RowPlate {
-    Plain,
-    Selected,
-    Ranged,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum CopySurface {
-    Nowhere,
-    Timeline,
-    Thread,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CommandChord {
@@ -677,9 +650,7 @@ pub(crate) enum AppMessage {
     LeaveHuddleHere,
     HuddleLeft(bool),
     SecretTyped(String, String),
-    WelcomeNameChanged(String),
     ChannelDraftChanged(String),
-    PaletteDraftChanged(String),
 }
 impl ::std::fmt::Debug for AppMessage {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
