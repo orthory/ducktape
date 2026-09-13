@@ -127,10 +127,12 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
     impl<'ast> syn::visit::Visit<'ast> for Exits {
         fn visit_block(&mut self, block: &'ast syn::Block) {
             for (index, statement) in block.stmts.iter().enumerate() {
-                let syn::Stmt::Expr(syn::Expr::Return(returned), _) = statement else {
-                    continue;
+                let expression = match statement {
+                    syn::Stmt::Expr(syn::Expr::Return(returned), _) => returned.expr.as_deref(),
+                    syn::Stmt::Expr(expression, _) => Some(expression),
+                    _ => None,
                 };
-                let Some(syn::Expr::Call(call)) = returned.expr.as_deref() else {
+                let Some(syn::Expr::Call(call)) = expression else {
                     continue;
                 };
                 let syn::Expr::Path(path) = call.func.as_ref() else {

@@ -5444,7 +5444,7 @@ pub(crate) mod tests {
                 let mut published_width = None;
                 guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
                     if let wire::Node::Container { key, max_width, .. } = node {
-                        if key == "PagesView/root/pages/@container:436" {
+                        if key == "pages/document/surface" {
                             published_width = *max_width;
                         }
                     }

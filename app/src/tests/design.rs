@@ -184,13 +184,11 @@ fn view_theme_follows_the_current_appearance_without_cache_invalidation() {
     }
 }
 #[test]
-fn every_current_row_marker_rests_on_one_selection_token() {
+fn wasm_buttons_use_native_kit_selection_without_custom_recipes() {
     let tree = rust_tokens(include_str!("../view_tree.rs"));
-    assert!(tree.contains("wire::Face"));
-    assert!(tree.contains("background"));
-    let chat = rust_tokens(super::connection::CHAT);
-    assert!(chat.contains("selected"));
-    assert!(chat.contains("row_hover") || chat.contains("palette"));
+    assert!(tree.contains(".selected(checked.unwrap_or(false))"));
+    assert!(!tree.contains("ButtonCustomVariant"));
+    assert!(!tree.contains("style.recipe"));
 }
 #[test]
 fn every_repeated_component_mount_is_culled_or_argued() {
