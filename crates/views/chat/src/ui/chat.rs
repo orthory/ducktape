@@ -547,43 +547,23 @@ impl super::ChatView {
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
                 height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
                 children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); match & crate ::host::message_plate(message
-                .deleted, true, crate ::host::seq_in_copy_range(message.seq,
-                copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                CopySurface::Timeline,),) { RowPlate::Plain => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:571",
-                message_card_scope_2680), self
-                .message_contents(format!("{}/MessageContents@1995",
-                message_card_scope_2680), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } RowPlate::Selected => {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:591",
-                message_card_scope_2680), self
-                .message_contents(format!("{}/MessageContents@2015",
-                message_card_scope_2680), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } RowPlate::Ranged => {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:611",
-                message_card_scope_2680), self
-                .message_contents(format!("{}/MessageContents@2035",
-                message_card_scope_2680), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } } wire::Node::Stack {
-                key : format!("{}/@layout:549", message_card_scope_2680), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }, { let mut children : Vec < wire::Node > = Vec::new(); if ! message
-                .deleted && ! message.pending { children.push(wire::Node::Container {
-                shadow : Default::default(), max_width : None, max_height : None, clip :
-                false, key : format!("{}/@container:632", message_card_scope_2680), width
-                : Some(wire::Length::Fill), height : None, padding : Some(wire::Edges {
-                top : 0.0f32, right : 8.0f32, bottom : 0.0f32, left : 0.0f32, }), align_x
-                : Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content :
-                Box::new(native::padded(native::container(format!("{}/@container:640",
+                wire::Node > = Vec::new(); { children.push(self.message_card(& message,
+                CopySurface::Timeline, crate ::host::message_plate(message.deleted, true,
+                crate ::host::seq_in_copy_range(message.seq, copy_anchor_seq,
+                copy_head_seq, copy_surface.clone(), CopySurface::Timeline,),))); }
+                wire::Node::Stack { key : format!("{}/@layout:549",
+                message_card_scope_2680), width : Some(wire::Length::Fill), height :
+                None, padding : None, background : None, border : None, clip : false,
+                under : 0u32, children : children, } }, { let mut children : Vec <
+                wire::Node > = Vec::new(); if ! message.deleted && ! message.pending {
+                children.push(wire::Node::Container { shadow : Default::default(),
+                max_width : None, max_height : None, clip : false, key :
+                format!("{}/@container:632", message_card_scope_2680), width :
+                Some(wire::Length::Fill), height : None, padding : Some(wire::Edges { top
+                : 0.0f32, right : 8.0f32, bottom : 0.0f32, left : 0.0f32, }), align_x :
+                Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top), background
+                : None.map(wire::Background::Color), border : None, snap : None, content
+                : Box::new(native::padded(native::container(format!("{}/@container:640",
                 message_card_scope_2680), { let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:661", message_card_scope_2680), content :
@@ -694,32 +674,12 @@ impl super::ChatView {
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
                 height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
                 children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); match & crate
-                ::host::message_plate(cached_message.deleted, false, crate
-                ::host::seq_in_copy_range(cached_message.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Timeline,),) {
-                RowPlate::Plain => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:571",
-                message_card_scope_2701), self
-                .message_contents(format!("{}/MessageContents@1995",
-                message_card_scope_2701), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } RowPlate::Selected => {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:591",
-                message_card_scope_2701), self
-                .message_contents(format!("{}/MessageContents@2015",
-                message_card_scope_2701), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } RowPlate::Ranged => {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:611",
-                message_card_scope_2701), self
-                .message_contents(format!("{}/MessageContents@2035",
-                message_card_scope_2701), & message, CopySurface::Timeline),),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 4.0f32, right :
-                7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } } wire::Node::Stack {
-                key : format!("{}/@layout:549", message_card_scope_2701), width :
+                wire::Node > = Vec::new(); { children.push(self.message_card(& message,
+                CopySurface::Timeline, crate ::host::message_plate(cached_message
+                .deleted, false, crate ::host::seq_in_copy_range(cached_message.seq,
+                copy_anchor_seq, copy_head_seq, copy_surface.clone(),
+                CopySurface::Timeline,),))); } wire::Node::Stack { key :
+                format!("{}/@layout:549", message_card_scope_2701), width :
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }, { let mut children : Vec < wire::Node > = Vec::new(); if !
@@ -1841,31 +1801,11 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), height :
                 Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children :
                 Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
-                Vec::new(); match & crate ::host::message_plate(thread_message.deleted,
+                Vec::new(); { children.push(self.message_card(& thread_message,
+                CopySurface::Thread, crate ::host::message_plate(thread_message.deleted,
                 thread_message.seq == thread_target_seq, crate
                 ::host::seq_in_copy_range(thread_message.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),) {
-                RowPlate::Plain => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:783",
-                thread_message_card_scope_2752), self
-                .message_contents(format!("{}/MessageContents@2207",
-                thread_message_card_scope_2752), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); }
-                RowPlate::Selected => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:803",
-                thread_message_card_scope_2752), self
-                .message_contents(format!("{}/MessageContents@2227",
-                thread_message_card_scope_2752), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); }
-                RowPlate::Ranged => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:823",
-                thread_message_card_scope_2752), self
-                .message_contents(format!("{}/MessageContents@2247",
-                thread_message_card_scope_2752), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } }
+                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),))); }
                 wire::Node::Stack { key : format!("{}/@layout:778",
                 thread_message_card_scope_2752), width : Some(wire::Length::Fill), height
                 : None, padding : None, background : None, border : None, clip : false,
@@ -1945,31 +1885,11 @@ impl super::ChatView {
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
                 height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
                 children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); match & crate
+                wire::Node > = Vec::new(); { children.push(self.message_card(&
+                thread_message, CopySurface::Thread, crate
                 ::host::message_plate(cached_reply.deleted, false, crate
                 ::host::seq_in_copy_range(cached_reply.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),) {
-                RowPlate::Plain => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:783",
-                thread_message_card_scope_2769), self
-                .message_contents(format!("{}/MessageContents@2207",
-                thread_message_card_scope_2769), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); }
-                RowPlate::Selected => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:803",
-                thread_message_card_scope_2769), self
-                .message_contents(format!("{}/MessageContents@2227",
-                thread_message_card_scope_2769), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); }
-                RowPlate::Ranged => { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:823",
-                thread_message_card_scope_2769), self
-                .message_contents(format!("{}/MessageContents@2247",
-                thread_message_card_scope_2769), & thread_message,
-                CopySurface::Thread),), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 7.0f32, bottom : 4.0f32, left : 7.0f32, },),); } }
+                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),))); }
                 wire::Node::Stack { key : format!("{}/@layout:778",
                 thread_message_card_scope_2769), width : Some(wire::Length::Fill), height
                 : None, padding : None, background : None, border : None, clip : false,
