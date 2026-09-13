@@ -5,7 +5,7 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     let chat = rust_tokens(super::connection::CHAT);
     assert!(chat.contains("Node::KeyedColumn") && chat.contains("virtual_row:"));
     assert!(
-        chat.contains("Some((44.0)asf32)"),
+        chat.contains("virtual_row:Some(44.0f32)"),
         "the wire supplies a bounded row estimate"
     );
     assert!(chat.contains("anchor_y:") && chat.contains("ScrollAnchor::End"));
@@ -38,9 +38,12 @@ fn the_message_line_is_one_rich_text_paragraph() {
         let source = rust_tokens(source);
         assert!(source.contains("Node::RichText"));
         assert!(source.contains("mention_link"));
-        assert!(source.contains("underline:true"));
+        assert!(source.contains("underline:true") || source.contains("underline:link.is_some()"));
         assert!(source.contains("on_link:"));
-        assert!(source.contains("1.55"), "paragraph leading is retained");
+        assert!(
+            source.contains("Wrapping::WordOrGlyph"),
+            "a paragraph wraps as one text layout"
+        );
     }
     let native = rust_tokens(include_str!("../view_tree.rs"));
     assert!(

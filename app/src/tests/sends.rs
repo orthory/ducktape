@@ -140,6 +140,16 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
             use syn::visit::Visit;
             struct Mounts(Vec<String>);
             impl<'ast> Visit<'ast> for Mounts {
+                fn visit_macro(&mut self, node: &'ast syn::Macro) {
+                    use syn::parse::Parser;
+                    let expressions =
+                        syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+                    if let Ok(expressions) = expressions.parse2(node.tokens.clone()) {
+                        for expression in &expressions {
+                            self.visit_expr(expression);
+                        }
+                    }
+                }
                 fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
                     let surface = node
                         .path
