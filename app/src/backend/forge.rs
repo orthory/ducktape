@@ -486,11 +486,6 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
     }
 }
 
-/// Shared row metrics for the Forge source and patch readers.
-pub const CODE_SIZE: f32 = 11.5;
-pub const CODE_ROW_HEIGHT: f32 = 20.0;
-pub const CODE_GUTTER_WIDTH: f32 = 44.0;
-
 /// The highlighter's language token: the path's final extension, else the
 /// file name itself lowercased (Makefile, Dockerfile). syntect matches both
 /// and falls back to plain text on an unknown token — an unknown file renders

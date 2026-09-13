@@ -27,15 +27,6 @@ pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
 
-/// `12` — the bell's unread count on its seat. Zero reads as nothing at all,
-/// because a badge that says "0" is louder than the absence it reports.
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
-}
-
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
     if keep_pending {
         return current;
@@ -215,18 +206,6 @@ pub fn channel_switch_facts(
         archived: row.is_some_and(|row| row.archived),
         members_only: row.is_some_and(|row| row.members_only),
     }
-}
-
-/// Is the reader inside the last tenth of the loaded scrollback?
-///
-/// The stream is bottom-anchored, so a scrollable reports its offset relative
-/// to the END — 1.0 is the TOP of the history in hand, which is where the next
-/// older page belongs.
-///
-/// An undefined relative offset (for example `0/0` when content fits) is not
-/// a request for older history: NaN compares false here.
-pub fn near_scroll_top(relative_offset: f64) -> bool {
-    relative_offset >= 0.9
 }
 
 /// Is the reader AT the live tail — the other end of the same offset.
@@ -547,16 +526,6 @@ pub fn frozen_unread_boundary(
     let head = head_seq_of(&channels, &next_channel);
     let arrived_with_unread = head > last_read;
     if arrived_with_unread { last_read } else { 0 }
-}
-
-pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
-    let below = (pointer_y - 4.0).max(0.0);
-    let below_fits = below + 190.0 <= viewport_height;
-    if below_fits {
-        below
-    } else {
-        (pointer_y - 190.0).max(0.0)
-    }
 }
 
 pub(crate) struct Tip {

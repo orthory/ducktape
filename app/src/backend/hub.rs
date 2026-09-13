@@ -72,28 +72,6 @@ pub fn wallet_list(wallets: Vec<WalletInfo>, error: String, keystore: bool) -> W
     }
 }
 
-/// A pubkey at row width: enough hex to recognize an identity by, never the
-/// full 64. Empty in, empty out — a row with no reading claims none.
-pub fn short_pubkey(pubkey: &str) -> String {
-    let head: String = pubkey.chars().take(16).collect();
-    match head.len() < pubkey.len() {
-        true => format!("{head}…"),
-        false => head,
-    }
-}
-
-/// The wallet screens' captions name the network whose keystore is on
-/// screen: a wallet is an identity on ONE network, and the screen says which.
-pub fn wallet_caption(network: &str) -> String {
-    format!("Unlock an identity on {network} to sign what you do.")
-}
-
-pub fn password_caption(network: &str) -> String {
-    format!(
-        "Set a password for your key on {network}. It encrypts the key on this disk — the next screen shows the 24 words that are the only way to get that key back."
-    )
-}
-
 /// The launch window's boot read: the known-network list and the row it
 /// opens on. No wallets here — a wallet is an identity ON a network, kept in
 /// that network's workspace, so the keystore is read once a network is picked
@@ -530,19 +508,6 @@ pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<Hu
             row
         })
         .collect()
-}
-
-/// The command that starts a dead local network's node — the honest row
-/// subtitle, same doctrine as provisioning's `blocked` step.
-pub fn network_run_hint(row: &HubNetwork) -> String {
-    if row.kind != "local" {
-        return "node unreachable".into();
-    }
-    let selector = match row.chain_id.is_empty() {
-        true => &row.id,
-        false => &row.chain_id,
-    };
-    format!("not running · ducktape node run -n {selector}")
 }
 
 /// Probe every known network's endpoint, emitting one reading per row as it
@@ -1178,17 +1143,6 @@ mod tests {
         assert!(phrase_rows().is_empty(), "the phrase outlived its ceremony");
         assert_eq!(recovery_prompt(), "");
         assert!(confirmed_phrase(&right).is_err());
-    }
-
-    /// A row's pubkey is shortened, never invented.
-    #[test]
-    fn short_pubkey_says_only_what_it_knows() {
-        assert_eq!(short_pubkey(""), "");
-        assert_eq!(short_pubkey("abcd"), "abcd");
-        assert_eq!(
-            short_pubkey(&"a".repeat(64)),
-            format!("{}…", "a".repeat(16))
-        );
     }
 
     /// The tray's Open row (#1782): a window already tracked is always

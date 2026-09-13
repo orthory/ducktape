@@ -11,15 +11,6 @@ pub struct NavItem {
     pub live: bool,
 }
 
-/// `tally_label` for two readings that are ALREADY rendered — the consensus
-/// trio off `/v1/status` is optional per field, so each arrives as its own
-/// `optional_number` string (`—` when the node reports nothing). Joining the
-/// numbers instead would mean carrying them as `i64` and printing a measured
-/// `0` for "not reported".
-pub fn reading_pair(left: &str, right: &str) -> String {
-    format!("{left} / {right}")
-}
-
 /// The rail's navigation: nine collaboration surfaces plus the node operator
 /// surface, with the active pane flagged. `settings` is not here because the
 /// rail pins it to its own footer beside the account avatar.

@@ -57,25 +57,6 @@ impl Picture {
     }
 }
 
-/// Does the path name a picture the viewer decodes? The extension is the
-/// path's call — the wires only say binary-or-text. SVG is a different
-/// widget and is left out on purpose.
-pub fn picture_path(path: String) -> bool {
-    let name = path.rsplit('/').next().unwrap_or_default();
-    let Some((_, extension)) = name.rsplit_once('.') else {
-        return false;
-    };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
-    )
-}
-
-/// `1024 × 768` — the caption under a drawn picture.
-pub fn picture_caption(width: i64, height: i64) -> String {
-    format!("{width} × {height}")
-}
-
 /// Decode source bytes into a picture: an SVG document (by its first tag —
 /// the bytes' call, not the path's) is validated and measured by usvg and
 /// kept as a vector; anything else decodes to RGBA, downscaled past
@@ -366,31 +347,6 @@ mod tests {
         .write_to(&mut out, image::ImageFormat::Png)
         .expect("encode");
         out.into_inner()
-    }
-
-    #[test]
-    fn the_extension_is_the_paths_call() {
-        for yes in [
-            "a.png",
-            "dir/b.JPG",
-            "c.jpeg",
-            "d.gif",
-            "e.webp",
-            "f.bmp",
-            "g.svg",
-        ] {
-            assert!(picture_path(yes.into()), "{yes}");
-        }
-        for no in [
-            "README.md",
-            "logo",
-            "png",
-            "dir.png/file",
-            "x.png.txt",
-            "a.xml",
-        ] {
-            assert!(!picture_path(no.into()), "{no}");
-        }
     }
 
     /// A JPEG tagged EXIF orientation 6 (stored rotated 90° CCW, to be shown

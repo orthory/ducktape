@@ -2,11 +2,7 @@ use super::*;
 
 /// The global-key router for the command palette: platform-Command+K
 /// toggles, Escape closes an open palette; anything else is `none`.
-pub fn palette_key_action(
-    logical: String,
-    modifiers: gpui_kit::Modifiers,
-    open: bool,
-) -> String {
+pub fn palette_key_action(logical: String, modifiers: gpui_kit::Modifiers, open: bool) -> String {
     let is_toggle = command_held(modifiers) && logical.eq_ignore_ascii_case("k");
     if is_toggle {
         return match open {
@@ -25,7 +21,11 @@ pub fn palette_key_action(
 /// off the native modifier stream. Command on a Mac, Control elsewhere:
 /// arming and routing a chord must use the same platform modifier.
 pub fn command_held(modifiers: gpui_kit::Modifiers) -> bool {
-    if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control }
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
 }
 
 /// Is ⇧ down right now? A press carries no modifiers of its own, so the chat's
@@ -41,10 +41,7 @@ pub fn shift_held(modifiers: gpui_kit::Modifiers) -> bool {
 /// so it reads them itself.
 ///
 /// GPUI supplies the platform-resolved key name, including keyboard layout.
-pub fn command_chord(
-    logical: String,
-    modifiers: gpui_kit::Modifiers,
-) -> crate::CommandChord {
+pub fn command_chord(logical: String, modifiers: gpui_kit::Modifiers) -> crate::CommandChord {
     if !command_held(modifiers) {
         return crate::CommandChord::Ignored;
     }
@@ -121,15 +118,6 @@ pub fn escape_target(
     topmost
 }
 
-/// True when the live connection is in a state the shell should banner:
-/// the stream is down, retrying, or a resync failed and is backing off.
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
-}
-
 pub fn canonical_endpoint(input: String) -> String {
     let configured = input.trim();
     rpc_client(configured)
@@ -145,9 +133,6 @@ pub fn canonical_endpoint(input: String) -> String {
 /// It reaches that route only when no widget captured the press (the
 /// subscription is `status=ignored`), so a caret in a composer or a field with
 /// its own selection keeps its own copy, exactly as it should.
-pub fn is_copy_chord(
-    logical: String,
-    modifiers: gpui_kit::Modifiers,
-) -> bool {
+pub fn is_copy_chord(logical: String, modifiers: gpui_kit::Modifiers) -> bool {
     command_held(modifiers) && logical.eq_ignore_ascii_case("c")
 }

@@ -104,11 +104,29 @@ fn a_page_search_hit_names_the_page_it_came_from() {
         PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
     );
-    let panel = crate::tests::rust_tokens(PANEL);
+    struct TextValues(Vec<String>);
+    impl<'ast> syn::visit::Visit<'ast> for TextValues {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            use quote::ToTokens;
+            let kit_text = matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.iter().map(|part| part.ident.to_string()).collect::<Vec<_>>() == ["kit", "text"]);
+            if kit_text {
+                if let Some(value) = call.args.iter().nth(1) {
+                    self.0
+                        .push(value.to_token_stream().to_string().replace(' ', ""));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    use syn::visit::Visit as _;
+    let mut panel = TextValues(Vec::new());
+    panel.visit_file(&syn::parse_file(PANEL).expect("Pages composition parses"));
+    assert!(panel.0.iter().any(|value| value == "&hit.page_title"));
+    assert!(panel.0.iter().any(|value| value == "&hit.text"));
     assert!(
-        panel.contains("content:hit.page_title.to_owned()")
-            && !panel.contains("content:hit.block_id"),
-        "the pages search panel names the page instead of printing a raw block id"
+        panel.0.iter().all(|value| !value.contains("hit.block_id")),
+        "block ids identify actions, not visible search titles"
     );
 }
 

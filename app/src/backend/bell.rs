@@ -265,10 +265,6 @@ fn bell_summary(item: &BellItem, actor: &str) -> BellPresentation {
     }
 }
 
-pub fn bell_label(item: &BellItem, presentations: &[BellPresentation]) -> String {
-    bell_presentation(item, presentations).title
-}
-
 pub fn bell_openable(item: &BellItem, presentations: &[BellPresentation]) -> bool {
     presentations.iter().any(|entry| {
         entry.seq == item.seq && entry.target != BellTarget::Unavailable && !entry.object.is_empty()

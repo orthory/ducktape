@@ -294,9 +294,8 @@ pub fn optional_number(value: Option<i64>) -> String {
 pub fn node_status_live(rpc: String) -> futures::stream::BoxStream<'static, NodeFacts> {
     struct State {
         rpc: String,
-        stream: Option<
-            futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>,
-        >,
+        stream:
+            Option<futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>>,
         retry_attempt: u32,
     }
     futures::stream::unfold(
@@ -425,10 +424,8 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
             return Err("the runs module returned the wrong model roster reply".into());
         };
-        let (accounts, working) = tokio::join!(
-            read_accounts(&client),
-            agents_with_a_run_in_flight(&client)
-        );
+        let (accounts, working) =
+            tokio::join!(read_accounts(&client), agents_with_a_run_in_flight(&client));
         let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
             .filter_map(|account| match account.control {
@@ -489,28 +486,6 @@ async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
         .iter()
         .filter_map(|run| run["agent_id"].as_str().map(str::to_string))
         .collect()
-}
-
-/// Pause or resume one agent — owner-gated at the module, not quorum-gated.
-pub async fn set_agent_status(
-    rpc: String,
-    password: String,
-    agent_id: String,
-    paused: bool,
-) -> Result<bool, AppError> {
-    async {
-        let agent_id = required_id(agent_id, "agent")?;
-        let rpc = rpc_client(&rpc)?;
-        let operation = match paused {
-            true => runs::ModelMsg::PauseModel { agent_id },
-            false => runs::ModelMsg::ResumeModel { agent_id },
-        };
-        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
-        signed_write(&rpc, "runs", payload, password).await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
 }
 
 /// The editor's record as the Agents view hands it back: every field the
@@ -707,11 +682,6 @@ pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
     }
     .await
     .map_err(app_error)
-}
-
-/// Construct an empty account result for app fixtures.
-pub fn account_data_none(generation: i64) -> AccountData {
-    AccountData::none(generation)
 }
 
 /// The probe's answer as the discriminant the launch window branches on.
@@ -1162,16 +1132,6 @@ impl CeremonyStep {
             detail: message,
             left: String::new(),
         }
-    }
-}
-
-/// Construct an account ceremony step for app fixtures.
-pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep {
-    CeremonyStep {
-        phase,
-        qr,
-        detail,
-        left: String::new(),
     }
 }
 
