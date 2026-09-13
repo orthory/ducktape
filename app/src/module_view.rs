@@ -2854,6 +2854,7 @@ impl gpui_kit::Render for NativeModuleView {
                     gpui_kit::div()
                         .key_context(context)
                         .size_full()
+                        .p_4()
                         .child(input::Observe::new(
                             content.clone().into_any_element(),
                             self,
