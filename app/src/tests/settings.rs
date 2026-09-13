@@ -27,6 +27,15 @@ fn authored_items() -> syn::File {
     syn::parse_file(SETTINGS).unwrap()
 }
 
+fn tokens(value: &impl ToTokens) -> String {
+    value
+        .to_token_stream()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
 fn view_method(file: &syn::File) -> &syn::ImplItemFn {
     file.items
         .iter()
@@ -173,7 +182,7 @@ fn every_pane_has_a_tab_and_an_arm() {
         );
         assert_eq!(arms.iter().filter(|(name, _)| name == pane).count(), 1);
     }
-    let body = rust_tokens(&method.block.to_token_stream().to_string());
+    let body = tokens(&method.block);
     assert!(body.contains("tabs.into_iter().map(|(key,label,pane)|"));
     assert!(body.contains("Message::PickSettingsPane(SETTINGS_SCOPE.into(),pane)"));
     assert!(
@@ -227,7 +236,7 @@ fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
         );
     }
     let file = authored_items();
-    let body = rust_tokens(&view_method(&file).block.to_token_stream().to_string());
+    let body = tokens(&view_method(&file).block);
     assert_eq!(body.matches("matchstate.settings_pane").count(), 1);
     for (group, _) in GROUPS {
         assert!(
@@ -258,8 +267,7 @@ fn the_scrollable_is_the_screens_root() {
     assert_eq!(function.path.to_token_stream().to_string(), "kit :: scroll");
     assert_eq!(root.args.len(), 2);
     assert!(
-        rust_tokens(&root.args[1].to_token_stream().to_string())
-            .contains("kit::column(\"settings/content\",content)"),
+        tokens(&root.args[1]).contains("kit::column(\"settings/content\",content)"),
         "the entire header, tab strip and selected pane share the scroll root"
     );
 }
