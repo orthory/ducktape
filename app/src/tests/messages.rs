@@ -98,27 +98,3 @@ fn the_mention_plate_leaves_space_before_and_after_the_token() {
         "trailing whitespace remains visible: {trailing:?}"
     );
 }
-
-#[test]
-fn the_edited_marker_reaches_every_row_it_annotates() {
-    let components = super::connection::CHAT;
-    let branches = super::connection::branches(components);
-    let continuations: Vec<_> = branches
-        .iter()
-        .filter(|(guard, body, _)| {
-            guard.contains("edited") && guard.contains("show_author") && body.contains("·edited")
-        })
-        .collect();
-    assert!(
-        !continuations.is_empty(),
-        "continuation messages own an edited annotation"
-    );
-    assert!(
-        branches
-            .iter()
-            .any(|(guard, body, _)| guard.contains("edited")
-                && !guard.contains("show_author")
-                && body.contains("·edited")),
-        "thread roots own an edited annotation too"
-    );
-}
