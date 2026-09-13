@@ -158,7 +158,7 @@ impl super::ChatView {
             },
         )
     }
-    pub(super) fn render_chat_screen_50(&self, use_scope: String) -> wire::Node {
+    pub(super) fn chat_screen(&self, use_scope: String) -> wire::Node {
         let _component_owner =
             ::ducktape_view_guest::slots::component("ChatScreen", &use_scope, false);
         {
@@ -250,8 +250,8 @@ impl super::ChatView {
                                                         .to_string(),
                                                     ),
                                                     wire::TextOptions {
-                                                        wrapping: Some(wire::Wrapping::None)
-                                                            ..Default::default(),
+                                                        wrapping: Some(wire::Wrapping::None),
+                                                            ..Default::default()
                                                     },
                                                 ));
                                                 wire::Node::Linear {
@@ -490,7 +490,7 @@ impl super::ChatView {
                                             let for_scope =
                                                 format!("{}/@for:3076({})", use_scope, index);
                                             children.push(
-                                                self.render_channel_button_1(
+                                                self.channel_button(
                                                     format!("{}/ChannelButton@3077", for_scope),
                                                     (move |event_0| {
                                                         Message::ChooseChannel(event_0)
@@ -523,7 +523,7 @@ impl super::ChatView {
                                         for (index, dm) in self.dm_rows.iter().enumerate() {
                                             let for_scope =
                                                 format!("{}/@for:3119({})", use_scope, index);
-                                            children.push(self.render_dm_button_13(
+                                            children.push(self.direct_message(
                                                 format!("{}/DmButton@3120", for_scope),
                                                 (move |event_0| Message::ChooseDm(event_0)).clone(),
                                                 dm.peer.clone(),
@@ -634,7 +634,7 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, align_x : None,
                 align_y : None, background : None.map(wire::Background::Color), border :
                 None, snap : None, content : Box::new(self
-                .render_dm_header_23(format!("{}/DmHeader@3185", use_scope)),), }); } if
+                .direct_message_header(format!("{}/DmHeader@3185", use_scope)),), }); } if
                 self.active_dm.name.is_empty() { children
                 .push(native::text_options(native::text(format!("{}/@text:584",
                 use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
@@ -647,7 +647,7 @@ impl super::ChatView {
                 None, snap : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:601",
                 use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } if self.active_channel_archived {
                 children.push(self.archived_badge(format!("{}/Badge.Outline@3211",
                 use_scope),),); } if self.active_channel_members_only { children
@@ -730,9 +730,9 @@ impl super::ChatView {
                 .push(self.empty_messages(format!("{}/EmptyState@3308", use_scope),),); }
                 if self.connected && self.loading && self.messages.is_empty() { children
                 .push({ let mut children : Vec < wire::Node > = vec![self
-                .render_skeleton_row_35(format!("{}/SkeletonRow@3320", use_scope),), self
-                .render_skeleton_row_35(format!("{}/SkeletonRow@3321", use_scope),), self
-                .render_skeleton_row_35(format!("{}/SkeletonRow@3322", use_scope),)];
+                .loading_messages(format!("{}/SkeletonRow@3320", use_scope),), self
+                .loading_messages(format!("{}/SkeletonRow@3321", use_scope),), self
+                .loading_messages(format!("{}/SkeletonRow@3322", use_scope),)];
                 native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:712",
                 use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
                 top : 4.0f32, right : 0.0f32, bottom : 0.0f32, left : 0.0f32, },),
@@ -961,7 +961,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -992,7 +992,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1023,7 +1023,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1037,13 +1037,13 @@ impl super::ChatView {
                 .show_author { children.push({ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_1995), message.author.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if message.avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_1995),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_1995), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if message.height > 0 { children
                 .push(native::text_options(native::text(format!("{}/@text:377",
@@ -1052,7 +1052,7 @@ impl super::ChatView {
                 Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
                 { children.push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -1201,7 +1201,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -1224,7 +1224,7 @@ impl super::ChatView {
                 message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -1252,11 +1252,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -1275,11 +1275,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -1349,7 +1349,7 @@ impl super::ChatView {
                 message_contents_scope_1995), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_1995), message.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -1409,7 +1409,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -1440,7 +1440,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1471,7 +1471,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1485,13 +1485,13 @@ impl super::ChatView {
                 .show_author { children.push({ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2015), message.author.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if message.avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2015),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2015), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if message.height > 0 { children
                 .push(native::text_options(native::text(format!("{}/@text:377",
@@ -1500,7 +1500,7 @@ impl super::ChatView {
                 Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
                 { children.push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -1649,7 +1649,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -1672,7 +1672,7 @@ impl super::ChatView {
                 message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -1700,11 +1700,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -1723,11 +1723,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -1797,7 +1797,7 @@ impl super::ChatView {
                 message_contents_scope_2015), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2015), message.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -1857,7 +1857,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -1888,7 +1888,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1919,7 +1919,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -1933,13 +1933,13 @@ impl super::ChatView {
                 .show_author { children.push({ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2035), message.author.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if message.avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2035),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2035), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if message.height > 0 { children
                 .push(native::text_options(native::text(format!("{}/@text:377",
@@ -1948,7 +1948,7 @@ impl super::ChatView {
                 Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
                 { children.push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -2097,7 +2097,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -2120,7 +2120,7 @@ impl super::ChatView {
                 message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -2148,11 +2148,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -2171,11 +2171,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -2245,7 +2245,7 @@ impl super::ChatView {
                 message_contents_scope_2035), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2035), message.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -2434,7 +2434,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -2466,7 +2466,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -2498,7 +2498,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -2513,24 +2513,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_1995), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_1995),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_1995), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_1995), crate
                 ::host::height_label_short(cached_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -2680,7 +2680,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -2703,7 +2703,7 @@ impl super::ChatView {
                 && ! cached_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -2732,11 +2732,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -2756,11 +2756,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -2805,7 +2805,7 @@ impl super::ChatView {
                 message_contents_scope_1995), crate ::host::plural(cached_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_1995), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -2830,7 +2830,7 @@ impl super::ChatView {
                 message_contents_scope_1995), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_1995), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -2890,7 +2890,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -2922,7 +2922,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -2954,7 +2954,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -2969,24 +2969,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2015), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2015),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2015), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2015), crate
                 ::host::height_label_short(cached_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -3136,7 +3136,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -3159,7 +3159,7 @@ impl super::ChatView {
                 && ! cached_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -3188,11 +3188,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -3212,11 +3212,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -3261,7 +3261,7 @@ impl super::ChatView {
                 message_contents_scope_2015), crate ::host::plural(cached_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2015), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -3286,7 +3286,7 @@ impl super::ChatView {
                 message_contents_scope_2015), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2015), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -3346,7 +3346,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -3378,7 +3378,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -3410,7 +3410,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -3425,24 +3425,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2035), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2035),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2035), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2035), crate
                 ::host::height_label_short(cached_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -3592,7 +3592,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -3615,7 +3615,7 @@ impl super::ChatView {
                 && ! cached_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -3644,11 +3644,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -3668,11 +3668,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -3717,7 +3717,7 @@ impl super::ChatView {
                 message_contents_scope_2035), crate ::host::plural(cached_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2035), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -3742,7 +3742,7 @@ impl super::ChatView {
                 message_contents_scope_2035), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2035), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -4056,7 +4056,7 @@ impl super::ChatView {
                 vec![self.icon(format!("{}/Icon@3701", use_scope), "trash", 14f32,
                 "@media:70",), native::text_options(native::text(format!("{}/@text:1103",
                 use_scope), "Delete message…".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:1093", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
@@ -4267,7 +4267,7 @@ impl super::ChatView {
                 content : Box::new({ let mut children : Vec < wire::Node > = Vec::new();
                 if self.search_phase == SearchPhase::Searching { children.push({ let mut
                 children : Vec < wire::Node > = vec![self
-                .render_skeleton_row_35(format!("{}/SkeletonRow@3922", use_scope),)];
+                .loading_messages(format!("{}/SkeletonRow@3922", use_scope),)];
                 native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1314",
                 use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
                 top : 8.0f32, right : 8.0f32, bottom : 8.0f32, left : 8.0f32, },),
@@ -4292,7 +4292,7 @@ impl super::ChatView {
                 Box::new({ let mut children : Vec < wire::Node > = Vec::new(); for
                 (index, hit) in self.search_hits.iter().enumerate() { let for_scope =
                 format!("{}/@for:3937({})", use_scope, index); children.push(self
-                .render_chat_search_result_41(format!("{}/ChatSearchResult@3938",
+                .search_result(format!("{}/ChatSearchResult@3938",
                 for_scope), (move | event_0, event_1, event_2 |
                 Message::OpenChatSearchHit(event_0, event_1, event_2,)).clone(), hit
                 .clone(),),); }
@@ -4320,7 +4320,7 @@ impl super::ChatView {
                                     native::sized(
                                         native::container(
                                             format!("{}/@container:1355", use_scope),
-                                            self.render_composer_gate_44(format!(
+                                            self.composer_gate(format!(
                                                 "{}/ComposerGate@3964",
                                                 use_scope
                                             )),
@@ -4540,7 +4540,7 @@ impl super::ChatView {
                 : Some(wire::Wrapping::None), ..Default::default() },),); } children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:1468",
                 use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), Some(wire::Length::Fill), None,),);
                 wire::Node::Linear { max_width : None, clip : false, key :
                 format!("{}/@layout:1450", use_scope), wrap : None, axis :
@@ -4606,7 +4606,7 @@ impl super::ChatView {
                 use_scope)), wire::Node::Space { width : Some(wire::Length::Fill), height
                 : None, }, native::text_options(native::text(format!("{}/@text:1530",
                 use_scope), crate ::host::count_label(self.channel_members.len() as i64,)
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:1520", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
@@ -4647,7 +4647,7 @@ impl super::ChatView {
                 < wire::Node > = Vec::new(); for (index, member) in self.channel_members
                 .iter().enumerate() { let for_scope = format!("{}/@for:4173({})",
                 use_scope, index); children.push(self
-                .render_chat_member_row_47(format!("{}/ChatMemberRow@4174", for_scope),
+                .member_row(format!("{}/ChatMemberRow@4174", for_scope),
                 (move | event_0 | Message::RemoveChannelMemberSubmit(event_0)).clone(),
                 member.clone(),),); }
                 native::spaced(native::sized(native::column(format!("{}/@layout:1569",
@@ -4787,7 +4787,7 @@ impl super::ChatView {
                 Some(wire::Wrapping::None), ..Default::default() },),); } children
                 .push(native::text_options(native::text(format!("{}/@text:1676",
                 use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:1666", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(2.0f32), padding : None, width : None,
@@ -4955,7 +4955,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }); } if ! (thread_message.avatar_kind == "agent") {
                 children.push({ let human_plate_scope_925 = format!("{}/HumanPlate@925",
@@ -4974,23 +4974,23 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), thread_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }, { let mut children
                 : Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:1030",
                 thread_parent_block_scope_2747), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if thread_message.height > 0 { children
                 .push(native::text_options(native::text(format!("{}/@text:1038",
                 thread_parent_block_scope_2747), crate
                 ::host::height_label_short(thread_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if thread_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:1047",
                 thread_parent_block_scope_2747), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
                 .id),).is_empty() { children
@@ -5140,7 +5140,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -5179,7 +5179,7 @@ impl super::ChatView {
                 thread_parent_block_scope_2747), crate ::host::plural(thread_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:1069", thread_parent_block_scope_2747),
                 wrap : None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding :
@@ -5236,7 +5236,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), thread_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -5268,7 +5268,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -5300,7 +5300,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -5315,24 +5315,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2207), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2207),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2207), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if thread_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2207), crate
                 ::host::height_label_short(thread_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if thread_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -5482,7 +5482,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -5505,7 +5505,7 @@ impl super::ChatView {
                 && ! thread_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -5534,11 +5534,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -5558,11 +5558,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -5607,7 +5607,7 @@ impl super::ChatView {
                 message_contents_scope_2207), crate ::host::plural(thread_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2207), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -5632,7 +5632,7 @@ impl super::ChatView {
                 message_contents_scope_2207), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2207), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -5692,7 +5692,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), thread_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -5724,7 +5724,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -5756,7 +5756,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -5771,24 +5771,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2227), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2227),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2227), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if thread_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2227), crate
                 ::host::height_label_short(thread_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if thread_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -5938,7 +5938,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -5961,7 +5961,7 @@ impl super::ChatView {
                 && ! thread_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -5990,11 +5990,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -6014,11 +6014,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -6063,7 +6063,7 @@ impl super::ChatView {
                 message_contents_scope_2227), crate ::host::plural(thread_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2227), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -6088,7 +6088,7 @@ impl super::ChatView {
                 message_contents_scope_2227), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2227), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -6148,7 +6148,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), thread_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -6180,7 +6180,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -6212,7 +6212,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -6227,24 +6227,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2247), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2247),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2247), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if thread_message.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2247), crate
                 ::host::height_label_short(thread_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if thread_message.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -6394,7 +6394,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -6417,7 +6417,7 @@ impl super::ChatView {
                 && ! thread_message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
                 .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
@@ -6446,11 +6446,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -6470,11 +6470,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -6519,7 +6519,7 @@ impl super::ChatView {
                 message_contents_scope_2247), crate ::host::plural(thread_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2247), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -6544,7 +6544,7 @@ impl super::ChatView {
                 message_contents_scope_2247), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2247), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -6688,7 +6688,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -6720,7 +6720,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -6752,7 +6752,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -6767,24 +6767,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2207), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2207),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2207), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_reply.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2207), crate
                 ::host::height_label_short(cached_reply.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_reply.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -6934,7 +6934,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -6957,7 +6957,7 @@ impl super::ChatView {
                 ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -6986,11 +6986,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7010,11 +7010,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7059,7 +7059,7 @@ impl super::ChatView {
                 message_contents_scope_2207), crate ::host::plural(cached_reply
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2207), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -7084,7 +7084,7 @@ impl super::ChatView {
                 message_contents_scope_2207), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2207), cached_reply.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -7144,7 +7144,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -7176,7 +7176,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -7208,7 +7208,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -7223,24 +7223,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2227), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2227),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2227), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_reply.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2227), crate
                 ::host::height_label_short(cached_reply.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_reply.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -7390,7 +7390,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -7413,7 +7413,7 @@ impl super::ChatView {
                 ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -7442,11 +7442,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7466,11 +7466,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7515,7 +7515,7 @@ impl super::ChatView {
                 message_contents_scope_2227), crate ::host::plural(cached_reply
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2227), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -7540,7 +7540,7 @@ impl super::ChatView {
                 message_contents_scope_2227), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2227), cached_reply.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -7600,7 +7600,7 @@ impl super::ChatView {
                 : None, content :
                 Box::new(native::text_options(native::text(format!("{}/@text:336",
                 human_plate_scope_925), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
                 } native::column(node_scope.clone(), children) } } }];
@@ -7632,7 +7632,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -7664,7 +7664,7 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_reply.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), } } }); } native::column(node_scope.clone(),
                 children) } } }]; native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
@@ -7679,24 +7679,24 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2247), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
                 children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2247),
                 native::text_options(native::text(format!("{}/@text:360",
                 message_contents_scope_2247), "AGENT".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), wire::Edges { top : 2.0f32, right : 5.0f32,
                 bottom : 2.0f32, left : 5.0f32, },),); } if cached_reply.height > 0 {
                 children.push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2247), crate
                 ::host::height_label_short(cached_reply.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if cached_reply.edited { children
                 .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
                 Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
                 max_width : None, clip : false, key : format!("{}/@layout:342",
@@ -7846,7 +7846,7 @@ impl super::ChatView {
                 : None, line_height : None, font : None, color : None, link : None,
                 background : None, border : None, padding : None, underline : false,
                 strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
                 ..Default::default() }, key : format!("{}/@text:32",
                 rich_line_scope_780), size : Some(13.5f32), color : None, font :
                 wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
@@ -7869,7 +7869,7 @@ impl super::ChatView {
                 ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
                 .is_empty() { children.push({ let mut children : Vec < wire::Node > =
@@ -7898,11 +7898,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:238",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:231", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7922,11 +7922,11 @@ impl super::ChatView {
                 reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:282",
                 reaction_chip_scope_1849), reaction.count.to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:275", reaction_chip_scope_1849), wrap :
                 None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding : None,
@@ -7971,7 +7971,7 @@ impl super::ChatView {
                 message_contents_scope_2247), crate ::host::plural(cached_reply
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
                 ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:458", message_contents_scope_2247), wrap
                 : None, axis : wire::Axis::Row, spacing : Some(6.0f32), padding : None,
@@ -7996,7 +7996,7 @@ impl super::ChatView {
                 message_contents_scope_2247), { let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2247), cached_reply.meta.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },), { let (hash, bytes) =
                 ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
@@ -8089,7 +8089,7 @@ impl super::ChatView {
                 for_scope = format!("{}/@for:4377({})", use_scope, index); if crate
                 ::host::run_in_thread(::std::borrow::Borrow::borrow(& live), self
                 .active_thread_seq,) { children.push(self
-                .render_live_run_card_49(format!("{}/LiveRunCard@4379", for_scope), (move
+                .live_run_card(format!("{}/LiveRunCard@4379", for_scope), (move
                 | event_0 | Message::CancelRun(event_0)).clone(), (move | event_0 |
                 Message::OpenRun(event_0)).clone(), live.clone(),),); } } if self
                 .thread_has_more && self.thread_next_reply_seq > 0 && self.thread_loading
@@ -8269,7 +8269,7 @@ impl super::ChatView {
                 vec![self.icon(format!("{}/Icon@4605", use_scope), "trash", 14f32,
                 "@media:70",), native::text_options(native::text(format!("{}/@text:2007",
                 use_scope), "Delete message…".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None)
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
                 false, key : format!("{}/@layout:1997", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :

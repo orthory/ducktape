@@ -23,7 +23,7 @@ impl super::ChatView {
             delay: None,
             child: Box::new({
                 let node_scope = format!("{}/chat", "ChatView");
-                self.render_chat_screen_50(node_scope.clone())
+                self.chat_screen(node_scope.clone())
             }),
         }
     }
