@@ -383,6 +383,54 @@ fn a_search_reads_the_index_and_lands_its_hits() {
     });
 }
 
+#[test]
+fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(type_into(&frame, "Search…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
+        let read = request(&frame, "rpc.view").id;
+        let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
+        assert!(has_text(&frame, "No messages match"));
+        let frame = tick_native(type_into(&frame, "Search…", "different"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(frame.requests.is_empty());
+        let frame = tick_native(press(&frame, "Clear message search"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(has_text(&frame, "first light"));
+        let frame = tick_native(type_into(&frame, "Search…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
+        let read = request(&frame, "rpc.view").id;
+        let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
+        let frame = tick_native(press(&frame, "Clear message search"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(has_text(&frame, "first light"));
+    });
+}
+
+#[test]
+fn edited_annotations_reach_author_continuation_and_thread_rows() {
+    fn annotations(node: &Node) -> usize {
+        usize::from(matches!(node, Node::Text { content, .. } if content == "· edited"))
+            + node.children().map(annotations).sum::<usize>()
+    }
+    on_a_deep_stack(|| {
+        let mut first = row(1, "first edited"); first["edited"] = true.into();
+        let mut second = row(2, "second edited"); second["edited"] = true.into(); second["reply_count"] = 1.into();
+        let window = serde_json::json!({"roots":{"roots":[first,second.clone()],"has_more":false}}).to_string().into_bytes();
+        let (frame, _) = connected_room_reading(window);
+        assert_eq!(annotations(node_ending(&frame, "/message-stream")), 2);
+        let frame = tick_native(press(&frame, "Open thread"));
+        // A thread remains independently annotated when its root and a reply
+        // share the same author, just like adjacent timeline messages.
+        let read = request(&frame, "rpc.view").id;
+        let mut third = reply(3, "edited reply", 2); third["edited"] = true.into();
+        let page = serde_json::json!({"thread":{"root":second,"replies":[third],"has_more":false,"next_reply_seq":null}}).to_string();
+        let frame = tick_native(vec![answer(read, page.as_bytes())]);
+        assert_eq!(annotations(node_ending(&frame, "/thread-stream")), 2);
+    });
+}
+
 /// A send in flight is a row at the tail: the app hands the body over as a
 /// session fact, and the committed row replaces it when the block lands.
 #[test]
