@@ -17,9 +17,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext as _, Bounds, BoxShadow, Context, CursorStyle, Div,
-    Element, ElementId, Entity, EntityInputHandler as _, EventEmitter, Focusable as _, FollowMode,
-    FontWeight, GlobalElementId, HighlightStyle, HitboxBehavior, Hsla, Image, ImageFormat,
-    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, ListAlignment,
+    Element, ElementId, Entity, EntityInputHandler as _, EventEmitter, FocusHandle, Focusable as _,
+    FollowMode, FontWeight, GlobalElementId, HighlightStyle, HitboxBehavior, Hsla, Image,
+    ImageFormat, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, ListAlignment,
     ListSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement as _, StrikethroughStyle,
@@ -278,6 +278,7 @@ struct Field {
 
 #[derive(Default)]
 pub(crate) struct NativePresentation {
+    focused_container: Option<(String, std::mem::Discriminant<wire::Node>)>,
     inputs: HashMap<String, InputPresentation>,
     editors: HashMap<String, wire::editor_document::EditorDocumentRef>,
     scrolls: HashMap<String, ScrollPresentation>,
@@ -299,6 +300,8 @@ struct InputPresentation {
 
 pub struct ViewTree {
     root: wire::Node,
+    // Structural nodes enter the native focus path only on an explicit Focus request.
+    focus_targets: HashMap<String, (std::mem::Discriminant<wire::Node>, FocusHandle)>,
     fields: HashMap<String, Field>,
     rich_selections: HashMap<String, RichSelection>,
     scrolls: HashMap<String, ScrollHandle>,
@@ -550,6 +553,7 @@ impl ViewTree {
     pub fn new(root: wire::Node) -> Self {
         Self {
             root,
+            focus_targets: HashMap::new(),
             fields: HashMap::new(),
             rich_selections: HashMap::new(),
             scrolls: HashMap::new(),
@@ -645,6 +649,9 @@ impl ViewTree {
         if let Some(field) = self.fields.get(target) {
             return field.state.read(cx).focus_handle(cx).is_focused(window);
         }
+        if let Some((_, handle)) = self.focus_targets.get(target) {
+            return handle.is_focused(window);
+        }
         if let Some(picker) = self.pickers.get(target) {
             return picker
                 .state
@@ -671,6 +678,7 @@ impl ViewTree {
             let available = self.mounted.contains(key)
                 && (self.fields.contains_key(key)
                     || self.pickers.contains_key(key)
+                    || self.focus_targets.contains_key(key)
                     || self.editors.contains_key(key));
             if available {
                 targets.push(key.to_owned());
@@ -709,6 +717,28 @@ impl ViewTree {
         use wire::WidgetCommand as C;
         if !self.mounted.contains(target) {
             return Ok(wire::encode(&()));
+        }
+        if matches!(command, C::Focus { .. }) {
+            let mut kind = None;
+            self.root.clone().for_each_mut(&mut |node| {
+                if node.key() == Some(target)
+                    && matches!(
+                        node,
+                        wire::Node::Container { .. } | wire::Node::Linear { .. }
+                    )
+                {
+                    kind = Some(std::mem::discriminant(node));
+                }
+            });
+            if let Some(kind) = kind {
+                let (_, handle) = self
+                    .focus_targets
+                    .entry(target.into())
+                    .or_insert_with(|| (kind, cx.focus_handle()));
+                handle.focus(window, cx);
+                cx.notify();
+                return Ok(wire::encode(&()));
+            }
         }
         if let Some(editor) = self.editors.get(target) {
             editor.view.update(cx, |editor, cx| {
@@ -874,6 +904,7 @@ impl ViewTree {
     }
 
     pub fn replace(&mut self, mut root: wire::Node, cx: &mut Context<Self>) {
+        let mut focusable = HashMap::new();
         let mut inputs = std::collections::HashSet::new();
         let mut scrolls = std::collections::HashSet::new();
         let mut pickers = std::collections::HashSet::new();
@@ -885,6 +916,12 @@ impl ViewTree {
         root.for_each_mut(&mut |node| {
             if let Some(key) = node.key() {
                 live_keys.insert(key.to_owned());
+                if matches!(
+                    node,
+                    wire::Node::Container { .. } | wire::Node::Linear { .. }
+                ) {
+                    focusable.insert(key.to_owned(), std::mem::discriminant(node));
+                }
             }
             match node {
                 wire::Node::Input { key, .. } => {
@@ -965,6 +1002,8 @@ impl ViewTree {
             }
         });
         self.bounds.retain(|key, _| live_keys.contains(key));
+        self.focus_targets
+            .retain(|key, (kind, _)| focusable.get(key) == Some(kind));
         self.fields.retain(|key, _| inputs.contains(key));
         self.rich_selections
             .retain(|key, _| live_keys.contains(key));
@@ -1054,6 +1093,9 @@ impl ViewTree {
             }
         });
         NativePresentation {
+            focused_container: self.focus_targets.iter().find_map(|(key, (kind, handle))| {
+                handle.is_focused(window).then(|| (key.clone(), *kind))
+            }),
             inputs,
             editors,
             scrolls,
@@ -1063,6 +1105,37 @@ impl ViewTree {
     pub(crate) fn with_presentation(mut self, presentation: NativePresentation) -> Self {
         self.presentation = presentation;
         self
+    }
+
+    fn focusable_container(
+        &mut self,
+        node: &wire::Node,
+        element: Div,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = node.key().expect("keyed container");
+        let kind = std::mem::discriminant(node);
+        let restore = self
+            .presentation
+            .focused_container
+            .as_ref()
+            .is_some_and(|(saved, saved_kind)| saved == key && *saved_kind == kind);
+        if restore {
+            self.presentation.focused_container = None;
+            let (_, handle) = self
+                .focus_targets
+                .entry(key.into())
+                .or_insert_with(|| (kind, cx.focus_handle()));
+            handle.focus(window, cx);
+        }
+        match self.focus_targets.get(key) {
+            Some((_, handle)) => element
+                .id(SharedString::from(key.to_owned()))
+                .track_focus(handle)
+                .into_any_element(),
+            None => element.into_any_element(),
+        }
     }
 
     fn input(
@@ -1310,7 +1383,7 @@ impl ViewTree {
                 for child in children {
                     element = element.child(self.node(child, window, cx));
                 }
-                element.into_any_element()
+                self.focusable_container(node, element, window, cx)
             }
             Node::KeyedColumn {
                 key,
@@ -1401,10 +1474,10 @@ impl ViewTree {
                 if *clip {
                     element = element.overflow_hidden();
                 }
-                element
+                let element = element
                     .child(self.node(content, window, cx))
-                    .child(self.measure(key, cx))
-                    .into_any_element()
+                    .child(self.measure(key, cx));
+                self.focusable_container(node, element, window, cx)
             }
             Node::Scroll {
                 key,
@@ -4021,6 +4094,113 @@ fn append_arc_to(
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn container_focus_is_native_and_handoff_never_reuses_retired_handles(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        struct Host {
+            tree: Entity<ViewTree>,
+            keys: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let keys = self.keys.clone();
+                div()
+                    .capture_key_down(move |_, _, cx| {
+                        keys.set(keys.get() + 1);
+                        cx.stop_propagation();
+                    })
+                    .child(self.tree.clone())
+            }
+        }
+        cx.update(gpui_kit::init);
+        let menu = || {
+            ducktape_view_guest::kit::column(
+                "menu",
+                [ducktape_view_guest::kit::text(
+                    "label",
+                    "A real menu, without an input",
+                )],
+            )
+        };
+        let keys = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.open_window(size(px(500.), px(300.)), |_, cx| Host {
+            tree: cx.new(|_| ViewTree::new(menu())),
+            keys: keys.clone(),
+        });
+        let host = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        let tree = host.read_with(&native, |host, _| host.tree.clone());
+        native.update(|window, cx| {
+            tree.update(cx, |tree, cx| {
+                assert!(tree.fields.is_empty());
+                tree.execute_widget_command(
+                    wire::WidgetCommand::Focus {
+                        target: "menu".into(),
+                    },
+                    window,
+                    cx,
+                )
+                .unwrap();
+            })
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        let retired = native.update(|window, cx| {
+            tree.read_with(cx, |tree, cx| {
+                assert!(tree.target_focused("menu", window, cx));
+                tree.focus_targets["menu"].1.clone()
+            })
+        });
+        native.update(|window, cx| {
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx)
+        });
+        assert_eq!(
+            keys.get(),
+            1,
+            "focused menu participates in native key capture"
+        );
+        native.update(|window, cx| {
+            let saved = tree.read_with(cx, |tree, cx| tree.presentation(window, cx));
+            host.update(cx, |host, cx| {
+                host.tree = cx.new(|_| ViewTree::new(menu()).with_presentation(saved));
+                cx.notify();
+            });
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        let replacement = host.read_with(&native, |host, _| host.tree.clone());
+        native.update(|window, cx| {
+            replacement.read_with(cx, |tree, cx| {
+                assert!(tree.target_focused("menu", window, cx));
+                assert!(
+                    !retired.is_focused(window),
+                    "handoff uses a fresh native handle"
+                );
+            })
+        });
+        native.update(|window, cx| {
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx)
+        });
+        assert_eq!(keys.get(), 2);
+        native.update(|window, cx| {
+            replacement.update(cx, |tree, cx| {
+                tree.replace(ducktape_view_guest::kit::text("closed", "menu closed"), cx);
+                assert!(tree.focus_targets.is_empty());
+                assert!(!tree.target_focused("menu", window, cx));
+            })
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        native.update(|window, cx| {
+            retired.focus(window, cx);
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+        });
+        assert_eq!(
+            keys.get(),
+            2,
+            "retired menu has no current native dispatch path"
+        );
+    }
 
     #[gpui_kit::test]
     fn text_respects_parent_width_and_keeps_nowrap_inside_its_box(
