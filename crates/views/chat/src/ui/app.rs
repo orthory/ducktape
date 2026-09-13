@@ -341,12 +341,12 @@ impl ChatView {
 impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::room(
                     self.room_key.clone(),
                 )
-                .map(move |value| Message::RoomArrived(value))])
+                .map(Message::RoomArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -354,7 +354,7 @@ impl ChatView {
                 ::ducktape_view_guest::Subscription::batch([crate::host::thread(
                     self.thread_key.clone(),
                 )
-                .map(move |value| Message::ThreadArrived(value))])
+                .map(Message::ThreadArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -362,11 +362,11 @@ impl ChatView {
                 ::ducktape_view_guest::Subscription::batch([crate::host::search(
                     self.search_key.clone(),
                 )
-                .map(move |value| Message::SearchArrived(value))])
+                .map(Message::SearchArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }

@@ -239,7 +239,7 @@ fn each_tab_selects_only_its_own_groups_inside_the_shared_scroll_root() {
     ];
     let (mut frame, props, _) = connected(&facts(), 2);
     for selected in panes {
-        frame = tick_native(press(&frame, selected));
+        tick_native(press(&frame, selected));
         // Unrelated incoming facts must not select a different pane.
         frame = tick_native(vec![item(props, &encoded(&facts()))]);
         let mut root = frame.root.clone().expect("Settings tree");
@@ -256,11 +256,10 @@ fn each_tab_selects_only_its_own_groups_inside_the_shared_scroll_root() {
                 on_press,
                 ..
             } = node
+                && let Some(pane) = key.strip_prefix("settings/tab/")
             {
-                if let Some(pane) = key.strip_prefix("settings/tab/") {
-                    assert!(on_press.is_some());
-                    tabs.push((pane.to_owned(), *checked));
-                }
+                assert!(on_press.is_some());
+                tabs.push((pane.to_owned(), *checked));
             }
         });
         assert_eq!(tabs.len(), panes.len());

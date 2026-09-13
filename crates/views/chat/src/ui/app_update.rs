@@ -196,15 +196,14 @@ impl super::ChatView {
         self.live_agents = next.live_agents.clone();
         self.loading = self.session_loading
             || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel));
-        return ::ducktape_view_guest::Task::batch([
-            (::ducktape_view_guest::Task::done(moved_room))
-                .map(|value| Message::SessionSettled(value)),
-            (::ducktape_view_guest::Task::done(sent_now)).map(|value| Message::SnapStream(value)),
-            (::ducktape_view_guest::Task::done(chord_now)).map(|value| Message::CopyChord(value)),
-        ]);
+        ::ducktape_view_guest::Task::batch([
+            (::ducktape_view_guest::Task::done(moved_room)).map(Message::SessionSettled),
+            (::ducktape_view_guest::Task::done(sent_now)).map(Message::SnapStream),
+            (::ducktape_view_guest::Task::done(chord_now)).map(Message::CopyChord),
+        ])
     }
     fn on_session_settled(&mut self, moved_room: bool) -> ducktape_view_guest::Task<Message> {
-        return match crate::host::room_move(moved_room) {
+        match crate::host::room_move(moved_room) {
             RoomMove::Stayed => {
                 self.messages = crate::host::with_pending(
                     ::std::convert::AsRef::as_ref(&(self.room_messages)),
@@ -283,41 +282,41 @@ impl super::ChatView {
                 );
                 ::ducktape_view_guest::Task::none()
             }
-        };
+        }
     }
     fn on_snap_stream(&mut self, moved: bool) -> ducktape_view_guest::Task<Message> {
         if !moved {
             return ::ducktape_view_guest::Task::none();
         }
-        return ::ducktape_view_guest::widget::perform::<Message>(
+        ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Snap {
                 target: String::from("ChatView/chat/message-stream"),
-                x: (0.0) as f32,
-                y: (0.0) as f32,
+                x: 0.0_f32,
+                y: 0.0_f32,
             },
-        );
+        )
     }
     fn on_reveal_stream(&mut self, target_key: i64) -> ducktape_view_guest::Task<Message> {
         if target_key <= 0 {
             return ::ducktape_view_guest::Task::none();
         }
-        return ::ducktape_view_guest::widget::perform::<Message>(
+        ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
                 target: String::from("ChatView/chat/message-stream"),
                 key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key(),
             },
-        );
+        )
     }
     fn on_reveal_thread(&mut self, target_key: i64) -> ducktape_view_guest::Task<Message> {
         if target_key <= 0 {
             return ::ducktape_view_guest::Task::none();
         }
-        return ::ducktape_view_guest::widget::perform::<Message>(
+        ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
                 target: String::from("ChatView/chat/thread-pane/thread-stream"),
                 key: ::ducktape_view_guest::wire::ListKey::from(target_key).virtual_key(),
             },
-        );
+        )
     }
     fn on_room_arrived(
         &mut self,
@@ -361,8 +360,8 @@ impl super::ChatView {
             self.land_seq,
             self.land_seq > 0,
         );
-        return match crate::host::landing_thread(item.thread_root) {
-            LandingThread::Absent => (|| {
+        match crate::host::landing_thread(item.thread_root) {
+            LandingThread::Absent => {
                 self.thread_key = crate::host::thread_key(
                     self.connection_serial + self.room_serial,
                     self.names_serial,
@@ -371,10 +370,10 @@ impl super::ChatView {
                     self.thread_target_seq,
                     self.thread_pages,
                 );
-                return (::ducktape_view_guest::Task::done(self.stream_reveal_key))
-                    .map(|value| Message::RevealStream(value));
-            })(),
-            LandingThread::Seated => (|| {
+                (::ducktape_view_guest::Task::done(self.stream_reveal_key))
+                    .map(Message::RevealStream)
+            }
+            LandingThread::Seated => {
                 self.active_thread_seq = item.thread_root;
                 self.thread_target_seq = self.land_seq;
                 self.thread_pages = 0;
@@ -387,10 +386,10 @@ impl super::ChatView {
                     self.land_seq,
                     0,
                 );
-                return (::ducktape_view_guest::Task::done(self.stream_reveal_key))
-                    .map(|value| Message::RevealStream(value));
-            })(),
-        };
+                (::ducktape_view_guest::Task::done(self.stream_reveal_key))
+                    .map(Message::RevealStream)
+            }
+        }
     }
     fn on_thread_arrived(
         &mut self,
@@ -423,8 +422,7 @@ impl super::ChatView {
             item.target_seq,
             item.target_seq > 0,
         );
-        return (::ducktape_view_guest::Task::done(self.thread_reveal_key))
-            .map(|value| Message::RevealThread(value));
+        (::ducktape_view_guest::Task::done(self.thread_reveal_key)).map(Message::RevealThread)
     }
     fn on_search_arrived(
         &mut self,
@@ -435,7 +433,7 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         self.search_hits = item.hits.clone();
-        return match crate::host::search_outcome((item.error).is_empty()) {
+        match crate::host::search_outcome((item.error).is_empty()) {
             SearchOutcome::Answered => {
                 self.search_phase = SearchPhase::Done;
                 ::ducktape_view_guest::Task::none()
@@ -445,7 +443,7 @@ impl super::ChatView {
                 self.search_query = "".to_owned();
                 ::ducktape_view_guest::Task::none()
             }
-        };
+        }
     }
     fn on_act_done(&mut self, item: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
         self.busy = self.session_busy;
@@ -459,7 +457,7 @@ impl super::ChatView {
         self.thread_message_action = MessageAction::Toolbar;
         self.thread_edit_draft = "".to_owned();
         self.member_key_draft = "".to_owned();
-        self.room_serial = self.room_serial + 1;
+        self.room_serial += 1;
         self.room_key = crate::host::room_key(
             self.connection_serial + self.room_serial,
             self.names_serial,
@@ -599,7 +597,7 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         self.history_loading = true;
-        self.history_pages = self.history_pages + 1;
+        self.history_pages += 1;
         self.room_key = crate::host::room_key(
             self.connection_serial + self.room_serial,
             self.names_serial,
@@ -618,7 +616,7 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         self.history_loading = true;
-        self.history_pages = self.history_pages + 1;
+        self.history_pages += 1;
         self.room_key = crate::host::room_key(
             self.connection_serial + self.room_serial,
             self.names_serial,
@@ -912,7 +910,7 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         self.thread_loading = true;
-        self.thread_pages = self.thread_pages + 1;
+        self.thread_pages += 1;
         self.thread_key = crate::host::thread_key(
             self.connection_serial + self.room_serial,
             self.names_serial,
@@ -1160,9 +1158,9 @@ impl super::ChatView {
         }
         let range = crate::host::copy_range_after_press(
             self.copy_anchor_seq,
-            self.copy_surface.clone(),
+            self.copy_surface,
             seq,
-            surface.clone(),
+            surface,
         );
         self.copy_anchor_seq = range.anchor;
         self.copy_head_seq = range.head;
@@ -1180,7 +1178,7 @@ impl super::ChatView {
         let rows = crate::host::copy_range_rows(
             ::std::convert::AsRef::as_ref(&(self.messages)),
             ::std::convert::AsRef::as_ref(&(self.thread_messages)),
-            self.copy_surface.clone(),
+            self.copy_surface,
         );
         let count = crate::host::copy_range_count(
             ::std::convert::AsRef::as_ref(&(rows)),
@@ -1209,7 +1207,7 @@ impl super::ChatView {
         let rows = crate::host::copy_range_rows(
             ::std::convert::AsRef::as_ref(&(self.messages)),
             ::std::convert::AsRef::as_ref(&(self.thread_messages)),
-            self.copy_surface.clone(),
+            self.copy_surface,
         );
         let count = crate::host::copy_range_count(
             ::std::convert::AsRef::as_ref(&(rows)),
