@@ -1,124 +1,18 @@
 use super::*;
 impl super::ChatView {
-    pub(super) fn render_timeline_selection(
-        &self,
-        use_scope: String,
-        cb_13: impl Fn() -> Message + Clone + 'static,
-        cb_18: impl Fn() -> Message + Clone + 'static,
-    ) -> wire::Node {
-        let node_scope = format!("{}/root", use_scope);
-        native::padded(
-            native::sized(
-                native::container(
-                    node_scope.clone(),
-                    {
-                        let children: Vec<wire::Node> = vec![
-                            native::text_options(native::text(format!("{}/@text:200",
-                            use_scope), crate ::host::copy_range_label(crate
-                            ::host::copy_range_count(::std::convert::AsRef::as_ref(& self
-                            .messages), self.copy_anchor_seq, self.copy_head_seq,))
-                            .to_string(),), wire::TextOptions { wrapping :
-                            Some(wire::Wrapping::None), ..Default::default() },),
-                            wire::Node::Space { width : Some(wire::Length::Fill), height
-                            : None, },
-                            native::padded(native::button(format!("{}/@button:207",
-                            use_scope), String::from("Clear"),
-                            Some(::ducktape_view_guest::slots::message(cb_13())),
-                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
-                            { let node_scope = format!("{}/copy-range", node_scope);
-                            native::padded(native::button(node_scope.clone(),
-                            String::from("Copy"),
-                            Some(::ducktape_view_guest::slots::message(cb_18())),
-                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)
-                            },
-                        ];
-                        wire::Node::Linear {
-                            max_width: None,
-                            clip: false,
-                            key: format!("{}/@layout:195", use_scope),
-                            wrap: None,
-                            axis: wire::Axis::Row,
-                            spacing: Some(9.0f32),
-                            padding: None,
-                            width: Some(wire::Length::Fill),
-                            height: None,
-                            align: Some(wire::AlignX::Center),
-                            background: None,
-                            border: None,
-                            children: children,
-                        }
-                    },
-                ),
-                Some(wire::Length::Fill),
-                None,
-            ),
-            wire::Edges {
-                top: 7.0f32,
-                right: 12.0f32,
-                bottom: 7.0f32,
-                left: 12.0f32,
-            },
-        )
+    pub(super) fn render_timeline_selection(&self, key: String, clear: impl Fn() -> Message + Clone + 'static, copy: impl Fn() -> Message + Clone + 'static) -> wire::Node {
+        self.selection_bar(key, &self.messages, clear, copy)
     }
-    pub(super) fn render_thread_selection(
-        &self,
-        use_scope: String,
-        cb_13: impl Fn() -> Message + Clone + 'static,
-        cb_18: impl Fn() -> Message + Clone + 'static,
-    ) -> wire::Node {
-        let node_scope = format!("{}/root", use_scope);
-        native::padded(
-            native::sized(
-                native::container(
-                    node_scope.clone(),
-                    {
-                        let children: Vec<wire::Node> = vec![
-                            native::text_options(native::text(format!("{}/@text:200",
-                            use_scope), crate ::host::copy_range_label(crate
-                            ::host::copy_range_count(::std::convert::AsRef::as_ref(& self
-                            .thread_messages), self.copy_anchor_seq, self
-                            .copy_head_seq,)).to_string(),), wire::TextOptions { wrapping
-                            : Some(wire::Wrapping::None), ..Default::default() },),
-                            wire::Node::Space { width : Some(wire::Length::Fill), height
-                            : None, },
-                            native::padded(native::button(format!("{}/@button:207",
-                            use_scope), String::from("Clear"),
-                            Some(::ducktape_view_guest::slots::message(cb_13())),
-                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
-                            { let node_scope = format!("{}/copy-range", node_scope);
-                            native::padded(native::button(node_scope.clone(),
-                            String::from("Copy"),
-                            Some(::ducktape_view_guest::slots::message(cb_18())),
-                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)
-                            },
-                        ];
-                        wire::Node::Linear {
-                            max_width: None,
-                            clip: false,
-                            key: format!("{}/@layout:195", use_scope),
-                            wrap: None,
-                            axis: wire::Axis::Row,
-                            spacing: Some(9.0f32),
-                            padding: None,
-                            width: Some(wire::Length::Fill),
-                            height: None,
-                            align: Some(wire::AlignX::Center),
-                            background: None,
-                            border: None,
-                            children: children,
-                        }
-                    },
-                ),
-                Some(wire::Length::Fill),
-                None,
-            ),
-            wire::Edges {
-                top: 7.0f32,
-                right: 12.0f32,
-                bottom: 7.0f32,
-                left: 12.0f32,
-            },
-        )
+    pub(super) fn render_thread_selection(&self, key: String, clear: impl Fn() -> Message + Clone + 'static, copy: impl Fn() -> Message + Clone + 'static) -> wire::Node {
+        self.selection_bar(key, &self.thread_messages, clear, copy)
+    }
+    fn selection_bar(&self, key: String, messages: &[crate::host::ChatMessage], clear: impl Fn() -> Message + Clone + 'static, copy: impl Fn() -> Message + Clone + 'static) -> wire::Node {
+        let count = crate::host::copy_range_count(messages, self.copy_anchor_seq, self.copy_head_seq);
+        native::row(key.clone(), [
+            native::text(format!("{key}/count"), crate::host::copy_range_label(count)),
+            native::button(format!("{key}/clear"), "Clear", Some(ducktape_view_guest::slots::message(clear())), wire::ButtonPreset::Secondary),
+            native::button(format!("{key}/root/copy-range"), "Copy", Some(ducktape_view_guest::slots::message(copy())), wire::ButtonPreset::Secondary),
+        ])
     }
     pub(super) fn chat_screen(&self, use_scope: String) -> wire::Node {
         if !self.connected {
