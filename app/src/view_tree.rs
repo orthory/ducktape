@@ -1773,7 +1773,7 @@ impl ViewTree {
                 .absolute()
                 .inset_0();
                 let (width, height) = content_dimensions(content);
-                dimensions(div(), width, height)
+                let element = dimensions(div(), width, height)
                     .id(key.clone())
                     .relative()
                     .cursor(native_cursor(*cursor))
@@ -1787,8 +1787,13 @@ impl ViewTree {
                         }),
                     )
                     .child(self.node(content, window, cx))
-                    .child(capture)
-                    .into_any_element()
+                    .child(capture);
+                #[cfg(test)]
+                let element = {
+                    use gpui_kit::test::TestSupportExt as _;
+                    element.test_support()
+                };
+                element.into_any_element()
             }
             Node::Responsive {
                 key,
