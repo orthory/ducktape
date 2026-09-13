@@ -20,9 +20,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use ducktape_view_guest::host;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ducktape_view_guest::host;
 
 /// The plane every block moves: this view re-reads the node's own facts on
 /// it, because a height, a checkpoint and a peer sample answer to no module.
@@ -209,10 +209,7 @@ fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let applied = sync["applied_height"].as_i64().unwrap_or(UNMEASURED);
     let target = sync["target_height"].as_i64().unwrap_or(UNMEASURED);
     NodeFacts {
-        node_key: status["public_key"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
+        node_key: status["public_key"].as_str().unwrap_or_default().to_owned(),
         node_height: served_height(&status["height"]),
         node_checkpoint: operations["storage"]["checkpoint_height"]
             .as_i64()
@@ -715,38 +712,12 @@ pub fn copy(text: &str, label: &str) -> bool {
 
 // ---------- the readings the screen draws ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
-}
-
 pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
-}
-
 pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
     if loaded { next } else { current }.to_owned()
-}
-
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
 }
 
 /// `h 84,912`; a height the node has not reported reads `h —`.

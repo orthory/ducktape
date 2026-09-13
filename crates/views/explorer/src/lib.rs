@@ -32,7 +32,7 @@ pub struct ExplorerView {
     pub(crate) host_error: String,
     pub(crate) sent: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Message {
     SessionArrived(crate::host::SessionItem),
     LedgerArrived(crate::host::LedgerItem),
@@ -46,11 +46,6 @@ pub enum Message {
     LedgerResized(f64, f64),
     ViewportChanged(f64, f64),
     BindQuery(String),
-}
-impl ::std::fmt::Debug for Message {
-    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        formatter.write_str("Message")
-    }
 }
 impl ExplorerView {
     fn state() -> Self {
@@ -89,27 +84,20 @@ impl ExplorerView {
     }
 }
 
-#[allow(unused_parens)]
 impl ExplorerView {
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
-            if self.connected {
-                Subscription::batch([crate::host::ledger(self.ledger_serial)
-                    .map(move |value| Message::LedgerArrived(value))])
-            } else {
-                Subscription::none()
-            },
-            if (self.connected && (!(self.sent_query).is_empty())) {
-                Subscription::batch([crate::host::workspace_search(
-                    self.sent_query.to_owned(),
-                    self.search_serial,
-                )
-                .map(move |value| Message::SearchArrived(value))])
-            } else {
-                Subscription::none()
-            },
-        ])
+        let mut subscriptions = vec![host::session().map(Message::SessionArrived)];
+        if !self.connected {
+            return Subscription::batch(subscriptions);
+        }
+        subscriptions.push(host::ledger(self.ledger_serial).map(Message::LedgerArrived));
+        if !self.sent_query.is_empty() {
+            subscriptions.push(
+                host::workspace_search(self.sent_query.clone(), self.search_serial)
+                    .map(Message::SearchArrived),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 }
 #[cfg(test)]
@@ -146,7 +134,6 @@ mod tests {
     }
 }
 impl ExplorerView {
-    #[allow(clippy::assign_op_pattern)]
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
@@ -164,129 +151,104 @@ impl ExplorerView {
         }
     }
     fn on_session_arrived(&mut self, item: crate::host::SessionItem) -> Task<Message> {
-        {
-            self.host_error = item.error.to_owned();
-            if (!(item.error).is_empty()) {
-                return Task::none();
-            }
-            let next = item.next.clone();
-            self.head = next.head;
-            self.sync_line = next.sync_line.to_owned();
-            self.ledger_serial = crate::host::connection_serial_after(
-                self.connected,
-                next.connected,
-                self.ledger_serial,
-            );
-            self.loading = crate::host::loading_after(self.connected, next.connected, self.loading);
-            self.connected = next.connected;
-            Task::none()
+        self.host_error = item.error.to_owned();
+        if !(item.error).is_empty() {
+            return Task::none();
         }
+        let next = item.next.clone();
+        self.head = next.head;
+        self.sync_line = next.sync_line.to_owned();
+        self.ledger_serial = crate::host::connection_serial_after(
+            self.connected,
+            next.connected,
+            self.ledger_serial,
+        );
+        self.loading = crate::host::loading_after(self.connected, next.connected, self.loading);
+        self.connected = next.connected;
+        Task::none()
     }
     fn on_ledger_arrived(&mut self, item: crate::host::LedgerItem) -> Task<Message> {
-        {
-            self.loading = false;
-            self.host_error = item.error.to_owned();
-            if (!(item.error).is_empty()) {
-                return Task::none();
-            }
-            self.blocks = item.blocks.clone();
-            self.ops = item.ops.clone();
-            Task::none()
+        self.loading = false;
+        self.host_error = item.error.to_owned();
+        if !(item.error).is_empty() {
+            return Task::none();
         }
+        self.blocks = item.blocks.clone();
+        self.ops = item.ops.clone();
+        Task::none()
     }
     fn on_search_arrived(&mut self, item: crate::host::SearchItem) -> Task<Message> {
-        {
-            self.searching = false;
-            self.host_error = item.error.to_owned();
-            if (!(item.error).is_empty()) {
-                return Task::none();
-            }
-            self.hits = item.hits.clone();
-            self.kinds = item.kinds.clone();
-            self.partial = item.partial.to_owned();
-            Task::none()
+        self.searching = false;
+        self.host_error = item.error.to_owned();
+        if !(item.error).is_empty() {
+            return Task::none();
         }
+        self.hits = item.hits.clone();
+        self.kinds = item.kinds.clone();
+        self.partial = item.partial.to_owned();
+        Task::none()
     }
     fn on_refresh(&mut self) -> Task<Message> {
-        {
-            if ((!self.connected) || self.loading) {
-                return Task::none();
-            }
-            self.loading = true;
-            self.ledger_serial = (self.ledger_serial + 1);
-            Task::none()
+        if (!self.connected) || self.loading {
+            return Task::none();
         }
+        self.loading = true;
+        self.ledger_serial += 1;
+        Task::none()
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
-        {
-            self.sent = crate::host::copy(
-                ::std::convert::AsRef::as_ref(&(text)),
-                ::std::convert::AsRef::as_ref(&(label)),
-            );
-            Task::none()
-        }
+        self.sent = crate::host::copy(
+            ::std::convert::AsRef::as_ref(&(text)),
+            ::std::convert::AsRef::as_ref(&(label)),
+        );
+        Task::none()
     }
     fn on_search_submit(&mut self) -> Task<Message> {
-        {
-            let blocked = (((!self.connected) || self.searching)
-                || ((self.query).trim().to_owned()).is_empty());
-            if blocked {
-                return Task::none();
-            }
-            self.kind = "all".to_owned();
-            self.hits = Vec::new();
-            self.kinds = Vec::new();
-            self.partial = "".to_owned();
-            self.searching = true;
-            self.search_serial = (self.search_serial + 1);
-            self.sent_query = (self.query).trim().to_owned();
-            Task::none()
+        let blocked =
+            ((!self.connected) || self.searching) || ((self.query).trim().to_owned()).is_empty();
+        if blocked {
+            return Task::none();
         }
+        self.kind = "all".to_owned();
+        self.hits = Vec::new();
+        self.kinds = Vec::new();
+        self.partial = "".to_owned();
+        self.searching = true;
+        self.search_serial += 1;
+        self.sent_query = (self.query).trim().to_owned();
+        Task::none()
     }
     fn on_clear_explorer_search(&mut self) -> Task<Message> {
-        {
-            self.query = "".to_owned();
-            self.kind = "all".to_owned();
-            self.hits = Vec::new();
-            self.kinds = Vec::new();
-            self.partial = "".to_owned();
-            self.searching = false;
-            self.sent_query = "".to_owned();
-            Task::none()
-        }
+        self.query = "".to_owned();
+        self.kind = "all".to_owned();
+        self.hits = Vec::new();
+        self.kinds = Vec::new();
+        self.partial = "".to_owned();
+        self.searching = false;
+        self.sent_query = "".to_owned();
+        Task::none()
     }
     fn on_pick_explorer_kind(&mut self, next: String) -> Task<Message> {
-        {
-            self.kind = next.to_owned();
-            Task::none()
-        }
+        self.kind = next.to_owned();
+        Task::none()
     }
     fn on_select_explorer_block(&mut self, height: i64) -> Task<Message> {
-        {
-            self.selected = height;
-            Task::none()
-        }
+        self.selected = height;
+        Task::none()
     }
     fn on_ledger_resized(&mut self, dx: f64, _dy: f64) -> Task<Message> {
-        {
-            self.ledger_width =
-                crate::host::ledger_width_after_delta(self.ledger_width, dx, self.viewport_width);
-            Task::none()
-        }
+        self.ledger_width =
+            crate::host::ledger_width_after_delta(self.ledger_width, dx, self.viewport_width);
+        Task::none()
     }
     fn on_viewport_changed(&mut self, width: f64, _height: f64) -> Task<Message> {
-        {
-            self.viewport_width = width;
-            self.ledger_width =
-                crate::host::ledger_width_after_delta(self.ledger_width, 0.0, width);
-            Task::none()
-        }
+        self.viewport_width = width;
+        self.ledger_width = crate::host::ledger_width_after_delta(self.ledger_width, 0.0, width);
+        Task::none()
     }
     fn on_bind_query(&mut self, value: String) -> Task<Message> {
-        {
-            self.query = value;
-            Task::none()
-        }
+        self.query = value;
+        Task::none()
     }
 }
 mod presentation;

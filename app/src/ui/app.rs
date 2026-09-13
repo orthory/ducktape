@@ -1,12 +1,10 @@
 use ducktape_view_guest::Task;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AppTheme {
     App,
     AppDark,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LiveKind {
     Retry,
@@ -17,27 +15,23 @@ pub(crate) enum LiveKind {
     Plane,
     Resync,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SearchPhase {
     Idle,
     Searching,
     Done,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Appearance {
     System,
     Light,
     Dark,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SubmitVerdict {
     Admitted,
     Refused,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ComposerKind {
     Message,
@@ -45,7 +39,6 @@ pub(crate) enum ComposerKind {
     Edit,
     ThreadEdit,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MessageAction {
     Toolbar,
@@ -54,7 +47,6 @@ pub(crate) enum MessageAction {
     Editing,
     Delete,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ForgePhase {
     Idle,
@@ -62,7 +54,6 @@ pub(crate) enum ForgePhase {
     Ready,
     Failed,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HubStep {
     Loading,
@@ -77,60 +68,51 @@ pub(crate) enum HubStep {
     Live,
     Account,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum WalletDoor {
     Wallets,
     Password,
     Unreached,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum WindowSummon {
     Open,
     Raise,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TrayOpen {
     Launch,
     Console,
     Raise,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConsoleEntry {
     Idle,
     Entering,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RowPlate {
     Plain,
     Selected,
     Ranged,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CopySurface {
     Nowhere,
     Timeline,
     Thread,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CommandChord {
     Ignored,
     Quit,
     CloseWindow,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AccountProbe {
     Found,
     Missing,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CeremonyPhase {
     Working,
@@ -138,13 +120,11 @@ pub(crate) enum CeremonyPhase {
     Done,
     Failed,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum WelcomeDoor {
     Create,
     Login,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DuckKind {
     Unknown,
@@ -160,7 +140,6 @@ pub(crate) enum DuckKind {
     Run,
     Account,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ShellTab {
     Chat,
@@ -174,14 +153,12 @@ pub(crate) enum ShellTab {
     Governance,
     Settings,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ForgeIntent {
     OpenLink,
     Copy,
     Composer,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AgentsIntent {
     Badge,
@@ -189,7 +166,6 @@ pub(crate) enum AgentsIntent {
     OpenRun,
     OpenLink,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsIntent {
     Tab,
@@ -212,13 +188,11 @@ pub(crate) enum SettingsIntent {
     Dark,
     Notifications,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PagesIntent {
     OpenLink,
     Copy,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChatIntent {
     OpenHit,
@@ -237,7 +211,6 @@ pub(crate) enum ChatIntent {
     OpenRun,
     Composer,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MutationPhase {
     Idle,
@@ -256,14 +229,12 @@ pub(crate) enum MutationPhase {
     Page,
     PageDelete,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CeremonyRetirement {
     Keep,
     Welcome,
     Account,
 }
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BellTarget {
     Unavailable,
@@ -273,7 +244,6 @@ pub(crate) enum BellTarget {
     Repo,
     Run,
 }
-#[allow(dead_code)]
 pub struct Ducktape {
     pub(crate) appearance_save_generation: u64,
     pub(crate) appearance_save_task: Option<::ducktape_view_guest::task::Handle>,

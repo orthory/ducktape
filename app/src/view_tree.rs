@@ -2042,6 +2042,14 @@ impl ViewTree {
                 let mut element = shadows(
                     div()
                         .relative()
+                        .bg(gpui_kit::component::Theme::global(cx)
+                            .color_tokens()
+                            .popover)
+                        .text_color(
+                            gpui_kit::component::Theme::global(cx)
+                                .color_tokens()
+                                .popover_foreground,
+                        )
                         .left(px(x.evaluate(geometry)))
                         .top(px(y.evaluate(geometry))),
                     *shadow,
