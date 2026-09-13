@@ -1,13 +1,9 @@
+use ducktape_view_guest::{kit as native, wire};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AppTheme {
     App,
     AppDark,
-}
-#[derive(Clone, Copy)]
-struct Palette {
-    name: &'static str,
-    colors: [::ducktape_view_guest::wire::Rgba; 128],
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -309,1556 +305,6 @@ impl ::std::fmt::Debug for Message {
 }
 #[allow(unused_parens)]
 impl ChatView {
-    fn palette(&self) -> Palette {
-        match self.active_palette.clone() {
-            AppTheme::App => Palette {
-                name: "app",
-                colors: [
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        56.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        210.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        253.0 / 255.0,
-                        251.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        44.0 / 255.0,
-                        43.0 / 255.0,
-                        39.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        105.0 / 255.0,
-                        98.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        246.0 / 255.0,
-                        245.0 / 255.0,
-                        242.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        47.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        235.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        179.0 / 255.0,
-                        177.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        94.0 / 255.0,
-                        92.0 / 255.0,
-                        85.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        242.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        63.0 / 255.0,
-                        62.0 / 255.0,
-                        57.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        90.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        249.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        231.0 / 255.0,
-                        210.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        184.0 / 255.0,
-                        84.0 / 255.0,
-                        76.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        244.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        239.0 / 255.0,
-                        214.0 / 255.0,
-                        211.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        101.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        158.0 / 255.0,
-                        116.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        245.0 / 255.0,
-                        240.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        227.0 / 255.0,
-                        215.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        92.0 / 255.0,
-                        180.0 / 255.0,
-                        95.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        123.0 / 255.0,
-                        50.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        244.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        220.0 / 255.0,
-                        174.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        180.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        210.0 / 255.0,
-                        208.0 / 255.0,
-                        199.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        79.0 / 255.0,
-                        77.0 / 255.0,
-                        71.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        231.0 / 255.0,
-                        230.0 / 255.0,
-                        226.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        223.0 / 255.0,
-                        215.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        138.0 / 255.0,
-                        137.0 / 255.0,
-                        131.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.619608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.858824,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.129412,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.219608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.301961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.219608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.101961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        225.0 / 255.0,
-                        217.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        234.0 / 255.0,
-                        227.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        250.0 / 255.0,
-                        248.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        251.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        242.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        235.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        248.0 / 255.0,
-                        247.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        239.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        214.0 / 255.0,
-                        212.0 / 255.0,
-                        204.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        239.0 / 255.0,
-                        238.0 / 255.0,
-                        233.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        9.0 / 255.0,
-                        11.0 / 255.0,
-                        14.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        42.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        233.0 / 255.0,
-                        225.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        214.0 / 255.0,
-                        208.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        246.0 / 255.0,
-                        244.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        82.0 / 255.0,
-                        72.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        70.0 / 255.0,
-                        61.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        47.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        57.0 / 255.0,
-                        52.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        154.0 / 255.0,
-                        152.0 / 255.0,
-                        143.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        167.0 / 255.0,
-                        165.0 / 255.0,
-                        155.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        179.0 / 255.0,
-                        177.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        189.0 / 255.0,
-                        187.0 / 255.0,
-                        177.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        203.0 / 255.0,
-                        201.0 / 255.0,
-                        191.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        123.0 / 255.0,
-                        167.0 / 255.0,
-                        140.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        122.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        242.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        218.0 / 255.0,
-                        226.0 / 255.0,
-                        236.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        82.0 / 255.0,
-                        72.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        236.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        207.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        106.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        248.0 / 255.0,
-                        240.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.341176,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        247.0 / 255.0,
-                        246.0 / 255.0,
-                        242.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        249.0 / 255.0,
-                        246.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        252.0 / 255.0,
-                        251.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        250.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        248.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        236.0 / 255.0,
-                        225.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        231.0 / 255.0,
-                        200.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        217.0 / 255.0,
-                        216.0 / 255.0,
-                        208.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        213.0 / 255.0,
-                        211.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        182.0 / 255.0,
-                        180.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        200.0 / 255.0,
-                        198.0 / 255.0,
-                        188.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        194.0 / 255.0,
-                        192.0 / 255.0,
-                        182.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        208.0 / 255.0,
-                        206.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        219.0 / 255.0,
-                        212.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        120.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        126.0 / 255.0,
-                        158.0 / 255.0,
-                        136.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        102.0 / 255.0,
-                        100.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        111.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        241.0 / 255.0,
-                        237.0 / 255.0,
-                        245.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        221.0 / 255.0,
-                        210.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        245.0 / 255.0,
-                        241.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        235.0 / 255.0,
-                        224.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        246.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        225.0 / 255.0,
-                        239.0 / 255.0,
-                        227.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        47.0 / 255.0,
-                        107.0 / 255.0,
-                        65.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        238.0 / 255.0,
-                        236.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        221.0 / 255.0,
-                        216.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        161.0 / 255.0,
-                        67.0 / 255.0,
-                        56.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        246.0 / 255.0,
-                        243.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        72.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        145.0 / 255.0,
-                        138.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        138.0 / 255.0,
-                        90.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        138.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        237.0 / 255.0,
-                        244.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        111.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        241.0 / 255.0,
-                        239.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        72.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        242.0 / 255.0,
-                        241.0 / 255.0,
-                        237.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        185.0 / 255.0,
-                        113.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        240.0 / 255.0,
-                        233.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        192.0 / 255.0,
-                        138.0 / 255.0,
-                        62.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        243.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                ],
-            },
-            AppTheme::AppDark => Palette {
-                name: "app_dark",
-                colors: [
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        210.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        34.0 / 255.0,
-                        33.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        166.0 / 255.0,
-                        156.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        242.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        50.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        106.0 / 255.0,
-                        97.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        41.0 / 255.0,
-                        37.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        181.0 / 255.0,
-                        179.0 / 255.0,
-                        169.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        39.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        201.0 / 255.0,
-                        138.0 / 255.0,
-                        99.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        38.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        56.0 / 255.0,
-                        43.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        217.0 / 255.0,
-                        123.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        33.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        101.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        184.0 / 255.0,
-                        148.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        71.0 / 255.0,
-                        58.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        92.0 / 255.0,
-                        180.0 / 255.0,
-                        95.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        169.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        39.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        63.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        180.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        57.0 / 255.0,
-                        49.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        53.0 / 255.0,
-                        52.0 / 255.0,
-                        46.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        59.0 / 255.0,
-                        58.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        133.0 / 255.0,
-                        131.0 / 255.0,
-                        123.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.619608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.858824,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.250980,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.349020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.450980,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.349020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.149020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        18.0 / 255.0,
-                        17.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        25.0 / 255.0,
-                        24.0 / 255.0,
-                        21.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        32.0 / 255.0,
-                        31.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        29.0 / 255.0,
-                        25.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        41.0 / 255.0,
-                        37.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        49.0 / 255.0,
-                        48.0 / 255.0,
-                        43.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        35.0 / 255.0,
-                        30.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        39.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        14.0 / 255.0,
-                        13.0 / 255.0,
-                        11.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        44.0 / 255.0,
-                        43.0 / 255.0,
-                        38.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        9.0 / 255.0,
-                        11.0 / 255.0,
-                        14.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        42.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        47.0 / 255.0,
-                        41.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        29.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        194.0 / 255.0,
-                        90.0 / 255.0,
-                        79.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        211.0 / 255.0,
-                        104.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        242.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        218.0 / 255.0,
-                        210.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        141.0 / 255.0,
-                        132.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        124.0 / 255.0,
-                        122.0 / 255.0,
-                        113.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        106.0 / 255.0,
-                        97.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        96.0 / 255.0,
-                        95.0 / 255.0,
-                        86.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        85.0 / 255.0,
-                        84.0 / 255.0,
-                        76.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        123.0 / 255.0,
-                        167.0 / 255.0,
-                        140.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        37.0 / 255.0,
-                        48.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        62.0 / 255.0,
-                        82.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        211.0 / 255.0,
-                        104.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        31.0 / 255.0,
-                        28.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        106.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        37.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        32.0 / 255.0,
-                        31.0 / 255.0,
-                        26.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        35.0 / 255.0,
-                        34.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        32.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        36.0 / 255.0,
-                        24.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        53.0 / 255.0,
-                        50.0 / 255.0,
-                        42.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        58.0 / 255.0,
-                        30.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        63.0 / 255.0,
-                        62.0 / 255.0,
-                        54.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        110.0 / 255.0,
-                        109.0 / 255.0,
-                        99.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        91.0 / 255.0,
-                        90.0 / 255.0,
-                        82.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        98.0 / 255.0,
-                        97.0 / 255.0,
-                        90.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        73.0 / 255.0,
-                        65.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        50.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        161.0 / 255.0,
-                        152.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        126.0 / 255.0,
-                        158.0 / 255.0,
-                        136.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        157.0 / 255.0,
-                        155.0 / 255.0,
-                        146.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        154.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        38.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        87.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        71.0 / 255.0,
-                        58.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        29.0 / 255.0,
-                        42.0 / 255.0,
-                        32.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        53.0 / 255.0,
-                        42.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        201.0 / 255.0,
-                        162.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        47.0 / 255.0,
-                        31.0 / 255.0,
-                        28.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        61.0 / 255.0,
-                        39.0 / 255.0,
-                        35.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        222.0 / 255.0,
-                        139.0 / 255.0,
-                        127.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        35.0 / 255.0,
-                        48.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        92.0 / 255.0,
-                        85.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        192.0 / 255.0,
-                        168.0 / 255.0,
-                        110.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        184.0 / 255.0,
-                        148.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        154.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        38.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        208.0 / 255.0,
-                        144.0 / 255.0,
-                        104.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        38.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        169.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        39.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                ],
-            },
-        }
-    }
     fn title(&self) -> String {
         "Chat".to_owned()
     }
@@ -1976,9 +422,9 @@ impl ChatView {
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "cf1516e075a6b4b32487abe6afbfe3678c29fde066a7987abc12f3d3b256ef2b";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        ::ducktape_view_guest::wire::Snapshot {
+        wire::Snapshot {
             schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: ::ducktape_view_guest::wire::SnapshotValue::Record {
+            state: wire::SnapshotValue::Record {
                 name: String::from("ChatView"),
                 fields: vec![
                     (String::from("active_palette"), match & self.active_palette {
@@ -2761,16 +1207,13 @@ impl ChatView {
             .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot = ::ducktape_view_guest::wire::Snapshot::decode(bytes)?;
+        let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
             return Err(String::from("snapshot schema mismatch"));
         }
         let value = snapshot.state;
         ((|| {
-            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name,
-                fields,
-            } = value else {
+            let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
             if name != "ChatView" || fields.len() != 88 {
@@ -2782,10 +1225,7 @@ impl ChatView {
                 return None;
             }
             let active_palette: AppTheme = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "AppTheme" || fields.len() != 1 {
@@ -2813,7 +1253,7 @@ impl ChatView {
                 return None;
             }
             let endpoint: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2821,7 +1261,7 @@ impl ChatView {
                 return None;
             }
             let network_name: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2829,7 +1269,7 @@ impl ChatView {
                 return None;
             }
             let network_chain_id: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2837,7 +1277,7 @@ impl ChatView {
                 return None;
             }
             let status: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2845,7 +1285,7 @@ impl ChatView {
                 return None;
             }
             let block_height: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2853,7 +1293,7 @@ impl ChatView {
                 return None;
             }
             let connected: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2861,7 +1301,7 @@ impl ChatView {
                 return None;
             }
             let session_loading: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2869,7 +1309,7 @@ impl ChatView {
                 return None;
             }
             let session_busy: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2877,14 +1317,11 @@ impl ChatView {
                 return None;
             }
             let rooms: Vec<crate::host::ChatSidebarRow> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatSidebarRow" || fields.len() != 2 {
@@ -2901,10 +1338,8 @@ impl ChatView {
                             }
                             Some(crate::host::ChatSidebarRow {
                                 channel: ((|| {
-                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name,
-                                        fields,
-                                    } = field_0 else {
+                                    let wire::SnapshotValue::Record { name, fields } = field_0
+                                    else {
                                         return None;
                                     };
                                     if name != "ChatChannel" || fields.len() != 6 {
@@ -2937,47 +1372,33 @@ impl ChatView {
                                     }
                                     Some(crate::host::ChatChannel {
                                         id: (match field_0 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         name: (match field_1 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         archived: (match field_2 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         members_only: (match field_3 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         huddle_count: (match field_4 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         head_seq: (match field_5 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                     })
                                 })())?,
                                 unread: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -2991,14 +1412,11 @@ impl ChatView {
                 return None;
             }
             let dm_rows: Vec<crate::host::DmSidebarRow> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "DmSidebarRow" || fields.len() != 2 {
@@ -3015,10 +1433,8 @@ impl ChatView {
                             }
                             Some(crate::host::DmSidebarRow {
                                 peer: ((|| {
-                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name,
-                                        fields,
-                                    } = field_0 else {
+                                    let wire::SnapshotValue::Record { name, fields } = field_0
+                                    else {
                                         return None;
                                     };
                                     if name != "DmPeer" || fields.len() != 5 {
@@ -3047,41 +1463,29 @@ impl ChatView {
                                     }
                                     Some(crate::host::DmPeer {
                                         key: (match field_0 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         name: (match field_1 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         initials: (match field_2 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         is_agent: (match field_3 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         channel_id: (match field_4 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                     })
                                 })())?,
                                 unread: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -3095,7 +1499,7 @@ impl ChatView {
                 return None;
             }
             let channel_create_open: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3103,7 +1507,7 @@ impl ChatView {
                 return None;
             }
             let active_channel: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3111,7 +1515,7 @@ impl ChatView {
                 return None;
             }
             let active_dm_peer: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3119,10 +1523,7 @@ impl ChatView {
                 return None;
             }
             let active_dm: crate::host::DmPeer = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "DmPeer" || fields.len() != 5 {
@@ -3151,33 +1552,23 @@ impl ChatView {
                 }
                 Some(crate::host::DmPeer {
                     key: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     name: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     initials: (match field_2 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     is_agent: (match field_3 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Bool(item) => Some(item),
                         _ => None,
                     })?,
                     channel_id: (match field_4 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -3187,7 +1578,7 @@ impl ChatView {
                 return None;
             }
             let huddle_joined: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3195,7 +1586,7 @@ impl ChatView {
                 return None;
             }
             let huddle_channel: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3203,7 +1594,7 @@ impl ChatView {
                 return None;
             }
             let huddle_channel_name: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3211,7 +1602,7 @@ impl ChatView {
                 return None;
             }
             let huddle_joined_at: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3219,7 +1610,7 @@ impl ChatView {
                 return None;
             }
             let huddle_now: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3227,7 +1618,7 @@ impl ChatView {
                 return None;
             }
             let call_muted: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3235,7 +1626,7 @@ impl ChatView {
                 return None;
             }
             let unread_boundary: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3243,14 +1634,11 @@ impl ChatView {
                 return None;
             }
             let live_agents: Vec<crate::host::LiveRunHint> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "LiveRunHint" || fields.len() != 6 {
@@ -3283,39 +1671,27 @@ impl ChatView {
                             }
                             Some(crate::host::LiveRunHint {
                                 anchor_seq: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 thread_root: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 run_id: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 dispatch_id: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 agent: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 status: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -3329,7 +1705,7 @@ impl ChatView {
                 return None;
             }
             let shift_held: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3337,7 +1713,7 @@ impl ChatView {
                 return None;
             }
             let copy_chord_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3345,7 +1721,7 @@ impl ChatView {
                 return None;
             }
             let sent_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3353,14 +1729,11 @@ impl ChatView {
                 return None;
             }
             let pending_sends: Vec<crate::host::PendingSend> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "PendingSend" || fields.len() != 3 {
@@ -3381,21 +1754,15 @@ impl ChatView {
                             }
                             Some(crate::host::PendingSend {
                                 id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 body: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 thread_seq: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -3409,7 +1776,7 @@ impl ChatView {
                 return None;
             }
             let me: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3417,7 +1784,7 @@ impl ChatView {
                 return None;
             }
             let me_key: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3425,7 +1792,7 @@ impl ChatView {
                 return None;
             }
             let names_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3433,7 +1800,7 @@ impl ChatView {
                 return None;
             }
             let land_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3441,7 +1808,7 @@ impl ChatView {
                 return None;
             }
             let connection_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3449,7 +1816,7 @@ impl ChatView {
                 return None;
             }
             let room_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3457,7 +1824,7 @@ impl ChatView {
                 return None;
             }
             let history_pages: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3465,10 +1832,7 @@ impl ChatView {
                 return None;
             }
             let room_key: crate::host::RoomKey = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "RoomKey" || fields.len() != 5 {
@@ -3497,33 +1861,23 @@ impl ChatView {
                 }
                 Some(crate::host::RoomKey {
                     serial: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     names: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     channel: (match field_2 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     land: (match field_3 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     pages: (match field_4 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -3533,7 +1887,7 @@ impl ChatView {
                 return None;
             }
             let room_channel: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3541,14 +1895,11 @@ impl ChatView {
                 return None;
             }
             let room_messages: Vec<crate::host::ChatMessage> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatMessage" || fields.len() != 21 {
@@ -3641,56 +1992,40 @@ impl ChatView {
                             }
                             Some(crate::host::ChatMessage {
                                 id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 view_key: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 seq: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 author: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 meta: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 body: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edit_body: (match field_6 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 blocks: (match field_7 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatBlock" || fields.len() != 5 {
@@ -3719,38 +2054,28 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatBlock {
                                                     kind: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     text: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     lang: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     rich: (match field_3 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     spans: (match field_4 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                                        wire::SnapshotValue::List(items) => {
                                                             items
                                                                 .into_iter()
                                                                 .map(|item| (|| {
-                                                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                                        name,
-                                                                        fields,
-                                                                    } = item else {
+                                                                    let wire::SnapshotValue::Record { name, fields } = item
+                                                                    else {
                                                                         return None;
                                                                     };
                                                                     if name != "ChatSpan" || fields.len() != 8 {
@@ -3791,51 +2116,35 @@ impl ChatView {
                                                                     }
                                                                     Some(crate::host::ChatSpan {
                                                                         mention: (match field_0 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         mention_link: (match field_1 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link_text: (match field_2 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link: (match field_3 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold_italic: (match field_4 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold: (match field_5 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         italic: (match field_6 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         plain: (match field_7 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                     })
@@ -3851,80 +2160,56 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 pending: (match field_8 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 rev: (match field_9 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edited: (match field_10 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 deleted: (match field_11 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reply_count: (match field_12 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 thread_seq: (match field_13 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 show_author: (match field_14 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 initial: (match field_15 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 avatar_kind: (match field_16 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 height: (match field_17 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 time: (match field_18 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reactions: (match field_19 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatReaction" || fields.len() != 3 {
@@ -3945,21 +2230,15 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatReaction {
                                                     emoji: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     count: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::I64(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     reacted_by_me: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                 })
@@ -3969,9 +2248,7 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 render_rev: (match field_20 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -3985,14 +2262,11 @@ impl ChatView {
                 return None;
             }
             let messages: Vec<crate::host::ChatMessage> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatMessage" || fields.len() != 21 {
@@ -4085,56 +2359,40 @@ impl ChatView {
                             }
                             Some(crate::host::ChatMessage {
                                 id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 view_key: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 seq: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 author: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 meta: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 body: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edit_body: (match field_6 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 blocks: (match field_7 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatBlock" || fields.len() != 5 {
@@ -4163,38 +2421,28 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatBlock {
                                                     kind: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     text: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     lang: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     rich: (match field_3 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     spans: (match field_4 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                                        wire::SnapshotValue::List(items) => {
                                                             items
                                                                 .into_iter()
                                                                 .map(|item| (|| {
-                                                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                                        name,
-                                                                        fields,
-                                                                    } = item else {
+                                                                    let wire::SnapshotValue::Record { name, fields } = item
+                                                                    else {
                                                                         return None;
                                                                     };
                                                                     if name != "ChatSpan" || fields.len() != 8 {
@@ -4235,51 +2483,35 @@ impl ChatView {
                                                                     }
                                                                     Some(crate::host::ChatSpan {
                                                                         mention: (match field_0 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         mention_link: (match field_1 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link_text: (match field_2 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link: (match field_3 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold_italic: (match field_4 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold: (match field_5 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         italic: (match field_6 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         plain: (match field_7 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                     })
@@ -4295,80 +2527,56 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 pending: (match field_8 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 rev: (match field_9 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edited: (match field_10 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 deleted: (match field_11 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reply_count: (match field_12 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 thread_seq: (match field_13 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 show_author: (match field_14 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 initial: (match field_15 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 avatar_kind: (match field_16 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 height: (match field_17 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 time: (match field_18 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reactions: (match field_19 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatReaction" || fields.len() != 3 {
@@ -4389,21 +2597,15 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatReaction {
                                                     emoji: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     count: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::I64(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     reacted_by_me: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                 })
@@ -4413,9 +2615,7 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 render_rev: (match field_20 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -4429,14 +2629,11 @@ impl ChatView {
                 return None;
             }
             let channel_members: Vec<crate::host::ChatMember> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatMember" || fields.len() != 2 {
@@ -4453,15 +2650,11 @@ impl ChatView {
                             }
                             Some(crate::host::ChatMember {
                                 key: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 label: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -4475,7 +2668,7 @@ impl ChatView {
                 return None;
             }
             let active_channel_name: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4483,7 +2676,7 @@ impl ChatView {
                 return None;
             }
             let active_channel_archived: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4491,7 +2684,7 @@ impl ChatView {
                 return None;
             }
             let active_channel_members_only: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4499,7 +2692,7 @@ impl ChatView {
                 return None;
             }
             let post_refusal: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4507,7 +2700,7 @@ impl ChatView {
                 return None;
             }
             let has_older_history: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4515,7 +2708,7 @@ impl ChatView {
                 return None;
             }
             let loading: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4523,7 +2716,7 @@ impl ChatView {
                 return None;
             }
             let busy: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -4531,10 +2724,7 @@ impl ChatView {
                 return None;
             }
             let timeline: crate::host::Timeline = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "Timeline" || fields.len() != 2 {
@@ -4551,14 +2741,12 @@ impl ChatView {
                 }
                 Some(crate::host::Timeline {
                     messages: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                        wire::SnapshotValue::List(items) => {
                             items
                                 .into_iter()
                                 .map(|item| (|| {
-                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name,
-                                        fields,
-                                    } = item else {
+                                    let wire::SnapshotValue::Record { name, fields } = item
+                                    else {
                                         return None;
                                     };
                                     if name != "ChatMessage" || fields.len() != 21 {
@@ -4651,56 +2839,40 @@ impl ChatView {
                                     }
                                     Some(crate::host::ChatMessage {
                                         id: (match field_0 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         view_key: (match field_1 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         seq: (match field_2 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         author: (match field_3 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         meta: (match field_4 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         body: (match field_5 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         edit_body: (match field_6 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         blocks: (match field_7 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                            wire::SnapshotValue::List(items) => {
                                                 items
                                                     .into_iter()
                                                     .map(|item| (|| {
-                                                        let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                            name,
-                                                            fields,
-                                                        } = item else {
+                                                        let wire::SnapshotValue::Record { name, fields } = item
+                                                        else {
                                                             return None;
                                                         };
                                                         if name != "ChatBlock" || fields.len() != 5 {
@@ -4729,38 +2901,28 @@ impl ChatView {
                                                         }
                                                         Some(crate::host::ChatBlock {
                                                             kind: (match field_0 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Str(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             text: (match field_1 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Str(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             lang: (match field_2 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Str(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             rich: (match field_3 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Bool(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             spans: (match field_4 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                                                wire::SnapshotValue::List(items) => {
                                                                     items
                                                                         .into_iter()
                                                                         .map(|item| (|| {
-                                                                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                                                name,
-                                                                                fields,
-                                                                            } = item else {
+                                                                            let wire::SnapshotValue::Record { name, fields } = item
+                                                                            else {
                                                                                 return None;
                                                                             };
                                                                             if name != "ChatSpan" || fields.len() != 8 {
@@ -4801,51 +2963,35 @@ impl ChatView {
                                                                             }
                                                                             Some(crate::host::ChatSpan {
                                                                                 mention: (match field_0 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 mention_link: (match field_1 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 link_text: (match field_2 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 link: (match field_3 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 bold_italic: (match field_4 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 bold: (match field_5 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 italic: (match field_6 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                                 plain: (match field_7 {
-                                                                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                        Some(item)
-                                                                                    }
+                                                                                    wire::SnapshotValue::Str(item) => Some(item),
                                                                                     _ => None,
                                                                                 })?,
                                                                             })
@@ -4861,80 +3007,56 @@ impl ChatView {
                                             _ => None,
                                         })?,
                                         pending: (match field_8 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         rev: (match field_9 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         edited: (match field_10 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         deleted: (match field_11 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         reply_count: (match field_12 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         thread_seq: (match field_13 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         show_author: (match field_14 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Bool(item) => Some(item),
                                             _ => None,
                                         })?,
                                         initial: (match field_15 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         avatar_kind: (match field_16 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         height: (match field_17 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         time: (match field_18 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         reactions: (match field_19 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                            wire::SnapshotValue::List(items) => {
                                                 items
                                                     .into_iter()
                                                     .map(|item| (|| {
-                                                        let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                            name,
-                                                            fields,
-                                                        } = item else {
+                                                        let wire::SnapshotValue::Record { name, fields } = item
+                                                        else {
                                                             return None;
                                                         };
                                                         if name != "ChatReaction" || fields.len() != 3 {
@@ -4955,21 +3077,15 @@ impl ChatView {
                                                         }
                                                         Some(crate::host::ChatReaction {
                                                             emoji: (match field_0 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Str(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             count: (match field_1 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::I64(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                             reacted_by_me: (match field_2 {
-                                                                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                                    Some(item)
-                                                                }
+                                                                wire::SnapshotValue::Bool(item) => Some(item),
                                                                 _ => None,
                                                             })?,
                                                         })
@@ -4979,9 +3095,7 @@ impl ChatView {
                                             _ => None,
                                         })?,
                                         render_rev: (match field_20 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                     })
@@ -4991,14 +3105,12 @@ impl ChatView {
                         _ => None,
                     })?,
                     live_agents: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                        wire::SnapshotValue::List(items) => {
                             items
                                 .into_iter()
                                 .map(|item| (|| {
-                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                        name,
-                                        fields,
-                                    } = item else {
+                                    let wire::SnapshotValue::Record { name, fields } = item
+                                    else {
                                         return None;
                                     };
                                     if name != "LiveRunHint" || fields.len() != 6 {
@@ -5031,39 +3143,27 @@ impl ChatView {
                                     }
                                     Some(crate::host::LiveRunHint {
                                         anchor_seq: (match field_0 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         thread_root: (match field_1 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::I64(item) => Some(item),
                                             _ => None,
                                         })?,
                                         run_id: (match field_2 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         dispatch_id: (match field_3 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         agent: (match field_4 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                         status: (match field_5 {
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                Some(item)
-                                            }
+                                            wire::SnapshotValue::Str(item) => Some(item),
                                             _ => None,
                                         })?,
                                     })
@@ -5079,7 +3179,7 @@ impl ChatView {
                 return None;
             }
             let thread_pages: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5087,10 +3187,7 @@ impl ChatView {
                 return None;
             }
             let thread_key: crate::host::ThreadKey = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "ThreadKey" || fields.len() != 6 {
@@ -5123,39 +3220,27 @@ impl ChatView {
                 }
                 Some(crate::host::ThreadKey {
                     serial: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     names: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     channel: (match field_2 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     root: (match field_3 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     target: (match field_4 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     pages: (match field_5 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -5165,7 +3250,7 @@ impl ChatView {
                 return None;
             }
             let active_thread_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5173,7 +3258,7 @@ impl ChatView {
                 return None;
             }
             let thread_target_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5181,7 +3266,7 @@ impl ChatView {
                 return None;
             }
             let thread_reveal_key: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5189,7 +3274,7 @@ impl ChatView {
                 return None;
             }
             let stream_reveal_key: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5197,14 +3282,11 @@ impl ChatView {
                 return None;
             }
             let thread_messages: Vec<crate::host::ChatMessage> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatMessage" || fields.len() != 21 {
@@ -5297,56 +3379,40 @@ impl ChatView {
                             }
                             Some(crate::host::ChatMessage {
                                 id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 view_key: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 seq: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 author: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 meta: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 body: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edit_body: (match field_6 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 blocks: (match field_7 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatBlock" || fields.len() != 5 {
@@ -5375,38 +3441,28 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatBlock {
                                                     kind: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     text: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     lang: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     rich: (match field_3 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     spans: (match field_4 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                                        wire::SnapshotValue::List(items) => {
                                                             items
                                                                 .into_iter()
                                                                 .map(|item| (|| {
-                                                                    let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                                        name,
-                                                                        fields,
-                                                                    } = item else {
+                                                                    let wire::SnapshotValue::Record { name, fields } = item
+                                                                    else {
                                                                         return None;
                                                                     };
                                                                     if name != "ChatSpan" || fields.len() != 8 {
@@ -5447,51 +3503,35 @@ impl ChatView {
                                                                     }
                                                                     Some(crate::host::ChatSpan {
                                                                         mention: (match field_0 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         mention_link: (match field_1 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link_text: (match field_2 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         link: (match field_3 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold_italic: (match field_4 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         bold: (match field_5 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         italic: (match field_6 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                         plain: (match field_7 {
-                                                                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                                                Some(item)
-                                                                            }
+                                                                            wire::SnapshotValue::Str(item) => Some(item),
                                                                             _ => None,
                                                                         })?,
                                                                     })
@@ -5507,80 +3547,56 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 pending: (match field_8 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 rev: (match field_9 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 edited: (match field_10 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 deleted: (match field_11 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reply_count: (match field_12 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 thread_seq: (match field_13 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 show_author: (match field_14 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Bool(item) => Some(item),
                                     _ => None,
                                 })?,
                                 initial: (match field_15 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 avatar_kind: (match field_16 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 height: (match field_17 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 time: (match field_18 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 reactions: (match field_19 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                                    wire::SnapshotValue::List(items) => {
                                         items
                                             .into_iter()
                                             .map(|item| (|| {
-                                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                                    name,
-                                                    fields,
-                                                } = item else {
+                                                let wire::SnapshotValue::Record { name, fields } = item
+                                                else {
                                                     return None;
                                                 };
                                                 if name != "ChatReaction" || fields.len() != 3 {
@@ -5601,21 +3617,15 @@ impl ChatView {
                                                 }
                                                 Some(crate::host::ChatReaction {
                                                     emoji: (match field_0 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Str(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     count: (match field_1 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::I64(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                     reacted_by_me: (match field_2 {
-                                                        ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                                            Some(item)
-                                                        }
+                                                        wire::SnapshotValue::Bool(item) => Some(item),
                                                         _ => None,
                                                     })?,
                                                 })
@@ -5625,9 +3635,7 @@ impl ChatView {
                                     _ => None,
                                 })?,
                                 render_rev: (match field_20 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -5641,7 +3649,7 @@ impl ChatView {
                 return None;
             }
             let thread_has_more: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5649,7 +3657,7 @@ impl ChatView {
                 return None;
             }
             let thread_next_reply_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5657,7 +3665,7 @@ impl ChatView {
                 return None;
             }
             let thread_loading: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5665,10 +3673,7 @@ impl ChatView {
                 return None;
             }
             let search_key: crate::host::SearchKey = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "SearchKey" || fields.len() != 3 {
@@ -5689,21 +3694,15 @@ impl ChatView {
                 }
                 Some(crate::host::SearchKey {
                     serial: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     names: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     query: (match field_2 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -5713,10 +3712,7 @@ impl ChatView {
                 return None;
             }
             let search_phase: SearchPhase = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "SearchPhase" || fields.len() != 1 {
@@ -5750,7 +3746,7 @@ impl ChatView {
                 return None;
             }
             let search_query: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5758,14 +3754,11 @@ impl ChatView {
                 return None;
             }
             let search_hits: Vec<crate::host::ChatSearchHit> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name,
-                                fields,
-                            } = item else {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
                             if name != "ChatSearchHit" || fields.len() != 6 {
@@ -5798,39 +3791,27 @@ impl ChatView {
                             }
                             Some(crate::host::ChatSearchHit {
                                 channel_id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 seq: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 root_seq: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                                 author: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 text: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                                 meta: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
+                                    wire::SnapshotValue::Str(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -5844,7 +3825,7 @@ impl ChatView {
                 return None;
             }
             let history_view: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5852,7 +3833,7 @@ impl ChatView {
                 return None;
             }
             let at_live_tail: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5860,7 +3841,7 @@ impl ChatView {
                 return None;
             }
             let history_loading: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5868,7 +3849,7 @@ impl ChatView {
                 return None;
             }
             let unread_marker_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5876,7 +3857,7 @@ impl ChatView {
                 return None;
             }
             let selected_message_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5884,7 +3865,7 @@ impl ChatView {
                 return None;
             }
             let selected_message_rev: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5892,10 +3873,7 @@ impl ChatView {
                 return None;
             }
             let message_action: MessageAction = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "MessageAction" || fields.len() != 1 {
@@ -5941,7 +3919,7 @@ impl ChatView {
                 return None;
             }
             let channel_settings_open: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5949,7 +3927,7 @@ impl ChatView {
                 return None;
             }
             let thread_selected_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5957,7 +3935,7 @@ impl ChatView {
                 return None;
             }
             let thread_selected_rev: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -5965,10 +3943,7 @@ impl ChatView {
                 return None;
             }
             let thread_message_action: MessageAction = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "MessageAction" || fields.len() != 1 {
@@ -6014,7 +3989,7 @@ impl ChatView {
                 return None;
             }
             let copy_anchor_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6022,7 +3997,7 @@ impl ChatView {
                 return None;
             }
             let copy_head_seq: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6030,10 +4005,7 @@ impl ChatView {
                 return None;
             }
             let copy_surface: CopySurface = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "CopySurface" || fields.len() != 1 {
@@ -6067,9 +4039,7 @@ impl ChatView {
                 return None;
             }
             let chat_viewport_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6077,9 +4047,7 @@ impl ChatView {
                 return None;
             }
             let sidebar_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6087,9 +4055,7 @@ impl ChatView {
                 return None;
             }
             let details_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6097,9 +4063,7 @@ impl ChatView {
                 return None;
             }
             let thread_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6107,7 +4071,7 @@ impl ChatView {
                 return None;
             }
             let search_draft: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6115,7 +4079,7 @@ impl ChatView {
                 return None;
             }
             let message_edit_draft: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6123,7 +4087,7 @@ impl ChatView {
                 return None;
             }
             let channel_name_draft: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6131,7 +4095,7 @@ impl ChatView {
                 return None;
             }
             let member_key_draft: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6139,7 +4103,7 @@ impl ChatView {
                 return None;
             }
             let thread_edit_draft: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6147,7 +4111,7 @@ impl ChatView {
                 return None;
             }
             let host_error: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6155,7 +4119,7 @@ impl ChatView {
                 return None;
             }
             let sent: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -6166,10 +4130,7 @@ impl ChatView {
                 String,
                 ChatScreenState,
             > = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "ChatScreen instances" {
@@ -6178,10 +4139,7 @@ impl ChatView {
                 let mut values = ::std::collections::HashMap::new();
                 for (scope, value) in fields {
                     let component = ((|| {
-                        let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name,
-                            fields,
-                        } = value else {
+                        let wire::SnapshotValue::Record { name, fields } = value else {
                             return None;
                         };
                         if name != "ChatScreen" || fields.len() != 5 {
@@ -6193,9 +4151,7 @@ impl ChatView {
                             return None;
                         }
                         let message_action_focus: String = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                Some(item)
-                            }
+                            wire::SnapshotValue::Str(item) => Some(item),
                             _ => None,
                         })?;
                         let (name, value) = fields.next()?;
@@ -6203,9 +4159,9 @@ impl ChatView {
                             return None;
                         }
                         let chat_pointer_y: f64 = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::F64(
-                                item,
-                            ) if item.is_finite() => Some(item),
+                            wire::SnapshotValue::F64(item) if item.is_finite() => {
+                                Some(item)
+                            }
                             _ => None,
                         })?;
                         let (name, value) = fields.next()?;
@@ -6213,9 +4169,9 @@ impl ChatView {
                             return None;
                         }
                         let chat_height: f64 = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::F64(
-                                item,
-                            ) if item.is_finite() => Some(item),
+                            wire::SnapshotValue::F64(item) if item.is_finite() => {
+                                Some(item)
+                            }
                             _ => None,
                         })?;
                         let (name, value) = fields.next()?;
@@ -6223,9 +4179,9 @@ impl ChatView {
                             return None;
                         }
                         let thread_pointer_y: f64 = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::F64(
-                                item,
-                            ) if item.is_finite() => Some(item),
+                            wire::SnapshotValue::F64(item) if item.is_finite() => {
+                                Some(item)
+                            }
                             _ => None,
                         })?;
                         let (name, value) = fields.next()?;
@@ -6233,9 +4189,9 @@ impl ChatView {
                             return None;
                         }
                         let thread_height: f64 = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::F64(
-                                item,
-                            ) if item.is_finite() => Some(item),
+                            wire::SnapshotValue::F64(item) if item.is_finite() => {
+                                Some(item)
+                            }
                             _ => None,
                         })?;
                         Some(ChatScreenState {
@@ -6257,10 +4213,7 @@ impl ChatView {
                 return None;
             }
             let chat_screen_initial: ChatScreenState = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "ChatScreen" || fields.len() != 5 {
@@ -6272,7 +4225,7 @@ impl ChatView {
                     return None;
                 }
                 let message_action_focus: String = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                    wire::SnapshotValue::Str(item) => Some(item),
                     _ => None,
                 })?;
                 let (name, value) = fields.next()?;
@@ -6280,9 +4233,7 @@ impl ChatView {
                     return None;
                 }
                 let chat_pointer_y: f64 = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(
-                        item,
-                    ) if item.is_finite() => Some(item),
+                    wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                     _ => None,
                 })?;
                 let (name, value) = fields.next()?;
@@ -6290,9 +4241,7 @@ impl ChatView {
                     return None;
                 }
                 let chat_height: f64 = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(
-                        item,
-                    ) if item.is_finite() => Some(item),
+                    wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                     _ => None,
                 })?;
                 let (name, value) = fields.next()?;
@@ -6300,9 +4249,7 @@ impl ChatView {
                     return None;
                 }
                 let thread_pointer_y: f64 = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(
-                        item,
-                    ) if item.is_finite() => Some(item),
+                    wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                     _ => None,
                 })?;
                 let (name, value) = fields.next()?;
@@ -6310,9 +4257,7 @@ impl ChatView {
                     return None;
                 }
                 let thread_height: f64 = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(
-                        item,
-                    ) if item.is_finite() => Some(item),
+                    wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                     _ => None,
                 })?;
                 Some(ChatScreenState {

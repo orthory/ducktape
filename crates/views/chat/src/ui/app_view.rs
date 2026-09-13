@@ -1,8 +1,7 @@
 use super::*;
 impl super::ChatView {
-    pub(crate) fn view(&self) -> ::ducktape_view_guest::wire::Node {
-        let palette = self.palette();
-        ::ducktape_view_guest::wire::Node::Sensor {
+    pub(crate) fn view(&self) -> wire::Node {
+        wire::Node::Sensor {
             key: format!("{}/@sensor:906", "ChatView"),
             reset: None,
             on_show: Some(
@@ -24,7 +23,7 @@ impl super::ChatView {
             delay: None,
             child: Box::new({
                 let node_scope = format!("{}/chat", "ChatView");
-                self.render_chat_screen_50(palette, node_scope.clone())
+                self.render_chat_screen_50(node_scope.clone())
             }),
         }
     }
