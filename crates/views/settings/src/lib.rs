@@ -164,18 +164,13 @@ impl SettingsView {
         Subscription::batch([
             crate::host::session().map(|value| Message::SessionArrived(Box::new(value))),
             if self.connected {
-                Subscription::batch([
-                    crate::host::standing(self.connection_serial).map(Message::StandingArrived)
-                ])
+                crate::host::standing(self.connection_serial).map(Message::StandingArrived)
             } else {
                 Subscription::none()
             },
-            if self.connected && (!(self.seat_key).is_empty()) {
-                Subscription::batch([crate::host::account_keys(
-                    self.connection_serial,
-                    self.seat_key.to_owned(),
-                )
-                .map(Message::KeysArrived)])
+            if self.connected && !self.seat_key.is_empty() {
+                crate::host::account_keys(self.connection_serial, self.seat_key.to_owned())
+                    .map(Message::KeysArrived)
             } else {
                 Subscription::none()
             },
