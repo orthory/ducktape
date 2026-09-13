@@ -716,10 +716,6 @@ pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
-    if loaded { next } else { current }.to_owned()
-}
-
 /// `h 84,912`; a height the node has not reported reads `h —`.
 pub fn height_label_short(height: i64) -> String {
     if height < 0 {

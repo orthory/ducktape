@@ -30,7 +30,6 @@ pub struct ExplorerView {
     pub(crate) viewport_width: f64,
     pub(crate) ledger_width: f64,
     pub(crate) host_error: String,
-    pub(crate) sent: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -70,7 +69,6 @@ impl ExplorerView {
             viewport_width: 1280.0,
             ledger_width: 340.0,
             host_error: "".to_owned(),
-            sent: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -79,6 +77,7 @@ impl ExplorerView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         use ducktape_view_guest::wire;
+        self.validate_snapshot()?;
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
             state: wire::SnapshotValue::Bytes(wire::encode(self)),
@@ -94,7 +93,16 @@ impl ExplorerView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid explorer snapshot state".into());
         };
-        wire::decode(&state)
+        let restored: Self = wire::decode(&state)?;
+        restored.validate_snapshot()?;
+        Ok(restored)
+    }
+    fn validate_snapshot(&self) -> Result<(), String> {
+        let finite = self.viewport_width.is_finite() && self.ledger_width.is_finite();
+        if !finite {
+            return Err("non-finite explorer geometry".into());
+        }
+        Ok(())
     }
 }
 
@@ -117,6 +125,18 @@ impl ExplorerView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_rejects_non_finite_geometry_on_both_sides() {
+        use ducktape_view_guest::wire;
+        let (mut app, _) = ExplorerView::boot();
+        app.ledger_width = f64::NAN;
+        assert!(app.snapshot().is_err());
+        let bytes = wire::Snapshot {
+            schema: ExplorerView::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(&app)),
+        }.encode().unwrap();
+        assert!(ExplorerView::restore(&bytes).is_err());
+    }
     #[test]
     fn snapshot_uses_the_host_envelope_and_rejects_invalid_state() {
         use ducktape_view_guest::wire;
@@ -177,8 +197,8 @@ impl ExplorerView {
         }
     }
     fn on_session_arrived(&mut self, item: crate::host::SessionItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        if !(item.error).is_empty() {
+        self.host_error = item.error;
+        if !self.host_error.is_empty() {
             return Task::none();
         }
         let next = item.next.clone();
@@ -199,19 +219,19 @@ impl ExplorerView {
         if !(item.error).is_empty() {
             return Task::none();
         }
-        self.blocks = item.blocks.clone();
-        self.ops = item.ops.clone();
+        self.blocks = item.blocks;
+        self.ops = item.ops;
         Task::none()
     }
     fn on_search_arrived(&mut self, item: crate::host::SearchItem) -> Task<Message> {
         self.searching = false;
-        self.host_error = item.error.to_owned();
-        if !(item.error).is_empty() {
+        self.host_error = item.error;
+        if !self.host_error.is_empty() {
             return Task::none();
         }
-        self.hits = item.hits.clone();
-        self.kinds = item.kinds.clone();
-        self.partial = item.partial.to_owned();
+        self.hits = item.hits;
+        self.kinds = item.kinds;
+        self.partial = item.partial;
         Task::none()
     }
     fn on_refresh(&mut self) -> Task<Message> {
@@ -223,15 +243,11 @@ impl ExplorerView {
         Task::none()
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
-        self.sent = crate::host::copy(
-            ::std::convert::AsRef::as_ref(&(text)),
-            ::std::convert::AsRef::as_ref(&(label)),
-        );
+        host::copy(&text, &label);
         Task::none()
     }
     fn on_search_submit(&mut self) -> Task<Message> {
-        let blocked =
-            ((!self.connected) || self.searching) || ((self.query).trim().to_owned()).is_empty();
+        let blocked = !self.connected || self.searching || self.query.trim().is_empty();
         if blocked {
             return Task::none();
         }
@@ -241,7 +257,7 @@ impl ExplorerView {
         self.partial = "".to_owned();
         self.searching = true;
         self.search_serial += 1;
-        self.sent_query = (self.query).trim().to_owned();
+        self.sent_query = self.query.trim().to_owned();
         Task::none()
     }
     fn on_clear_explorer_search(&mut self) -> Task<Message> {
@@ -255,7 +271,7 @@ impl ExplorerView {
         Task::none()
     }
     fn on_pick_explorer_kind(&mut self, next: String) -> Task<Message> {
-        self.kind = next.to_owned();
+        self.kind = next;
         Task::none()
     }
     fn on_select_explorer_block(&mut self, height: i64) -> Task<Message> {

@@ -32,7 +32,6 @@ pub struct NodeView {
     pub(crate) connection_serial: i64,
     pub(crate) node_tab: NodeTab,
     pub(crate) facts: crate::host::NodeFacts,
-    pub(crate) loading: bool,
     pub(crate) module_rows: Vec<crate::host::ModuleRow>,
     pub(crate) node_peers: Vec<crate::host::PeerRow>,
     pub(crate) log_lines: Vec<crate::host::LogRow>,
@@ -40,7 +39,6 @@ pub struct NodeView {
     pub(crate) live_log_filter: String,
     pub(crate) live_filter_note: String,
     pub(crate) host_error: String,
-    pub(crate) sent: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -70,7 +68,6 @@ impl NodeView {
             connection_serial: 0,
             node_tab: NodeTab::Overview,
             facts: crate::host::empty_facts(),
-            loading: true,
             module_rows: Vec::new(),
             node_peers: Vec::new(),
             log_lines: Vec::new(),
@@ -78,7 +75,6 @@ impl NodeView {
             live_log_filter: "".to_owned(),
             live_filter_note: "".to_owned(),
             host_error: "".to_owned(),
-            sent: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -202,52 +198,44 @@ impl NodeView {
         );
         self.connected = next.connected;
         self.admin = next.admin;
-        self.tier = next.tier.to_owned();
-        self.status = next.status.to_owned();
-        self.node_data_dir = next.data_dir.to_owned();
+        self.tier = next.tier;
+        self.status = next.status;
+        self.node_data_dir = next.data_dir;
         self.wall_now = next.wall_now;
         Task::none()
     }
     fn on_facts_arrived(&mut self, item: crate::host::FactsItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        self.loading = false;
-        if !(item.error).is_empty() {
+        self.host_error = item.error;
+        if !self.host_error.is_empty() {
             return Task::none();
         }
-        self.facts = item.facts.clone();
+        self.facts = item.facts;
         Task::none()
     }
     fn on_peers_arrived(&mut self, item: crate::host::PeersItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        if !(item.error).is_empty() {
+        self.host_error = item.error;
+        if !self.host_error.is_empty() {
             return Task::none();
         }
-        self.node_peers = item.rows.clone();
+        self.node_peers = item.rows;
         Task::none()
     }
     fn on_modules_arrived(&mut self, item: crate::host::ModulesItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        if !(item.error).is_empty() {
+        self.host_error = item.error;
+        if !self.host_error.is_empty() {
             return Task::none();
         }
-        self.module_rows = item.rows.clone();
+        self.module_rows = item.rows;
         Task::none()
     }
     fn on_logs_arrived(&mut self, item: crate::host::LogItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        self.log_lines = crate::host::push_logs(
-            ::std::convert::AsRef::as_ref(&(self.log_lines)),
-            ::std::convert::AsRef::as_ref(&(item.lines)),
-        );
+        self.host_error = item.error;
+        self.log_lines = host::push_logs(&self.log_lines, &item.lines);
         Task::none()
     }
     fn on_act_done(&mut self, item: crate::host::ActItem) -> Task<Message> {
-        self.host_error = item.error.to_owned();
-        self.live_filter_note = crate::host::keep_str(
-            (item.error).is_empty(),
-            ::std::convert::AsRef::as_ref(&(item.reply)),
-            ::std::convert::AsRef::as_ref(&(item.error)),
-        );
+        self.host_error = item.error;
+        self.live_filter_note = if self.host_error.is_empty() { item.reply } else { self.host_error.clone() };
         Task::none()
     }
     fn on_select_node_tab(&mut self, next: NodeTab) -> Task<Message> {
@@ -259,11 +247,11 @@ impl NodeView {
         Task::none()
     }
     fn on_node_log_filter_changed(&mut self, next: String) -> Task<Message> {
-        self.node_log_filter = next.to_owned();
+        self.node_log_filter = next;
         Task::none()
     }
     fn on_live_log_filter_changed(&mut self, next: String) -> Task<Message> {
-        self.live_log_filter = next.to_owned();
+        self.live_log_filter = next;
         Task::none()
     }
     fn on_apply_live_log_filter(&mut self) -> Task<Message> {
@@ -271,15 +259,11 @@ impl NodeView {
             return Task::none();
         }
         self.live_filter_note = "".to_owned();
-        self.sent =
-            crate::host::set_log_filter(::std::convert::AsRef::as_ref(&(self.live_log_filter)));
+        host::set_log_filter(&self.live_log_filter);
         Task::none()
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
-        self.sent = crate::host::copy(
-            ::std::convert::AsRef::as_ref(&(text)),
-            ::std::convert::AsRef::as_ref(&(label)),
-        );
+        host::copy(&text, &label);
         Task::none()
     }
 }
