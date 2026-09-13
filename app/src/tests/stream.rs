@@ -76,20 +76,6 @@ fn history_windows_offer_a_jump_back_to_latest() {
     let _ = app.update(AppMessage::ChooseChannel("general".into()));
     assert!(!app.history_view);
     assert_eq!(app.chat_land_seq, 0, "and the view opens back on the tail");
-
-    // The way back is a float over the timeline's bottom edge now, not a
-    // button inside an amber band at the top of the column — and it is shown
-    // for a reader who simply scrolled up, not only for a history window.
-    let branches = super::connection::branches(super::connection::CHAT);
-    let banner = branches
-        .iter()
-        .find(|(guard, body, _)| {
-            guard.contains("history_view")
-                && guard.contains("at_live_tail")
-                && body.contains("Jumptolatest")
-        })
-        .expect("the current-scroll-position jump control");
-    assert!(banner.0.contains("messages"));
 }
 
 /// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.

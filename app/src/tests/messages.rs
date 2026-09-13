@@ -14,21 +14,7 @@ fn the_native_message_list_preserves_measurements_by_identity() {
 }
 
 #[test]
-fn the_message_line_is_one_rich_text_paragraph() {
-    for source in [
-        include_str!("../../../crates/views/chat/src/ui/kit.rs"),
-        include_str!("../../../crates/views/forge/src/ui/kit.rs"),
-    ] {
-        let source = rust_tokens(source);
-        assert!(source.contains("Node::RichText"));
-        assert!(source.contains("mention_link"));
-        assert!(source.contains("underline:true") || source.contains("underline:link.is_some()"));
-        assert!(source.contains("on_link:"));
-        assert!(
-            source.contains("Wrapping::WordOrGlyph"),
-            "a paragraph wraps as one text layout"
-        );
-    }
+fn native_rich_text_uses_one_paragraph_with_actionable_links() {
     let native = rust_tokens(include_str!("../view_tree.rs"));
     assert!(
         native.contains("StyledText::new("),

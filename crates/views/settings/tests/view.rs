@@ -391,6 +391,21 @@ fn a_block_on_a_plane_reads_only_that_plane_again() {
 
 // ---------- the acts ----------
 
+#[test]
+fn working_browser_ceremony_can_be_cancelled_without_an_account() {
+    let working = Session {
+        account_exists: false,
+        account_ceremony_phase: "working".into(),
+        account_ceremony_detail: "Waiting for browser".into(),
+        ..facts()
+    };
+    let (frame, _, _) = connected(&working, 0);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(!button_disabled(&frame, "Cancel"));
+    let frame = tick_native(press(&frame, "Cancel"));
+    assert_eq!(one_intent(&frame).kind, "settings.ceremony_cancel");
+}
+
 /// The seat's password leaves as an `unlock` intent and never comes back:
 /// what the kernel pushes is the FLAG.
 #[test]

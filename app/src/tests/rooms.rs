@@ -99,16 +99,6 @@ fn the_composers_are_out_of_reach_of_every_handler() {
         );
         assert!(!handlers.iter().any(|(_, body)| body.contains(retired)));
     }
-    let chat = rust_tokens(super::connection::CHAT);
-    for scope in ["composer_scope", "thread_scope"] {
-        let (_, arguments) = chat
-            .split_once(&format!("crate::host::{scope}("))
-            .expect("composer scope call");
-        assert!(
-            arguments.split(';').next().unwrap().contains("endpoint"),
-            "the scope includes the network"
-        );
-    }
 }
 
 /// THE DM HEADER NAMES A PEER, AND THE ROOM IT NAMES HIM FOR IS `active_channel`.

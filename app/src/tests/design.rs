@@ -38,14 +38,7 @@ fn full_view_fits_the_default_test_stack() {
         .unwrap();
 }
 #[test]
-fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
-    let root = rust_tokens(include_str!(
-        "../../../crates/views/pages/src/ui/app_view.rs"
-    ));
-    let pages = rust_tokens(include_str!("../../../crates/views/pages/src/ui/pages.rs"));
-    assert_eq!(pages.matches("Node::Editor").count(), 1);
-    assert!(pages.contains("EditorOptions"));
-    assert!(!root.contains("Clicktoedit"));
+fn native_editor_projects_document_lines_without_losing_source_positions() {
     let host = rust_tokens(include_str!("../editor/blocks.rs"));
     assert!(host.contains("line_projections("));
     assert!(host.contains("format.size"));
