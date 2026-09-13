@@ -117,7 +117,15 @@ fn empty_editor_updates_native_placeholder_and_hides_it_after_typing(
                 handler: 1,
                 editable: true,
                 placeholder: "Start writing".into(),
-                options: Default::default(),
+                options: wire::EditorOptions {
+                    binding: Some(Box::new(wire::EditorBinding {
+                        authored: true,
+                        on_request: 2,
+                        on_event: 3,
+                        claims: Vec::new(),
+                    })),
+                    ..Default::default()
+                },
             },
         );
         locked.documents.insert(
@@ -166,6 +174,7 @@ fn empty_editor_updates_native_placeholder_and_hides_it_after_typing(
         let input = editor.lines[0].input.read(cx);
         assert_eq!(input.value().as_ref(), "Written text");
         assert!(input.presentation().placeholder().is_empty());
+        assert!(store.lock().fault.is_none());
         window.blur(cx);
     });
 }
@@ -751,6 +760,10 @@ impl WireEditor {
             self.focus_line = Some(next.position.line as usize);
         }
         self.painted = None;
+        // Several native notifications can arrive before the next frame. Keep
+        // the diff baseline aligned with the preview after consuming an edit,
+        // so a focus/style notification cannot apply that same edit twice.
+        self.sync(window, cx);
         cx.emit(());
         cx.notify();
     }

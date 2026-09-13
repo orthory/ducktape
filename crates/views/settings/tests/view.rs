@@ -226,6 +226,57 @@ fn a_connected_view_reads_its_own_standing_and_key_rows() {
     }
 }
 
+#[test]
+fn each_tab_selects_only_its_own_groups_inside_the_shared_scroll_root() {
+    let panes = ["General", "Network", "Account", "Security"];
+    let groups = [
+        ("settings/appearance", "General"),
+        ("settings/notifications", "General"),
+        ("settings/network", "Network"),
+        ("settings/identity-title", "Account"),
+        ("settings/keys-title", "Account"),
+        ("settings/security-title", "Security"),
+    ];
+    let (mut frame, props, _) = connected(&facts(), 2);
+    for selected in panes {
+        frame = tick_native(press(&frame, selected));
+        // Unrelated incoming facts must not select a different pane.
+        frame = tick_native(vec![item(props, &encoded(&facts()))]);
+        let mut root = frame.root.clone().expect("Settings tree");
+        assert!(matches!(&root, Node::Scroll { key, .. } if key == "settings"));
+        let mut visible_keys = Vec::new();
+        let mut tabs = Vec::new();
+        root.for_each_mut(&mut |node| {
+            if let Some(key) = node.key() {
+                visible_keys.push(key.to_owned());
+            }
+            if let Node::Button {
+                key,
+                checked,
+                on_press,
+                ..
+            } = node
+            {
+                if let Some(pane) = key.strip_prefix("settings/tab/") {
+                    assert!(on_press.is_some());
+                    tabs.push((pane.to_owned(), *checked));
+                }
+            }
+        });
+        assert_eq!(tabs.len(), panes.len());
+        for pane in panes {
+            assert!(tabs.contains(&(pane.to_lowercase(), Some(pane == selected))));
+        }
+        for (group, owner) in groups {
+            assert_eq!(
+                visible_keys.iter().filter(|key| *key == group).count(),
+                usize::from(owner == selected),
+                "{group} while {selected} selected"
+            );
+        }
+    }
+}
+
 /// A view with no connection reads nothing — the session is the only thing
 /// it is waiting on.
 #[test]
