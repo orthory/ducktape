@@ -42,12 +42,7 @@ impl FilesView {
         if !self.connected {
             return self.disconnected(format!("{key}/disconnected"));
         }
-        let _owner = slots::component("FilesScreen", &key, false);
-        let history = self
-            .files_screen_states
-            .get(&key)
-            .unwrap_or(&self.files_screen_initial)
-            .history_open;
+        let history = self.history_open;
         let mut children = vec![
             self.breadcrumb(format!("{key}/crumb"), Message::OpenDirAt),
             self.toolbar(&key, history),
@@ -155,7 +150,7 @@ impl FilesView {
         let mut toggle = action(
             format!("{key}/history-toggle"),
             "History",
-            Message::FilesScreenFsToggleHistory(key.into()),
+            Message::ToggleHistory,
             false,
         );
         if let wire::Node::Button { expanded, .. } = &mut toggle {

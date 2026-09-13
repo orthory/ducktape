@@ -26,9 +26,7 @@ impl super::FilesView {
             Message::DiscardDraft(id) => self.on_discard_draft(id),
             Message::SaveEdit(token) => self.on_save_edit(token),
             Message::OpenLinkAt(url) => self.on_open_link_at(url),
-            Message::FilesScreenFsToggleHistory(scope) => {
-                self.on_files_screen_fs_toggle_history(scope)
-            }
+            Message::ToggleHistory => self.on_toggle_history(),
             Message::NewNameChanged(value) => self.on_new_name_changed(value),
             Message::DraftTransaction(transaction) => self.on_draft_transaction(transaction),
             Message::EditDraft(document) => self.on_edit_draft(document),
@@ -623,18 +621,8 @@ impl super::FilesView {
         self.sent = crate::host::open_link(::std::convert::AsRef::as_ref(&(url)));
         ::ducktape_view_guest::Task::none()
     }
-    fn on_files_screen_fs_toggle_history(
-        &mut self,
-        scope: String,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("FilesScreen", &(scope.clone()));
-        let local = self
-            .files_screen_states
-            .entry(scope.clone())
-            .or_insert_with(|| FilesScreenState {
-                history_open: self.files_screen_initial.history_open.clone(),
-            });
-        local.history_open = !local.history_open;
+    fn on_toggle_history(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.history_open = !self.history_open;
         ::ducktape_view_guest::Task::none()
     }
     fn on_new_name_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {

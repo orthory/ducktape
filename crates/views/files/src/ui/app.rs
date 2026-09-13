@@ -7,14 +7,6 @@ struct DerivedCache {
     draft_parked: ::std::cell::OnceCell<bool>,
     edit_context: ::std::cell::OnceCell<String>,
 }
-pub(crate) struct FilesScreenState {
-    history_open: bool,
-}
-impl ::std::default::Default for FilesScreenState {
-    fn default() -> Self {
-        Self { history_open: false }
-    }
-}
 pub struct FilesView {
     pub(crate) connected: bool,
     pub(crate) dark: bool,
@@ -60,11 +52,7 @@ pub struct FilesView {
     pub(crate) object_width: f64,
     derived: DerivedCache,
     pub(crate) preview_text_revision: u64,
-    pub(crate) files_screen_states: ::std::collections::HashMap<
-        String,
-        FilesScreenState,
-    >,
-    pub(crate) files_screen_initial: FilesScreenState,
+    pub(crate) history_open: bool,
 }
 impl ::std::fmt::Debug for FilesView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -97,7 +85,7 @@ pub enum Message {
     DiscardDraft(i64),
     SaveEdit(String),
     OpenLinkAt(String),
-    FilesScreenFsToggleHistory(String),
+    ToggleHistory,
     NewNameChanged(String),
     EditDraft(::ducktape_view_guest::EditorDocumentUpdate),
     DraftTransaction(::ducktape_view_guest::EditorTransaction<Message>),
@@ -113,41 +101,33 @@ impl FilesView {
     fn derived_refusal(&self) -> &String {
         self.derived
             .refusal
-            .get_or_init(|| crate::host::write_refusal(
-                ::std::convert::AsRef::as_ref(&(self.path)),
-            ))
+            .get_or_init(|| crate::host::write_refusal(::std::convert::AsRef::as_ref(&(self.path))))
     }
     fn derived_loading(&self) -> &bool {
         self.derived
             .loading
-            .get_or_init(|| {
-                (self.acting || self.saving) || (self.connected && (!self.listed)) 
-            })
+            .get_or_init(|| (self.acting || self.saving) || (self.connected && (!self.listed)))
     }
     fn derived_draft_here(&self) -> &bool {
-        self.derived
-            .draft_here
-            .get_or_init(|| {
-                (self.editing && (self.draft_path == self.preview_path))
-                    && (self.draft_chain == self.chain) 
-            })
+        self.derived.draft_here.get_or_init(|| {
+            (self.editing && (self.draft_path == self.preview_path))
+                && (self.draft_chain == self.chain)
+        })
     }
     fn derived_draft_parked(&self) -> &bool {
         self.derived
             .draft_parked
-            .get_or_init(|| self.editing && (!(*self.derived_draft_here())) )
+            .get_or_init(|| self.editing && (!(*self.derived_draft_here())))
     }
     fn derived_edit_context(&self) -> &String {
-        self.derived
-            .edit_context
-            .get_or_init(|| {
-                crate::host::edit_token(
-                    ::std::convert::AsRef::as_ref(&(self.chain)),
-                    ::std::convert::AsRef::as_ref(&(self.preview_path)),
-                    ::std::convert::AsRef::as_ref(&(self.preview_base)),
-                    self.draft_id,
-                )
-            })
+        self.derived.edit_context.get_or_init(|| {
+            crate::host::edit_token(
+                ::std::convert::AsRef::as_ref(&(self.chain)),
+                ::std::convert::AsRef::as_ref(&(self.preview_path)),
+                ::std::convert::AsRef::as_ref(&(self.preview_base)),
+                self.draft_id,
+            )
+        })
     }
 }
 impl FilesView {
@@ -197,186 +177,427 @@ impl FilesView {
             object_width: 306.0,
             derived: ::std::default::Default::default(),
             preview_text_revision: ::ducktape_view_guest::rev::seed(),
-            files_screen_states: ::std::collections::HashMap::new(),
-            files_screen_initial: ::std::default::Default::default(),
+            history_open: false,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    pub(crate) const SNAPSHOT_SCHEMA: &'static str = "524542bd8f5b55e48d5274087dd4997a644784746056385b50157aadfe239bba";
+    pub(crate) const SNAPSHOT_SCHEMA: &'static str =
+        "524542bd8f5b55e48d5274087dd4997a644784746056385b50157aadfe239bba";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: String::from(Self::SNAPSHOT_SCHEMA),
             state: wire::SnapshotValue::Record {
                 name: String::from("FilesView"),
                 fields: vec![
-                    (String::from("connected"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .connected)),), (String::from("dark"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self.dark)),),
-                    (String::from("chain"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.chain),),), (String::from("generation"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .generation)),), (String::from("route_serial"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .route_serial)),), (String::from("path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.path),),), (String::from("listed"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .listed)),), (String::from("entries"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.entries)
-                    .iter().map(| item |
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).key))),
-                    (String::from("path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).path))), (String::from("name"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).name))), (String::from("kind"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).kind))), (String::from("size"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).size))),
-                    (String::from("object"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).object)))], }).collect(),),), (String::from("directories"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.directories)
-                    .iter().map(| item |
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).key))),
-                    (String::from("path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).path))), (String::from("name"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).name))), (String::from("kind"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).kind))), (String::from("size"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).size))),
-                    (String::from("object"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).object)))], }).collect(),),), (String::from("history"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.history)
-                    .iter().map(| item |
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FsSnapshot"), fields : ::std::vec![(String::from("id"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).id))), (String::from("short_id"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).short_id))), (String::from("author"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).author))), (String::from("height"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item)
-                    .height))), (String::from("message"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).message)))], }).collect(),),), (String::from("omitted"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .omitted)),), (String::from("diff_omitted"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .diff_omitted)),), (String::from("preview_path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.preview_path),),), (String::from("preview_entry"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
-                    .preview_entry).key))), (String::from("path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.preview_entry).path))), (String::from("name"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.preview_entry).name))), (String::from("kind"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.preview_entry).kind))), (String::from("size"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
-                    .preview_entry).size))), (String::from("object"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (& self.preview_entry).object)))], },),
-                    (String::from("preview_base"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.preview_base),),), (String::from("preview_text"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.preview_text),),), (String::from("preview_display_text"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.preview_display_text),),), (String::from("preview_clipped"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .preview_clipped)),), (String::from("preview_truncated"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .preview_truncated),),), (String::from("preview_binary"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .preview_binary)),), (String::from("preview_picture"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .preview_picture)),), (String::from("preview_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .preview_width)),), (String::from("preview_height"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .preview_height)),), (String::from("delete_target"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.delete_target),),), (String::from("diff_from"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.diff_from),),), (String::from("diff"),
-                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.diff).iter()
-                    .map(| item | ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name : String::from("FsDiffEntry"), fields :
-                    ::std::vec![(String::from("path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).path))), (String::from("kind"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    (item).kind)))], }).collect(),),), (String::from("acting"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .acting)),), (String::from("saving"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .saving)),), (String::from("notice"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.notice),),), (String::from("new_name"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.new_name),),), (String::from("draft"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bytes((& self.draft)
-                    .snapshot()),), (String::from("editing"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
-                    .editing)),), (String::from("draft_chain"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.draft_chain),),), (String::from("draft_path"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.draft_path),),), (String::from("draft_base"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
-                    self.draft_base),),), (String::from("draft_id"),
-                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
-                    .draft_id)),), (String::from("sent"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self.sent)),),
-                    (String::from("viewport_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .viewport_width)),), (String::from("viewport_height"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .viewport_height)),), (String::from("tree_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .tree_width)),), (String::from("preview_pane_height"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .preview_pane_height),),), (String::from("object_width"),
-                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
-                    .object_width)),), (String::from("files_screen_states"), { let values
-                    = & self.files_screen_states; let mut scopes = values.keys()
-                    .collect::< Vec < _ >> (); scopes.sort();
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FilesScreen instances"), fields : scopes.into_iter()
-                    .map(| scope | { let component = & values[scope]; (scope.clone(),
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FilesScreen"), fields :
-                    vec![(String::from("history_open"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& component
-                    .history_open),),)], },) }).collect(), } }),
-                    (String::from("files_screen_initial"), { let component = & self
-                    .files_screen_initial;
-                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
-                    String::from("FilesScreen"), fields :
-                    vec![(String::from("history_open"),
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& component
-                    .history_open),),)], } }),
+                    (
+                        String::from("connected"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.connected)),
+                    ),
+                    (
+                        String::from("dark"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.dark)),
+                    ),
+                    (
+                        String::from("chain"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.chain),
+                        ),
+                    ),
+                    (
+                        String::from("generation"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.generation)),
+                    ),
+                    (
+                        String::from("route_serial"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.route_serial)),
+                    ),
+                    (
+                        String::from("path"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.path),
+                        ),
+                    ),
+                    (
+                        String::from("listed"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.listed)),
+                    ),
+                    (
+                        String::from("entries"),
+                        ::ducktape_view_guest::wire::SnapshotValue::List(
+                            (&self.entries)
+                                .iter()
+                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
+                                    name: String::from("FsEntry"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("key"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                                *(&(item).key)
+                                            )
+                                        ),
+                                        (
+                                            String::from("path"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("name"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).name)
+                                            )
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        ),
+                                        (
+                                            String::from("size"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                                *(&(item).size)
+                                            )
+                                        ),
+                                        (
+                                            String::from("object"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).object)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("directories"),
+                        ::ducktape_view_guest::wire::SnapshotValue::List(
+                            (&self.directories)
+                                .iter()
+                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
+                                    name: String::from("FsEntry"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("key"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                                *(&(item).key)
+                                            )
+                                        ),
+                                        (
+                                            String::from("path"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("name"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).name)
+                                            )
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        ),
+                                        (
+                                            String::from("size"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                                *(&(item).size)
+                                            )
+                                        ),
+                                        (
+                                            String::from("object"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).object)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("history"),
+                        ::ducktape_view_guest::wire::SnapshotValue::List(
+                            (&self.history)
+                                .iter()
+                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
+                                    name: String::from("FsSnapshot"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("id"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).id)
+                                            )
+                                        ),
+                                        (
+                                            String::from("short_id"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(
+                                                    &(item).short_id
+                                                )
+                                            )
+                                        ),
+                                        (
+                                            String::from("author"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).author)
+                                            )
+                                        ),
+                                        (
+                                            String::from("height"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                                *(&(item).height)
+                                            )
+                                        ),
+                                        (
+                                            String::from("message"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).message)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("omitted"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.omitted)),
+                    ),
+                    (
+                        String::from("diff_omitted"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.diff_omitted)),
+                    ),
+                    (
+                        String::from("preview_path"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.preview_path),
+                        ),
+                    ),
+                    (
+                        String::from("preview_entry"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Record {
+                            name: String::from("FsEntry"),
+                            fields: ::std::vec![
+                                (
+                                    String::from("key"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                        *(&(&self.preview_entry).key)
+                                    )
+                                ),
+                                (
+                                    String::from("path"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                        ::std::string::ToString::to_string(
+                                            &(&self.preview_entry).path
+                                        )
+                                    )
+                                ),
+                                (
+                                    String::from("name"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                        ::std::string::ToString::to_string(
+                                            &(&self.preview_entry).name
+                                        )
+                                    )
+                                ),
+                                (
+                                    String::from("kind"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                        ::std::string::ToString::to_string(
+                                            &(&self.preview_entry).kind
+                                        )
+                                    )
+                                ),
+                                (
+                                    String::from("size"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::I64(
+                                        *(&(&self.preview_entry).size)
+                                    )
+                                ),
+                                (
+                                    String::from("object"),
+                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                        ::std::string::ToString::to_string(
+                                            &(&self.preview_entry).object
+                                        )
+                                    )
+                                )
+                            ],
+                        },
+                    ),
+                    (
+                        String::from("preview_base"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.preview_base),
+                        ),
+                    ),
+                    (
+                        String::from("preview_text"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.preview_text),
+                        ),
+                    ),
+                    (
+                        String::from("preview_display_text"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.preview_display_text),
+                        ),
+                    ),
+                    (
+                        String::from("preview_clipped"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_clipped)),
+                    ),
+                    (
+                        String::from("preview_truncated"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(
+                            *(&self.preview_truncated),
+                        ),
+                    ),
+                    (
+                        String::from("preview_binary"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_binary)),
+                    ),
+                    (
+                        String::from("preview_picture"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_picture)),
+                    ),
+                    (
+                        String::from("preview_width"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.preview_width)),
+                    ),
+                    (
+                        String::from("preview_height"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.preview_height)),
+                    ),
+                    (
+                        String::from("delete_target"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.delete_target),
+                        ),
+                    ),
+                    (
+                        String::from("diff_from"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.diff_from),
+                        ),
+                    ),
+                    (
+                        String::from("diff"),
+                        ::ducktape_view_guest::wire::SnapshotValue::List(
+                            (&self.diff)
+                                .iter()
+                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
+                                    name: String::from("FsDiffEntry"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("path"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("acting"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.acting)),
+                    ),
+                    (
+                        String::from("saving"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.saving)),
+                    ),
+                    (
+                        String::from("notice"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.notice),
+                        ),
+                    ),
+                    (
+                        String::from("new_name"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.new_name),
+                        ),
+                    ),
+                    (
+                        String::from("draft"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bytes((&self.draft).snapshot()),
+                    ),
+                    (
+                        String::from("editing"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.editing)),
+                    ),
+                    (
+                        String::from("draft_chain"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.draft_chain),
+                        ),
+                    ),
+                    (
+                        String::from("draft_path"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.draft_path),
+                        ),
+                    ),
+                    (
+                        String::from("draft_base"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Str(
+                            ::std::string::ToString::to_string(&self.draft_base),
+                        ),
+                    ),
+                    (
+                        String::from("draft_id"),
+                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.draft_id)),
+                    ),
+                    (
+                        String::from("sent"),
+                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.sent)),
+                    ),
+                    (
+                        String::from("viewport_width"),
+                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.viewport_width)),
+                    ),
+                    (
+                        String::from("viewport_height"),
+                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.viewport_height)),
+                    ),
+                    (
+                        String::from("tree_width"),
+                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.tree_width)),
+                    ),
+                    (
+                        String::from("preview_pane_height"),
+                        ::ducktape_view_guest::wire::SnapshotValue::F64(
+                            *(&self.preview_pane_height),
+                        ),
+                    ),
+                    (
+                        String::from("object_width"),
+                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.object_width)),
+                    ),
+                    (
+                        String::from("history_open"),
+                        wire::SnapshotValue::Bool(self.history_open),
+                    ),
                 ],
             },
         }
-            .encode()
+        .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
         let snapshot = wire::Snapshot::decode(bytes)?;
@@ -388,7 +609,7 @@ impl FilesView {
             let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
-            if name != "FilesView" || fields.len() != 44 {
+            if name != "FilesView" || fields.len() != 43 {
                 return None;
             }
             let mut fields = fields.into_iter();
@@ -453,73 +674,70 @@ impl FilesView {
                 return None;
             }
             let entries: Vec<crate::host::FsEntry> = (match value {
-                wire::SnapshotValue::List(items) => {
-                    items
-                        .into_iter()
-                        .map(|item| {
-                            (|| {
-                                let wire::SnapshotValue::Record { name, fields } = item
-                                else {
-                                    return None;
-                                };
-                                if name != "FsEntry" || fields.len() != 6 {
-                                    return None;
-                                }
-                                let mut fields = fields.into_iter();
-                                let (name, field_0) = fields.next()?;
-                                if name != "key" {
-                                    return None;
-                                }
-                                let (name, field_1) = fields.next()?;
-                                if name != "path" {
-                                    return None;
-                                }
-                                let (name, field_2) = fields.next()?;
-                                if name != "name" {
-                                    return None;
-                                }
-                                let (name, field_3) = fields.next()?;
-                                if name != "kind" {
-                                    return None;
-                                }
-                                let (name, field_4) = fields.next()?;
-                                if name != "size" {
-                                    return None;
-                                }
-                                let (name, field_5) = fields.next()?;
-                                if name != "object" {
-                                    return None;
-                                }
-                                Some(crate::host::FsEntry {
-                                    key: (match field_0 {
-                                        wire::SnapshotValue::I64(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    path: (match field_1 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    name: (match field_2 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    kind: (match field_3 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    size: (match field_4 {
-                                        wire::SnapshotValue::I64(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    object: (match field_5 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                })
-                            })()
-                        })
-                        .collect::<Option<Vec<_>>>()
-                }
+                wire::SnapshotValue::List(items) => items
+                    .into_iter()
+                    .map(|item| {
+                        (|| {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
+                                return None;
+                            };
+                            if name != "FsEntry" || fields.len() != 6 {
+                                return None;
+                            }
+                            let mut fields = fields.into_iter();
+                            let (name, field_0) = fields.next()?;
+                            if name != "key" {
+                                return None;
+                            }
+                            let (name, field_1) = fields.next()?;
+                            if name != "path" {
+                                return None;
+                            }
+                            let (name, field_2) = fields.next()?;
+                            if name != "name" {
+                                return None;
+                            }
+                            let (name, field_3) = fields.next()?;
+                            if name != "kind" {
+                                return None;
+                            }
+                            let (name, field_4) = fields.next()?;
+                            if name != "size" {
+                                return None;
+                            }
+                            let (name, field_5) = fields.next()?;
+                            if name != "object" {
+                                return None;
+                            }
+                            Some(crate::host::FsEntry {
+                                key: (match field_0 {
+                                    wire::SnapshotValue::I64(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                path: (match field_1 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                name: (match field_2 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                kind: (match field_3 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                size: (match field_4 {
+                                    wire::SnapshotValue::I64(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                object: (match field_5 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                            })
+                        })()
+                    })
+                    .collect::<Option<Vec<_>>>(),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -527,73 +745,70 @@ impl FilesView {
                 return None;
             }
             let directories: Vec<crate::host::FsEntry> = (match value {
-                wire::SnapshotValue::List(items) => {
-                    items
-                        .into_iter()
-                        .map(|item| {
-                            (|| {
-                                let wire::SnapshotValue::Record { name, fields } = item
-                                else {
-                                    return None;
-                                };
-                                if name != "FsEntry" || fields.len() != 6 {
-                                    return None;
-                                }
-                                let mut fields = fields.into_iter();
-                                let (name, field_0) = fields.next()?;
-                                if name != "key" {
-                                    return None;
-                                }
-                                let (name, field_1) = fields.next()?;
-                                if name != "path" {
-                                    return None;
-                                }
-                                let (name, field_2) = fields.next()?;
-                                if name != "name" {
-                                    return None;
-                                }
-                                let (name, field_3) = fields.next()?;
-                                if name != "kind" {
-                                    return None;
-                                }
-                                let (name, field_4) = fields.next()?;
-                                if name != "size" {
-                                    return None;
-                                }
-                                let (name, field_5) = fields.next()?;
-                                if name != "object" {
-                                    return None;
-                                }
-                                Some(crate::host::FsEntry {
-                                    key: (match field_0 {
-                                        wire::SnapshotValue::I64(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    path: (match field_1 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    name: (match field_2 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    kind: (match field_3 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    size: (match field_4 {
-                                        wire::SnapshotValue::I64(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    object: (match field_5 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                })
-                            })()
-                        })
-                        .collect::<Option<Vec<_>>>()
-                }
+                wire::SnapshotValue::List(items) => items
+                    .into_iter()
+                    .map(|item| {
+                        (|| {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
+                                return None;
+                            };
+                            if name != "FsEntry" || fields.len() != 6 {
+                                return None;
+                            }
+                            let mut fields = fields.into_iter();
+                            let (name, field_0) = fields.next()?;
+                            if name != "key" {
+                                return None;
+                            }
+                            let (name, field_1) = fields.next()?;
+                            if name != "path" {
+                                return None;
+                            }
+                            let (name, field_2) = fields.next()?;
+                            if name != "name" {
+                                return None;
+                            }
+                            let (name, field_3) = fields.next()?;
+                            if name != "kind" {
+                                return None;
+                            }
+                            let (name, field_4) = fields.next()?;
+                            if name != "size" {
+                                return None;
+                            }
+                            let (name, field_5) = fields.next()?;
+                            if name != "object" {
+                                return None;
+                            }
+                            Some(crate::host::FsEntry {
+                                key: (match field_0 {
+                                    wire::SnapshotValue::I64(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                path: (match field_1 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                name: (match field_2 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                kind: (match field_3 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                size: (match field_4 {
+                                    wire::SnapshotValue::I64(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                object: (match field_5 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                            })
+                        })()
+                    })
+                    .collect::<Option<Vec<_>>>(),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -601,65 +816,62 @@ impl FilesView {
                 return None;
             }
             let history: Vec<crate::host::FsSnapshot> = (match value {
-                wire::SnapshotValue::List(items) => {
-                    items
-                        .into_iter()
-                        .map(|item| {
-                            (|| {
-                                let wire::SnapshotValue::Record { name, fields } = item
-                                else {
-                                    return None;
-                                };
-                                if name != "FsSnapshot" || fields.len() != 5 {
-                                    return None;
-                                }
-                                let mut fields = fields.into_iter();
-                                let (name, field_0) = fields.next()?;
-                                if name != "id" {
-                                    return None;
-                                }
-                                let (name, field_1) = fields.next()?;
-                                if name != "short_id" {
-                                    return None;
-                                }
-                                let (name, field_2) = fields.next()?;
-                                if name != "author" {
-                                    return None;
-                                }
-                                let (name, field_3) = fields.next()?;
-                                if name != "height" {
-                                    return None;
-                                }
-                                let (name, field_4) = fields.next()?;
-                                if name != "message" {
-                                    return None;
-                                }
-                                Some(crate::host::FsSnapshot {
-                                    id: (match field_0 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    short_id: (match field_1 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    author: (match field_2 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    height: (match field_3 {
-                                        wire::SnapshotValue::I64(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    message: (match field_4 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                })
-                            })()
-                        })
-                        .collect::<Option<Vec<_>>>()
-                }
+                wire::SnapshotValue::List(items) => items
+                    .into_iter()
+                    .map(|item| {
+                        (|| {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
+                                return None;
+                            };
+                            if name != "FsSnapshot" || fields.len() != 5 {
+                                return None;
+                            }
+                            let mut fields = fields.into_iter();
+                            let (name, field_0) = fields.next()?;
+                            if name != "id" {
+                                return None;
+                            }
+                            let (name, field_1) = fields.next()?;
+                            if name != "short_id" {
+                                return None;
+                            }
+                            let (name, field_2) = fields.next()?;
+                            if name != "author" {
+                                return None;
+                            }
+                            let (name, field_3) = fields.next()?;
+                            if name != "height" {
+                                return None;
+                            }
+                            let (name, field_4) = fields.next()?;
+                            if name != "message" {
+                                return None;
+                            }
+                            Some(crate::host::FsSnapshot {
+                                id: (match field_0 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                short_id: (match field_1 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                author: (match field_2 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                height: (match field_3 {
+                                    wire::SnapshotValue::I64(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                message: (match field_4 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                            })
+                        })()
+                    })
+                    .collect::<Option<Vec<_>>>(),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -842,41 +1054,38 @@ impl FilesView {
                 return None;
             }
             let diff: Vec<crate::host::FsDiffEntry> = (match value {
-                wire::SnapshotValue::List(items) => {
-                    items
-                        .into_iter()
-                        .map(|item| {
-                            (|| {
-                                let wire::SnapshotValue::Record { name, fields } = item
-                                else {
-                                    return None;
-                                };
-                                if name != "FsDiffEntry" || fields.len() != 2 {
-                                    return None;
-                                }
-                                let mut fields = fields.into_iter();
-                                let (name, field_0) = fields.next()?;
-                                if name != "path" {
-                                    return None;
-                                }
-                                let (name, field_1) = fields.next()?;
-                                if name != "kind" {
-                                    return None;
-                                }
-                                Some(crate::host::FsDiffEntry {
-                                    path: (match field_0 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                    kind: (match field_1 {
-                                        wire::SnapshotValue::Str(item) => Some(item),
-                                        _ => None,
-                                    })?,
-                                })
-                            })()
-                        })
-                        .collect::<Option<Vec<_>>>()
-                }
+                wire::SnapshotValue::List(items) => items
+                    .into_iter()
+                    .map(|item| {
+                        (|| {
+                            let wire::SnapshotValue::Record { name, fields } = item else {
+                                return None;
+                            };
+                            if name != "FsDiffEntry" || fields.len() != 2 {
+                                return None;
+                            }
+                            let mut fields = fields.into_iter();
+                            let (name, field_0) = fields.next()?;
+                            if name != "path" {
+                                return None;
+                            }
+                            let (name, field_1) = fields.next()?;
+                            if name != "kind" {
+                                return None;
+                            }
+                            Some(crate::host::FsDiffEntry {
+                                path: (match field_0 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                                kind: (match field_1 {
+                                    wire::SnapshotValue::Str(item) => Some(item),
+                                    _ => None,
+                                })?,
+                            })
+                        })()
+                    })
+                    .collect::<Option<Vec<_>>>(),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -916,9 +1125,7 @@ impl FilesView {
                 return None;
             }
             let draft: ::ducktape_view_guest::Editor = (match value {
-                wire::SnapshotValue::Bytes(bytes) => {
-                    ::ducktape_view_guest::Editor::restore(&bytes)
-                }
+                wire::SnapshotValue::Bytes(bytes) => ::ducktape_view_guest::Editor::restore(&bytes),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -1010,71 +1217,12 @@ impl FilesView {
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
-            if name != "files_screen_states" {
+            if name != "history_open" {
                 return None;
             }
-            let files_screen_states: ::std::collections::HashMap<
-                String,
-                FilesScreenState,
-            > = ((|| {
-                let wire::SnapshotValue::Record { name, fields } = value else {
-                    return None;
-                };
-                if name != "FilesScreen instances" {
-                    return None;
-                }
-                let mut values = ::std::collections::HashMap::new();
-                for (scope, value) in fields {
-                    let component = ((|| {
-                        let wire::SnapshotValue::Record { name, fields } = value else {
-                            return None;
-                        };
-                        if name != "FilesScreen" || fields.len() != 1 {
-                            return None;
-                        }
-                        let mut fields = fields.into_iter();
-                        let (name, value) = fields.next()?;
-                        if name != "history_open" {
-                            return None;
-                        }
-                        let history_open: bool = (match value {
-                            wire::SnapshotValue::Bool(item) => Some(item),
-                            _ => None,
-                        })?;
-                        Some(FilesScreenState {
-                            history_open: history_open,
-                        })
-                    })())?;
-                    if values.insert(scope, component).is_some() {
-                        return None;
-                    }
-                }
-                Some(values)
-            })())?;
-            let (name, value) = fields.next()?;
-            if name != "files_screen_initial" {
+            let wire::SnapshotValue::Bool(history_open) = value else {
                 return None;
-            }
-            let files_screen_initial: FilesScreenState = ((|| {
-                let wire::SnapshotValue::Record { name, fields } = value else {
-                    return None;
-                };
-                if name != "FilesScreen" || fields.len() != 1 {
-                    return None;
-                }
-                let mut fields = fields.into_iter();
-                let (name, value) = fields.next()?;
-                if name != "history_open" {
-                    return None;
-                }
-                let history_open: bool = (match value {
-                    wire::SnapshotValue::Bool(item) => Some(item),
-                    _ => None,
-                })?;
-                Some(FilesScreenState {
-                    history_open: history_open,
-                })
-            })())?;
+            };
             Some(Self {
                 connected: connected,
                 dark: dark,
@@ -1120,11 +1268,10 @@ impl FilesView {
                 object_width: object_width,
                 derived: ::std::default::Default::default(),
                 preview_text_revision: ::ducktape_view_guest::rev::seed(),
-                files_screen_states: files_screen_states,
-                files_screen_initial: files_screen_initial,
+                history_open,
             })
         })())
-            .ok_or_else(|| String::from("snapshot state mismatch"))
+        .ok_or_else(|| String::from("snapshot state mismatch"))
     }
 }
 impl FilesView {
@@ -1132,26 +1279,29 @@ impl FilesView {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(move |value| Message::SessionArrived(value)),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::listing(self.generation, self.path.to_owned())
-                        .map(move |value| Message::ListingArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::listing(
+                    self.generation,
+                    self.path.to_owned(),
+                )
+                .map(move |value| Message::ListingArrived(value))])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if self.connected && (!(self.preview_path).is_empty())  {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::preview(self.generation, self.preview_path.to_owned())
-                        .map(move |value| Message::PreviewArrived(value)),
-                ])
+            if self.connected && (!(self.preview_path).is_empty()) {
+                ::ducktape_view_guest::Subscription::batch([crate::host::preview(
+                    self.generation,
+                    self.preview_path.to_owned(),
+                )
+                .map(move |value| Message::PreviewArrived(value))])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            if self.connected && (!(self.diff_from).is_empty())  {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::diff(self.generation, self.diff_from.to_owned())
-                        .map(move |value| Message::DiffArrived(value)),
-                ])
+            if self.connected && (!(self.diff_from).is_empty()) {
+                ::ducktape_view_guest::Subscription::batch([crate::host::diff(
+                    self.generation,
+                    self.diff_from.to_owned(),
+                )
+                .map(move |value| Message::DiffArrived(value))])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -1177,7 +1327,11 @@ mod tests {
         app.draft = ducktape_view_guest::Editor::new("unsaved A — 한글");
         let save = Message::SaveEdit(app.derived_edit_context().clone());
         let _ = app.update(Message::SessionArrived(crate::host::SessionItem {
-            next: crate::host::Session { connected: true, chain: "chain-b".into(), ..Default::default() },
+            next: crate::host::Session {
+                connected: true,
+                chain: "chain-b".into(),
+                ..Default::default()
+            },
             ..Default::default()
         }));
         // Message IDs belong to a frame; admission tests retain the actual

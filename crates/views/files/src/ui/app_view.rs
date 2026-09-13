@@ -48,7 +48,7 @@ impl FilesView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new(self.files_screen("FilesView/root/FilesScreen@2164".into())),
+            child: Box::new(self.files_screen("FilesView/screen".into())),
         });
         native::sized(
             native::column("FilesView/root", children),
