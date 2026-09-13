@@ -381,7 +381,7 @@ impl PagesView {
             .document
             .document("app:document".into(), Message::DocumentUpdated);
         let presentation =
-            crate::editor_view::paint(self.document.state_view(), self.document_paint.clone());
+            crate::editor_view::paint(self.document.state_view(), &self.document_paint);
         presentation
             .validate(self.document.state_view().text)
             .expect("invalid editor presentation");

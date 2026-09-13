@@ -206,7 +206,7 @@ impl PagesView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     const SNAPSHOT_SCHEMA: &'static str =
-        "a8e6006820699ce3ada3eec58c7aa178e96d4b16c4d5476a8246c97381857e71";
+        "87cd7a014db885c60adf9b912eec1110214698b6aa8a191805f8458a9b326c7b";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),

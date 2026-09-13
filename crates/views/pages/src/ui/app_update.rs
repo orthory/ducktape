@@ -1,4 +1,16 @@
 impl PagesView {
+    fn refresh_document_presentation(&mut self) {
+        self.document_paint = crate::editor_view::document_presentation(
+            &self.document,
+            self.document_menu.clone(),
+            self.document_dark,
+            self.document_commented.clone(),
+            self.document_marks.clone(),
+            self.document_focused,
+            self.document_reserve,
+        );
+    }
+
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
@@ -76,15 +88,7 @@ impl PagesView {
         self.connected = next.connected;
         self.chain = next.chain.to_owned();
         self.document_dark = next.dark;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         let route_moved = (crate::host::route_arrived(next.route_serial, self.route_serial)
             && (!(next.route_page).is_empty()))
             && (next.route_page != self.active_page);
@@ -174,15 +178,7 @@ impl PagesView {
         );
         self.active_page = item.active_page.to_owned();
         self.buffer_page = item.active_page.to_owned();
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         if !install {
             return Task::none();
         }
@@ -196,15 +192,7 @@ impl PagesView {
         self.document_menu = crate::editor_binding::initial_menu();
         self.document_focused = false;
         self.document_error = "".to_owned();
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_search_arrived(&mut self, item: crate::host::SearchItem) -> Task<Message> {
@@ -277,15 +265,7 @@ impl PagesView {
             let next = crate::host::document_editor(&(item.document));
             self.document.replace(next, reset);
         };
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_page_autosave_tick(&mut self) -> Task<Message> {
@@ -426,15 +406,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = recovered;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_discard_orphaned_comment_draft(&mut self, draft: String) -> Task<Message> {
@@ -474,15 +446,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = toggled_reserve;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_close_block_comments(&mut self) -> Task<Message> {
@@ -503,15 +467,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = crate::editor_view::no_reserve();
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_narrow_comment_scope(&mut self, target: String) -> Task<Message> {
@@ -634,15 +590,7 @@ impl PagesView {
     fn on_document_window_unfocused(&mut self) -> Task<Message> {
         self.focus_query += 1;
         self.document_focused = false;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_document_focus_checked(&mut self, query: i64, focused: bool) -> Task<Message> {
@@ -650,15 +598,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_focused = focused;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_sidebar_resized(&mut self, dx: f64, _dy: f64) -> Task<Message> {
@@ -688,15 +628,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = next;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_comments_card_measured(&mut self, _width: f64, height: f64) -> Task<Message> {
@@ -717,15 +649,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = next;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_toggle_page_menu(&mut self) -> Task<Message> {
@@ -742,15 +666,7 @@ impl PagesView {
     ) -> Task<Message> {
         self.document_history = next.history.clone();
         self.document_menu = next.menu.clone();
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         let comment_line = crate::host::navigation_comment_line(next.interaction.clone());
         self.page_refusal = "".to_owned();
         self.sent =
@@ -783,15 +699,7 @@ impl PagesView {
             return Task::none();
         }
         self.document_reserve = opened;
-        self.document_paint = crate::editor_view::document_presentation(
-            &(self.document),
-            self.document_menu.clone(),
-            self.document_dark,
-            self.document_commented.clone(),
-            self.document_marks.clone(),
-            self.document_focused,
-            self.document_reserve,
-        );
+        self.refresh_document_presentation();
         Task::none()
     }
     fn on_page_draft_changed(&mut self, value: String) -> Task<Message> {

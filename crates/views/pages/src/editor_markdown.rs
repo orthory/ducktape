@@ -443,8 +443,6 @@ fn highlight(
 
 /// The document ink, one set per light/dark palette.
 struct Ink {
-    body: Color,
-    strong: Color,
     muted: Color,
     marker: Color,
     link: Color,
@@ -469,8 +467,6 @@ const fn wash(r: u8, g: u8, b: u8, a: f32) -> Color {
 }
 
 const LIGHT: Ink = Ink {
-    body: rgb8(0x3a, 0x38, 0x33),
-    strong: rgb8(0x26, 0x25, 0x1f),
     muted: rgb8(0x6b, 0x69, 0x62),
     marker: rgb8(0xb3, 0xb1, 0xa8),
     link: rgb8(0x5f, 0x7a, 0x9e),
@@ -489,8 +485,6 @@ const LIGHT: Ink = Ink {
 };
 
 const DARK: Ink = Ink {
-    body: rgb8(0xd4, 0xd2, 0xca),
-    strong: rgb8(0xe8, 0xe6, 0xdf),
     muted: rgb8(0xa8, 0xa6, 0x9c),
     marker: rgb8(0x6b, 0x6a, 0x61),
     link: rgb8(0x8f, 0xa9, 0xc9),
@@ -605,7 +599,6 @@ fn paint(mark: &Mark, dark: bool) -> Format {
     let ink = ink(dark);
     match *mark {
         Mark::Title => Format {
-            color: Some(ink.strong),
             font: Some(body_font(Weight::Semibold, FontStyle::Normal)),
             size: Some(TITLE_SIZE),
             line_height: Some(LineHeight::Absolute(TITLE_SIZE * TITLE_LINE_HEIGHT)),
@@ -747,16 +740,14 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         false => FontStyle::Normal,
     };
     let color = if style.link {
-        ink.link
+        Some(ink.link)
     } else if style.done || style.quote || style.divider {
-        ink.muted
-    } else if style.heading.is_some() {
-        ink.strong
+        Some(ink.muted)
     } else {
-        ink.body
+        None
     };
     let mut format = Format {
-        color: Some(color),
+        color,
         font: Some(body_font(weight, italic)),
         strikethrough: style.done.then_some(ink.marker),
         ..Format::default()
@@ -797,6 +788,51 @@ fn body_format(style: Style, ink: &Ink) -> Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_text_inherits_native_ink_without_erasing_semantic_marks() {
+        for dark in [false, true] {
+            for mark in [
+                Mark::Title,
+                Mark::Body(Style::default()),
+                Mark::Body(Style {
+                    strong: true,
+                    ..Style::default()
+                }),
+                Mark::Body(Style {
+                    heading: Some(1),
+                    ..Style::default()
+                }),
+            ] {
+                assert_eq!(format(&mark, dark).color, None);
+            }
+            assert!(
+                format(
+                    &Mark::Body(Style {
+                        link: true,
+                        ..Style::default()
+                    }),
+                    dark
+                )
+                .color
+                .is_some()
+            );
+            assert!(
+                format(
+                    &Mark::Body(Style {
+                        commented: true,
+                        ..Style::default()
+                    }),
+                    dark
+                )
+                .line_background
+                .is_some()
+            );
+            let code = format(&Mark::CodeBody, dark);
+            assert!(code.color.is_some());
+            assert!(code.line_background.is_some());
+        }
+    }
 
     fn shapes(line: &str) -> (Prefix, usize) {
         prefix_of(line)
@@ -961,10 +997,7 @@ mod tests {
         // fill reads as a swatch, not as a ticked box.
         let tick = format(&marks[2].1, false);
         assert_eq!(tick.color, Some(LIGHT.tick_mark));
-        assert_eq!(
-            tick.background.expect("a filled box"),
-            LIGHT.tick_fill
-        );
+        assert_eq!(tick.background.expect("a filled box"), LIGHT.tick_fill);
         assert!(tick.strikethrough.is_none());
         let Mark::Body(style) = marks[4].1 else {
             unreachable!("a body run")
