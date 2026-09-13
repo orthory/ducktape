@@ -4,12 +4,12 @@
 //! for the files plane, and a write leaves as `op.submit` carrying the
 //! duckfs commit.
 
-use files_view::host::Session;
-use files_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{
     answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
 use ducktape_view_guest::wire::{Frame, Node, Request};
+use files_view::host::Session;
+use files_view::{boot_native, tick_native};
 
 fn boot() -> Frame {
     boot_native();
@@ -145,9 +145,9 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
     let frame = with_preview(&frame, "hello");
     let fixed = |frame: &Frame, suffix: &str, vertical: bool| {
         let (width, height) = match node_ending(frame, suffix) {
-            Node::Container { width, height, .. } | Node::Linear { width, height, .. } | Node::Scroll { width, height, .. } => {
-                (width, height)
-            }
+            Node::Container { width, height, .. }
+            | Node::Linear { width, height, .. }
+            | Node::Scroll { width, height, .. } => (width, height),
             node => panic!("fixed pane {suffix}: {node:?}"),
         };
         match vertical {
@@ -482,7 +482,7 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         .find(|key| key.ends_with("/fs-editor"))
         .expect("the editor");
     let (editing, before) = read_draft(&editing);
-    let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
+    tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
 
     // the network moves under the draft
     let frame = tick_native(vec![item(
@@ -496,7 +496,11 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         })
         .unwrap(),
     )]);
-    assert!(has_text(&frame, "Unsaved changes to:"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "Unsaved changes to:"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(
         !frame
             .requests

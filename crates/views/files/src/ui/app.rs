@@ -99,6 +99,7 @@ impl ::std::fmt::Debug for Message {
 }
 impl FilesView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
+        self.validate_snapshot()?;
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
             state: wire::SnapshotValue::Bytes(wire::encode(self)),
@@ -114,7 +115,24 @@ impl FilesView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Files snapshot".into());
         };
-        wire::decode(&state)
+        let state: Self = wire::decode(&state)?;
+        state.validate_snapshot()?;
+        Ok(state)
+    }
+
+    fn validate_snapshot(&self) -> Result<(), String> {
+        let dimensions = [
+            self.viewport_width,
+            self.viewport_height,
+            self.tree_width,
+            self.preview_pane_height,
+            self.object_width,
+        ];
+        if dimensions.into_iter().all(f64::is_finite) {
+            Ok(())
+        } else {
+            Err("snapshot number must be finite".into())
+        }
     }
 
     #[must_use]
@@ -227,13 +245,13 @@ impl FilesView {
 impl FilesView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::listing(
                     self.generation,
                     self.path.to_owned(),
                 )
-                .map(move |value| Message::ListingArrived(value))])
+                .map(Message::ListingArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -242,7 +260,7 @@ impl FilesView {
                     self.generation,
                     self.preview_path.to_owned(),
                 )
-                .map(move |value| Message::PreviewArrived(value))])
+                .map(Message::PreviewArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -251,11 +269,11 @@ impl FilesView {
                     self.generation,
                     self.diff_from.to_owned(),
                 )
-                .map(move |value| Message::DiffArrived(value))])
+                .map(Message::DiffArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }
@@ -309,6 +327,19 @@ mod tests {
         app.acting = true;
         let restored = FilesView::restore(&app.snapshot().unwrap()).unwrap();
         assert!(*restored.derived_loading());
+    }
+    #[test]
+    fn snapshot_rejects_nonfinite_dimensions_on_both_sides() {
+        let (mut app, _) = FilesView::boot();
+        app.object_width = f64::NAN;
+        assert!(app.snapshot().is_err());
+        let bytes = wire::Snapshot {
+            schema: FilesView::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(&app)),
+        }
+        .encode()
+        .unwrap();
+        assert!(FilesView::restore(&bytes).is_err());
     }
     #[test]
     fn a_captured_save_refuses_after_its_network_moves() {

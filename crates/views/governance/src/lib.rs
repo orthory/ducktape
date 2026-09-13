@@ -6,9 +6,8 @@
 //! admin, dark). The view reads its own register through the kernel's
 //! `rpc.query` / `rpc.blocks`, re-reads it on every `rpc.live` hit for the
 //! governance plane, and a vote or a settle leaves as `op.submit` — the
-//! governance message the kernel signs with the seated key. The endpoint,
-//! the key and the password never cross: a guest that sees no key cannot
-//! leak one.
+//! governance message the kernel signs with the seated key. Signing secrets
+//! and passwords stay in the host; public proposal data belongs to the guest.
 pub mod host;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GovernanceView {
@@ -38,7 +37,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl GovernanceView {
     fn state() -> Self {
         Self {
@@ -58,7 +56,6 @@ impl GovernanceView {
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "7c12db27b05b027805b40f4d493f95bcbf83f7b71fb9a350d90ef241043cbc72";
 }
-#[allow(unused_parens)]
 impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         use ducktape_view_guest::wire;
@@ -81,16 +78,16 @@ impl GovernanceView {
     }
     fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::register(
                     self.connection_serial,
                 )
-                .map(move |value| Message::RegisterArrived(value))])
+                .map(Message::RegisterArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }
@@ -152,7 +149,6 @@ mod tests {
     }
 }
 impl GovernanceView {
-    #[allow(clippy::assign_op_pattern)]
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
@@ -168,7 +164,7 @@ impl GovernanceView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             self.host_error = item.error.to_owned();
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
@@ -189,7 +185,7 @@ impl GovernanceView {
         {
             self.host_error = item.error.to_owned();
             self.answered = true;
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             self.rows = item.rows.clone();
@@ -210,21 +206,21 @@ impl GovernanceView {
         approve: bool,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            if ((!self.connected) || (!(self.voting).is_empty())) {
+            if (!self.connected) || (!(self.voting).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             self.voting = proposal_id.to_owned();
-            let _sent = (crate::host::vote(proposal_id.to_owned(), approve));
+            let _sent = crate::host::vote(proposal_id.to_owned(), approve);
             ::ducktape_view_guest::Task::none()
         }
     }
     fn on_gov_execute(&mut self, proposal_id: String) -> ::ducktape_view_guest::Task<Message> {
         {
-            if ((!self.connected) || (!(self.voting).is_empty())) {
+            if (!self.connected) || (!(self.voting).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             self.voting = proposal_id.to_owned();
-            let _sent = (crate::host::execute(proposal_id.to_owned()));
+            let _sent = crate::host::execute(proposal_id.to_owned());
             ::ducktape_view_guest::Task::none()
         }
     }

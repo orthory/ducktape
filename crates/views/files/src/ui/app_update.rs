@@ -127,7 +127,7 @@ impl super::FilesView {
             return ::ducktape_view_guest::Task::none();
         }
         self.notice = "".to_owned();
-        self.generation = self.generation + 1;
+        self.generation += 1;
         {
             let next = crate::host::fs_parent(::std::convert::AsRef::as_ref(&(target)));
             if ::ducktape_view_guest::state_changed!(self.path, next) {
@@ -297,7 +297,7 @@ impl super::FilesView {
         );
         self.new_name =
             crate::host::keep_draft(named && ok, ::std::convert::AsRef::as_ref(&(self.new_name)));
-        self.generation = self.generation + 1;
+        self.generation += 1;
         ::ducktape_view_guest::Task::none()
     }
     fn on_open_dir_at(&mut self, target: String) -> ducktape_view_guest::Task<Message> {

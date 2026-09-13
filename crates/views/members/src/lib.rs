@@ -7,11 +7,10 @@
 //! and opening a membership ballot leave as `op.submit` — the module
 //! message the kernel signs with the seated key; copying a key stays an
 //! intent, because the clipboard is an OS door the kernel has not opened.
-//! The endpoint, the key and the password never cross: a guest that sees no
-//! key cannot leak one.
+//! Public member keys are view data; signing secrets and passwords stay in the host.
 pub mod host;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub(crate) enum MembersFilter {
+pub enum MembersFilter {
     All,
     Humans,
     Agents,
@@ -55,7 +54,6 @@ impl ::std::fmt::Debug for Message {
         formatter.write_str("Message")
     }
 }
-#[allow(unused_parens)]
 impl MembersView {
     fn state() -> Self {
         Self {
@@ -80,10 +78,10 @@ impl MembersView {
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "c5b4c71dda09d5a068e1b5197b676ac214130791d9b62a6629ac8f67428df93e";
 }
-#[allow(unused_parens)]
 impl MembersView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         use ducktape_view_guest::wire;
+        self.validate_snapshot()?;
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
             state: wire::SnapshotValue::Bytes(wire::encode(self)),
@@ -99,20 +97,30 @@ impl MembersView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Members snapshot".into());
         };
-        wire::decode(&state)
+        let state: Self = wire::decode(&state)?;
+        state.validate_snapshot()?;
+        Ok(state)
+    }
+    fn validate_snapshot(&self) -> Result<(), String> {
+        let finite = self.viewport_width.is_finite() && self.member_width.is_finite();
+        if finite {
+            Ok(())
+        } else {
+            Err("snapshot number must be finite".into())
+        }
     }
     fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::roster(
                     self.connection_serial,
                 )
-                .map(move |value| Message::RosterArrived(value))])
+                .map(Message::RosterArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }
@@ -146,6 +154,10 @@ mod tests {
         view.filter = MembersFilter::Agents;
         view.selected = "reviewer".into();
         view.member_width = 360.;
+        view.rows.push(host::MemberRow {
+            key: "reviewer".into(),
+            ..Default::default()
+        });
         let bytes = view.snapshot().unwrap();
         let restored = MembersView::restore(&bytes).unwrap();
         assert_eq!(restored.filter, MembersFilter::Agents);
@@ -154,20 +166,26 @@ mod tests {
         assert_eq!(restored.snapshot().unwrap(), bytes);
     }
     #[test]
+    fn snapshot_rejects_nonfinite_dimensions_on_both_sides() {
+        use ducktape_view_guest::wire;
+        let (mut view, _) = MembersView::boot();
+        view.member_width = f64::INFINITY;
+        assert!(view.snapshot().is_err());
+        let bytes = wire::Snapshot {
+            schema: MembersView::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(&view)),
+        }
+        .encode()
+        .unwrap();
+        assert!(MembersView::restore(&bytes).is_err());
+    }
+    #[test]
     fn view_fits_default_stack() {
-        ::std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let (app, _) = MembersView::boot();
-                let _ = app.view();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        let (app, _) = MembersView::boot();
+        let _ = app.view();
     }
 }
 impl MembersView {
-    #[allow(clippy::assign_op_pattern)]
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
@@ -188,7 +206,7 @@ impl MembersView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             self.host_error = item.error.to_owned();
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
@@ -209,7 +227,7 @@ impl MembersView {
         {
             self.host_error = item.error.to_owned();
             self.answered = true;
-            if (!(item.error).is_empty()) {
+            if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
             self.rows = item.rows.clone();
@@ -226,7 +244,7 @@ impl MembersView {
     }
     fn on_pick_filter(&mut self, next: MembersFilter) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.filter = next.clone();
+            self.filter = next;
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -244,11 +262,8 @@ impl MembersView {
     }
     fn on_member_resized(&mut self, dx: f64, _dy: f64) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.member_width = crate::host::member_width_after_delta(
-                self.member_width,
-                (-dx),
-                self.viewport_width,
-            );
+            self.member_width =
+                crate::host::member_width_after_delta(self.member_width, -dx, self.viewport_width);
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -270,12 +285,12 @@ impl MembersView {
         paused: bool,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            if ((!self.connected) || (!(self.acting).is_empty())) {
+            if (!self.connected) || (!(self.acting).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             self.acting = agent_id.to_owned();
             let _sent =
-                (crate::host::agent_status(::std::convert::AsRef::as_ref(&(agent_id)), paused));
+                crate::host::agent_status(::std::convert::AsRef::as_ref(&(agent_id)), paused);
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -285,15 +300,15 @@ impl MembersView {
         key: String,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            if (((!self.connected) || (!self.admin)) || (!(self.acting).is_empty())) {
+            if ((!self.connected) || (!self.admin)) || (!(self.acting).is_empty()) {
                 return ::ducktape_view_guest::Task::none();
             }
             self.acting = key.to_owned();
-            let _sent = (crate::host::propose(
+            let _sent = crate::host::propose(
                 ::std::convert::AsRef::as_ref(&(action)),
                 ::std::convert::AsRef::as_ref(&(key)),
                 self.height,
-            ));
+            );
             ::ducktape_view_guest::Task::none()
         }
     }
