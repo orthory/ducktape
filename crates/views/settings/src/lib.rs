@@ -1648,7 +1648,7 @@ impl SettingsView {
                 "settings/rename",
                 "Rename",
                 Message::AccountRenameSubmit,
-                available && !self.account_name_draft.trim().is_empty(),
+                !self.account_busy && !self.account_name_draft.trim().is_empty(),
             ),
         ];
         if !self.account_exists {
@@ -1696,10 +1696,7 @@ impl SettingsView {
             content.push(settings_action(
                 "settings/copy-number",
                 "Copy number",
-                Message::CopyToClipboard(
-                    self.account_number.clone(),
-                    "Account number copied".into(),
-                ),
+                Message::CopyToClipboard(self.account_number.clone(), "Number copied".into()),
                 !self.account_number.is_empty(),
             ));
             content.push(kit::heading("settings/keys-title", "ACCOUNT KEYS"));
