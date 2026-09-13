@@ -1485,13 +1485,16 @@ pub(crate) mod canary {
             _ => None,
         };
         if let Some(mut root) = root {
-            root.for_each_mut(&mut |node| {
-                match node {
-                    wire::Node::Text { content, .. }
-                    | wire::Node::Button { content: wire::ButtonContent::Label(content), .. } => texts.push(content.clone()),
-                    wire::Node::RichText { spans, .. } => texts.push(spans.iter().map(|span| span.content.as_str()).collect()),
-                    _ => {}
+            root.for_each_mut(&mut |node| match node {
+                wire::Node::Text { content, .. }
+                | wire::Node::Button {
+                    content: wire::ButtonContent::Label(content),
+                    ..
+                } => texts.push(content.clone()),
+                wire::Node::RichText { spans, .. } => {
+                    texts.push(spans.iter().map(|span| span.content.as_str()).collect())
                 }
+                _ => {}
             });
         }
         texts
@@ -2789,12 +2792,37 @@ impl NativeModuleView {
             }
             let commands_ready = !guest.inputs.pending() && !guest.widget_commands.is_empty();
             if commands_ready {
-                guest.execute_widget_commands(|command| {
-                    content.update(cx, |tree, cx| {
-                        tree.execute_widget_command(command, window, cx)
-                    })
+                let view = cx.entity().downgrade();
+                let seat = mounted.clone();
+                let alive = guest.alive.clone();
+                let revision = self.revision;
+                // The child tree mounts during this frame. A newly opened
+                // menu or input cannot receive focus before that render.
+                window.defer(cx, move |window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        let mut locked = seat.lock().expect("module view lock");
+                        let Slot::Ready(guest) = &mut locked.slot else {
+                            return;
+                        };
+                        let current_frame = guest.seated_generation() == generation
+                            && Arc::ptr_eq(&alive, &guest.alive)
+                            && guest.frame_rev == revision
+                            && this.revision == revision;
+                        if !current_frame || guest.inputs.pending() {
+                            cx.notify();
+                            return;
+                        }
+                        let Some(content) = &this.content else {
+                            return;
+                        };
+                        guest.execute_widget_commands(|command| {
+                            content.update(cx, |tree, cx| {
+                                tree.execute_widget_command(command, window, cx)
+                            })
+                        });
+                        cx.notify();
+                    });
                 });
-                window.request_animation_frame();
             }
         }
         for intent in std::mem::take(&mut guest.intents) {
@@ -3151,13 +3179,16 @@ pub(crate) mod tests {
     pub(super) fn texts(guest: &Guest) -> Vec<String> {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut texts = Vec::new();
-        root.for_each_mut(&mut |node| {
-            match node {
-                wire::Node::Text { content, .. }
-                | wire::Node::Button { content: wire::ButtonContent::Label(content), .. } => texts.push(content.clone()),
-                wire::Node::RichText { spans, .. } => texts.push(spans.iter().map(|span| span.content.as_str()).collect()),
-                _ => {}
+        root.for_each_mut(&mut |node| match node {
+            wire::Node::Text { content, .. }
+            | wire::Node::Button {
+                content: wire::ButtonContent::Label(content),
+                ..
+            } => texts.push(content.clone()),
+            wire::Node::RichText { spans, .. } => {
+                texts.push(spans.iter().map(|span| span.content.as_str()).collect())
             }
+            _ => {}
         });
         texts
     }
@@ -3860,9 +3891,10 @@ pub(crate) mod tests {
         }
         assert_eq!(surface_names(&guest), ["chat_composer"]);
 
-        guest
-            .pending
-            .push(wire::Event::Message(button_message(&guest, "# ops · Unread")));
+        guest.pending.push(wire::Event::Message(button_message(
+            &guest,
+            "# ops · Unread",
+        )));
         guest.redraw(&props);
         assert_eq!(
             std::mem::take(&mut guest.intents),
@@ -5410,17 +5442,33 @@ pub(crate) mod tests {
             settle_documents(&mut guest, &props);
             let mut sidebar_width = None;
             let mut divider_width = None;
-            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| match node {
-                wire::Node::Container { key, width: Some(wire::Length::Fixed(value)), .. }
-                    if key.ends_with("/page-list") => sidebar_width = Some(*value),
-                wire::Node::ResizeHandle { key, content, .. } if key.ends_with("/sidebar-divider") => {
-                    if let wire::Node::Space { width: Some(wire::Length::Fixed(value)), .. } = content.as_ref() {
-                        divider_width = Some(*value);
+            guest
+                .frame
+                .root
+                .clone()
+                .unwrap()
+                .for_each_mut(&mut |node| match node {
+                    wire::Node::Container {
+                        key,
+                        width: Some(wire::Length::Fixed(value)),
+                        ..
+                    } if key.ends_with("/page-list") => sidebar_width = Some(*value),
+                    wire::Node::ResizeHandle { key, content, .. }
+                        if key.ends_with("/sidebar-divider") =>
+                    {
+                        if let wire::Node::Space {
+                            width: Some(wire::Length::Fixed(value)),
+                            ..
+                        } = content.as_ref()
+                        {
+                            divider_width = Some(*value);
+                        }
                     }
-                }
-                _ => {}
-            });
-            let pane_width = width - sidebar_width.expect("authored sidebar") - divider_width.expect("authored divider");
+                    _ => {}
+                });
+            let pane_width = width
+                - sidebar_width.expect("authored sidebar")
+                - divider_width.expect("authored divider");
             // Install the event bridge before mounting the guest, as the real
             // NativeModuleView does. Otherwise its first Sensor::on_show is lost.
             let (view, mut native) = native_tree(
@@ -5507,10 +5555,7 @@ pub(crate) mod tests {
         assert!(squeeze_editor.size.width < beside_editor.size.width);
         let (inline_editor, inline_card) = measured(1100.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
-        assert_eq!(
-            inline_card.size.width,
-            inline_editor.size.width
-        );
+        assert_eq!(inline_card.size.width, inline_editor.size.width);
     }
 
     /// The forge view draws itself against session facts only; everything
