@@ -2,7 +2,7 @@
 //! decision, and an accepted edit waits for the guest's observed revision.
 //! Transfer assemblers and patch validation are the wire contract's own code.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use ui_lang_wire as wire;
@@ -20,7 +20,6 @@ struct Store {
     serial: u64,
     epoch: Instant,
     fields: HashMap<String, Field>,
-    focused: HashSet<String>,
     documents: HashMap<String, Document>,
     incoming: Option<Incoming>,
     outgoing: Option<Outgoing>,
@@ -101,7 +100,7 @@ struct Projection {
 impl EditorStore {
     pub fn new(instance: u64) -> Self {
         Self(Arc::new(Mutex::new(Store { instance, serial: 0, epoch: Instant::now(),
-            fields: HashMap::new(), focused: HashSet::new(), documents: HashMap::new(), incoming: None,
+            fields: HashMap::new(), documents: HashMap::new(), incoming: None,
             outgoing: None, events: Vec::new(), fault: None })))
     }
 
@@ -172,13 +171,6 @@ impl EditorStore {
         let store = self.lock();
         store.incoming.is_some() || store.outgoing.is_some() || !store.events.is_empty()
             || store.documents.values().any(|d| !d.queue.is_empty() || !matches!(d.phase, Phase::Ready))
-    }
-
-    pub fn focused(&self, key: &str) -> bool { self.lock().focused.contains(key) }
-
-    fn set_focused(&self, key: &str, focused: bool) {
-        let mut store = self.lock();
-        if focused { store.focused.insert(key.to_owned()); } else { store.focused.remove(key); }
     }
 
     fn projection(&self, key: &str) -> Option<Projection> {
@@ -265,7 +257,6 @@ impl Store {
                 reference: reference.clone(), text: None, queue: VecDeque::new(), queued_bytes: 0, phase: Phase::Ready });
         }
         self.fields = fields;
-        self.focused.retain(|key| self.fields.contains_key(key));
         let stale_incoming = self.incoming.as_ref().is_some_and(|incoming|
             self.documents.get(&incoming.id.document).is_none_or(|d| d.reference.reset != incoming.id.reset));
         if stale_incoming { self.incoming = None; }

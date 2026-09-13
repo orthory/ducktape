@@ -409,7 +409,6 @@ impl WireEditor {
             || (settled
                 && (canonical != self.preview || projection.reference.cursor != self.cursor));
         let focused = self.focused_line(window, cx);
-        self.store.set_focused(&self.key, focused.is_some());
         if install {
             self.preview = canonical;
             self.cursor = projection.reference.cursor;
@@ -556,8 +555,6 @@ impl WireEditor {
 
     fn observed(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focused_line(window, cx) == Some(index);
-        self.store
-            .set_focused(&self.key, self.focused_line(window, cx).is_some());
         if !focused {
             return;
         }
