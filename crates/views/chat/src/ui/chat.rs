@@ -378,37 +378,43 @@ impl ChatView {
             };
             let [reaction, more] = actions;
             if !message.pending && !message.deleted {
+                let mut controls = Vec::new();
                 if !thread && message.reply_count == 0 {
-                    children.push(action(
+                    controls.push(action(
                         format!("{scope}/thread"),
                         "Open thread",
                         Message::OpenThreadFor(message.seq),
                         false,
                     ));
                 }
-                children.push(action(
+                controls.push(action(
                     format!("{scope}/thumbs-up"),
                     "React with 👍",
                     Message::AddReactionAt(message.seq, "👍".into()),
                     self.active_channel_archived,
                 ));
-                children.push(native::row(
-                    format!("{scope}/actions"),
-                    [
-                        action(
-                            format!("{scope}/react"),
-                            "Manage reactions",
-                            reaction,
-                            self.active_channel_archived,
-                        ),
-                        action(
-                            format!("{scope}/more"),
-                            "More message actions",
-                            more.clone(),
-                            false,
-                        ),
-                    ],
-                ));
+                controls.extend([
+                    action(
+                        format!("{scope}/react"),
+                        "Manage reactions",
+                        reaction,
+                        self.active_channel_archived,
+                    ),
+                    action(
+                        format!("{scope}/more"),
+                        "More message actions",
+                        more.clone(),
+                        false,
+                    ),
+                ]);
+                let mut controls = native::row(format!("{scope}/actions"), controls);
+                if let wire::Node::Linear { wrap, .. } = &mut controls {
+                    *wrap = Some(wire::Wrap {
+                        spacing: None,
+                        align: None,
+                    });
+                }
+                children.push(controls);
                 let content = native::column(format!("{scope}/content"), children);
                 rows.push(wire::Node::MouseArea {
                     key: scope,

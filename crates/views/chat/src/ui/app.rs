@@ -421,7 +421,25 @@ mod tests {
         let mut reactions = 0;
         let mut menus = 0;
         let mut unread_rooms = 0;
+        let mut action_rows = 0;
         tree.for_each_mut(&mut |node| match node {
+            wire::Node::Linear {
+                key,
+                axis,
+                wrap,
+                children,
+                ..
+            } if key.ends_with("/actions") => {
+                assert_eq!(*axis, wire::Axis::Row);
+                assert!(wrap.is_some());
+                assert_eq!(children.len(), 4);
+                assert!(
+                    children
+                        .iter()
+                        .all(|child| matches!(child, wire::Node::Button { .. }))
+                );
+                action_rows += 1;
+            }
             wire::Node::Scroll {
                 key,
                 virtual_rows,
@@ -475,6 +493,7 @@ mod tests {
             (1, 1, 1, 2, 2, 2)
         );
         assert_eq!(unread_rooms, 1);
+        assert_eq!(action_rows, 2);
     }
 
     #[test]
