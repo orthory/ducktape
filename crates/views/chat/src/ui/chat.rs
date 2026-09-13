@@ -766,71 +766,17 @@ impl super::ChatView {
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
                 message_contents_scope_1995); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
-                message_body_scope_1809); { let mut children : Vec < wire::Node > =
-                Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
-                for_scope = format!("{}/@for:703({})", rich_body_scope_688, index); if
-                block.kind == "divider" { children.push({ let
-                component_separator_scope_705 = format!("{}/Separator@705", for_scope); {
-                let node_scope = format!("{}/root", component_separator_scope_705);
-                wire::Node::Rule { key : node_scope.clone(), axis : wire::Axis::Row,
-                thickness : 1.0f32, color : None, weak : false, radius : None, snap :
-                None, } } }); } if block.kind == "code" { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
+                message_body_scope_1809); Self::message_body(format!("{}/@layout:75",
+                rich_body_scope_688), & message.blocks,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if message.edited && !
-                message.show_author { children
+                Some(route(sent)) }),),)) }]; wire::Node::Linear { max_width :
+                Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if message.edited && ! message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1128,71 +1074,17 @@ impl super::ChatView {
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
                 message_contents_scope_2015); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
-                message_body_scope_1809); { let mut children : Vec < wire::Node > =
-                Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
-                for_scope = format!("{}/@for:703({})", rich_body_scope_688, index); if
-                block.kind == "divider" { children.push({ let
-                component_separator_scope_705 = format!("{}/Separator@705", for_scope); {
-                let node_scope = format!("{}/root", component_separator_scope_705);
-                wire::Node::Rule { key : node_scope.clone(), axis : wire::Axis::Row,
-                thickness : 1.0f32, color : None, weak : false, radius : None, snap :
-                None, } } }); } if block.kind == "code" { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
+                message_body_scope_1809); Self::message_body(format!("{}/@layout:75",
+                rich_body_scope_688), & message.blocks,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if message.edited && !
-                message.show_author { children
+                Some(route(sent)) }),),)) }]; wire::Node::Linear { max_width :
+                Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if message.edited && ! message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1490,71 +1382,17 @@ impl super::ChatView {
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
                 message_contents_scope_2035); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
-                message_body_scope_1809); { let mut children : Vec < wire::Node > =
-                Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
-                for_scope = format!("{}/@for:703({})", rich_body_scope_688, index); if
-                block.kind == "divider" { children.push({ let
-                component_separator_scope_705 = format!("{}/Separator@705", for_scope); {
-                let node_scope = format!("{}/root", component_separator_scope_705);
-                wire::Node::Rule { key : node_scope.clone(), axis : wire::Axis::Row,
-                thickness : 1.0f32, color : None, weak : false, radius : None, snap :
-                None, } } }); } if block.kind == "code" { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
+                message_body_scope_1809); Self::message_body(format!("{}/@layout:75",
+                rich_body_scope_688), & message.blocks,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if message.edited && !
-                message.show_author { children
+                Some(route(sent)) }),),)) }]; wire::Node::Linear { max_width :
+                Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if message.edited && ! message.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1985,73 +1823,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_1995); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_message.edited
-                && ! cached_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_410_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_message.edited && ! cached_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -2356,73 +2139,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2015); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_message.edited
-                && ! cached_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_410_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_message.edited && ! cached_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -2727,73 +2455,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2035); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_message.edited
-                && ! cached_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_410_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_message.edited && ! cached_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -4021,71 +3694,17 @@ impl super::ChatView {
                 border : None, children : children, } }, { let message_body_scope_2472 =
                 format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_2472); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_2472), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }];
+                format!("{}/RichBody@688", message_body_scope_2472);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                thread_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_720_16.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_2472), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }];
                 native::spaced(native::sized(native::column(format!("{}/@layout:1024",
                 thread_parent_block_scope_2747), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }]; wire::Node::Linear { max_width : None, clip : false,
@@ -4278,73 +3897,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2207); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if thread_message.edited
-                && ! thread_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                thread_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_720_16.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if thread_message.edited && ! thread_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -4649,73 +4213,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2227); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if thread_message.edited
-                && ! thread_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                thread_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_720_16.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if thread_message.edited && ! thread_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -5020,73 +4529,18 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2247); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if thread_message.edited
-                && ! thread_message.show_author { children
-                .push(native::text_options(native::text(format!("{}/@text:408",
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                thread_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_720_16.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if thread_message.edited && ! thread_message.show_author {
+                children.push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
@@ -5472,72 +4926,17 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2207); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_reply.edited &&
-                ! cached_reply.show_author { children
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_reply.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_424_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_reply.edited && ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2207), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -5841,72 +5240,17 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2227); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_reply.edited &&
-                ! cached_reply.show_author { children
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_reply.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_424_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_reply.edited && ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2227), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6210,72 +5554,17 @@ impl super::ChatView {
                 content : Box::new({ let message_body_scope_1809 =
                 format!("{}/MessageBody@1809", message_contents_scope_2247); { let
                 children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
-                Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
-                .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
-                rich_body_scope_688, index); if block.kind == "divider" { children.push({
-                let component_separator_scope_705 = format!("{}/Separator@705",
-                for_scope); { let node_scope = format!("{}/root",
-                component_separator_scope_705); wire::Node::Rule { key : node_scope
-                .clone(), axis : wire::Axis::Row, thickness : 1.0f32, color : None, weak
-                : false, radius : None, snap : None, } } }); } if block.kind == "code" {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:90",
-                for_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                block.lang.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:100",
-                for_scope), block.lang.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:106",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),);
-                native::spaced(native::sized(native::column(format!("{}/@layout:98",
-                for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
-                11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
-                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
-                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); }
-                native::padded(native::sized(native::column(format!("{}/@layout:121",
-                for_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 2.0f32, right : 0.0f32, bottom : 2.0f32, left : 13.0f32, },) },
-                native::sized(native::container(format!("{}/@container:144", for_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(3.0f32)), Some(wire::Length::Fill),)];
-                wire::Node::Stack { key : format!("{}/@layout:120", for_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
-                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
-                Some(::ducktape_view_guest::slots::handler:: < String, Message, >
-                (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
-                move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),)) }); } if ! block.rich { children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
-                for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
-                Some(wire::Length::Fill), None,),); } } }
-                native::spaced(native::sized(native::column(format!("{}/@layout:75",
-                rich_body_scope_688), children,), Some(wire::Length::Fill), None,),
-                5.0f32,) } }]; wire::Node::Linear { max_width : Some(760.0f32), clip :
-                false, key : format!("{}/@layout:60", message_body_scope_1809), wrap :
-                None, axis : wire::Axis::Column, spacing : None, padding : None, width :
-                Some(wire::Length::Fill), height : None, align : None, background : None,
-                border : None, children : children, } } }), }); if cached_reply.edited &&
-                ! cached_reply.show_author { children
+                format!("{}/RichBody@688", message_body_scope_1809);
+                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
+                cached_reply.blocks, Some(::ducktape_view_guest::slots::handler:: <
+                String, Message, > (Box::new({ let route = { let route_callback =
+                lazy_event_424_5.clone(); move | link : String | route_callback(link) };
+                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
+                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
+                message_body_scope_1809), wrap : None, axis : wire::Axis::Column, spacing
+                : None, padding : None, width : Some(wire::Length::Fill), height : None,
+                align : None, background : None, border : None, children : children, } }
+                }), }); if cached_reply.edited && ! cached_reply.show_author { children
                 .push(native::text_options(native::text(format!("{}/@text:408",
                 message_contents_scope_2247), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),

@@ -2,6 +2,65 @@ use super::*;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    pub(super) fn message_body(
+        key: String,
+        blocks: &[crate::host::ChatBlock],
+        on_link: Option<u32>,
+    ) -> wire::Node {
+        let mut children = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let scope = format!("{key}/block/{index}");
+            let content = match block.kind.as_str() {
+                "divider" => wire::Node::Rule {
+                    key: scope,
+                    axis: wire::Axis::Row,
+                    thickness: 1.,
+                    color: None,
+                    weak: false,
+                    radius: None,
+                    snap: None,
+                },
+                "code" => {
+                    let mut children = Vec::new();
+                    if !block.lang.is_empty() {
+                        children.push(native::text(format!("{scope}/language"), &block.lang));
+                    }
+                    children.push(native::text_options(
+                        native::text(format!("{scope}/code"), &block.text),
+                        wire::TextOptions {
+                            wrapping: Some(wire::Wrapping::WordOrGlyph),
+                            font: Some(wire::NamedFont {
+                                family: wire::FontFamily::Monospace,
+                                weight: wire::Weight::Normal,
+                                stretch: wire::FontStretch::Normal,
+                                style: wire::FontStyle::Normal,
+                            }),
+                            ..Default::default()
+                        },
+                    ));
+                    native::column(scope, children)
+                }
+                "quote" | "paragraph" => {
+                    let text = if block.rich {
+                        Self::rich_line(format!("{scope}/text"), block, on_link)
+                    } else {
+                        native::text(format!("{scope}/text"), &block.text)
+                    };
+                    if block.kind == "quote" {
+                        native::row(
+                            scope.clone(),
+                            [native::text(format!("{scope}/quote"), "│"), text],
+                        )
+                    } else {
+                        text
+                    }
+                }
+                _ => continue,
+            };
+            children.push(content);
+        }
+        native::column(key, children)
+    }
     pub(super) fn rich_line(
         key: String,
         block: &crate::host::ChatBlock,
