@@ -59,6 +59,24 @@ struct PresentationReference {
     cursor: wire::EditorCursor,
 }
 
+impl PreparedPresentation {
+    pub fn validate(&self, document: &Editor) -> Result<(), String> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        if self.data.len() > 1024 * 1024 {
+            return Err("Pages presentation snapshot exceeds limit".into());
+        }
+        let paint: EditorPresentation = wire::decode(&self.data)?;
+        if self.reference == reference(document.state_view()) {
+            paint
+                .validate(document.state_view().text)
+                .map_err(|error| format!("invalid Pages presentation snapshot: {error:?}"))?;
+        }
+        Ok(())
+    }
+}
+
 pub fn empty_presentation() -> PreparedPresentation {
     PreparedPresentation::default()
 }

@@ -208,6 +208,7 @@ impl PagesView {
     const SNAPSHOT_SCHEMA: &'static str =
         "87cd7a014db885c60adf9b912eec1110214698b6aa8a191805f8458a9b326c7b";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
+        self.validate_snapshot()?;
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
             state: wire::SnapshotValue::Bytes(wire::encode(self)),
@@ -223,7 +224,27 @@ impl PagesView {
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
             return Err("invalid Pages snapshot schema".into());
         }
-        wire::decode(&state)
+        let state: Self = wire::decode(&state)?;
+        state.validate_snapshot()?;
+        Ok(state)
+    }
+
+    fn validate_snapshot(&self) -> Result<(), String> {
+        let finite_layout = [
+            self.pointer_y,
+            self.comment_anchor_y,
+            self.comments_card_height,
+            self.pages_viewport_width,
+            self.pages_viewport_height,
+            self.pages_pane_width,
+            self.sidebar_width,
+        ]
+        .into_iter()
+        .all(f64::is_finite);
+        if !finite_layout {
+            return Err("invalid Pages layout snapshot".into());
+        }
+        self.document_paint.validate(&self.document)
     }
 }
 
@@ -333,6 +354,45 @@ impl PagesView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_reject_nonfinite_layout_in_every_coordinate() {
+        let fields: [fn(&mut PagesView) -> &mut f64; 7] = [
+            |s| &mut s.pointer_y,
+            |s| &mut s.comment_anchor_y,
+            |s| &mut s.comments_card_height,
+            |s| &mut s.pages_viewport_width,
+            |s| &mut s.pages_viewport_height,
+            |s| &mut s.pages_pane_width,
+            |s| &mut s.sidebar_width,
+        ];
+        for field in fields {
+            let mut state = PagesView::initial_state();
+            *field(&mut state) = f64::NAN;
+            assert!(state.snapshot().is_err());
+            let bytes = wire::Snapshot {
+                schema: PagesView::SNAPSHOT_SCHEMA.into(),
+                state: wire::SnapshotValue::Bytes(wire::encode(&state)),
+            }
+            .encode()
+            .unwrap();
+            assert!(PagesView::restore(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshots_reject_malformed_cached_presentation() {
+        let mut state = PagesView::initial_state();
+        state.document_paint.data = vec![0xff];
+        assert!(state.snapshot().is_err());
+        let bytes = wire::Snapshot {
+            schema: PagesView::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(&state)),
+        }
+        .encode()
+        .unwrap();
+        assert!(PagesView::restore(&bytes).is_err());
+    }
     #[test]
     fn ordinary_state_preserves_document_and_drafts_through_snapshot() {
         let (mut app, _) = PagesView::boot();

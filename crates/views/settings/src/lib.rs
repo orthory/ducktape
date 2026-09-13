@@ -58,7 +58,7 @@ impl ::std::fmt::Debug for SettingsView {
 }
 #[derive(Clone)]
 pub enum Message {
-    SessionArrived(crate::host::SessionItem),
+    SessionArrived(Box<crate::host::SessionItem>),
     StandingArrived(crate::host::StandingItem),
     KeysArrived(crate::host::KeysItem),
     ShowTab(String),
@@ -162,19 +162,20 @@ impl SettingsView {
 impl SettingsView {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(|value| Message::SessionArrived(Box::new(value))),
             if self.connected {
-                Subscription::batch([crate::host::standing(self.connection_serial)
-                    .map(move |value| Message::StandingArrived(value))])
+                Subscription::batch([
+                    crate::host::standing(self.connection_serial).map(Message::StandingArrived)
+                ])
             } else {
                 Subscription::none()
             },
-            if (self.connected && (!(self.seat_key).is_empty())) {
+            if self.connected && (!(self.seat_key).is_empty()) {
                 Subscription::batch([crate::host::account_keys(
                     self.connection_serial,
                     self.seat_key.to_owned(),
                 )
-                .map(move |value| Message::KeysArrived(value))])
+                .map(Message::KeysArrived)])
             } else {
                 Subscription::none()
             },
@@ -282,9 +283,9 @@ impl SettingsView {
             Message::BindAccountKeyLabelDraft(value) => self.on_bind_account_key_label_draft(value),
         }
     }
-    fn on_session_arrived(&mut self, item: crate::host::SessionItem) -> Task<Message> {
+    fn on_session_arrived(&mut self, item: Box<crate::host::SessionItem>) -> Task<Message> {
         self.host_error = item.error.to_owned();
-        if (!(item.error).is_empty()) {
+        if !(item.error).is_empty() {
             return Task::none();
         }
         let next = item.next.clone();
@@ -316,12 +317,12 @@ impl SettingsView {
         let renamed = crate::host::renamed_to(&(next.account_name), &(self.renaming_to));
         self.renaming_to = crate::host::keep_draft(renamed, &(self.renaming_to));
         self.account_name_draft = crate::host::keep_draft(renamed, &(self.account_name_draft));
-        let founded = (next.account_exists && (!self.account_exists));
+        let founded = next.account_exists && (!self.account_exists);
         self.account_exists = next.account_exists;
         self.account_number = next.account_number.to_owned();
         self.account_create_draft = crate::host::keep_draft(founded, &(self.account_create_draft));
         self.account_join_draft = crate::host::keep_draft(founded, &(self.account_join_draft));
-        let minted = (!(next.account_ticket).is_empty());
+        let minted = !(next.account_ticket).is_empty();
         self.account_key_draft = crate::host::keep_draft(minted, &(self.account_key_draft));
         self.account_key_label_draft =
             crate::host::keep_draft(minted, &(self.account_key_label_draft));
@@ -330,7 +331,7 @@ impl SettingsView {
     fn on_standing_arrived(&mut self, item: crate::host::StandingItem) -> Task<Message> {
         self.host_error = item.error.to_owned();
         self.members_answered = item.answered;
-        if (!(item.error).is_empty()) {
+        if !(item.error).is_empty() {
             return Task::none();
         }
         self.tier = item.next.tier.to_owned();
@@ -340,7 +341,7 @@ impl SettingsView {
     }
     fn on_keys_arrived(&mut self, item: crate::host::KeysItem) -> Task<Message> {
         self.host_error = item.error.to_owned();
-        if (!(item.error).is_empty()) {
+        if !(item.error).is_empty() {
             return Task::none();
         }
         self.account_key_rows = item.rows.clone();
@@ -359,7 +360,7 @@ impl SettingsView {
         Task::none()
     }
     fn on_settings_unlock_submit(&mut self, pw: String) -> Task<Message> {
-        if (self.busy || (pw).is_empty()) {
+        if self.busy || (pw).is_empty() {
             return Task::none();
         }
         crate::host::unlock(&(pw));
@@ -373,37 +374,37 @@ impl SettingsView {
         if !self.connected {
             return Task::none();
         }
-        if (self.account_busy || ((self.account_name_draft).trim().to_owned()).is_empty()) {
+        if self.account_busy || ((self.account_name_draft).trim().to_owned()).is_empty() {
             return Task::none();
         }
         self.renaming_to = (self.account_name_draft).trim().to_owned();
-        crate::host::rename_account(&((self.account_name_draft).trim().to_owned()));
+        crate::host::rename_account((self.account_name_draft).trim());
         Task::none()
     }
     fn on_account_create_submit(&mut self) -> Task<Message> {
         if !self.connected {
             return Task::none();
         }
-        if ((self.account_busy || (!self.unlocked))
-            || ((self.account_create_draft).trim().to_owned()).is_empty())
+        if (self.account_busy || (!self.unlocked))
+            || ((self.account_create_draft).trim().to_owned()).is_empty()
         {
             return Task::none();
         }
-        crate::host::create_account(&((self.account_create_draft).trim().to_owned()));
+        crate::host::create_account((self.account_create_draft).trim());
         Task::none()
     }
     fn on_account_key_add_submit(&mut self) -> Task<Message> {
         if !self.connected {
             return Task::none();
         }
-        if ((self.account_busy || (!self.unlocked))
-            || ((self.account_key_draft).trim().to_owned()).is_empty())
+        if (self.account_busy || (!self.unlocked))
+            || ((self.account_key_draft).trim().to_owned()).is_empty()
         {
             return Task::none();
         }
         crate::host::mint_ticket(
-            &((self.account_key_draft).trim().to_owned()),
-            &((self.account_key_label_draft).trim().to_owned()),
+            (self.account_key_draft).trim(),
+            (self.account_key_label_draft).trim(),
         );
         Task::none()
     }
@@ -411,12 +412,12 @@ impl SettingsView {
         if !self.connected {
             return Task::none();
         }
-        if ((self.account_busy || (!self.unlocked))
-            || ((self.account_join_draft).trim().to_owned()).is_empty())
+        if (self.account_busy || (!self.unlocked))
+            || ((self.account_join_draft).trim().to_owned()).is_empty()
         {
             return Task::none();
         }
-        crate::host::join_account(&((self.account_join_draft).trim().to_owned()));
+        crate::host::join_account((self.account_join_draft).trim());
         Task::none()
     }
     fn on_account_key_remove(&mut self, pubkey: String) -> Task<Message> {
@@ -433,14 +434,14 @@ impl SettingsView {
         if !self.connected {
             return Task::none();
         }
-        crate::host::add_passkey(&((self.account_key_label_draft).trim().to_owned()));
+        crate::host::add_passkey((self.account_key_label_draft).trim());
         Task::none()
     }
     fn on_account_passkey_desktop(&mut self) -> Task<Message> {
         if !self.connected {
             return Task::none();
         }
-        crate::host::add_passkey_here(&((self.account_key_label_draft).trim().to_owned()));
+        crate::host::add_passkey_here((self.account_key_label_draft).trim());
         Task::none()
     }
     fn on_account_ceremony_cancel(&mut self) -> Task<Message> {
@@ -451,7 +452,7 @@ impl SettingsView {
         if !self.connected {
             return Task::none();
         }
-        crate::host::link_wallet(&((self.account_key_label_draft).trim().to_owned()));
+        crate::host::link_wallet((self.account_key_label_draft).trim());
         Task::none()
     }
     fn on_account_login_submit(&mut self) -> Task<Message> {
