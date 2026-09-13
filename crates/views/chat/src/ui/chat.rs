@@ -724,6 +724,7 @@ impl ChatView {
                 ]);
             }
             MessageAction::Reactions => {
+                let mut choices = Vec::new();
                 for emoji in crate::host::reaction_palette() {
                     let mut button = action(
                         format!("{key}/{prefix}reaction/{emoji}"),
@@ -738,8 +739,21 @@ impl ChatView {
                         *label = Some("Add reaction".into());
                         *description = Some(emoji);
                     }
-                    children.push(button);
+                    choices.push(button);
                 }
+                children.push(wire::Node::Grid {
+                    key: format!("{key}/{prefix}reaction-grid"),
+                    columns: Some(8),
+                    fluid: None,
+                    spacing: Some(4.),
+                    padding: None,
+                    width: Some(wire::Length::Fill),
+                    height: None,
+                    aspect: None,
+                    background: None,
+                    border: None,
+                    children: choices,
+                });
             }
             MessageAction::Editing => {
                 children.push(wire::Node::Surface {

@@ -512,6 +512,48 @@ mod tests {
     }
 
     #[test]
+    fn reaction_menu_keeps_every_choice_in_four_native_grid_rows() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.selected_message_seq = 1;
+        state.message_action = MessageAction::Reactions;
+        let mut tree = state.view();
+        let mut grids = 0;
+        tree.for_each_mut(&mut |node| {
+            if let wire::Node::Grid {
+                key,
+                columns,
+                children,
+                ..
+            } = node
+                && key.ends_with("/message-reaction-grid")
+            {
+                assert_eq!(*columns, Some(8));
+                assert_eq!(children.len(), 32);
+                for (node, emoji) in children.iter().zip(crate::host::reaction_palette()) {
+                    let wire::Node::Button {
+                        on_press,
+                        description,
+                        content,
+                        ..
+                    } = node
+                    else {
+                        panic!("reaction choice must be a native button");
+                    };
+                    assert!(on_press.is_some());
+                    assert_eq!(description.as_ref(), Some(&emoji));
+                    assert!(
+                        matches!(content, wire::ButtonContent::Label(label) if label == &emoji)
+                    );
+                }
+                grids += 1;
+            }
+        });
+        assert_eq!(grids, 1);
+    }
+
+    #[test]
     fn snapshot_preserves_drafts_selection_and_subscription_identity() {
         let mut state = ChatView::state();
         state.search_draft = "unsent search".into();
