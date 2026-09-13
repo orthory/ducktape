@@ -506,7 +506,7 @@ impl super::ForgeView {
                                     children
                                         .push(
                                             self
-                                                .render_forge_tracker_list_44(
+                                                .issues(
                                                     format!("{}/ForgeTrackerList@3062", use_scope),
                                                     (move |event_0| Message::ForgeOpenItem(event_0)).clone(),
                                                 ),
@@ -518,7 +518,7 @@ impl super::ForgeView {
                                     children
                                         .push(
                                             self
-                                                .render_forge_tracker_list_46(
+                                                .pull_requests(
                                                     format!("{}/ForgeTrackerList@3070", use_scope),
                                                     (move |event_0| Message::ForgeOpenItem(event_0)).clone(),
                                                 ),
@@ -613,7 +613,7 @@ impl super::ForgeView {
                                             wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                                             ..Default::default() },), 16.0f32,),), }]; if self
                                             .forge_item_kind == "pr" { children.push(self
-                                            .render_pr_state_pill_49(format!("{}/PrStatePill@3124",
+                                            .pull_request_status(format!("{}/PrStatePill@3124",
                                             use_scope))); } if self.forge_item_kind != "pr" { children
                                             .push(self.item_status(format!("{}/StatusBadge@3126",
                                             use_scope))); } children.push(wire::Node::Button { checked :
@@ -744,7 +744,7 @@ impl super::ForgeView {
                                                         children
                                                             .push(
                                                                 self
-                                                                    .render_merged_banner_66(
+                                                                    .merged_notice(
                                                                         format!("{}/MergedBanner@3206", use_scope),
                                                                     ),
                                                             );
@@ -802,14 +802,14 @@ impl super::ForgeView {
                                                                 children
                                                                     .push(
                                                                         self
-                                                                            .render_merge_advisory_67(
+                                                                            .merge_advisory(
                                                                                 format!("{}/MergeAdvisory@3223", use_scope),
                                                                             ),
                                                                     );
                                                                 children
                                                                     .push({
                                                                         let mut children: Vec<wire::Node> = vec![
-                                                                            self.render_merge_button_69(format!("{}/MergeButton@3229",
+                                                                            self.merge_button(format!("{}/MergeButton@3229",
                                                                             use_scope), (move | | Message::ForgeMergeSubmit).clone()),
                                                                             native::text_options(native::text(format!("{}/@text:496",
                                                                             use_scope), self.forge_item_approvals.to_string(),),
@@ -904,7 +904,7 @@ impl super::ForgeView {
                                                         children
                                                             .push(
                                                                 self
-                                                                    .render_review_card_76(
+                                                                    .review(
                                                                         format!("{}/ReviewCard@3268", for_scope),
                                                                         (move |event_0| Message::OpenMessageLink(event_0)).clone(),
                                                                         review.clone(),
