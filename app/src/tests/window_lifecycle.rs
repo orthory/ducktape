@@ -317,8 +317,43 @@ fn phone_and_desktop_account_authentication_retire_together() {
 }
 #[test]
 fn browser_authentication_keeps_a_visible_cancel_action() {
-    let source = rust_tokens(include_str!("../../../crates/views/settings/src/lib.rs"));
-    assert!(source.contains("plate-cancel-working"));
+    use quote::ToTokens;
+    use syn::visit::Visit;
+
+    struct WorkingCancel(bool);
+    impl<'ast> Visit<'ast> for WorkingCancel {
+        fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+            let owns_ceremony = expression
+                .expr
+                .to_token_stream()
+                .to_string()
+                .contains("account_ceremony_phase");
+            if owns_ceremony {
+                for arm in &expression.arms {
+                    if arm.pat.to_token_stream().to_string() == "\"working\"" {
+                        let body = arm
+                            .body
+                            .to_token_stream()
+                            .to_string()
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .collect::<String>()
+                            .replace(",)", ")");
+                        self.0 = body.contains("settings_action(\"settings/ceremony-cancel\",\"Cancel\",Message::AccountCeremonyCancel,true)");
+                    }
+                }
+            }
+            syn::visit::visit_expr_match(self, expression);
+        }
+    }
+    let source = include_str!("../../../crates/views/settings/src/lib.rs");
+    let mut cancel = WorkingCancel(false);
+    cancel.visit_file(&syn::parse_file(source).expect("Settings Rust"));
+    assert!(
+        cancel.0,
+        "working ceremony renders an enabled cancellation action"
+    );
+    let source = rust_tokens(source);
     assert!(source.contains("crate::host::cancel_ceremony()"));
     let host = rust_tokens(include_str!("../../../crates/views/settings/src/host.rs"));
     assert!(host.contains("notify(\"settings.ceremony_cancel\",&())"));
