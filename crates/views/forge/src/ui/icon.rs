@@ -4,7 +4,6 @@ impl super::ForgeView {
         scope: String,
         name: &str,
         size: f32,
-        color: ducktape_view_guest::wire::Rgba,
         media: &str,
     ) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::wire::{Axis, Length, Node};
@@ -26,9 +25,9 @@ impl super::ForgeView {
                 key: format!("{scope}/{media}"),
                 hash,
                 bytes,
-                inherit_button_ink: false,
+                inherit_button_ink: true,
                 label: None,
-                color: Some(color),
+                color: None,
                 hover: None,
                 fit: None,
                 rotation: None,
