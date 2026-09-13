@@ -30,7 +30,6 @@ impl super::FilesView {
             Message::NewNameChanged(value) => self.on_new_name_changed(value),
             Message::DraftTransaction(transaction) => self.on_draft_transaction(transaction),
             Message::EditDraft(document) => self.on_edit_draft(document),
-            Message::Ignore => self.on_ignore(),
         }
     }
     fn on_tree_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
@@ -640,9 +639,6 @@ impl super::FilesView {
         document: ::ducktape_view_guest::EditorDocumentUpdate,
     ) -> ducktape_view_guest::Task<Message> {
         document.apply(&mut self.draft);
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_ignore(&mut self) -> ducktape_view_guest::Task<Message> {
         ::ducktape_view_guest::Task::none()
     }
 }
