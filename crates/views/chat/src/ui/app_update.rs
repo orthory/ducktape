@@ -77,21 +77,6 @@ impl super::ChatView {
             Message::ClearCopyRange => self.on_clear_copy_range(),
             Message::CopySelectedMessages => self.on_copy_selected_messages(),
             Message::CopyChord(fired) => self.on_copy_chord(fired),
-            Message::ChatScreenChatPointerPressed(scope, _x, y) => {
-                self.on_chat_screen_chat_pointer_pressed(scope, _x, y)
-            }
-            Message::ChatScreenChatResized(scope, _width, height) => {
-                self.on_chat_screen_chat_resized(scope, _width, height)
-            }
-            Message::ChatScreenThreadPointerPressed(scope, _x, y) => {
-                self.on_chat_screen_thread_pointer_pressed(scope, _x, y)
-            }
-            Message::ChatScreenThreadResized(scope, _width, height) => {
-                self.on_chat_screen_thread_resized(scope, _width, height)
-            }
-            Message::ChatScreenMessageActionFocusChanged(scope, value) => {
-                self.on_chat_screen_message_action_focus_changed(scope, value)
-            }
             Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
             Message::ChannelNameDraftChanged(value) => self.on_channel_name_draft_changed(value),
             Message::MemberKeyDraftChanged(value) => self.on_member_key_draft_changed(value),
@@ -232,16 +217,6 @@ impl super::ChatView {
                     ::std::convert::AsRef::as_ref(&(self.messages)),
                     self.unread_boundary,
                 );
-                {
-                    let next = crate::host::timeline_of(
-                        ::std::convert::AsRef::as_ref(&(self.messages)),
-                        ::std::convert::AsRef::as_ref(&(self.live_agents)),
-                    );
-                    if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                        self.timeline = next;
-                        self.timeline_revision += 1;
-                    }
-                }
                 self.room_key = crate::host::room_key(
                     self.connection_serial + self.room_serial,
                     self.names_serial,
@@ -272,7 +247,6 @@ impl super::ChatView {
                     let next = Vec::new();
                     if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                         self.thread_messages = next;
-                        self.thread_messages_revision += 1;
                     }
                 }
                 self.thread_has_more = false;
@@ -289,16 +263,6 @@ impl super::ChatView {
                 self.at_live_tail = true;
                 self.room_messages = Vec::new();
                 self.messages = Vec::new();
-                {
-                    let next = crate::host::timeline_of(
-                        ::std::convert::AsRef::as_ref(&(Vec::new())),
-                        ::std::convert::AsRef::as_ref(&(Vec::new())),
-                    );
-                    if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                        self.timeline = next;
-                        self.timeline_revision += 1;
-                    }
-                }
                 self.unread_marker_seq = 0;
                 self.channel_members = Vec::new();
                 self.post_refusal = "".to_owned();
@@ -391,16 +355,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(self.messages)),
             self.unread_boundary,
         );
-        {
-            let next = crate::host::timeline_of(
-                ::std::convert::AsRef::as_ref(&(self.messages)),
-                ::std::convert::AsRef::as_ref(&(self.live_agents)),
-            );
-            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                self.timeline = next;
-                self.timeline_revision += 1;
-            }
-        }
         self.has_older_history = item.has_older;
         self.history_view = (self.land_seq > 0) || (self.history_pages > 0);
         self.stream_reveal_key = crate::host::message_target_key(
@@ -460,7 +414,6 @@ impl super::ChatView {
             );
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.thread_target_seq = item.target_seq;
@@ -930,7 +883,6 @@ impl super::ChatView {
             let next = Vec::new();
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.thread_has_more = false;
@@ -955,7 +907,6 @@ impl super::ChatView {
             let next = Vec::new();
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.thread_pages = 0;
@@ -1022,16 +973,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(self.me)),
         );
         {
-            let next = crate::host::timeline_of(
-                ::std::convert::AsRef::as_ref(&(self.messages)),
-                ::std::convert::AsRef::as_ref(&(self.live_agents)),
-            );
-            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                self.timeline = next;
-                self.timeline_revision += 1;
-            }
-        }
-        {
             let next = crate::host::reaction_applied(
                 ::std::convert::AsRef::as_ref(&(self.thread_messages)),
                 self.selected_message_seq,
@@ -1040,7 +981,6 @@ impl super::ChatView {
             );
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.sent = crate::host::write_reaction(
@@ -1080,16 +1020,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(self.me)),
         );
         {
-            let next = crate::host::timeline_of(
-                ::std::convert::AsRef::as_ref(&(self.messages)),
-                ::std::convert::AsRef::as_ref(&(self.live_agents)),
-            );
-            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                self.timeline = next;
-                self.timeline_revision += 1;
-            }
-        }
-        {
             let next = crate::host::reaction_applied(
                 ::std::convert::AsRef::as_ref(&(self.thread_messages)),
                 seq,
@@ -1098,7 +1028,6 @@ impl super::ChatView {
             );
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.sent = crate::host::write_reaction(
@@ -1138,16 +1067,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(self.me)),
         );
         {
-            let next = crate::host::timeline_of(
-                ::std::convert::AsRef::as_ref(&(self.messages)),
-                ::std::convert::AsRef::as_ref(&(self.live_agents)),
-            );
-            if ::ducktape_view_guest::state_changed!(self.timeline, next) {
-                self.timeline = next;
-                self.timeline_revision += 1;
-            }
-        }
-        {
             let next = crate::host::reaction_applied(
                 ::std::convert::AsRef::as_ref(&(self.thread_messages)),
                 seq,
@@ -1156,7 +1075,6 @@ impl super::ChatView {
             );
             if ::ducktape_view_guest::state_changed!(self.thread_messages, next) {
                 self.thread_messages = next;
-                self.thread_messages_revision += 1;
             }
         }
         self.sent = crate::host::write_reaction(
@@ -1336,105 +1254,6 @@ impl super::ChatView {
             ),
             ::std::convert::AsRef::as_ref(&(crate::host::copy_range_label(count))),
         );
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_chat_screen_chat_pointer_pressed(
-        &mut self,
-        scope: String,
-        _x: f64,
-        y: f64,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
-        let local = self
-            .chat_screen_states
-            .entry(scope.clone())
-            .or_insert_with(|| ChatScreenState {
-                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
-                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
-                chat_height: self.chat_screen_initial.chat_height.clone(),
-                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
-                thread_height: self.chat_screen_initial.thread_height.clone(),
-            });
-        local.chat_pointer_y = y;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_chat_screen_chat_resized(
-        &mut self,
-        scope: String,
-        _width: f64,
-        height: f64,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
-        let local = self
-            .chat_screen_states
-            .entry(scope.clone())
-            .or_insert_with(|| ChatScreenState {
-                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
-                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
-                chat_height: self.chat_screen_initial.chat_height.clone(),
-                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
-                thread_height: self.chat_screen_initial.thread_height.clone(),
-            });
-        local.chat_height = height;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_chat_screen_thread_pointer_pressed(
-        &mut self,
-        scope: String,
-        _x: f64,
-        y: f64,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
-        let local = self
-            .chat_screen_states
-            .entry(scope.clone())
-            .or_insert_with(|| ChatScreenState {
-                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
-                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
-                chat_height: self.chat_screen_initial.chat_height.clone(),
-                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
-                thread_height: self.chat_screen_initial.thread_height.clone(),
-            });
-        local.thread_pointer_y = y;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_chat_screen_thread_resized(
-        &mut self,
-        scope: String,
-        _width: f64,
-        height: f64,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope.clone()));
-        let local = self
-            .chat_screen_states
-            .entry(scope.clone())
-            .or_insert_with(|| ChatScreenState {
-                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
-                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
-                chat_height: self.chat_screen_initial.chat_height.clone(),
-                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
-                thread_height: self.chat_screen_initial.thread_height.clone(),
-            });
-        local.thread_height = height;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_chat_screen_message_action_focus_changed(
-        &mut self,
-        scope: String,
-        value: String,
-    ) -> ducktape_view_guest::Task<Message> {
-        ::ducktape_view_guest::invalidate_component("ChatScreen", &(scope));
-        let local = self
-            .chat_screen_states
-            .entry(scope)
-            .or_insert_with(|| ChatScreenState {
-                message_action_focus: self.chat_screen_initial.message_action_focus.clone(),
-                chat_pointer_y: self.chat_screen_initial.chat_pointer_y.clone(),
-                chat_height: self.chat_screen_initial.chat_height.clone(),
-                thread_pointer_y: self.chat_screen_initial.thread_pointer_y.clone(),
-                thread_height: self.chat_screen_initial.thread_height.clone(),
-            });
-        local.message_action_focus = value;
         ::ducktape_view_guest::Task::none()
     }
     fn on_search_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {

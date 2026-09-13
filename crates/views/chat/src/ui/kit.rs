@@ -2,13 +2,23 @@ use super::*;
 use ducktape_view_guest::slots;
 
 impl ChatView {
-    pub(super) fn message_card(&self, message: &crate::host::ChatMessage, surface: CopySurface, plate: RowPlate) -> wire::Node {
+    pub(super) fn message_card(
+        &self,
+        message: &crate::host::ChatMessage,
+        surface: CopySurface,
+        plate: RowPlate,
+    ) -> wire::Node {
         let key = format!("message/{surface:?}/{}", message.view_key);
         let mut children = Vec::new();
         match plate {
-            RowPlate::Plain => {},
-            RowPlate::Selected => children.push(native::text(format!("{key}/selected"), "Selected message")),
-            RowPlate::Ranged => children.push(native::text(format!("{key}/selected"), "Included in copy selection")),
+            RowPlate::Plain => {}
+            RowPlate::Selected => {
+                children.push(native::text(format!("{key}/selected"), "Selected message"))
+            }
+            RowPlate::Ranged => children.push(native::text(
+                format!("{key}/selected"),
+                "Included in copy selection",
+            )),
         }
         children.push(self.message_contents(format!("{key}/contents"), message, surface));
         native::column(key, children)

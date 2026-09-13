@@ -76,8 +76,17 @@ impl ChatView {
         )
     }
     fn sidebar(&self, key: &str) -> wire::Node {
-        let mut search = field(format!("{key}/channel-sidebar/chat-search"), "Search messages", &self.search_draft, Message::SearchDraftChanged, Some(Message::SearchChatSubmit), false);
-        if let wire::Node::Input { placeholder, .. } = &mut search { *placeholder = "Search…".into(); }
+        let mut search = field(
+            format!("{key}/channel-sidebar/chat-search"),
+            "Search messages",
+            &self.search_draft,
+            Message::SearchDraftChanged,
+            Some(Message::SearchChatSubmit),
+            false,
+        );
+        if let wire::Node::Input { placeholder, .. } = &mut search {
+            *placeholder = "Search…".into();
+        }
         let mut children = vec![
             native::heading(format!("{key}/network"), &self.network_name),
             native::text(
@@ -189,8 +198,15 @@ impl ChatView {
         if !self.host_error.is_empty() {
             children.push(native::text(format!("{key}/error"), &self.host_error));
         }
-        let query_matches = !self.search_query.is_empty() && self.search_draft.trim() == self.search_query;
-        let search_stands = query_matches && (self.search_phase == SearchPhase::Searching || crate::host::search_answer_stands(&self.search_query, &self.search_draft, false));
+        let query_matches =
+            !self.search_query.is_empty() && self.search_draft.trim() == self.search_query;
+        let search_stands = query_matches
+            && (self.search_phase == SearchPhase::Searching
+                || crate::host::search_answer_stands(
+                    &self.search_query,
+                    &self.search_draft,
+                    false,
+                ));
         if search_stands {
             children.push(self.search_results(format!("{key}/search-results")));
         } else {
@@ -319,9 +335,19 @@ impl ChatView {
                 if crate::host::run_in_thread(live, message.seq) {
                     let run_key = format!("{scope}/run/{}", live.agent);
                     let content = if thread {
-                        self.live_run_card(run_key, Message::CancelRun, Message::OpenRun, live.clone())
+                        self.live_run_card(
+                            run_key,
+                            Message::CancelRun,
+                            Message::OpenRun,
+                            live.clone(),
+                        )
                     } else {
-                        action(run_key, &crate::host::live_thread_label(&live.agent), Message::OpenThreadFor(message.seq), false)
+                        action(
+                            run_key,
+                            &crate::host::live_thread_label(&live.agent),
+                            Message::OpenThreadFor(message.seq),
+                            false,
+                        )
                     };
                     children.push(content);
                 }
@@ -347,7 +373,12 @@ impl ChatView {
             };
             let [reaction, more] = actions;
             if !message.pending && !message.deleted {
-                children.push(action(format!("{scope}/thumbs-up"), "React with 👍", Message::AddReactionAt(message.seq, "👍".into()), self.active_channel_archived));
+                children.push(action(
+                    format!("{scope}/thumbs-up"),
+                    "React with 👍",
+                    Message::AddReactionAt(message.seq, "👍".into()),
+                    self.active_channel_archived,
+                ));
                 children.push(native::row(
                     format!("{scope}/actions"),
                     [

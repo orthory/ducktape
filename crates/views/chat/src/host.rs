@@ -19,9 +19,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use ducktape_view_guest::host;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ducktape_view_guest::host;
 
 /// One page of roots, replies or hits — chat's own index page size.
 const PAGE_LIMIT: usize = 64;
@@ -431,7 +431,7 @@ async fn view(variant: &str, query: serde_json::Value) -> Result<serde_json::Val
 }
 
 /// What the room subscription is keyed by: a fresh key re-reads the room.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomKey {
     pub serial: i64,
     pub names: i64,
@@ -606,10 +606,7 @@ async fn older_roots_exist(channel: &str, floor: u64) -> Result<bool, String> {
         }),
     )
     .await?;
-    Ok(!page["roots"]
-        .as_array()
-        .map(Vec::is_empty)
-        .unwrap_or(true))
+    Ok(!page["roots"].as_array().map(Vec::is_empty).unwrap_or(true))
 }
 
 async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
@@ -642,7 +639,7 @@ async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, S
 }
 
 /// What the thread subscription is keyed by.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadKey {
     pub serial: i64,
     pub names: i64,
@@ -759,7 +756,7 @@ async fn read_thread_now(key: &ThreadKey, names: &Names) -> Result<ThreadItem, S
 }
 
 /// What the search subscription is keyed by: an empty query reads nothing.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchKey {
     pub serial: i64,
     pub names: i64,
@@ -1300,7 +1297,10 @@ fn avatar_initial(author: &str, names: &Names) -> String {
     source
         .chars()
         .find(char::is_ascii_alphanumeric)
-        .map_or_else(|| "•".into(), |glyph| glyph.to_ascii_uppercase().to_string())
+        .map_or_else(
+            || "•".into(),
+            |glyph| glyph.to_ascii_uppercase().to_string(),
+        )
 }
 
 /// A person's key or account is `human`; a program account (an agent's) and
@@ -1345,8 +1345,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
-    let looks_hex =
-        !hex.is_empty() && hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    let looks_hex = !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit());
     if !looks_hex {
         return Vec::new();
     }
@@ -1713,10 +1714,6 @@ pub(crate) fn copy_range_after_press(
     }
 }
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
 pub fn connection_degraded(status: &str) -> bool {
     status == "Offline"
         || status == "Sync delayed"
@@ -1763,23 +1760,6 @@ pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
 /// `chiefduck · View thread` — the live run card's one label.
 pub fn live_thread_label(agent: &str) -> String {
     format!("{agent} · View thread")
-}
-
-/// The stream and the runs live in it, as one value: the timeline memo hashes
-/// its one dependency, so the two lists that draw together must cross the
-/// boundary together — a run's status folded into `live_agents` alone would
-/// leave the memo's key unmoved and the hint would never repaint.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct Timeline {
-    pub messages: Vec<ChatMessage>,
-    pub live_agents: Vec<LiveRunHint>,
-}
-
-pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveRunHint]) -> Timeline {
-    Timeline {
-        messages: messages.to_vec(),
-        live_agents: live_agents.to_vec(),
-    }
 }
 
 /// The rows the sends in flight add at the tail of `messages`.
@@ -2084,7 +2064,6 @@ pub(crate) fn surface_name(surface: crate::CopySurface) -> String {
     }
     .to_owned()
 }
-
 
 pub fn no_dm_peer() -> DmPeer {
     DmPeer::default()

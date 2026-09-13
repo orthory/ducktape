@@ -29,7 +29,13 @@ impl ChatView {
             Some(slots::message(choose(channel.id)))
         };
         let mut button = native::button(key, label, action, wire::ButtonPreset::Secondary);
-        if let wire::Node::Button { checked, width, label, .. } = &mut button {
+        if let wire::Node::Button {
+            checked,
+            width,
+            label,
+            ..
+        } = &mut button
+        {
             *checked = Some(selected);
             *width = Some(wire::Length::Fill);
             *label = Some(channel.name);
@@ -51,10 +57,13 @@ impl ChatView {
         let content = native::column(
             format!("{key}/content"),
             [
-            native::row(format!("{key}/byline"), [
-                native::text(format!("{key}/author"), hit.author),
-                native::text(format!("{key}/meta"), hit.meta),
-            ]),
+                native::row(
+                    format!("{key}/byline"),
+                    [
+                        native::text(format!("{key}/author"), hit.author),
+                        native::text(format!("{key}/meta"), hit.meta),
+                    ],
+                ),
                 native::text(format!("{key}/text"), hit.text.clone()),
             ],
         );
