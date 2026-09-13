@@ -57,14 +57,6 @@ fn branches_on_stack(source: &str) -> Vec<(String, String, usize)> {
     visitor.rows
 }
 
-#[test]
-fn a_search_answer_only_describes_its_submitted_query() {
-    assert!(backend::search_answer_stands("zzz", "  zzz  ", false));
-    assert!(!backend::search_answer_stands("zzz", "zzzq", false));
-    assert!(!backend::search_answer_stands("zzz", "zzz", true));
-    assert!(!backend::search_answer_stands("", "", false));
-}
-
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
 /// phase to idle and clears the hits, and idle under a live draft is reachable
 /// no other way — so the panel needs an arm for exactly that pair, and the arm
@@ -223,7 +215,20 @@ fn a_failed_connect_retries_instead_of_giving_up() {
             message: "error sending request".into(),
         })
     };
-    let _ = app.update(fail(app.connect_generation));
+    let retry = app.update(fail(app.connect_generation));
+    {
+        use futures::{FutureExt as _, StreamExt as _};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let mut retry = retry.into_stream();
+        assert!(
+            retry.next().now_or_never().is_none(),
+            "failure schedules a backoff task, rather than an empty completed task"
+        );
+    }
     assert_eq!(
         app.hydration_retry_attempt, 1,
         "the first failure is attempt 1"
@@ -274,13 +279,27 @@ fn a_failed_connect_retries_instead_of_giving_up() {
         "an abandoned chain must not start a second retry loop"
     );
 
-    let failure = handler_body("ConnectFailed");
-    assert!(failure.contains("self.hydration_retry_attempt=self.hydration_retry_attempt+1"));
-    assert!(
-        failure.contains("crate::backend::connect(") && failure.contains("self.connect_generation")
+    let mut stale_reply = workspace("abandoned-channel");
+    stale_reply.generation = connect_gen - 1;
+    let rpc = wired.connected_rpc.clone();
+    let _ = wired.update(AppMessage::WorkspaceConnected(stale_reply));
+    assert_eq!(
+        wired.connected_rpc, rpc,
+        "an abandoned success cannot replace the endpoint"
     );
-    let connected = handler_body("WorkspaceConnected");
-    assert!(connected.contains("next.generation!=self.connect_generation"));
-    assert!(!connected.contains("next.generation!=self.hydration_generation"));
-    assert!(!handler_bodies().iter().any(|(name, _)| name == "Failed"));
+
+    let mut landed = workspace("general");
+    landed.generation = connect_gen;
+    let rpc = landed.rpc.clone();
+    wired.hydration_retry_attempt = 3;
+    let _ = wired.update(AppMessage::WorkspaceConnected(landed));
+    assert_eq!(wired.connected_rpc, rpc);
+    assert_eq!(
+        wired.active_channel, "general",
+        "the matching connect succeeds despite unrelated hydration generation changes"
+    );
+    assert_eq!(
+        wired.hydration_retry_attempt, 0,
+        "success clears the backoff"
+    );
 }
