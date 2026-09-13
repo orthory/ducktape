@@ -6,12 +6,12 @@ use syn::visit::Visit;
 const SETTINGS: &str = include_str!("../../../crates/views/settings/src/lib.rs");
 const PANES: [&str; 4] = ["General", "Network", "Account", "Security"];
 const GROUPS: [(&str, &str); 6] = [
-    ("APPEARANCE", "General"),
-    ("NOTIFICATIONS", "General"),
-    ("NETWORK", "Network"),
-    ("YOURIDENTITY", "Account"),
-    ("ACCOUNTKEYS", "Account"),
-    ("IDENTITYKEY", "Security"),
+    ("settings/appearance", "General"),
+    ("settings/notifications", "General"),
+    ("settings/network", "Network"),
+    ("settings/identity-title", "Account"),
+    ("settings/keys-title", "Account"),
+    ("settings/security-title", "Security"),
 ];
 
 fn pane_arms() -> Vec<(String, String)> {
@@ -25,6 +25,21 @@ fn pane_arms() -> Vec<(String, String)> {
 
 fn authored_items() -> syn::File {
     syn::parse_file(SETTINGS).unwrap()
+}
+
+fn view_method(file: &syn::File) -> &syn::ImplItemFn {
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(&item.items),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "view" => Some(method),
+            _ => None,
+        })
+        .expect("Settings has one authored view")
 }
 
 fn pane_arms_on_stack() -> Vec<(String, String)> {
@@ -55,7 +70,7 @@ fn pane_arms_on_stack() -> Vec<(String, String)> {
     }
     let mut visitor = Panes(Vec::new());
     let file = authored_items();
-    visitor.visit_file(&file);
+    visitor.visit_impl_item_fn(view_method(&file));
     struct Methods(Vec<(String, String)>);
     impl<'ast> Visit<'ast> for Methods {
         fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
@@ -103,13 +118,68 @@ fn every_group_is_authored_under_exactly_one_pane() {
 
 #[test]
 fn every_pane_has_a_tab_and_an_arm() {
-    let source = rust_tokens(SETTINGS);
+    let file = authored_items();
+    let method = view_method(&file);
+    let tabs = method
+        .block
+        .stmts
+        .iter()
+        .find_map(|statement| {
+            let syn::Stmt::Local(local) = statement else {
+                return None;
+            };
+            let syn::Pat::Ident(binding) = &local.pat else {
+                return None;
+            };
+            if binding.ident != "tabs" {
+                return None;
+            }
+            let syn::Expr::Array(array) = local.init.as_ref()?.expr.as_ref() else {
+                return None;
+            };
+            Some(array)
+        })
+        .expect("the tab strip declares its pane choices");
     let arms = pane_arms();
     assert_eq!(arms.len(), PANES.len(), "one exhaustive pane dispatch");
-    for pane in PANES {
-        assert!(source.contains(&format!("/settings-{}-tab", pane.to_lowercase())));
+    assert_eq!(tabs.elems.len(), PANES.len(), "one tab per pane");
+    for (choice, pane) in tabs.elems.iter().zip(PANES) {
+        let syn::Expr::Tuple(choice) = choice else {
+            panic!("tab choice is key, label, pane");
+        };
+        assert_eq!(choice.elems.len(), 3);
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(key),
+            ..
+        }) = &choice.elems[0]
+        else {
+            panic!("tab key");
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(label),
+            ..
+        }) = &choice.elems[1]
+        else {
+            panic!("tab label");
+        };
+        let syn::Expr::Path(target) = &choice.elems[2] else {
+            panic!("tab pane route");
+        };
+        assert_eq!(key.value(), pane.to_lowercase());
+        assert_eq!(label.value(), pane);
+        assert_eq!(
+            target.path.to_token_stream().to_string(),
+            format!("SettingsPane :: {pane}")
+        );
         assert_eq!(arms.iter().filter(|(name, _)| name == pane).count(), 1);
     }
+    let body = rust_tokens(&method.block.to_token_stream().to_string());
+    assert!(body.contains("tabs.into_iter().map(|(key,label,pane)|"));
+    assert!(body.contains("Message::PickSettingsPane(SETTINGS_SCOPE.into(),pane)"));
+    assert!(
+        body.contains("Some(state.settings_pane==pane)"),
+        "native checked state follows the same pane"
+    );
 }
 
 #[test]
@@ -156,6 +226,15 @@ fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
             1
         );
     }
+    let file = authored_items();
+    let body = rust_tokens(&view_method(&file).block.to_token_stream().to_string());
+    assert_eq!(body.matches("matchstate.settings_pane").count(), 1);
+    for (group, _) in GROUPS {
+        assert!(
+            !body.contains(&format!("\"{group}\"")),
+            "groups belong to pane methods, never the common screen"
+        );
+    }
 }
 
 #[test]
@@ -168,7 +247,19 @@ fn the_pane_moves_only_through_the_strip() {
 
 #[test]
 fn the_scrollable_is_the_screens_root() {
-    let source = rust_tokens(SETTINGS);
-    assert!(source.contains("format!(\"{}/settings-body\""));
-    assert!(source.contains("Node::Scroll{on_scroll:"));
+    let file = authored_items();
+    let method = view_method(&file);
+    let Some(syn::Stmt::Expr(syn::Expr::Call(root), None)) = method.block.stmts.last() else {
+        panic!("the view returns its scroll root directly");
+    };
+    let syn::Expr::Path(function) = root.func.as_ref() else {
+        panic!("named root builder");
+    };
+    assert_eq!(function.path.to_token_stream().to_string(), "kit :: scroll");
+    assert_eq!(root.args.len(), 2);
+    assert!(
+        rust_tokens(&root.args[1].to_token_stream().to_string())
+            .contains("kit::column(\"settings/content\",content)"),
+        "the entire header, tab strip and selected pane share the scroll root"
+    );
 }
