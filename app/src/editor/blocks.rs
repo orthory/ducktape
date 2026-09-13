@@ -94,6 +94,84 @@ impl EventEmitter<()> for WireEditor {}
 
 #[cfg(test)]
 #[gpui_kit::test]
+fn empty_editor_updates_native_placeholder_and_hides_it_after_typing(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt as _;
+    cx.update(gpui_kit::init);
+    let store = EditorStore::new(79);
+    let reference = wire::editor_document::EditorDocumentRef {
+        document: "empty".into(),
+        reset: 1,
+        revision: 0,
+        text_revision: 0,
+        byte_len: 0,
+        cursor: Default::default(),
+    };
+    {
+        let mut locked = store.lock();
+        locked.fields.insert(
+            "document".into(),
+            super::Field {
+                reference: reference.clone(),
+                handler: 1,
+                editable: true,
+                placeholder: "Start writing".into(),
+                options: Default::default(),
+            },
+        );
+        locked.documents.insert(
+            reference.document.clone(),
+            super::Document {
+                reference,
+                text: Some(Arc::from("")),
+                queue: Default::default(),
+                queued_bytes: 0,
+                phase: super::Phase::Ready,
+            },
+        );
+    }
+    let window = cx.open_window(gpui_kit::size(px(400.), px(200.)), |window, cx| {
+        WireEditor::new("document".into(), store.clone(), window, cx)
+    });
+    let editor = window.root(cx).unwrap();
+    let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        let input = &editor.read(cx).lines[0].input;
+        assert!(input.read(cx).value().is_empty());
+        assert_eq!(
+            input.read(cx).presentation().placeholder().as_ref(),
+            "Start writing"
+        );
+    });
+    store.lock().fields.get_mut("document").unwrap().placeholder = "새 문서".into();
+    native.update(|window, cx| {
+        editor.update(cx, |editor, cx| editor.sync(window, cx));
+        window.render_frame(cx);
+        let input = &editor.read(cx).lines[0].input;
+        assert_eq!(
+            input.read(cx).presentation().placeholder().as_ref(),
+            "새 문서"
+        );
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        window.render_frame(cx);
+        window.input("Written text", cx);
+    });
+    native.run_until_parked();
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        let editor = editor.read(cx);
+        assert_eq!(editor.preview.as_ref(), "Written text");
+        let input = editor.lines[0].input.read(cx);
+        assert_eq!(input.value().as_ref(), "Written text");
+        assert!(input.presentation().placeholder().is_empty());
+        window.blur(cx);
+    });
+}
+
+#[cfg(test)]
+#[gpui_kit::test]
 fn typing_after_enter_waits_for_the_new_paragraph(cx: &mut gpui_kit::TestAppContext) {
     enter_typing(cx, true);
 }
@@ -419,6 +497,11 @@ impl WireEditor {
         }
         let repaint = install
             || self.painted.as_ref() != Some(&projection.options)
+            || self
+                .projection
+                .as_ref()
+                .map(|previous| &previous.placeholder)
+                != Some(&projection.placeholder)
             || self.lines.len() != wire::editor_lines(&self.preview).count();
         if repaint {
             let display = line_projections(&self.preview, &projection.options);
@@ -465,6 +548,12 @@ impl WireEditor {
                 let text = &row.projection.display;
                 let local_cursor = local_cursor(&row.projection, self.cursor, index);
                 row.input.update(cx, |input, cx| {
+                    let placeholder = if index == 0 && self.preview.is_empty() {
+                        projection.placeholder.clone()
+                    } else {
+                        String::new()
+                    };
+                    input.set_placeholder(placeholder, window, cx);
                     if input.value().as_ref() != text {
                         input.set_value(text.clone(), window, cx);
                     }
