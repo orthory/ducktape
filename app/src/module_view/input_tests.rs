@@ -113,8 +113,12 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
         (&["More message actions"][..], "Add reaction", false),
         (&["Manage reactions"][..], "🦆", true),
     ] {
-        let seat = seated(opened);
+        let seat = seated(&[]);
         let (view, mut native) = open(cx);
+        for label in opened {
+            click_before_frame(&mut native, button(&seat, label));
+            native.update(|window, cx| window.render_frame(cx));
+        }
         let focus = if reacted { "reaction" } else { "action" };
         native.update(|window, cx| {
             let content = view.read(cx).content.clone().unwrap();
