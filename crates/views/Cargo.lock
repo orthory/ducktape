@@ -111,7 +111,6 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "chat-view"
 version = "0.1.0"
 dependencies = [
- "design",
  "ducktape-view-guest",
  "futures",
  "serde",
@@ -438,7 +437,6 @@ dependencies = [
 name = "explorer-view"
 version = "0.1.0"
 dependencies = [
- "design",
  "ducktape-view-guest",
  "futures",
  "serde",
@@ -450,7 +448,6 @@ name = "files-view"
 version = "0.1.0"
 dependencies = [
  "base64",
- "design",
  "ducktape-view-guest",
  "futures",
  "serde",
@@ -479,7 +476,6 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 name = "forge-view"
 version = "0.1.0"
 dependencies = [
- "design",
  "ducktape-view-guest",
  "futures",
  "serde",
@@ -816,7 +812,6 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "node-view"
 version = "0.1.0"
 dependencies = [
- "design",
  "ducktape-view-guest",
  "futures",
  "serde",
