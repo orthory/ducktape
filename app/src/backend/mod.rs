@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
+use ::chat::index::{ChatViewQuery, ChatViewReply};
 // No `ChatQuery`/`ChatReply` here on purpose: every chat read in this app goes
 // through `/v1/index/chat/view`, off the node's select loop. A dispatch query
 // import reappearing is the signal that one crawled back onto it.
@@ -24,14 +24,13 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
-    CHAT_HOT_WINDOW_LIMIT, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReader,
-    MentionCandidates, NameDirectory, author_display, chat_message, mark_message_groups,
-    short_label,
+    ChatChannel, ChatDelta, ChatMember, ChatReader, MentionCandidates, NameDirectory,
+    author_display, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{BoundAccount, author_name, paragraph_blocks};
+pub use ::chat::client::{BoundAccount, ChatMessage, author_name, paragraph_blocks};
 pub use inbox::client::{BellDelta, BellItem};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
@@ -274,7 +273,7 @@ pub use rpc::*;
 pub use search::*;
 pub use shell::*;
 pub use storage::*;
-pub use style::*;
+pub(crate) use style::*;
 
 #[cfg(test)]
 mod tests;
