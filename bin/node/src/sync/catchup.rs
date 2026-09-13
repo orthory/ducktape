@@ -372,7 +372,13 @@ pub(crate) fn advance_next_seq_from_frames(next_seq: &mut u64, frames: &[Vec<u8>
             if let Some((origin, seq)) = node::frame_origin_seq(&member)
                 && origin == me
             {
-                *next_seq = (*next_seq).max(seq + 1);
+                // Finalized batches are journaled before member admission;
+                // their claimed sender and sequence are not yet authenticated.
+                if node::decode_frame(&member).is_err() {
+                    continue;
+                }
+                let following = seq.checked_add(1).expect("local submit sequence exhausted");
+                *next_seq = (*next_seq).max(following);
             }
         }
     }
@@ -457,6 +463,62 @@ mod tests {
         let mut next_seq = 3;
         advance_next_seq_from_frames(&mut next_seq, &retained, local.public_key().as_ref());
         assert_eq!(next_seq, 13);
+    }
+
+    #[test]
+    fn sequence_recovery_does_not_trust_forged_local_headers() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+        let local = PrivateKey::from_seed(1);
+        let message = sdk::Msg {
+            target: "heartbeat".into(),
+            payload: Vec::new(),
+        };
+        let mut forged = node::frame_preimage(
+            keyscheme::KeyScheme::Ed25519,
+            local.public_key().as_ref(),
+            u64::MAX,
+            &message,
+        );
+        let mut truncated = forged.clone();
+        truncated.pop();
+        forged.extend_from_slice(&[0; 64]);
+
+        for member in [forged, truncated] {
+            assert_eq!(
+                node::frame_origin_seq(&member),
+                Some((local.public_key().as_ref().to_vec(), u64::MAX))
+            );
+            assert!(node::decode_frame(&member).is_err());
+            let mut next_seq = 40;
+            advance_next_seq_from_frames(
+                &mut next_seq,
+                &[node::encode_batch(&[member])],
+                local.public_key().as_ref(),
+            );
+            assert_eq!(next_seq, 40);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "local submit sequence exhausted")]
+    fn sequence_recovery_fails_closed_when_the_local_sequence_is_exhausted() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+        let local = PrivateKey::from_seed(1);
+        let member = node::encode_frame(
+            &local,
+            u64::MAX,
+            &sdk::Msg {
+                target: "heartbeat".into(),
+                payload: Vec::new(),
+            },
+        );
+        advance_next_seq_from_frames(
+            &mut 40,
+            &[node::encode_batch(&[member])],
+            local.public_key().as_ref(),
+        );
     }
 
     /// the drain's checkpoint capture, with the manifest fields this path
