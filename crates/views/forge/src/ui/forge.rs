@@ -134,7 +134,7 @@ impl super::ForgeView {
                     content: Box::new({
                         let mut children: Vec<wire::Node> = vec![
                             self
-                            .render_forge_org_header_3(format!("{}/ForgeOrgHeader@2809",
+                            .organization_header(format!("{}/ForgeOrgHeader@2809",
                             use_scope))
                         ];
                         if self.repos.is_empty() && self.list_phase == "loading" {
@@ -269,7 +269,7 @@ impl super::ForgeView {
                                             "{}/@for:2867({})", use_scope, index
                                         );
                                         let flex_child: wire::Node = self
-                                            .render_repo_card_5(
+                                            .repository(
                                                 format!("{}/RepoCard@2868", for_scope),
                                                 (move |event_0| Message::ForgeOpenRepo(event_0)).clone(),
                                                 repo.clone(),
@@ -344,7 +344,7 @@ impl super::ForgeView {
                         vec![wire::Node::Button { checked : None, expanded : None,
                         description : None, key : format!("{}/@button:145", use_scope),
                         content : wire::ButtonContent::Child(Box::new(self
-                        .render_repo_crumb_7(format!("{}/RepoCrumb@2893",
+                        .repository_breadcrumb(format!("{}/RepoCrumb@2893",
                         use_scope)),),), label : Some(String::from("All repos"
                         .to_owned())), on_press :
                         Some(::ducktape_view_guest::slots::message(Message::ForgeCloseRepo,),),
@@ -413,7 +413,7 @@ impl super::ForgeView {
                         children : children, } }); } children.push(wire::Node::Space {
                         width : Some(wire::Length::Fill), height : None, }); if self
                         .forge_item_number > 0 && self.item_phase == "ready" { children
-                        .push(self.render_back_to_list_9(format!("{}/BackToList@2944",
+                        .push(self.back_to_tracker(format!("{}/BackToList@2944",
                         use_scope), (move | | Message::ForgeCloseItem).clone())); } if
                         self.forge_item_number > 0 && self.item_phase != "ready" {
                         children
