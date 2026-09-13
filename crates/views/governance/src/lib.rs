@@ -759,7 +759,7 @@ impl GovernanceView {
             available.then(|| slots::message(Message::GovVote(proposal.id.clone(), false))),
             wire::ButtonPreset::Danger,
         );
-        let approval = if proposal.approvals < proposal.required_yes {
+        let mut approval = if proposal.approvals < proposal.required_yes {
             kit::button(
                 format!("{key}/approve"),
                 host::approve_label(proposal.approvals, proposal.required_yes),
@@ -774,6 +774,16 @@ impl GovernanceView {
                 wire::ButtonPreset::Primary,
             )
         };
+        if let wire::Node::Button { label, .. } = &mut approval {
+            *label = Some(
+                if proposal.approvals < proposal.required_yes {
+                    "Approve"
+                } else {
+                    "Settle"
+                }
+                .into(),
+            );
+        }
         content.push(kit::row(format!("{key}/actions"), [reject, approval]));
         kit::padded(kit::column(key, content), wire::Edges::all(12.))
     }
