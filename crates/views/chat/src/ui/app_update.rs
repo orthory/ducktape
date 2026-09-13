@@ -641,15 +641,11 @@ impl super::ChatView {
         self.selected_message_rev = rev;
         self.message_action = MessageAction::More;
         self.message_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/message-action-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/message-action-focus"),
+            },
+        )
     }
     fn on_open_message_reactions(
         &mut self,
@@ -671,15 +667,11 @@ impl super::ChatView {
         self.selected_message_rev = rev;
         self.message_action = MessageAction::Reactions;
         self.message_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/message-reaction-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/message-reaction-focus"),
+            },
+        )
     }
     fn on_begin_message_edit(
         &mut self,
@@ -726,15 +718,11 @@ impl super::ChatView {
         self.selected_message_rev = rev;
         self.message_action = MessageAction::Delete;
         self.message_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/message-delete-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/message-delete-focus"),
+            },
+        )
     }
     fn on_clear_message_selection(&mut self) -> ducktape_view_guest::Task<Message> {
         self.selected_message_seq = 0;
@@ -756,15 +744,11 @@ impl super::ChatView {
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::More;
         self.thread_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/thread-pane/thread-action-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/thread-pane/thread-action-focus"),
+            },
+        )
     }
     fn on_open_thread_message_reactions(
         &mut self,
@@ -786,15 +770,11 @@ impl super::ChatView {
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::Reactions;
         self.thread_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/thread-pane/thread-reaction-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/thread-pane/thread-reaction-focus"),
+            },
+        )
     }
     fn on_begin_thread_message_edit(
         &mut self,
@@ -844,15 +824,11 @@ impl super::ChatView {
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::Delete;
         self.thread_edit_draft = body.to_owned();
-        return ::ducktape_view_guest::Task::none()
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                    target: String::from("ChatView/chat/thread-pane/thread-delete-focus"),
-                },
-            ))
-            .chain(::ducktape_view_guest::widget::perform::<Message>(
-                ::ducktape_view_guest::wire::WidgetCommand::FocusNext,
-            ));
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: String::from("ChatView/chat/thread-pane/thread-delete-focus"),
+            },
+        )
     }
     fn on_clear_thread_message_selection(&mut self) -> ducktape_view_guest::Task<Message> {
         self.thread_selected_seq = 0;

@@ -220,7 +220,11 @@ fn view_asking<'a>(frame: &'a Frame, name: &str) -> &'a Request {
             request.kind == "rpc.view"
                 && serde_json::from_slice::<serde_json::Value>(&request.payload)
                     .ok()
-                    .and_then(|ask| ask["query"].as_object().and_then(|q| q.keys().next().cloned()))
+                    .and_then(|ask| {
+                        ask["query"]
+                            .as_object()
+                            .and_then(|q| q.keys().next().cloned())
+                    })
                     .as_deref()
                     == Some(name)
         })
@@ -415,16 +419,22 @@ fn edited_annotations_reach_author_continuation_and_thread_rows() {
             + node.children().iter().map(annotations).sum::<usize>()
     }
     on_a_deep_stack(|| {
-        let mut first = row(1, "first edited"); first["rev"] = 1.into();
-        let mut second = row(2, "second edited"); second["rev"] = 1.into(); second["reply_count"] = 1.into();
-        let window = serde_json::json!({"roots":{"roots":[first,second.clone()],"has_more":false}}).to_string().into_bytes();
+        let mut first = row(1, "first edited");
+        first["rev"] = 1.into();
+        let mut second = row(2, "second edited");
+        second["rev"] = 1.into();
+        second["reply_count"] = 1.into();
+        let window = serde_json::json!({"roots":{"roots":[first,second.clone()],"has_more":false}})
+            .to_string()
+            .into_bytes();
         let (frame, _) = connected_room_reading(window);
         assert_eq!(annotations(node_ending(&frame, "/message-stream")), 2);
         let frame = tick_native(press(&frame, "Open thread"));
         // A thread remains independently annotated when its root and a reply
         // share the same author, just like adjacent timeline messages.
         let read = request(&frame, "rpc.view").id;
-        let mut third = reply(3, "edited reply", 2); third["rev"] = 1.into();
+        let mut third = reply(3, "edited reply", 2);
+        third["rev"] = 1.into();
         let page = serde_json::json!({"thread":{"root":second,"replies":[third],"has_more":false,"next_reply_seq":null}}).to_string();
         let frame = tick_native(vec![answer(read, page.as_bytes())]);
         assert_eq!(annotations(node_ending(&frame, "/thread-stream")), 2);
@@ -556,7 +566,6 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
     });
 }
 
-
 /// A RUN IN FLIGHT HANGS OFF ITS ANCHOR, AND STOP LEAVES AS A CANCEL. The run
 /// lives in the app's process, not on the chain, so it reaches the view as a
 /// session fact and the timeline draws its door under the message that summoned
@@ -623,7 +632,9 @@ fn widget_commands(frame: &Frame) -> Vec<ducktape_view_guest::wire::WidgetComman
         .requests
         .iter()
         .filter(|request| request.kind == "host.widget")
-        .map(|request| ducktape_view_guest::wire::decode(&request.payload).expect("a command decodes"))
+        .map(|request| {
+            ducktape_view_guest::wire::decode(&request.payload).expect("a command decodes")
+        })
         .collect()
 }
 
@@ -688,6 +699,18 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         // the keyboard needs and leaves the offset alone
         let frame = tick_native(press(&frame, "More message actions"));
         let after = widget_commands(&frame);
+        assert_eq!(
+            after,
+            vec![ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: "ChatView/chat/message-action-focus".into(),
+            }]
+        );
+        let focus = request(&frame, "host.widget").id;
+        let settled = tick_native(vec![answer(focus, &[])]);
+        assert!(
+            widget_commands(&settled).is_empty(),
+            "focus stays on the menu after the host acknowledges it"
+        );
         assert!(
             !after.iter().any(|command| matches!(
                 command,

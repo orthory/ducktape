@@ -554,6 +554,42 @@ mod tests {
     }
 
     #[test]
+    fn every_thread_menu_mount_matches_its_focus_target() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.active_thread_seq = 1;
+        for (message, suffix) in [
+            (
+                Message::OpenThreadMessageActions(1, "body".into(), 0),
+                "thread-action-focus",
+            ),
+            (
+                Message::OpenThreadMessageReactions(1, "body".into(), 0),
+                "thread-reaction-focus",
+            ),
+            (
+                Message::ArmThreadMessageDelete(1, "body".into(), 0),
+                "thread-delete-focus",
+            ),
+        ] {
+            let _ = state.update(message);
+            let target = format!("ChatView/chat/thread-pane/{suffix}");
+            let mut tree = state.view();
+            let mut matches = 0;
+            tree.for_each_mut(&mut |node| {
+                if let wire::Node::Linear { key, children, .. } = node
+                    && key == &target
+                {
+                    assert!(!children.is_empty());
+                    matches += 1;
+                }
+            });
+            assert_eq!(matches, 1, "one real menu owns {target}");
+        }
+    }
+
+    #[test]
     fn snapshot_preserves_drafts_selection_and_subscription_identity() {
         let mut state = ChatView::state();
         state.search_draft = "unsent search".into();

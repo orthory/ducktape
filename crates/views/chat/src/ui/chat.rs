@@ -530,7 +530,7 @@ impl ChatView {
             children.push(self.selection_bar(format!("{key}/copy-range"), &self.thread_messages));
         }
         if self.thread_selected_seq > 0 {
-            children.push(self.message_menu("ChatView/chat", true));
+            children.push(self.message_menu(&key, true));
         }
         children.push(wire::Node::Surface {
             key: format!("{key}/reply_composer"),
