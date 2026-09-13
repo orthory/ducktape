@@ -1772,7 +1772,8 @@ impl ViewTree {
                 )
                 .absolute()
                 .inset_0();
-                div()
+                let (width, height) = content_dimensions(content);
+                dimensions(div(), width, height)
                     .id(key.clone())
                     .relative()
                     .cursor(native_cursor(*cursor))
@@ -1957,17 +1958,7 @@ impl ViewTree {
                 .inset_0();
                 // A sensor is layout-transparent. In particular, a fill spacer
                 // must not collapse inside an auto-sized measurement wrapper.
-                let (width, height) = match child.as_ref() {
-                    Node::Space { width, height }
-                    | Node::Linear { width, height, .. }
-                    | Node::KeyedColumn { width, height, .. }
-                    | Node::Grid { width, height, .. }
-                    | Node::Container { width, height, .. }
-                    | Node::Scroll { width, height, .. }
-                    | Node::Stack { width, height, .. }
-                    | Node::Responsive { width, height, .. } => (*width, *height),
-                    _ => (None, None),
-                };
+                let (width, height) = content_dimensions(child);
                 dimensions(div().relative(), width, height)
                     .child(self.node(child, window, cx))
                     .child(measure)
@@ -3325,6 +3316,20 @@ fn native_cursor(cursor: Option<wire::mouse::Cursor>) -> CursorStyle {
 fn rgba(color: wire::Rgba) -> Hsla {
     let [r, g, b, a] = color.0;
     gpui_kit::Rgba { r, g, b, a }.into()
+}
+
+fn content_dimensions(node: &wire::Node) -> (Option<wire::Length>, Option<wire::Length>) {
+    match node {
+        wire::Node::Space { width, height }
+        | wire::Node::Linear { width, height, .. }
+        | wire::Node::KeyedColumn { width, height, .. }
+        | wire::Node::Grid { width, height, .. }
+        | wire::Node::Container { width, height, .. }
+        | wire::Node::Scroll { width, height, .. }
+        | wire::Node::Stack { width, height, .. }
+        | wire::Node::Responsive { width, height, .. } => (*width, *height),
+        _ => (None, None),
+    }
 }
 
 fn dimensions<T: Styled>(

@@ -342,7 +342,7 @@ fn thread_width(seat: &Arc<Mutex<Mounted>>) -> f32 {
 fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();
     let seat = seated(&["Open thread"]);
-    let (view, mut native) = open(cx);
+    let (_, mut native) = open(cx);
     let key = {
         let locked = seat.lock().unwrap();
         let Slot::Ready(guest) = &locked.slot else {
@@ -360,15 +360,11 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it(cx: &mut TestApp
         });
         key.unwrap()
     };
-    let bounds = native.update(|_, cx| {
-        view.read(cx)
-            .content
-            .as_ref()
-            .unwrap()
-            .read(cx)
-            .measured_bounds(&key)
-            .expect("native divider bounds")
-    });
+    let bounds = native.update(|window, _| window.find(key.clone()).bounds());
+    assert!(
+        bounds.size.width >= gpui::px(10.) && bounds.size.height > gpui::px(100.),
+        "native divider fills its pane: {bounds:?}"
+    );
     assert_eq!(thread_width(&seat), 330.);
     let start = bounds.center();
     let end = start - gpui::point(gpui::px(100.), gpui::px(0.));
