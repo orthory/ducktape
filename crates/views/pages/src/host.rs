@@ -21,10 +21,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use ducktape_view_guest::host;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ducktape_view_guest::host;
 
 use crate::document_sync::{
     self, BlockOp, PageBlock, document_body, document_plan, document_title, page_document_text,
@@ -357,7 +357,8 @@ async fn read_page_index() -> Result<Vec<PageItem>, String> {
         }
         wire.extend(rows(&listed["pages"]));
         let next = listed["next_after"].as_str().map(str::to_owned);
-        let done = !listed["has_more"].as_bool().unwrap_or(false) || next.is_none() || next == after;
+        let done =
+            !listed["has_more"].as_bool().unwrap_or(false) || next.is_none() || next == after;
         if done {
             return Ok(page_items(&wire));
         }
@@ -617,7 +618,9 @@ async fn read_names() -> Names {
             let number = account["number"].as_i64().unwrap_or_default();
             let name = text_of(&account["name"]);
             for key in rows(&account["keys"]) {
-                names.by_key.insert(hex_encode(&json_bytes(&key["pubkey"])), name.clone());
+                names
+                    .by_key
+                    .insert(hex_encode(&json_bytes(&key["pubkey"])), name.clone());
             }
             names.by_account.insert(number, name);
         }
@@ -657,7 +660,6 @@ fn short_label(id: &str) -> String {
     label
 }
 
-
 fn page_comment(ordinal: usize, comment: &Value, names: &Names) -> PageComment {
     let ordinal = count_i64(ordinal);
     let edited = !comment["edited_at"].is_null();
@@ -685,7 +687,9 @@ pub struct SearchItem {
 
 /// The page search: one answer per query the reader sends.
 pub fn search(query: String, serial: i64) -> ducktape_view_guest::Subscription<SearchItem> {
-    ducktape_view_guest::Subscription::run_with((query, serial), |key| stream::once(run_search(key.0.clone())))
+    ducktape_view_guest::Subscription::run_with((query, serial), |key| {
+        stream::once(run_search(key.0.clone()))
+    })
 }
 
 async fn run_search(query: String) -> SearchItem {
@@ -941,9 +945,7 @@ async fn create_page(title: String) -> Result<ActItem, String> {
 /// `RemoveBlock` on a page: the module takes its whole subtree with it.
 pub fn delete(page_id: &str) -> bool {
     let page_id = page_id.to_owned();
-    push_act(Box::pin(async move {
-        acted(delete_page(page_id).await)
-    }))
+    push_act(Box::pin(async move { acted(delete_page(page_id).await) }))
 }
 
 async fn delete_page(page_id: String) -> Result<ActItem, String> {
@@ -956,17 +958,17 @@ async fn delete_page(page_id: String) -> Result<ActItem, String> {
 
 /// `AddComment` — a new thread on `target`, or a reply on the open one.
 pub fn post(text: &str, target: &str, thread_id: &str) -> bool {
-    let (text, target, thread_id) = (text.trim().to_owned(), target.to_owned(), thread_id.to_owned());
+    let (text, target, thread_id) = (
+        text.trim().to_owned(),
+        target.to_owned(),
+        thread_id.to_owned(),
+    );
     push_act(Box::pin(async move {
         acted(post_comment(text, target, thread_id).await)
     }))
 }
 
-async fn post_comment(
-    text: String,
-    target: String,
-    thread_id: String,
-) -> Result<ActItem, String> {
+async fn post_comment(text: String, target: String, thread_id: String) -> Result<ActItem, String> {
     if text.is_empty() || target.is_empty() {
         return Err("write a comment first".into());
     }
@@ -1283,18 +1285,6 @@ pub fn open_link(link: &str) -> bool {
 
 // ---------- readings ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-/// A count as the header chip prints it: the number, or nothing for zero.
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
-}
-
 pub fn keep_str(keep: bool, next: &str, current: &str) -> String {
     if keep { next } else { current }.to_owned()
 }
@@ -1324,29 +1314,6 @@ pub fn sidebar_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
 /// the box holds and the round trip is over.
 pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
-}
-
-/// A principal's plate letters: two initials, or the first letter.
-pub fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
-    }
 }
 
 /// `duck://page/<id>?net=<chain>` — the open page's own address.
@@ -1391,11 +1358,7 @@ pub fn comment_scope_label(
 /// block-anchored thread replied to with the page id is refused. A thread id
 /// the list does not carry (a stale card) answers `""`, which the submit
 /// refuses rather than posting somewhere else.
-pub fn comment_post_target(
-    rows: &[PageCommentThreadRow],
-    thread_id: &str,
-    scope: &str,
-) -> String {
+pub fn comment_post_target(rows: &[PageCommentThreadRow], thread_id: &str, scope: &str) -> String {
     if thread_id.is_empty() {
         return scope.to_owned();
     }

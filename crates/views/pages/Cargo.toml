@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 futures.workspace = true
 pulldown-cmark = "0.12.2"
 ui-lang-wire.workspace = true
-# the product icon set, as bytes the wire carries
+# Shared document font families for Markdown presentation.
 design = { path = "../support/design" }
 serde.workspace = true
 serde_json.workspace = true

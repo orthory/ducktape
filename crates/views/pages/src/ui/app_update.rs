@@ -93,11 +93,6 @@ impl PagesView {
             crate::host::keep_str(route_moved, &(next.route_page), &(self.active_page));
         self.loading = (self.loading || route_moved);
         self.page_link = crate::host::page_address(&(self.active_page), &(self.chain));
-        self.active_palette = AppTheme::App;
-        if (!next.dark) {
-            return Task::none();
-        }
-        self.active_palette = AppTheme::AppDark;
         Task::none()
     }
     fn on_comment_pointer_moved(&mut self, _x: f64, y: f64) -> Task<Message> {

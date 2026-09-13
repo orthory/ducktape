@@ -9,7 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 use wire::keyboard::{Key, Modifiers, Named};
 
 /// Guest-owned editor history retained in state snapshots.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryState {
     pub snapshot: Vec<u8>,
 }
@@ -41,7 +41,7 @@ pub fn initial_history() -> HistoryState {
 
 /// Small menu state is separate from the bounded undo snapshots so painting
 /// never needs to decode the document history.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MenuState {
     pub snapshot: Vec<u8>,
 }
