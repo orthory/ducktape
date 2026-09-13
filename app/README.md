@@ -67,11 +67,10 @@ and selection operations; and scroll offsets, relative movement, end snapping
 and keyed-row reveals. Requests are validated and bounded, run only after the
 matching native frame is laid out and editor work has drained, and are refused
 if their frame was replaced. They cannot address another view's widgets.
-A view may leave a slot for something only the host can draw: the Node view's
-Activity tab declares `node_log_timeline` as a host surface, and the app
-paints its own retained log ring there (`src/module_view/surfaces.rs`),
-queuing what the reader does in it for the handler to drain. A view that
-needs the network can use the kernel's bounded request/reply interface:
+A view may leave a slot for native rendering, such as the Files and Forge
+code and Markdown readers (`src/module_view/surfaces.rs`). Node's Activity
+tab keeps its log rows in the guest and composes native controls through the
+wire tree. A view that needs the network uses the kernel's bounded request/reply interface:
 Explorer queries through `rpc.query` and `rpc.view`. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
