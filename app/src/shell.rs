@@ -176,6 +176,7 @@ impl Desktop {
             crate::Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
             crate::Appearance::System => Theme::sync_system_appearance(None, cx),
         }
+        configure_native_theme(cx);
     }
 
     fn start(&self, task: Task<Message>, cx: &mut Context<Self>) -> gpui_kit::Task<()> {
@@ -1105,7 +1106,7 @@ impl DesktopWindow {
                                             .flex_1()
                                             .p_3()
                                             .border_1()
-                                            .rounded_lg()
+                                            .rounded_none()
                                             .flex()
                                             .flex_col()
                                             .items_center()
@@ -1608,7 +1609,7 @@ impl DesktopWindow {
             .id("shell-modal")
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .rounded_lg()
+            .rounded_none()
             .max_h(relative(0.85))
             .overflow_y_scroll()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1746,6 +1747,23 @@ pub(crate) fn test_window(
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn appearance_changes_keep_native_fonts_and_square_controls(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            use gpui_kit::component::{Theme, ThemeMode};
+            gpui_kit::init(cx);
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                Theme::change(mode, None, cx);
+                configure_native_theme(cx);
+                let theme = Theme::global(cx);
+                assert_eq!(theme.font_family.as_ref(), design::fonts::FAMILY_UI);
+                assert_eq!(theme.mono_font_family.as_ref(), design::fonts::FAMILY_MONO);
+                assert_eq!(theme.radius, gpui_kit::px(0.));
+                assert_eq!(theme.radius_lg, gpui_kit::px(0.));
+            }
+        });
+    }
 
     #[test]
     fn shell_commands_precede_focused_input_actions_in_only_their_window() {
@@ -2053,6 +2071,16 @@ mod close_tests {
     }
 }
 
+fn configure_native_theme(cx: &mut gpui_kit::App) {
+    let theme = gpui_kit::component::Theme::global_mut(cx);
+    theme.font_family = design::fonts::FAMILY_UI.into();
+    theme.mono_font_family = design::fonts::FAMILY_MONO.into();
+    theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
+    theme.radius = gpui_kit::px(0.);
+    theme.radius_lg = gpui_kit::px(0.);
+    gpui_kit::component::Theme::sync_base(cx);
+}
+
 pub(crate) fn run() {
     let application = gpui_kit::application();
     let (url_sender, mut urls) = mpsc::unbounded::<Vec<String>>();
@@ -2071,11 +2099,7 @@ pub(crate) fn run() {
         if let Err(error) = cx.text_system().add_fonts(fonts) {
             tracing::error!(target: "ducktape::app", reason = "font_registration_failed", %error, "bundled desktop fonts could not be registered");
         }
-        let theme = gpui_kit::component::Theme::global_mut(cx);
-        theme.font_family = design::fonts::FAMILY_UI.into();
-        theme.mono_font_family = design::fonts::FAMILY_MONO.into();
-        theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
-        gpui_kit::component::Theme::sync_base(cx);
+        configure_native_theme(cx);
         let mut commands = commands();
         let (state, initial) = Ducktape::boot();
         let (mut tray, mut tray_events) = crate::tray::init(cx);
