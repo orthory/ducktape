@@ -285,7 +285,7 @@ impl ChatView {
                 .map(|hit| {
                     self.search_result(
                         format!("{key}/{}/{}", hit.channel_id, hit.seq),
-                        Message::OpenSearchHit,
+                        Message::OpenChatSearchHit,
                         hit.clone(),
                     )
                 })
@@ -325,6 +325,17 @@ impl ChatView {
                 children.push(native::text(format!("{scope}/unread"), "New messages"));
             }
             children.push(self.message_card(message, surface, plate));
+            for live in &self.live_agents {
+                if crate::host::run_in_thread(live, message.seq) {
+                    let run_key = format!("{scope}/run/{}", live.agent);
+                    let content = if thread {
+                        self.live_run_card(run_key, Message::CancelRun, Message::OpenRun, live.clone())
+                    } else {
+                        action(run_key, &crate::host::live_thread_label(&live.agent), Message::OpenThreadFor(message.seq), false)
+                    };
+                    children.push(content);
+                }
+            }
             let actions = if thread {
                 [
                     Message::OpenThreadMessageReactions(
@@ -384,35 +395,6 @@ impl ChatView {
                 rows.push(native::column(scope, children));
             }
             keys.push(wire::ListKey::from(message.view_key));
-        }
-        if !thread {
-            for live in &self.live_agents {
-                if let Some(message) = messages
-                    .iter()
-                    .find(|message| crate::host::run_in_thread(live, message.seq))
-                {
-                    let label = crate::host::live_thread_label(&live.agent);
-                    rows.push(action(
-                        format!("{key}/run/{}", live.agent),
-                        &label,
-                        Message::OpenThreadFor(message.seq),
-                        false,
-                    ));
-                    keys.push(wire::ListKey::from(format!("run:{}", live.agent)));
-                }
-            }
-        } else {
-            for live in &self.live_agents {
-                if crate::host::run_in_thread(live, self.active_thread_seq) {
-                    rows.push(self.live_run_card(
-                        format!("{key}/run/{}", live.agent),
-                        Message::CancelRun,
-                        Message::OpenRun,
-                        live.clone(),
-                    ));
-                    keys.push(wire::ListKey::from(format!("run:{}", live.agent)));
-                }
-            }
         }
         let list = wire::Node::KeyedColumn {
             key: format!("{key}/rows"),
