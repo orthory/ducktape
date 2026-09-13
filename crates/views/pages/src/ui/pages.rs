@@ -209,21 +209,8 @@ impl PagesView {
                 &self.page_search_draft,
                 self.page_searching,
             );
-        if search_ready && !self.page_search_hits.is_empty() {
-            children.push(kit::scroll(
-                "pages/search/scroll",
-                kit::padded(
-                    kit::column(
-                        "pages/search/results",
-                        self.page_search_hits
-                            .iter()
-                            .map(|hit| self.search_result(hit)),
-                    ),
-                    wire::Edges::all(16.),
-                ),
-            ));
-        } else if search_ready {
-            children.push(kit::text("pages/search/empty", "No matching pages"));
+        if search_ready {
+            children.push(self.search_panel());
         }
         if self.connected && !self.active_page.is_empty() && self.block_comments_open {
             children.push(self.comments_layer());
@@ -332,6 +319,61 @@ impl PagesView {
             ) as f32);
         }
         surface
+    }
+
+    fn search_panel(&self) -> Node {
+        let results = if self.page_search_hits.is_empty() {
+            kit::text("pages/search/empty", "No matching pages")
+        } else {
+            kit::scroll(
+                "pages/search/scroll",
+                kit::column(
+                    "pages/search/results",
+                    self.page_search_hits
+                        .iter()
+                        .map(|hit| self.search_result(hit)),
+                ),
+            )
+        };
+        let contents = fill(kit::column(
+            "pages/search/content",
+            [
+                kit::row(
+                    "pages/search/header",
+                    [
+                        kit::heading(
+                            "pages/search/query",
+                            format!("Search · {}", self.page_search_query),
+                        ),
+                        action(
+                            "pages/search/clear",
+                            "Clear search",
+                            Message::ClearPageSearch,
+                            true,
+                            ButtonPreset::Secondary,
+                        ),
+                    ],
+                ),
+                results,
+            ],
+        ));
+        let panel = kit::sized(
+            kit::padded(
+                kit::container("pages/search/panel", contents),
+                wire::Edges::all(16.),
+            ),
+            Some(Length::Fixed(
+                (self.pages_pane_width as f32 - 48.).clamp(240., 720.),
+            )),
+            Some(Length::Fixed(400.)),
+        );
+        overlay(
+            "pages/search",
+            panel,
+            Message::ClearPageSearch,
+            wire::AlignX::Center,
+            wire::AlignY::Top,
+        )
     }
 
     fn document_editor(&self) -> Node {

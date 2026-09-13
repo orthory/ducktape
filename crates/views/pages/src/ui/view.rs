@@ -490,6 +490,50 @@ mod tests {
         );
         assert!(!content.iter().any(|text| text.starts_with("Stale")));
     }
+
+    #[test]
+    fn empty_search_without_selected_page_keeps_clear_action_on_native_overlay() {
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.page_search_draft = "missing".into();
+        app.page_search_query = "missing".into();
+        let mut found = false;
+        app.view().for_each_mut(&mut |node| {
+            let Node::Overlay {
+                key,
+                children,
+                on_dismiss,
+                ..
+            } = node
+            else {
+                return;
+            };
+            if key != "pages/search" {
+                return;
+            }
+            assert!(on_dismiss.is_some());
+            assert_eq!(
+                children.len(),
+                2,
+                "native overlay paints its modal surface over the base"
+            );
+            let mut clear = false;
+            children[1].for_each_mut(&mut |child| {
+                if let Node::Button {
+                    label, on_press, ..
+                } = child
+                {
+                    clear |= label.as_deref() == Some("Clear search") && on_press.is_some();
+                }
+            });
+            assert!(
+                clear,
+                "no result must still provide an exit without the page toolbar"
+            );
+            found = true;
+        });
+        assert!(found);
+    }
 }
 include!("app_update.rs");
 include!("app_view.rs");
