@@ -292,6 +292,25 @@ mod tests {
         );
     }
     #[test]
+    fn snapshot_rejects_wrong_schema_and_invalid_editor_state() {
+        let (app, _) = FilesView::boot();
+        let mut snapshot = wire::Snapshot::decode(&app.snapshot().unwrap()).unwrap();
+        snapshot.schema = "0".repeat(64);
+        assert!(FilesView::restore(&snapshot.encode().unwrap()).is_err());
+        let mut value = serde_json::to_value(&app).unwrap();
+        value["draft"] = serde_json::json!([255, 255]);
+        assert!(serde_json::from_value::<FilesView>(value).is_err());
+    }
+
+    #[test]
+    fn restored_state_recomputes_transient_derived_values() {
+        let (mut app, _) = FilesView::boot();
+        assert!(!app.derived_loading());
+        app.acting = true;
+        let restored = FilesView::restore(&app.snapshot().unwrap()).unwrap();
+        assert!(*restored.derived_loading());
+    }
+    #[test]
     fn a_captured_save_refuses_after_its_network_moves() {
         let (mut app, _) = FilesView::boot();
         app.connected = true;
