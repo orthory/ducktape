@@ -102,8 +102,9 @@ impl ForgeView {
         let path = host::forge_file_header(
             &self.opened_dir,
             &self.opened_rev,
-            &self.file_path,
+            &self.tree_path,
             &self.tree_rev,
+            &self.file_path,
         );
         let mut content = vec![
             native::text("forge/file-header", &path),
@@ -139,7 +140,7 @@ impl ForgeView {
                     if self.file_binary {
                         content.push(native::text(
                             "forge/binary",
-                            "Binary file — no text preview.",
+                            host::binary_note(&self.file_text),
                         ));
                     } else if self.file_picture {
                         content.push(wire::Node::Surface {
@@ -298,6 +299,10 @@ impl ForgeView {
             )),
             "closed" => content.push(native::text("forge/closed", "This pull request is closed.")),
             "open" => {
+                content.push(native::text(
+                    "forge/approvals",
+                    format!("{} approvals", self.forge_item_approvals),
+                ));
                 if !self.merge_conflicts.is_empty() {
                     content.push(native::text(
                         "forge/conflict-title",
@@ -387,6 +392,9 @@ impl ForgeView {
                 );
                 if let wire::Node::Button { checked, .. } = &mut button {
                     *checked = Some(self.review_verdict == value);
+                }
+                if let wire::Node::Button { label, .. } = &mut button {
+                    *label = Some(format!("Pick {} verdict", value.replace('_', " ")));
                 }
                 button
             }),

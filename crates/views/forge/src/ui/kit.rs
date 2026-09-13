@@ -48,33 +48,7 @@ impl ForgeView {
             ],
         )
     }
-    pub(super) fn code_tab_label(&self, key: String) -> wire::Node {
-        native::text(key, "Code")
-    }
-    pub(super) fn pulls_tab_label(&self, key: String) -> wire::Node {
-        native::row(
-            &key,
-            [
-                native::text(format!("{key}/label"), "Pull requests"),
-                native::text(
-                    format!("{key}/count"),
-                    crate::host::forge_open_count(&self.items, "pr").to_string(),
-                ),
-            ],
-        )
-    }
-    pub(super) fn issues_tab_label(&self, key: String) -> wire::Node {
-        native::row(
-            &key,
-            [
-                native::text(format!("{key}/label"), "Issues"),
-                native::text(
-                    format!("{key}/count"),
-                    crate::host::forge_open_count(&self.items, "issue").to_string(),
-                ),
-            ],
-        )
-    }
+
     pub(super) fn loading_tracker(&self, key: String) -> wire::Node {
         native::text(key, "Loading repository tracker…")
     }
@@ -105,18 +79,7 @@ impl ForgeView {
             "Could not load this item. Go back and open it again to retry.",
         )
     }
-    pub(super) fn item_status(&self, key: String) -> wire::Node {
-        native::text(key, self.forge_item_state.clone())
-    }
-    pub(super) fn merge_heading(&self, key: String) -> wire::Node {
-        native::heading(key, "Merge")
-    }
-    pub(super) fn reviews_heading(&self, key: String) -> wire::Node {
-        native::heading(key, "Reviews")
-    }
-    pub(super) fn discussion_heading(&self, key: String) -> wire::Node {
-        native::heading(key, "Discussion")
-    }
+
     pub(super) fn finality(&self, key: String, height: i64) -> wire::Node {
         let label = if height > 0 {
             format!("✓ finalized · h {height}")
@@ -124,16 +87,6 @@ impl ForgeView {
             "✓ finalized".into()
         };
         native::text(key, label)
-    }
-    pub(super) fn message_avatar(&self, key: String, initials: String, kind: String) -> wire::Node {
-        native::text(
-            key,
-            if kind == "human" {
-                initials
-            } else {
-                format!("AI · {initials}")
-            },
-        )
     }
 
     fn rich_line(
@@ -250,13 +203,5 @@ impl ForgeView {
         open: impl Fn(String) -> Message + Clone + 'static,
     ) -> wire::Node {
         self.rich_body(key, open, self.forge_item_blocks.clone())
-    }
-    pub(super) fn message_body(
-        &self,
-        key: String,
-        open: impl Fn(String) -> Message + Clone + 'static,
-        message: crate::host::ChatMessage,
-    ) -> wire::Node {
-        self.rich_body(key, open, message.blocks)
     }
 }

@@ -60,7 +60,9 @@ impl super::ForgeView {
         self.connected_rpc = next.connected_rpc.to_owned();
         let routed = next.link_tick != self.link_tick;
         self.link_tick = next.link_tick;
-        ducktape_view_guest::Task::done(Message::ForgeLandLink(crate::host::routed_link(routed, &next.link)))
+        ducktape_view_guest::Task::done(Message::ForgeLandLink(crate::host::routed_link(
+            routed, &next.link,
+        )))
     }
 
     fn on_forge_land_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
@@ -75,8 +77,7 @@ impl super::ForgeView {
         self.focus_seq = link.seq;
         self.focus_path = link.path.to_owned();
         self.focus_rev = link.rev.to_owned();
-        return (::ducktape_view_guest::Task::done(link.repo.to_owned()))
-            .map(|value| Message::ForgeOpenRepo(value));
+        (::ducktape_view_guest::Task::done(link.repo.to_owned())).map(Message::ForgeOpenRepo)
     }
     fn on_repos_arrived(
         &mut self,
@@ -125,8 +126,7 @@ impl super::ForgeView {
         }
         let number = self.focus_number;
         self.focus_number = 0;
-        return (::ducktape_view_guest::Task::done(number))
-            .map(|value| Message::ForgeOpenItem(value));
+        (::ducktape_view_guest::Task::done(number)).map(Message::ForgeOpenItem)
     }
     fn on_item_arrived(
         &mut self,
@@ -217,13 +217,13 @@ impl super::ForgeView {
         self.focus_seq = 0;
         self.linked_note =
             crate::host::note_at_seq(::std::convert::AsRef::as_ref(&(next.messages)), landed);
-        self.landed_tick = self.landed_tick + 1;
-        return ::ducktape_view_guest::widget::perform::<Message>(
+        self.landed_tick += 1;
+        ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::ScrollToKey {
                 target: String::from("ForgeView/forge/item-detail"),
                 key: ::ducktape_view_guest::wire::ListKey::from(landed).virtual_key(),
             },
-        );
+        )
     }
     fn on_tree_arrived(
         &mut self,
@@ -249,8 +249,7 @@ impl super::ForgeView {
         }
         let path = self.focus_path.to_owned();
         self.focus_path = "".to_owned();
-        return (::ducktape_view_guest::Task::done(path.to_owned()))
-            .map(|value| Message::ForgeOpenFile(value));
+        (::ducktape_view_guest::Task::done(path.to_owned())).map(Message::ForgeOpenFile)
     }
     fn on_blob_arrived(
         &mut self,
@@ -264,13 +263,7 @@ impl super::ForgeView {
         if !(next.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        {
-            let next = next.text.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
-                self.file_text = next;
-                self.file_text_revision += 1;
-            }
-        }
+        self.file_text = next.text.to_owned();
         self.file_binary = next.binary;
         self.file_truncated = next.truncated;
         self.file_picture = next.picture;
@@ -280,7 +273,7 @@ impl super::ForgeView {
     }
     fn on_act_done(&mut self, next: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
         self.host_error = next.error.to_owned();
-        return match crate::host::act_of(::std::convert::AsRef::as_ref(&(next.kind))) {
+        match crate::host::act_of(::std::convert::AsRef::as_ref(&(next.kind))) {
             Act::Review => (|| {
                 self.review_busy = false;
                 if !(next.error).is_empty() {
@@ -300,7 +293,7 @@ impl super::ForgeView {
                 self.merge_conflicts = next.conflicts.clone();
                 ::ducktape_view_guest::Task::none()
             }
-        };
+        }
     }
     fn on_forge_open_repo(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
         if !self.connected {
@@ -329,13 +322,7 @@ impl super::ForgeView {
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
         self.file_path = "".to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
-                self.file_text = next;
-                self.file_text_revision += 1;
-            }
-        }
+        self.file_text.clear();
         self.file_note = "".to_owned();
         self.file_phase = "idle".to_owned();
         self.opened_dir = "".to_owned();
@@ -365,13 +352,7 @@ impl super::ForgeView {
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
         self.file_path = "".to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
-                self.file_text = next;
-                self.file_text_revision += 1;
-            }
-        }
+        self.file_text.clear();
         self.file_note = "".to_owned();
         self.file_phase = "idle".to_owned();
         self.opened_dir = "".to_owned();
@@ -414,13 +395,7 @@ impl super::ForgeView {
         self.opened_dir = self.tree_path.to_owned();
         self.opened_rev = self.tree_rev.to_owned();
         self.file_path = path.to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.file_text, next) {
-                self.file_text = next;
-                self.file_text_revision += 1;
-            }
-        }
+        self.file_text.clear();
         self.file_binary = false;
         self.file_truncated = false;
         self.file_picture = false;
@@ -468,7 +443,7 @@ impl super::ForgeView {
         if self.forge_item_number <= 0 {
             return ::ducktape_view_guest::Task::none();
         }
-        return (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem);
+        (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem)
     }
     fn on_forge_review_pick(&mut self, verdict: String) -> ducktape_view_guest::Task<Message> {
         self.review_verdict = verdict.to_owned();

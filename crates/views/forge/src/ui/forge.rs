@@ -127,10 +127,35 @@ impl ForgeView {
                     (self.tab != tab || self.forge_item_number > 0)
                         .then(|| Message::SelectForgeTab(tab.into())),
                 );
-                if let wire::Node::Button { checked, .. } = &mut button {
+                if let wire::Node::Button { checked, label, .. } = &mut button {
                     *checked = Some(self.tab == tab);
+                    *label = Some(
+                        match tab {
+                            "code" => "Browse the code",
+                            "pulls" => "Show pull requests",
+                            _ => "Show issues",
+                        }
+                        .into(),
+                    );
                 }
-                button
+                let kind = match tab {
+                    "pulls" => "pr",
+                    "issues" => "issue",
+                    _ => "",
+                };
+                if kind.is_empty() {
+                    return button;
+                }
+                native::row(
+                    format!("forge/tab-count/{tab}"),
+                    [
+                        button,
+                        native::text(
+                            format!("forge/count/{tab}"),
+                            host::forge_open_count(&self.items, kind).to_string(),
+                        ),
+                    ],
+                )
             }),
         ));
         let body = if self.forge_item_number > 0 {
@@ -238,12 +263,12 @@ impl ForgeView {
                     content.push(self.note(format!("forge/linked/{}", note.seq), note));
                 }
                 if self.discussion.is_empty() && !self.discussion_clipped {
-                    content.push(native::text("forge/no-discussion", "No notes yet."));
+                    content.push(native::text("forge/no-discussion", "No discussion yet."));
                 }
                 if self.discussion_clipped {
                     content.push(native::text(
                         "forge/discussion-clipped",
-                        "Only the newest notes are shown.",
+                        "Older comments are not shown.",
                     ));
                 }
                 for note in &self.discussion {
@@ -283,6 +308,14 @@ impl ForgeView {
         native::column(
             &key,
             [
+                native::text(
+                    format!("{key}/avatar"),
+                    if note.avatar_kind == "human" {
+                        note.initial.clone()
+                    } else {
+                        format!("AI · {}", note.initial)
+                    },
+                ),
                 native::heading(format!("{key}/author"), &note.author),
                 native::text(format!("{key}/meta"), &note.meta),
                 self.rich_body(

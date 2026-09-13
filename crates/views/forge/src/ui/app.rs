@@ -84,7 +84,6 @@ pub struct ForgeView {
     pub(crate) sent: bool,
     pub(crate) viewport_width: f64,
     pub(crate) tree_width: f64,
-    pub(crate) file_text_revision: u64,
 }
 impl ::std::fmt::Debug for ForgeView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -212,101 +211,444 @@ impl ForgeView {
             sent: false,
             viewport_width: 1280.0,
             tree_width: 258.0,
-            file_text_revision: ::ducktape_view_guest::rev::seed(),
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    pub(crate) const SNAPSHOT_SCHEMA: &'static str = "6f5fe2a551e819c3aa46ee5398c1e2d53f84179b6f029050f43d932320cb977c";
+    pub(crate) const SNAPSHOT_SCHEMA: &'static str =
+        "6f5fe2a551e819c3aa46ee5398c1e2d53f84179b6f029050f43d932320cb977c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: String::from(Self::SNAPSHOT_SCHEMA),
             state: wire::SnapshotValue::Record {
                 name: String::from("ForgeView"),
                 fields: vec![
-                    (String::from("connected"), wire::SnapshotValue::Bool(* (& self
-                    .connected))), (String::from("dark"), wire::SnapshotValue::Bool(* (&
-                    self.dark))), (String::from("org"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .org))), (String::from("about"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .about))), (String::from("tier"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tier))), (String::from("network_chain_id"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .network_chain_id))), (String::from("connected_rpc"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .connected_rpc))), (String::from("connection_serial"),
-                    wire::SnapshotValue::I64(* (& self.connection_serial))),
-                    (String::from("link_tick"), wire::SnapshotValue::I64(* (& self
-                    .link_tick))), (String::from("repos"), wire::SnapshotValue::List((&
-                    self.repos).iter().map(| item | wire::SnapshotValue::Record { name :
-                    String::from("ForgeRepo"), fields :
-                    ::std::vec![(String::from("name"),
+                    (
+                        String::from("connected"),
+                        wire::SnapshotValue::Bool(self.connected),
+                    ),
+                    (
+                        String::from("dark"),
+                        wire::SnapshotValue::Bool(self.dark),
+                    ),
+                    (
+                        String::from("org"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(&self.org)),
+                    ),
+                    (
+                        String::from("about"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(&self.about)),
+                    ),
+                    (
+                        String::from("tier"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(&self.tier)),
+                    ),
+                    (
+                        String::from("network_chain_id"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.network_chain_id,
+                        )),
+                    ),
+                    (
+                        String::from("connected_rpc"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.connected_rpc,
+                        )),
+                    ),
+                    (
+                        String::from("connection_serial"),
+                        wire::SnapshotValue::I64(self.connection_serial),
+                    ),
+                    (
+                        String::from("link_tick"),
+                        wire::SnapshotValue::I64(self.link_tick),
+                    ),
+                    (
+                        String::from("repos"),
+                        wire::SnapshotValue::List(
+                            self.repos
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ForgeRepo"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("name"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).name)
+                                            )
+                                        ),
+                                        (
+                                            String::from("head"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).head)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("list_phase"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.list_phase,
+                        )),
+                    ),
+                    (
+                        String::from("open_repo"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.open_repo,
+                        )),
+                    ),
+                    (
+                        String::from("repo_phase"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.repo_phase,
+                        )),
+                    ),
+                    (
+                        String::from("branches"),
+                        wire::SnapshotValue::List(
+                            self.branches
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ForgeBranch"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("name"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).name)
+                                            )
+                                        ),
+                                        (
+                                            String::from("head"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).head)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("items"),
+                        wire::SnapshotValue::List(
+                            self.items
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ForgeItem"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("number"),
+                                            wire::SnapshotValue::I64((item).number)
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        ),
+                                        (
+                                            String::from("state"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).state)
+                                            )
+                                        ),
+                                        (
+                                            String::from("title"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).title)
+                                            )
+                                        ),
+                                        (
+                                            String::from("author"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).author)
+                                            )
+                                        ),
+                                        (
+                                            String::from("author_name"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(
+                                                    &(item).author_name
+                                                )
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("tab"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(&self.tab)),
+                    ),
+                    (
+                        String::from("forge_item_number"),
+                        wire::SnapshotValue::I64(self.forge_item_number),
+                    ),
+                    (
+                        String::from("item_phase"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.item_phase,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_kind"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_kind,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_title"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_title,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_state"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_state,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_author"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_author,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_branches"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_branches,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_body"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_body,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_blocks"),
+                        wire::SnapshotValue::List(
+                            self.forge_item_blocks
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ChatBlock"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        ),
+                                        (
+                                            String::from("text"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).text)
+                                            )
+                                        ),
+                                        (
+                                            String::from("lang"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).lang)
+                                            )
+                                        ),
+                                        (
+                                            String::from("rich"),
+                                            wire::SnapshotValue::Bool((item).rich)
+                                        ),
+                                        (
+                                            String::from("spans"),
+                                            wire::SnapshotValue::List(
+                                                (item).spans
+                                                    .iter()
+                                                    .map(|item| wire::SnapshotValue::Record {
+                                                        name: String::from("ChatSpan"),
+                                                        fields:
+                                                            ::std::vec![(String::from("mention"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .name))), (String::from("head"),
+                    .mention))), (String::from("mention_link"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .head)))] }).collect())), (String::from("list_phase"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .list_phase))), (String::from("open_repo"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .open_repo))), (String::from("repo_phase"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .repo_phase))), (String::from("branches"),
-                    wire::SnapshotValue::List((& self.branches).iter().map(| item |
-                    wire::SnapshotValue::Record { name : String::from("ForgeBranch"),
-                    fields : ::std::vec![(String::from("name"),
+                    .mention_link))), (String::from("link_text"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .name))), (String::from("head"),
+                    .link_text))), (String::from("link"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .head)))] }).collect())), (String::from("items"),
-                    wire::SnapshotValue::List((& self.items).iter().map(| item |
-                    wire::SnapshotValue::Record { name : String::from("ForgeItem"),
-                    fields : ::std::vec![(String::from("number"),
-                    wire::SnapshotValue::I64(* (& (item).number))),
-                    (String::from("kind"),
+                    .link))), (String::from("bold_italic"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .kind))), (String::from("state"),
+                    .bold_italic))), (String::from("bold"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .state))), (String::from("title"),
+                    .bold))), (String::from("italic"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .title))), (String::from("author"),
+                    .italic))), (String::from("plain"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author))), (String::from("author_name"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author_name)))] }).collect())), (String::from("tab"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tab))), (String::from("forge_item_number"),
-                    wire::SnapshotValue::I64(* (& self.forge_item_number))),
-                    (String::from("item_phase"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .item_phase))), (String::from("forge_item_kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_kind))), (String::from("forge_item_title"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_title))), (String::from("forge_item_state"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_state))), (String::from("forge_item_author"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_author))), (String::from("forge_item_branches"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_branches))), (String::from("forge_item_body"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_body))), (String::from("forge_item_blocks"),
-                    wire::SnapshotValue::List((& self.forge_item_blocks).iter().map(|
-                    item | wire::SnapshotValue::Record { name :
-                    String::from("ChatBlock"), fields :
-                    ::std::vec![(String::from("kind"),
+                    .plain)))]
+                                                    })
+                                                    .collect()
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("forge_item_files_changed"),
+                        wire::SnapshotValue::I64(self.forge_item_files_changed),
+                    ),
+                    (
+                        String::from("forge_item_additions"),
+                        wire::SnapshotValue::I64(self.forge_item_additions),
+                    ),
+                    (
+                        String::from("forge_item_deletions"),
+                        wire::SnapshotValue::I64(self.forge_item_deletions),
+                    ),
+                    (
+                        String::from("diff_rows"),
+                        wire::SnapshotValue::List(
+                            self.diff_rows
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("DiffLine"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("key"),
+                                            wire::SnapshotValue::I64((item).key)
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        ),
+                                        (
+                                            String::from("old_no"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).old_no)
+                                            )
+                                        ),
+                                        (
+                                            String::from("new_no"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).new_no)
+                                            )
+                                        ),
+                                        (
+                                            String::from("sign"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).sign)
+                                            )
+                                        ),
+                                        (
+                                            String::from("text"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).text)
+                                            )
+                                        ),
+                                        (
+                                            String::from("path"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("side"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).side)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("forge_item_diff_truncated"),
+                        wire::SnapshotValue::Bool(self.forge_item_diff_truncated),
+                    ),
+                    (
+                        String::from("forge_item_merge_oid"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_merge_oid,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_source_branch"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_source_branch,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_source_oid"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_source_oid,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_target_oid"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_target_oid,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_channel"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.forge_item_channel,
+                        )),
+                    ),
+                    (
+                        String::from("forge_item_reviews"),
+                        wire::SnapshotValue::List(
+                            self.forge_item_reviews
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ForgeReview"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("author"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).author)
+                                            )
+                                        ),
+                                        (
+                                            String::from("author_name"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(
+                                                    &(item).author_name
+                                                )
+                                            )
+                                        ),
+                                        (
+                                            String::from("verdict"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).verdict)
+                                            )
+                                        ),
+                                        (
+                                            String::from("body"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).body)
+                                            )
+                                        ),
+                                        (
+                                            String::from("blocks"),
+                                            wire::SnapshotValue::List(
+                                                (item).blocks
+                                                    .iter()
+                                                    .map(|item| wire::SnapshotValue::Record {
+                                                        name: String::from("ChatBlock"),
+                                                        fields: ::std::vec![(String::from("kind"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .kind))), (String::from("text"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .text))), (String::from("lang"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool(* (&
-                    (item).rich))), (String::from("spans"), wire::SnapshotValue::List((&
-                    (item).spans).iter().map(| item | wire::SnapshotValue::Record { name
+                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool((item).rich)), (String::from("spans"), wire::SnapshotValue::List((item).spans.iter().map(| item | wire::SnapshotValue::Record { name
                     : String::from("ChatSpan"), fields :
                     ::std::vec![(String::from("mention"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
@@ -324,96 +666,38 @@ impl ForgeView {
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .italic))), (String::from("plain"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .plain)))] }).collect()))] }).collect())),
-                    (String::from("forge_item_files_changed"), wire::SnapshotValue::I64(*
-                    (& self.forge_item_files_changed))),
-                    (String::from("forge_item_additions"), wire::SnapshotValue::I64(* (&
-                    self.forge_item_additions))), (String::from("forge_item_deletions"),
-                    wire::SnapshotValue::I64(* (& self.forge_item_deletions))),
-                    (String::from("diff_rows"), wire::SnapshotValue::List((& self
-                    .diff_rows).iter().map(| item | wire::SnapshotValue::Record { name :
-                    String::from("DiffLine"), fields : ::std::vec![(String::from("key"),
-                    wire::SnapshotValue::I64(* (& (item).key))), (String::from("kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .kind))), (String::from("old_no"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .old_no))), (String::from("new_no"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .new_no))), (String::from("sign"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .sign))), (String::from("text"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .text))), (String::from("path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .path))), (String::from("side"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .side)))] }).collect())), (String::from("forge_item_diff_truncated"),
-                    wire::SnapshotValue::Bool(* (& self.forge_item_diff_truncated))),
-                    (String::from("forge_item_merge_oid"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_merge_oid))), (String::from("forge_item_source_branch"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_source_branch))), (String::from("forge_item_source_oid"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_source_oid))), (String::from("forge_item_target_oid"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_target_oid))), (String::from("forge_item_channel"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .forge_item_channel))), (String::from("forge_item_reviews"),
-                    wire::SnapshotValue::List((& self.forge_item_reviews).iter().map(|
-                    item | wire::SnapshotValue::Record { name :
-                    String::from("ForgeReview"), fields :
-                    ::std::vec![(String::from("author"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author))), (String::from("author_name"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author_name))), (String::from("verdict"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .verdict))), (String::from("body"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .body))), (String::from("blocks"), wire::SnapshotValue::List((&
-                    (item).blocks).iter().map(| item | wire::SnapshotValue::Record { name
-                    : String::from("ChatBlock"), fields :
-                    ::std::vec![(String::from("kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .kind))), (String::from("text"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .text))), (String::from("lang"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool(* (&
-                    (item).rich))), (String::from("spans"), wire::SnapshotValue::List((&
-                    (item).spans).iter().map(| item | wire::SnapshotValue::Record { name
-                    : String::from("ChatSpan"), fields :
-                    ::std::vec![(String::from("mention"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .mention))), (String::from("mention_link"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .mention_link))), (String::from("link_text"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .link_text))), (String::from("link"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .link))), (String::from("bold_italic"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .bold_italic))), (String::from("bold"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .bold))), (String::from("italic"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .italic))), (String::from("plain"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .plain)))] }).collect()))] }).collect())), (String::from("commit"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .commit))), (String::from("outdated"), wire::SnapshotValue::Bool(* (&
-                    (item).outdated))), (String::from("created_at"),
-                    wire::SnapshotValue::I64(* (& (item).created_at))),
-                    (String::from("comments"), wire::SnapshotValue::List((& (item)
-                    .comments).iter().map(| item | wire::SnapshotValue::Record { name :
-                    String::from("ForgeReviewComment"), fields :
-                    ::std::vec![(String::from("anchor"),
+                    .plain)))] }).collect()))]
+                                                    })
+                                                    .collect()
+                                            )
+                                        ),
+                                        (
+                                            String::from("commit"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).commit)
+                                            )
+                                        ),
+                                        (
+                                            String::from("outdated"),
+                                            wire::SnapshotValue::Bool((item).outdated)
+                                        ),
+                                        (
+                                            String::from("created_at"),
+                                            wire::SnapshotValue::I64((item).created_at)
+                                        ),
+                                        (
+                                            String::from("comments"),
+                                            wire::SnapshotValue::List(
+                                                (item).comments
+                                                    .iter()
+                                                    .map(|item| wire::SnapshotValue::Record {
+                                                        name: String::from("ForgeReviewComment"),
+                                                        fields:
+                                                            ::std::vec![(String::from("anchor"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .anchor))), (String::from("body"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .body))), (String::from("blocks"), wire::SnapshotValue::List((&
-                    (item).blocks).iter().map(| item | wire::SnapshotValue::Record { name
+                    .body))), (String::from("blocks"), wire::SnapshotValue::List((item).blocks.iter().map(| item | wire::SnapshotValue::Record { name
                     : String::from("ChatBlock"), fields :
                     ::std::vec![(String::from("kind"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
@@ -421,9 +705,7 @@ impl ForgeView {
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .text))), (String::from("lang"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool(* (&
-                    (item).rich))), (String::from("spans"), wire::SnapshotValue::List((&
-                    (item).spans).iter().map(| item | wire::SnapshotValue::Record { name
+                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool((item).rich)), (String::from("spans"), wire::SnapshotValue::List((item).spans.iter().map(| item | wire::SnapshotValue::Record { name
                     : String::from("ChatSpan"), fields :
                     ::std::vec![(String::from("mention"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
@@ -441,31 +723,62 @@ impl ForgeView {
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .italic))), (String::from("plain"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .plain)))] }).collect()))] }).collect()))] }).collect()))] })
-                    .collect())), (String::from("forge_item_approvals"),
-                    wire::SnapshotValue::I64(* (& self.forge_item_approvals))),
-                    (String::from("forge_item_change_requests"),
-                    wire::SnapshotValue::I64(* (& self.forge_item_change_requests))),
-                    (String::from("discussion"), wire::SnapshotValue::List((& self
-                    .discussion).iter().map(| item | wire::SnapshotValue::Record { name :
-                    String::from("ChatMessage"), fields :
-                    ::std::vec![(String::from("seq"), wire::SnapshotValue::I64(* (&
-                    (item).seq))), (String::from("author"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author))), (String::from("meta"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .meta))), (String::from("blocks"), wire::SnapshotValue::List((&
-                    (item).blocks).iter().map(| item | wire::SnapshotValue::Record { name
-                    : String::from("ChatBlock"), fields :
-                    ::std::vec![(String::from("kind"),
+                    .plain)))] }).collect()))] }).collect()))]
+                                                    })
+                                                    .collect()
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("forge_item_approvals"),
+                        wire::SnapshotValue::I64(self.forge_item_approvals),
+                    ),
+                    (
+                        String::from("forge_item_change_requests"),
+                        wire::SnapshotValue::I64(self.forge_item_change_requests),
+                    ),
+                    (
+                        String::from("discussion"),
+                        wire::SnapshotValue::List(
+                            self.discussion
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ChatMessage"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("seq"),
+                                            wire::SnapshotValue::I64((item).seq)
+                                        ),
+                                        (
+                                            String::from("author"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).author)
+                                            )
+                                        ),
+                                        (
+                                            String::from("meta"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).meta)
+                                            )
+                                        ),
+                                        (
+                                            String::from("blocks"),
+                                            wire::SnapshotValue::List(
+                                                (item).blocks
+                                                    .iter()
+                                                    .map(|item| wire::SnapshotValue::Record {
+                                                        name: String::from("ChatBlock"),
+                                                        fields: ::std::vec![(String::from("kind"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .kind))), (String::from("text"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .text))), (String::from("lang"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool(* (&
-                    (item).rich))), (String::from("spans"), wire::SnapshotValue::List((&
-                    (item).spans).iter().map(| item | wire::SnapshotValue::Record { name
+                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool((item).rich)), (String::from("spans"), wire::SnapshotValue::List((item).spans.iter().map(| item | wire::SnapshotValue::Record { name
                     : String::from("ChatSpan"), fields :
                     ::std::vec![(String::from("mention"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
@@ -483,33 +796,72 @@ impl ForgeView {
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .italic))), (String::from("plain"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .plain)))] }).collect()))] }).collect())), (String::from("initial"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .initial))), (String::from("avatar_kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .avatar_kind))), (String::from("render_rev"),
-                    wire::SnapshotValue::I64(* (& (item).render_rev)))] }).collect())),
-                    (String::from("discussion_clipped"), wire::SnapshotValue::Bool(* (&
-                    self.discussion_clipped))), (String::from("linked_note"),
-                    wire::SnapshotValue::List((& self.linked_note).iter().map(| item |
-                    wire::SnapshotValue::Record { name : String::from("ChatMessage"),
-                    fields : ::std::vec![(String::from("seq"), wire::SnapshotValue::I64(*
-                    (& (item).seq))), (String::from("author"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .author))), (String::from("meta"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .meta))), (String::from("blocks"), wire::SnapshotValue::List((&
-                    (item).blocks).iter().map(| item | wire::SnapshotValue::Record { name
-                    : String::from("ChatBlock"), fields :
-                    ::std::vec![(String::from("kind"),
+                    .plain)))] }).collect()))]
+                                                    })
+                                                    .collect()
+                                            )
+                                        ),
+                                        (
+                                            String::from("initial"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).initial)
+                                            )
+                                        ),
+                                        (
+                                            String::from("avatar_kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(
+                                                    &(item).avatar_kind
+                                                )
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("discussion_clipped"),
+                        wire::SnapshotValue::Bool(self.discussion_clipped),
+                    ),
+                    (
+                        String::from("linked_note"),
+                        wire::SnapshotValue::List(
+                            self.linked_note
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ChatMessage"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("seq"),
+                                            wire::SnapshotValue::I64((item).seq)
+                                        ),
+                                        (
+                                            String::from("author"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).author)
+                                            )
+                                        ),
+                                        (
+                                            String::from("meta"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).meta)
+                                            )
+                                        ),
+                                        (
+                                            String::from("blocks"),
+                                            wire::SnapshotValue::List(
+                                                (item).blocks
+                                                    .iter()
+                                                    .map(|item| wire::SnapshotValue::Record {
+                                                        name: String::from("ChatBlock"),
+                                                        fields: ::std::vec![(String::from("kind"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .kind))), (String::from("text"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .text))), (String::from("lang"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool(* (&
-                    (item).rich))), (String::from("spans"), wire::SnapshotValue::List((&
-                    (item).spans).iter().map(| item | wire::SnapshotValue::Record { name
+                    .lang))), (String::from("rich"), wire::SnapshotValue::Bool((item).rich)), (String::from("spans"), wire::SnapshotValue::List((item).spans.iter().map(| item | wire::SnapshotValue::Record { name
                     : String::from("ChatSpan"), fields :
                     ::std::vec![(String::from("mention"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
@@ -527,105 +879,299 @@ impl ForgeView {
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
                     .italic))), (String::from("plain"),
                     wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .plain)))] }).collect()))] }).collect())), (String::from("initial"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .initial))), (String::from("avatar_kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .avatar_kind))), (String::from("render_rev"),
-                    wire::SnapshotValue::I64(* (& (item).render_rev)))] }).collect())),
-                    (String::from("roster_set"), wire::SnapshotValue::Bool(* (& self
-                    .roster_set))), (String::from("focus_seq"),
-                    wire::SnapshotValue::I64(* (& self.focus_seq))),
-                    (String::from("landed_tick"), wire::SnapshotValue::I64(* (& self
-                    .landed_tick))), (String::from("focus_number"),
-                    wire::SnapshotValue::I64(* (& self.focus_number))),
-                    (String::from("merge_conflicts"), wire::SnapshotValue::List((& self
-                    .merge_conflicts).iter().map(| item |
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(item)))
-                    .collect())), (String::from("merge_busy"),
-                    wire::SnapshotValue::Bool(* (& self.merge_busy))),
-                    (String::from("review_verdict"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .review_verdict))), (String::from("review_busy"),
-                    wire::SnapshotValue::Bool(* (& self.review_busy))),
-                    (String::from("staged_comments"), wire::SnapshotValue::List((& self
-                    .staged_comments).iter().map(| item | wire::SnapshotValue::Record {
-                    name : String::from("ForgeDraftComment"), fields :
-                    ::std::vec![(String::from("anchor"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .anchor))), (String::from("path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .path))), (String::from("line"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .line))), (String::from("side"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .side))), (String::from("body"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .body)))] }).collect())), (String::from("tree_pick"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tree_pick))), (String::from("tree_path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tree_path))), (String::from("tree_rev"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tree_rev))), (String::from("tree_entries"),
-                    wire::SnapshotValue::List((& self.tree_entries).iter().map(| item |
-                    wire::SnapshotValue::Record { name : String::from("TreeEntry"),
-                    fields : ::std::vec![(String::from("name"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .name))), (String::from("path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .path))), (String::from("kind"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& (item)
-                    .kind)))] }).collect())), (String::from("tree_born"),
-                    wire::SnapshotValue::Bool(* (& self.tree_born))),
-                    (String::from("tree_truncated"), wire::SnapshotValue::Bool(* (& self
-                    .tree_truncated))), (String::from("tree_phase"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .tree_phase))), (String::from("file_path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .file_path))), (String::from("file_text"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .file_text))), (String::from("file_binary"),
-                    wire::SnapshotValue::Bool(* (& self.file_binary))),
-                    (String::from("file_truncated"), wire::SnapshotValue::Bool(* (& self
-                    .file_truncated))), (String::from("file_picture"),
-                    wire::SnapshotValue::Bool(* (& self.file_picture))),
-                    (String::from("file_width"), wire::SnapshotValue::I64(* (& self
-                    .file_width))), (String::from("file_height"),
-                    wire::SnapshotValue::I64(* (& self.file_height))),
-                    (String::from("file_note"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .file_note))), (String::from("file_phase"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .file_phase))), (String::from("opened_dir"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .opened_dir))), (String::from("opened_rev"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .opened_rev))), (String::from("focus_path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .focus_path))), (String::from("focus_rev"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .focus_rev))), (String::from("review_draft"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .review_draft))), (String::from("comment_draft"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .comment_draft))), (String::from("comment_path"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .comment_path))), (String::from("comment_line"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .comment_line))), (String::from("comment_side"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .comment_side))), (String::from("host_error"),
-                    wire::SnapshotValue::Str(::std::string::ToString::to_string(& self
-                    .host_error))), (String::from("sent"), wire::SnapshotValue::Bool(* (&
-                    self.sent))), (String::from("viewport_width"),
-                    wire::SnapshotValue::F64(* (& self.viewport_width))),
-                    (String::from("tree_width"), wire::SnapshotValue::F64(* (& self
-                    .tree_width)))
+                    .plain)))] }).collect()))]
+                                                    })
+                                                    .collect()
+                                            )
+                                        ),
+                                        (
+                                            String::from("initial"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).initial)
+                                            )
+                                        ),
+                                        (
+                                            String::from("avatar_kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(
+                                                    &(item).avatar_kind
+                                                )
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("roster_set"),
+                        wire::SnapshotValue::Bool(self.roster_set),
+                    ),
+                    (
+                        String::from("focus_seq"),
+                        wire::SnapshotValue::I64(self.focus_seq),
+                    ),
+                    (
+                        String::from("landed_tick"),
+                        wire::SnapshotValue::I64(self.landed_tick),
+                    ),
+                    (
+                        String::from("focus_number"),
+                        wire::SnapshotValue::I64(self.focus_number),
+                    ),
+                    (
+                        String::from("merge_conflicts"),
+                        wire::SnapshotValue::List(
+                            self.merge_conflicts
+                                .iter()
+                                .map(|item| {
+                                    wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                                        item,
+                                    ))
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("merge_busy"),
+                        wire::SnapshotValue::Bool(self.merge_busy),
+                    ),
+                    (
+                        String::from("review_verdict"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.review_verdict,
+                        )),
+                    ),
+                    (
+                        String::from("review_busy"),
+                        wire::SnapshotValue::Bool(self.review_busy),
+                    ),
+                    (
+                        String::from("staged_comments"),
+                        wire::SnapshotValue::List(
+                            self.staged_comments
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("ForgeDraftComment"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("anchor"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).anchor)
+                                            )
+                                        ),
+                                        (
+                                            String::from("path"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("line"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).line)
+                                            )
+                                        ),
+                                        (
+                                            String::from("side"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).side)
+                                            )
+                                        ),
+                                        (
+                                            String::from("body"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).body)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("tree_pick"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.tree_pick,
+                        )),
+                    ),
+                    (
+                        String::from("tree_path"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.tree_path,
+                        )),
+                    ),
+                    (
+                        String::from("tree_rev"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.tree_rev,
+                        )),
+                    ),
+                    (
+                        String::from("tree_entries"),
+                        wire::SnapshotValue::List(
+                            self.tree_entries
+                                .iter()
+                                .map(|item| wire::SnapshotValue::Record {
+                                    name: String::from("TreeEntry"),
+                                    fields: ::std::vec![
+                                        (
+                                            String::from("name"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).name)
+                                            )
+                                        ),
+                                        (
+                                            String::from("path"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).path)
+                                            )
+                                        ),
+                                        (
+                                            String::from("kind"),
+                                            wire::SnapshotValue::Str(
+                                                ::std::string::ToString::to_string(&(item).kind)
+                                            )
+                                        )
+                                    ],
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        String::from("tree_born"),
+                        wire::SnapshotValue::Bool(self.tree_born),
+                    ),
+                    (
+                        String::from("tree_truncated"),
+                        wire::SnapshotValue::Bool(self.tree_truncated),
+                    ),
+                    (
+                        String::from("tree_phase"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.tree_phase,
+                        )),
+                    ),
+                    (
+                        String::from("file_path"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.file_path,
+                        )),
+                    ),
+                    (
+                        String::from("file_text"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.file_text,
+                        )),
+                    ),
+                    (
+                        String::from("file_binary"),
+                        wire::SnapshotValue::Bool(self.file_binary),
+                    ),
+                    (
+                        String::from("file_truncated"),
+                        wire::SnapshotValue::Bool(self.file_truncated),
+                    ),
+                    (
+                        String::from("file_picture"),
+                        wire::SnapshotValue::Bool(self.file_picture),
+                    ),
+                    (
+                        String::from("file_width"),
+                        wire::SnapshotValue::I64(self.file_width),
+                    ),
+                    (
+                        String::from("file_height"),
+                        wire::SnapshotValue::I64(self.file_height),
+                    ),
+                    (
+                        String::from("file_note"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.file_note,
+                        )),
+                    ),
+                    (
+                        String::from("file_phase"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.file_phase,
+                        )),
+                    ),
+                    (
+                        String::from("opened_dir"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.opened_dir,
+                        )),
+                    ),
+                    (
+                        String::from("opened_rev"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.opened_rev,
+                        )),
+                    ),
+                    (
+                        String::from("focus_path"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.focus_path,
+                        )),
+                    ),
+                    (
+                        String::from("focus_rev"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.focus_rev,
+                        )),
+                    ),
+                    (
+                        String::from("review_draft"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.review_draft,
+                        )),
+                    ),
+                    (
+                        String::from("comment_draft"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.comment_draft,
+                        )),
+                    ),
+                    (
+                        String::from("comment_path"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.comment_path,
+                        )),
+                    ),
+                    (
+                        String::from("comment_line"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.comment_line,
+                        )),
+                    ),
+                    (
+                        String::from("comment_side"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.comment_side,
+                        )),
+                    ),
+                    (
+                        String::from("host_error"),
+                        wire::SnapshotValue::Str(::std::string::ToString::to_string(
+                            &self.host_error,
+                        )),
+                    ),
+                    (
+                        String::from("sent"),
+                        wire::SnapshotValue::Bool(self.sent),
+                    ),
+                    (
+                        String::from("viewport_width"),
+                        wire::SnapshotValue::F64(self.viewport_width),
+                    ),
+                    (
+                        String::from("tree_width"),
+                        wire::SnapshotValue::F64(self.tree_width),
+                    ),
                 ],
             },
         }
-            .encode()
+        .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
         let snapshot = wire::Snapshot::decode(bytes)?;
@@ -1695,7 +2241,7 @@ impl ForgeView {
                             let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
-                            if name != "ChatMessage" || fields.len() != 7 {
+                            if name != "ChatMessage" || fields.len() != 6 {
                                 return None;
                             }
                             let mut fields = fields.into_iter();
@@ -1721,10 +2267,6 @@ impl ForgeView {
                             }
                             let (name, field_5) = fields.next()?;
                             if name != "avatar_kind" {
-                                return None;
-                            }
-                            let (name, field_6) = fields.next()?;
-                            if name != "render_rev" {
                                 return None;
                             }
                             Some(crate::host::ChatMessage {
@@ -1886,10 +2428,6 @@ impl ForgeView {
                                 })?,
                                 avatar_kind: (match field_5 {
                                     wire::SnapshotValue::Str(item) => Some(item),
-                                    _ => None,
-                                })?,
-                                render_rev: (match field_6 {
-                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -1918,7 +2456,7 @@ impl ForgeView {
                             let wire::SnapshotValue::Record { name, fields } = item else {
                                 return None;
                             };
-                            if name != "ChatMessage" || fields.len() != 7 {
+                            if name != "ChatMessage" || fields.len() != 6 {
                                 return None;
                             }
                             let mut fields = fields.into_iter();
@@ -1944,10 +2482,6 @@ impl ForgeView {
                             }
                             let (name, field_5) = fields.next()?;
                             if name != "avatar_kind" {
-                                return None;
-                            }
-                            let (name, field_6) = fields.next()?;
-                            if name != "render_rev" {
                                 return None;
                             }
                             Some(crate::host::ChatMessage {
@@ -2109,10 +2643,6 @@ impl ForgeView {
                                 })?,
                                 avatar_kind: (match field_5 {
                                     wire::SnapshotValue::Str(item) => Some(item),
-                                    _ => None,
-                                })?,
-                                render_rev: (match field_6 {
-                                    wire::SnapshotValue::I64(item) => Some(item),
                                     _ => None,
                                 })?,
                             })
@@ -2528,86 +3058,85 @@ impl ForgeView {
                 _ => None,
             })?;
             Some(Self {
-                connected: connected,
-                dark: dark,
-                org: org,
-                about: about,
-                tier: tier,
-                network_chain_id: network_chain_id,
-                connected_rpc: connected_rpc,
-                connection_serial: connection_serial,
-                link_tick: link_tick,
-                repos: repos,
-                list_phase: list_phase,
-                open_repo: open_repo,
-                repo_phase: repo_phase,
-                branches: branches,
-                items: items,
-                tab: tab,
-                forge_item_number: forge_item_number,
-                item_phase: item_phase,
-                forge_item_kind: forge_item_kind,
-                forge_item_title: forge_item_title,
-                forge_item_state: forge_item_state,
-                forge_item_author: forge_item_author,
-                forge_item_branches: forge_item_branches,
-                forge_item_body: forge_item_body,
-                forge_item_blocks: forge_item_blocks,
-                forge_item_files_changed: forge_item_files_changed,
-                forge_item_additions: forge_item_additions,
-                forge_item_deletions: forge_item_deletions,
-                diff_rows: diff_rows,
-                forge_item_diff_truncated: forge_item_diff_truncated,
-                forge_item_merge_oid: forge_item_merge_oid,
-                forge_item_source_branch: forge_item_source_branch,
-                forge_item_source_oid: forge_item_source_oid,
-                forge_item_target_oid: forge_item_target_oid,
-                forge_item_channel: forge_item_channel,
-                forge_item_reviews: forge_item_reviews,
-                forge_item_approvals: forge_item_approvals,
-                forge_item_change_requests: forge_item_change_requests,
-                discussion: discussion,
-                discussion_clipped: discussion_clipped,
-                linked_note: linked_note,
-                roster_set: roster_set,
-                focus_seq: focus_seq,
-                landed_tick: landed_tick,
-                focus_number: focus_number,
-                merge_conflicts: merge_conflicts,
-                merge_busy: merge_busy,
-                review_verdict: review_verdict,
-                review_busy: review_busy,
-                staged_comments: staged_comments,
-                tree_pick: tree_pick,
-                tree_path: tree_path,
-                tree_rev: tree_rev,
-                tree_entries: tree_entries,
-                tree_born: tree_born,
-                tree_truncated: tree_truncated,
-                tree_phase: tree_phase,
-                file_path: file_path,
-                file_text: file_text,
-                file_binary: file_binary,
-                file_truncated: file_truncated,
-                file_picture: file_picture,
-                file_width: file_width,
-                file_height: file_height,
-                file_note: file_note,
-                file_phase: file_phase,
-                opened_dir: opened_dir,
-                opened_rev: opened_rev,
-                focus_path: focus_path,
-                focus_rev: focus_rev,
-                review_draft: review_draft,
-                comment_draft: comment_draft,
-                comment_path: comment_path,
-                comment_line: comment_line,
-                comment_side: comment_side,
-                host_error: host_error,
-                sent: sent,
-                viewport_width: viewport_width,
-                tree_width: tree_width,
-                file_text_revision: ::ducktape_view_guest::rev::seed(),
+                connected,
+                dark,
+                org,
+                about,
+                tier,
+                network_chain_id,
+                connected_rpc,
+                connection_serial,
+                link_tick,
+                repos,
+                list_phase,
+                open_repo,
+                repo_phase,
+                branches,
+                items,
+                tab,
+                forge_item_number,
+                item_phase,
+                forge_item_kind,
+                forge_item_title,
+                forge_item_state,
+                forge_item_author,
+                forge_item_branches,
+                forge_item_body,
+                forge_item_blocks,
+                forge_item_files_changed,
+                forge_item_additions,
+                forge_item_deletions,
+                diff_rows,
+                forge_item_diff_truncated,
+                forge_item_merge_oid,
+                forge_item_source_branch,
+                forge_item_source_oid,
+                forge_item_target_oid,
+                forge_item_channel,
+                forge_item_reviews,
+                forge_item_approvals,
+                forge_item_change_requests,
+                discussion,
+                discussion_clipped,
+                linked_note,
+                roster_set,
+                focus_seq,
+                landed_tick,
+                focus_number,
+                merge_conflicts,
+                merge_busy,
+                review_verdict,
+                review_busy,
+                staged_comments,
+                tree_pick,
+                tree_path,
+                tree_rev,
+                tree_entries,
+                tree_born,
+                tree_truncated,
+                tree_phase,
+                file_path,
+                file_text,
+                file_binary,
+                file_truncated,
+                file_picture,
+                file_width,
+                file_height,
+                file_note,
+                file_phase,
+                opened_dir,
+                opened_rev,
+                focus_path,
+                focus_rev,
+                review_draft,
+                comment_draft,
+                comment_path,
+                comment_line,
+                comment_side,
+                host_error,
+                sent,
+                viewport_width,
+                tree_width,
             })
         })())
             .ok_or_else(|| String::from("snapshot state mismatch"))
@@ -2616,74 +3145,67 @@ impl ForgeView {
 impl ForgeView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(move |value| Message::SessionArrived(value)),
+            crate::host::session().map(Message::SessionArrived),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::repos(self.connection_serial)
-                        .map(move |value| Message::ReposArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::repos(
+                    self.connection_serial,
+                )
+                .map(Message::ReposArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::repo(self.connection_serial, self.open_repo.to_owned())
-                        .map(move |value| Message::RepoArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::repo(
+                    self.connection_serial,
+                    self.open_repo.to_owned(),
+                )
+                .map(Message::RepoArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::item(
-                            self.connection_serial,
-                            self.open_repo.to_owned(),
-                            self.forge_item_number,
-                        )
-                        .map(move |value| Message::ItemArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::item(
+                    self.connection_serial,
+                    self.open_repo.to_owned(),
+                    self.forge_item_number,
+                )
+                .map(Message::ItemArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::discussion(
-                            self.connection_serial,
-                            self.forge_item_channel.to_owned(),
-                        )
-                        .map(move |value| Message::DiscussionArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::discussion(
+                    self.connection_serial,
+                    self.forge_item_channel.to_owned(),
+                )
+                .map(Message::DiscussionArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::tree(
-                            self.connection_serial,
-                            self.open_repo.to_owned(),
-                            self.tree_rev.to_owned(),
-                            self.tree_path.to_owned(),
-                        )
-                        .map(move |value| Message::TreeArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::tree(
+                    self.connection_serial,
+                    self.open_repo.to_owned(),
+                    self.tree_rev.to_owned(),
+                    self.tree_path.to_owned(),
+                )
+                .map(Message::TreeArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([
-                    crate::host::blob(
-                            self.connection_serial,
-                            self.open_repo.to_owned(),
-                            self.tree_rev.to_owned(),
-                            self.file_path.to_owned(),
-                            self.network_chain_id.to_owned(),
-                        )
-                        .map(move |value| Message::BlobArrived(value)),
-                ])
+                ::ducktape_view_guest::Subscription::batch([crate::host::blob(
+                    self.connection_serial,
+                    self.open_repo.to_owned(),
+                    self.tree_rev.to_owned(),
+                    self.file_path.to_owned(),
+                    self.network_chain_id.to_owned(),
+                )
+                .map(Message::BlobArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
-            crate::host::acts().map(move |value| Message::ActDone(value)),
+            crate::host::acts().map(Message::ActDone),
         ])
     }
 }
@@ -2692,20 +3214,67 @@ mod tests {
     use super::*;
     #[test]
     fn view_fits_default_stack() {
-        ::std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let (app, _) = ForgeView::boot();
-                let _ = app.view();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        let (app, _) = ForgeView::boot();
+        let _ = app.view();
+    }
+
+    #[test]
+    fn disconnected_view_hides_retained_repository_and_review_controls() {
+        let (mut app, _) = ForgeView::boot();
+        app.repos.push(crate::host::ForgeRepo {
+            name: "stale-repo".into(),
+            head: "stale-head".into(),
+        });
+        app.open_repo = "stale-repo".into();
+        app.forge_item_number = 7;
+        app.item_phase = "ready".into();
+        app.forge_item_kind = "pr".into();
+        let mut tree = app.view();
+        tree.for_each_mut(&mut |node| {
+            assert!(!matches!(
+                node,
+                wire::Node::Button {
+                    on_press: Some(_),
+                    ..
+                } | wire::Node::Surface { .. }
+            ));
+            if let wire::Node::Text { content, .. } = node {
+                assert!(!content.contains("stale-"));
+            }
+        });
+        assert_eq!(app.repos.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_preserves_review_drafts_and_code_selection() {
+        let (mut app, _) = ForgeView::boot();
+        app.open_repo = "core".into();
+        app.review_draft = "한글 review".into();
+        app.tree_width = 310.;
+        app.file_path = "src/main.rs".into();
+        app.file_text = "fn main() {}".into();
+        app.discussion.push(crate::host::ChatMessage {
+            seq: 1,
+            author: "reader".into(),
+            initial: "R".into(),
+            avatar_kind: "human".into(),
+            ..Default::default()
+        });
+        app.linked_note = app.discussion.clone();
+        app.staged_comments.push(crate::host::ForgeDraftComment {
+            anchor: "src/main.rs:1".into(),
+            path: "src/main.rs".into(),
+            line: "1".into(),
+            side: "new".into(),
+            body: "keep".into(),
+        });
+        let snapshot = app.snapshot().unwrap();
+        let restored = ForgeView::restore(&snapshot).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
 }
 mod app_update;
 mod app_view;
 mod components;
 mod forge;
-mod icon;
 mod kit;
