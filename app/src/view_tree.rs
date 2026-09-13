@@ -1497,21 +1497,22 @@ impl ViewTree {
                     saved.direction == *direction && saved.anchors == (*anchor_x, *anchor_y)
                 });
                 if *direction == wire::ScrollDirection::Vertical
-                    && let Some(rows) = virtual_rows(content) {
-                        return self.virtual_scroll(
-                            key,
-                            rows,
-                            *anchor_y,
-                            *auto_scroll,
-                            *on_scroll,
-                            *width,
-                            *height,
-                            *background,
-                            *border,
-                            restored,
-                            cx,
-                        );
-                    }
+                    && let Some(rows) = virtual_rows(content)
+                {
+                    return self.virtual_scroll(
+                        key,
+                        rows,
+                        *anchor_y,
+                        *auto_scroll,
+                        *on_scroll,
+                        *width,
+                        *height,
+                        *background,
+                        *border,
+                        restored,
+                        cx,
+                    );
+                }
                 let handle = self.scrolls.entry(key.clone()).or_default().clone();
                 let element = decoration(
                     dimensions(div().relative(), *width, *height),
@@ -1757,10 +1758,9 @@ impl ViewTree {
                             }
                             let _ = releasing.update(cx, |this, cx| {
                                 let was_dragging = this.drags.remove(&release_key).is_some();
-                                if was_dragging
-                                    && let Some(message) = release {
-                                        cx.emit(wire::Event::Message(message));
-                                    }
+                                if was_dragging && let Some(message) = release {
+                                    cx.emit(wire::Event::Message(message));
+                                }
                             });
                         });
                     },
@@ -1884,9 +1884,10 @@ impl ViewTree {
                             if !visible {
                                 sensor.pending = None;
                                 if sensor.size.take().is_some()
-                                    && let Some(message) = sensor.on_hide {
-                                        cx.emit(wire::Event::Message(message));
-                                    }
+                                    && let Some(message) = sensor.on_hide
+                                {
+                                    cx.emit(wire::Event::Message(message));
+                                }
                                 return;
                             }
                             let unchanged = sensor.size == Some(bounds.size);
@@ -2038,14 +2039,13 @@ impl ViewTree {
                 if let Some(base) = children.first() {
                     element = element.child(self.node(base, window, cx));
                 }
-                if reveal
-                    && let Some(child) = children.get(1) {
-                        let mut layer = div().absolute().inset_0().rounded(px(*radius));
-                        if let Some(color) = tint {
-                            layer = layer.bg(rgba(*color));
-                        }
-                        element = element.child(layer.child(self.node(child, window, cx)));
+                if reveal && let Some(child) = children.get(1) {
+                    let mut layer = div().absolute().inset_0().rounded(px(*radius));
+                    if let Some(color) = tint {
+                        layer = layer.bg(rgba(*color));
                     }
+                    element = element.child(layer.child(self.node(child, window, cx)));
+                }
                 element
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         match hovered {
@@ -2156,6 +2156,8 @@ impl ViewTree {
                 hash,
                 bytes,
                 color,
+                inherit_button_ink,
+                fit,
                 width,
                 height,
                 opacity,
@@ -2167,11 +2169,22 @@ impl ViewTree {
                 let mut element =
                     dimensions(div(), *width, *height).opacity(opacity.unwrap_or(1.0));
                 if let Some(bytes) = self.vectors.get(hash) {
-                    let mut icon = svg().data(bytes).size_full();
-                    if let Some(color) = color {
-                        icon = icon.text_color(rgba(*color));
+                    let monochrome = color.is_some() || *inherit_button_ink;
+                    if monochrome {
+                        let ink = color.map(rgba).unwrap_or_else(|| window.text_style().color);
+                        element = element.child(svg().data(bytes).size_full().text_color(ink));
+                    } else {
+                        // GPUI's SVG icon renderer is an alpha mask. Untinted
+                        // artwork instead uses its native full-color image decoder.
+                        element = element.child(
+                            img(Arc::new(Image::from_bytes(
+                                ImageFormat::Svg,
+                                bytes.to_vec(),
+                            )))
+                            .size_full()
+                            .object_fit(object_fit(*fit)),
+                        );
                     }
-                    element = element.child(icon);
                 }
                 element.into_any_element()
             }
@@ -3410,9 +3423,10 @@ fn virtual_rows(node: &wire::Node) -> Option<Vec<VirtualRow>> {
                     }],
                 };
                 if index + 1 < children.len()
-                    && let Some(last) = part.last_mut() {
-                        last.gap += spacing.unwrap_or_default();
-                    }
+                    && let Some(last) = part.last_mut()
+                {
+                    last.gap += spacing.unwrap_or_default();
+                }
                 rows.extend(part);
             }
             found.then(|| wrap_virtual_rows(node, rows))
@@ -4096,6 +4110,65 @@ fn append_arc_to(
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn untinted_svg_uses_native_color_decoder_and_retains_pixels_without_resent_bytes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path fill="#ff0000" d="M0 0h12v24H0z"/><path fill="#0000ff" d="M12 0h12v24H12z"/></svg>"##.to_vec();
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, bytes.clone()));
+        let node = wire::Node::Svg {
+            key: "artwork".into(),
+            hash: 42,
+            bytes: Some(bytes),
+            inherit_button_ink: false,
+            label: None,
+            color: None,
+            hover: None,
+            fit: Some(wire::ContentFit::Contain),
+            rotation: None,
+            opacity: None,
+            width: Some(wire::Length::Fixed(24.)),
+            height: Some(wire::Length::Fixed(24.)),
+        };
+        let window = cx.open_window(size(px(80.), px(80.)), |_, _| ViewTree::new(node));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        native.run_until_parked();
+        native.update(|window, cx| {
+            assert!(
+                gpui_kit::ImageSource::Image(image.clone()).is_asset_cached(cx),
+                "the rendered SVG must request the native full-color image path"
+            );
+            let rendered = image
+                .clone()
+                .get_render_image(window, cx)
+                .expect("native SVG decoded");
+            let pixels = rendered.as_bytes(0).expect("decoded native pixels");
+            assert!(
+                pixels.chunks_exact(4).any(|p| p == [0, 0, 255, 255]),
+                "red survives"
+            );
+            assert!(
+                pixels.chunks_exact(4).any(|p| p == [255, 0, 0, 255]),
+                "blue survives"
+            );
+            tree.update(cx, |tree, cx| {
+                let mut next = tree.root.clone();
+                if let wire::Node::Svg { bytes, .. } = &mut next {
+                    *bytes = None;
+                }
+                tree.replace(next, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                image.clone().get_render_image(window, cx).is_some(),
+                "unchanged artwork remains available when a wire patch omits bytes"
+            );
+        });
+    }
 
     #[gpui_kit::test]
     fn container_focus_is_native_and_handoff_never_reuses_retired_handles(

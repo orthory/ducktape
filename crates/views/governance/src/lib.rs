@@ -95,6 +95,21 @@ impl GovernanceView {
 mod tests {
     use super::*;
     #[test]
+    fn an_empty_open_register_makes_no_claim_about_network_history() {
+        let (mut view, _) = GovernanceView::boot();
+        view.connected = true;
+        view.answered = true;
+        let mut message = None;
+        view.view().for_each_mut(&mut |node| {
+            if let ducktape_view_guest::wire::Node::Text { key, content, .. } = node
+                && key == "governance/empty"
+            {
+                message = Some(content.clone());
+            }
+        });
+        assert_eq!(message.as_deref(), Some("No proposals waiting."));
+    }
+    #[test]
     fn disconnected_view_hides_retained_proposals_and_actions() {
         let (mut view, _) = GovernanceView::boot();
         view.rows.push(host::ProposalRow {
@@ -229,15 +244,25 @@ impl GovernanceView {
     pub(crate) fn view(&self) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{kit, wire};
         let mut content = vec![
-            kit::row("governance/header", [
-                kit::sized(kit::container("governance/seal", wire::Node::Surface {
-                    key: "governance/seal/svg".into(),
-                    name: "artifact_svg".into(),
-                    args: vec![wire::SurfaceValue::Str("icons/seal.svg".into())],
-                    on_event: None,
-                }), Some(wire::Length::Fixed(24.)), Some(wire::Length::Fixed(24.))),
-                kit::heading("governance/title", "Approvals"),
-            ]),
+            kit::row(
+                "governance/header",
+                [
+                    kit::sized(
+                        kit::container(
+                            "governance/seal",
+                            wire::Node::Surface {
+                                key: "governance/seal/svg".into(),
+                                name: "artifact_svg".into(),
+                                args: vec![wire::SurfaceValue::Str("icons/seal.svg".into())],
+                                on_event: None,
+                            },
+                        ),
+                        Some(wire::Length::Fixed(24.)),
+                        Some(wire::Length::Fixed(24.)),
+                    ),
+                    kit::heading("governance/title", "Approvals"),
+                ],
+            ),
             kit::text(
                 "governance/summary",
                 host::proposals_summary(self.connected, &self.rows),
@@ -280,12 +305,7 @@ impl GovernanceView {
                 host::pending_label(&self.rows),
             ));
         } else if self.answered {
-            let message = if self.rows.is_empty() {
-                "No proposals yet — a membership or configuration change opens the first one."
-            } else {
-                "No proposals waiting — every decision on this network is finalized."
-            };
-            content.push(kit::text("governance/empty", message));
+            content.push(kit::text("governance/empty", "No proposals waiting."));
         }
         for proposal in self.rows.iter().filter(|proposal| proposal.open) {
             content.push(self.proposal(proposal));
