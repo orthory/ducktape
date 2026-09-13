@@ -143,7 +143,7 @@ impl super::FilesView {
                         width : Some(wire::Length::Fixed(self.tree_width as f32)), height
                         : Some(wire::Length::Fill), padding : None, align_x : None,
                         align_y : None, background : None, border : None, snap : None,
-                        content : Box::new({ let mut children : Vec < wire::Node > =
+                        content : Box::new({ let children : Vec < wire::Node > =
                         vec![wire::Node::Container { shadow : Default::default(),
                         max_width : None, max_height : None, clip : false, key :
                         format!("{}/@container:185", use_scope), width :
@@ -152,7 +152,7 @@ impl super::FilesView {
                         top : 0.0f32, right : 14.0f32, bottom : 0.0f32, left : 14.0f32,
                         }), align_x : None, align_y : Some(wire::AlignY::Center),
                         background : None.map(wire::Background::Color), border : None,
-                        snap : None, content : Box::new({ let mut children : Vec <
+                        snap : None, content : Box::new({ let children : Vec <
                         wire::Node > =
                         vec![native::text_options(native::text(format!("{}/@text:193",
                         use_scope), "duckfs".to_owned().to_string(),), wire::TextOptions
@@ -248,7 +248,7 @@ impl super::FilesView {
                         auto_scroll : false, background : None, border : None, content :
                         Box::new({ let mut children : Vec < wire::Node > = Vec::new(); if
                         ! self.diff_from.is_empty() { children.push({ let mut children :
-                        Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node >
+                        Vec < wire::Node > = vec![{ let children : Vec < wire::Node >
                         = vec![self.changes_heading(format!("{}/GroupLabel@1407",
                         use_scope)), wire::Node::Space { width :
                         Some(wire::Length::Fill), height : None, },
@@ -267,7 +267,7 @@ impl super::FilesView {
                         "No differences.".to_owned().to_string(),)); } for (index, entry)
                         in self.diff.iter().enumerate() { let for_scope =
                         format!("{}/@for:1418({})", use_scope, index); children.push({
-                        let mut children : Vec < wire::Node > =
+                        let children : Vec < wire::Node > =
                         vec![native::sized(native::text_options(native::text(format!("{}/@text:312",
                         for_scope), entry.kind.to_owned().to_string(),),
                         wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -296,7 +296,7 @@ impl super::FilesView {
                         format!("{}/@for:1447({})", use_scope, index); children
                         .push(native::padded(native::sized(native::container(format!("{}/@container:336",
                         for_scope), { let mut children : Vec < wire::Node > = vec![{ let
-                        mut children : Vec < wire::Node > =
+                        children : Vec < wire::Node > =
                         vec![native::text_options(native::text(format!("{}/@text:350",
                         for_scope), snapshot.short_id.to_owned().to_string(),),
                         wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -395,9 +395,9 @@ impl super::FilesView {
                         Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
                         Some(wire::Length::Fixed(1.0f32)),),), } }), } }); children
                         .push({ let node_scope = format!("{}/preview-pane", use_scope); {
-                        let mut children : Vec < wire::Node > =
+                        let children : Vec < wire::Node > =
                         vec![native::padded(native::sized(native::container(format!("{}/@container:411",
-                        use_scope), { let mut children : Vec < wire::Node > = vec![{ let
+                        use_scope), { let children : Vec < wire::Node > = vec![{ let
                         mut children : Vec < wire::Node > =
                         vec![native::sized(native::text_options(native::text(format!("{}/@text:426",
                         use_scope), self.preview_path.to_owned().to_string(),),

@@ -305,12 +305,6 @@ impl ::std::fmt::Debug for Message {
 }
 #[allow(unused_parens)]
 impl ChatView {
-    fn title(&self) -> String {
-        "Chat".to_owned()
-    }
-}
-#[allow(unused_parens)]
-impl ChatView {
     fn state() -> Self {
         Self {
             active_palette: AppTheme::App,

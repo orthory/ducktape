@@ -10,7 +10,7 @@ impl super::ChatView {
         native::padded(
             native::sized(
                 native::container(node_scope.clone(), {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:200", use_scope),
@@ -89,7 +89,7 @@ impl super::ChatView {
         native::padded(
             native::sized(
                 native::container(node_scope.clone(), {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:200", use_scope),
@@ -162,7 +162,7 @@ impl super::ChatView {
         let _component_owner =
             ::ducktape_view_guest::slots::component("ChatScreen", &use_scope, false);
         {
-            let mut children: Vec<wire::Node> = vec![
+            let children: Vec<wire::Node> = vec![
                 {
                     let node_scope = format!("{}/channel-sidebar", use_scope);
                     wire::Node::Container {
@@ -180,7 +180,7 @@ impl super::ChatView {
                         border: None,
                         snap: None,
                         content: Box::new({
-                            let mut children: Vec<wire::Node> = vec![
+                            let children: Vec<wire::Node> = vec![
                                 native::padded(
                                     native::sized(
                                         native::container(
@@ -505,7 +505,7 @@ impl super::ChatView {
                                         if !self.dm_rows.is_empty() {
                                             children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:491",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:503",
                 use_scope), "DIRECT".to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::None), ..Default::default() },),
@@ -625,7 +625,7 @@ impl super::ChatView {
                             let mut children: Vec<wire::Node> = Vec::new();
                             if !self.active_channel.is_empty() {
                                 children
-                .push({ let mut children : Vec < wire::Node > =
+                .push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::sized(native::container(format!("{}/@container:547",
                 use_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
                 self.active_dm.name.is_empty() { children.push(wire::Node::Container {
@@ -659,7 +659,7 @@ impl super::ChatView {
                 .active_channel_archived { children.push(self
                 .start_huddle(format!("{}/HuddleStart@3225", use_scope), (move | |
                 Message::JoinHuddleSubmit).clone(),),); } if ! self.channel_members
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:636",
                 use_scope), "·".to_owned().to_string(),), wire::TextOptions { wrapping :
                 Some(wire::Wrapping::None), ..Default::default() },),
@@ -729,7 +729,7 @@ impl super::ChatView {
                 .connected && ! self.loading && self.messages.is_empty() { children
                 .push(self.empty_messages(format!("{}/EmptyState@3308", use_scope),),); }
                 if self.connected && self.loading && self.messages.is_empty() { children
-                .push({ let mut children : Vec < wire::Node > = vec![self
+                .push({ let children : Vec < wire::Node > = vec![self
                 .loading_messages(format!("{}/SkeletonRow@3320", use_scope),), self
                 .loading_messages(format!("{}/SkeletonRow@3321", use_scope),), self
                 .loading_messages(format!("{}/SkeletonRow@3322", use_scope),)];
@@ -737,7 +737,7 @@ impl super::ChatView {
                 use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
                 top : 4.0f32, right : 0.0f32, bottom : 0.0f32, left : 0.0f32, },),
                 14.0f32,) }); } if self.connected && ! self.messages.is_empty() {
-                children.push({ let mut children : Vec < wire::Node > =
+                children.push({ let children : Vec < wire::Node > =
                 vec![wire::Node::Sensor { key : format!("{}/@sensor:731", use_scope),
                 reset : None, on_show : Some(::ducktape_view_guest::slots::handler:: <
                 (f32, f32), Message, > (Box::new({ let route = { let route_scope =
@@ -895,7 +895,7 @@ impl super::ChatView {
                 key = message.view_key; let key_recon = format!("{}/key({})",
                 message_timeline_scope_3465, key); let child : wire::Node = { let mut
                 children : Vec < wire::Node > = Vec::new(); if unread_boundary > 0 &&
-                message.seq == unread_marker_seq { children.push({ let mut children : Vec
+                message.seq == unread_marker_seq { children.push({ let children : Vec
                 < wire::Node > =
                 vec![native::sized(native::container(format!("{}/@container:50",
                 key_recon), native::text(format!("{}/@text:55", key_recon), "".to_owned()
@@ -915,21 +915,20 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }); } if message.seq == selected_message_seq { children
                 .push({ let node_scope = format!("{}/message({})", format!("{}/key({})",
-                message_timeline_scope_3465, key), message.id); { let mut children : Vec
+                message_timeline_scope_3465, key), message.id); { let children : Vec
                 < wire::Node > = vec![{ let message_card_scope_2680 =
                 format!("{}/MessageCard@2680", key_recon); { let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
                 height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); match & crate ::host::message_plate(message
                 .deleted, true, crate ::host::seq_in_copy_range(message.seq,
                 copy_anchor_seq, copy_head_seq, copy_surface.clone(),
                 CopySurface::Timeline,),) { RowPlate::Plain => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:571",
                 message_card_scope_2680), { let message_contents_scope_1995 =
-                format!("{}/MessageContents@1995", message_card_scope_2680); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@1995", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
@@ -937,7 +936,7 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -969,14 +968,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1000,14 +998,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1068,7 +1065,7 @@ impl super::ChatView {
                 None, on_middle_release : None, on_enter : None, on_exit : None, on_move
                 : None, on_press_at : None, on_scroll : None, content : Box::new({ let
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
-                message_contents_scope_1995); { let mut children : Vec < wire::Node > =
+                message_contents_scope_1995); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
                 message_body_scope_1809); { let mut children : Vec < wire::Node > =
                 Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
@@ -1094,7 +1091,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -1227,7 +1224,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_1995), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_543_17(crate
@@ -1249,7 +1246,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:218", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1272,7 +1269,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1302,12 +1299,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, max_width : None, max_height :
                 None, clip : false, surface_width : None, surface_height : None,
                 surface_max_width : None, }, } }); } if message.reply_count > 0 {
-                children.push({ let mut children : Vec < wire::Node > =
+                children.push({ let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:447", message_contents_scope_1995),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_1995), { let mut children : Vec < wire::Node > =
+                message_contents_scope_1995), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -1346,7 +1343,7 @@ impl super::ChatView {
                 message_contents_scope_1995), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_1995), { let mut children : Vec < wire::Node > =
+                message_contents_scope_1995), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_1995), message.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1376,8 +1373,7 @@ impl super::ChatView {
                 RowPlate::Selected => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:591",
                 message_card_scope_2680), { let message_contents_scope_2015 =
-                format!("{}/MessageContents@2015", message_card_scope_2680); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2015", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
@@ -1385,7 +1381,7 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -1417,14 +1413,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1448,14 +1443,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1516,7 +1510,7 @@ impl super::ChatView {
                 None, on_middle_release : None, on_enter : None, on_exit : None, on_move
                 : None, on_press_at : None, on_scroll : None, content : Box::new({ let
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
-                message_contents_scope_2015); { let mut children : Vec < wire::Node > =
+                message_contents_scope_2015); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
                 message_body_scope_1809); { let mut children : Vec < wire::Node > =
                 Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
@@ -1542,7 +1536,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -1675,7 +1669,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2015), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_543_17(crate
@@ -1697,7 +1691,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:218", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1720,7 +1714,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1750,12 +1744,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, max_width : None, max_height :
                 None, clip : false, surface_width : None, surface_height : None,
                 surface_max_width : None, }, } }); } if message.reply_count > 0 {
-                children.push({ let mut children : Vec < wire::Node > =
+                children.push({ let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:447", message_contents_scope_2015),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2015), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2015), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -1794,7 +1788,7 @@ impl super::ChatView {
                 message_contents_scope_2015), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2015), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2015), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2015), message.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1824,8 +1818,7 @@ impl super::ChatView {
                 RowPlate::Ranged => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:611",
                 message_card_scope_2680), { let message_contents_scope_2035 =
-                format!("{}/MessageContents@2035", message_card_scope_2680); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2035", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
@@ -1833,7 +1826,7 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -1865,14 +1858,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1896,14 +1888,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let mut children : Vec < wire::Node > = vec![{
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
                 let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1964,7 +1955,7 @@ impl super::ChatView {
                 None, on_middle_release : None, on_enter : None, on_exit : None, on_move
                 : None, on_press_at : None, on_scroll : None, content : Box::new({ let
                 message_body_scope_1809 = format!("{}/MessageBody@1809",
-                message_contents_scope_2035); { let mut children : Vec < wire::Node > =
+                message_contents_scope_2035); { let children : Vec < wire::Node > =
                 vec![{ let rich_body_scope_688 = format!("{}/RichBody@688",
                 message_body_scope_1809); { let mut children : Vec < wire::Node > =
                 Vec::new(); for (index, block) in message.blocks.iter().enumerate() { let
@@ -1990,7 +1981,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -2123,7 +2114,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& message.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2035), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_543_17(crate
@@ -2145,7 +2136,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:218", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2168,7 +2159,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2198,12 +2189,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, max_width : None, max_height :
                 None, clip : false, surface_width : None, surface_height : None,
                 surface_max_width : None, }, } }); } if message.reply_count > 0 {
-                children.push({ let mut children : Vec < wire::Node > =
+                children.push({ let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:447", message_contents_scope_2035),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2035), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2035), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -2242,7 +2233,7 @@ impl super::ChatView {
                 message_contents_scope_2035), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2035), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2035), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2035), message.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2282,7 +2273,7 @@ impl super::ChatView {
                 Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top), background
                 : None.map(wire::Background::Color), border : None, snap : None, content
                 : Box::new(native::padded(native::container(format!("{}/@container:640",
-                message_card_scope_2680), { let mut children : Vec < wire::Node > =
+                message_card_scope_2680), { let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:661", message_card_scope_2680), content :
                 wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:668",
@@ -2387,13 +2378,12 @@ impl super::ChatView {
                 let copy_head_seq : i64 = dependency.2.clone(); let copy_surface :
                 CopySurface = dependency.3.clone(); let lazy_scope = dependency.4
                 .clone(); { let node_scope = format!("{}/message({})", lazy_scope,
-                cached_message.id); { let mut children : Vec < wire::Node > = vec![{ let
+                cached_message.id); { let children : Vec < wire::Node > = vec![{ let
                 message_card_scope_2701 = format!("{}/MessageCard@2701", node_scope); {
                 let mut children : Vec < wire::Node > = Vec::new(); if cached_message
                 .show_author { children.push(wire::Node::Space { width :
                 Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); match & crate
                 ::host::message_plate(cached_message.deleted, false, crate
                 ::host::seq_in_copy_range(cached_message.seq, copy_anchor_seq,
@@ -2401,8 +2391,7 @@ impl super::ChatView {
                 RowPlate::Plain => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:571",
                 message_card_scope_2701), { let message_contents_scope_1995 =
-                format!("{}/MessageContents@1995", message_card_scope_2701); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@1995", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
@@ -2410,7 +2399,7 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -2442,14 +2431,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -2474,14 +2462,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -2546,8 +2533,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_1995); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_1995); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -2573,7 +2559,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -2706,7 +2692,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_1995), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
@@ -2729,7 +2715,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2753,7 +2739,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2783,12 +2769,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_message.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_1995), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_1995), { let mut children : Vec < wire::Node > =
+                message_contents_scope_1995), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -2827,7 +2813,7 @@ impl super::ChatView {
                 message_contents_scope_1995), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_1995), { let mut children : Vec < wire::Node > =
+                message_contents_scope_1995), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_1995), cached_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -2857,8 +2843,7 @@ impl super::ChatView {
                 RowPlate::Selected => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:591",
                 message_card_scope_2701), { let message_contents_scope_2015 =
-                format!("{}/MessageContents@2015", message_card_scope_2701); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2015", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
@@ -2866,7 +2851,7 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -2898,14 +2883,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -2930,14 +2914,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -3002,8 +2985,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2015); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2015); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -3029,7 +3011,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -3162,7 +3144,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2015), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
@@ -3185,7 +3167,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3209,7 +3191,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3239,12 +3221,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_message.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2015), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2015), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2015), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -3283,7 +3265,7 @@ impl super::ChatView {
                 message_contents_scope_2015), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2015), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2015), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2015), cached_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3313,8 +3295,7 @@ impl super::ChatView {
                 RowPlate::Ranged => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:611",
                 message_card_scope_2701), { let message_contents_scope_2035 =
-                format!("{}/MessageContents@2035", message_card_scope_2701); { let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2035", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
@@ -3322,7 +3303,7 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -3354,14 +3335,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -3386,14 +3366,13 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -3458,8 +3437,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2035); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2035); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -3485,7 +3463,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -3618,7 +3596,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2035), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
@@ -3641,7 +3619,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3665,7 +3643,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3695,12 +3673,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_message.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2035), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2035), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2035), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -3739,7 +3717,7 @@ impl super::ChatView {
                 message_contents_scope_2035), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2035), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2035), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2035), cached_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -3779,7 +3757,7 @@ impl super::ChatView {
                 Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top), background
                 : None.map(wire::Background::Color), border : None, snap : None, content
                 : Box::new(native::padded(native::container(format!("{}/@container:640",
-                message_card_scope_2701), { let mut children : Vec < wire::Node > =
+                message_card_scope_2701), { let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:661", message_card_scope_2701), content :
                 wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:668",
@@ -3914,7 +3892,7 @@ impl super::ChatView {
                 | state.chat_pointer_y.clone(),), self.chat_screen_states.get(&
                 use_scope).map_or_else(| | self.chat_screen_initial.chat_height.clone(),
                 | state | state.chat_height.clone(),),) as f32,),), }), }]; if self
-                .message_action == MessageAction::More { children.push({ let mut children
+                .message_action == MessageAction::More { children.push({ let children
                 : Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/message-action-focus", use_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Message action focus".to_owned()
@@ -3934,7 +3912,7 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::sized(native::container(format!("{}/@container:918",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:937", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
@@ -3944,7 +3922,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@3559", use_scope), "emoji", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:961",
                 use_scope), "Add reaction".to_owned().to_string(),), wire::TextOptions {
@@ -3970,7 +3948,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@3591", use_scope), "nav-chat", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:993",
                 use_scope), "Reply in thread".to_owned().to_string(),), wire::TextOptions
@@ -3995,7 +3973,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@3631", use_scope), "link", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:1033",
                 use_scope), "Copy link".to_owned().to_string(),), wire::TextOptions {
@@ -4022,7 +4000,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@3663", use_scope), "pencil", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:1065",
                 use_scope), "Edit message".to_owned().to_string(),), wire::TextOptions {
@@ -4052,7 +4030,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@3701", use_scope), "trash", 14f32,
                 "@media:70",), native::text_options(native::text(format!("{}/@text:1103",
                 use_scope), "Delete message…".to_owned().to_string(),),
@@ -4076,7 +4054,7 @@ impl super::ChatView {
                 key : format!("{}/@layout:904", use_scope), width : None, height : None,
                 padding : None, background : None, border : None, clip : false, under :
                 0u32, children : children, } }); } if self.message_action ==
-                MessageAction::Reactions { children.push({ let mut children : Vec <
+                MessageAction::Reactions { children.push({ let children : Vec <
                 wire::Node > = vec![{ let node_scope =
                 format!("{}/message-reaction-focus", use_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Message reaction focus"
@@ -4134,7 +4112,7 @@ impl super::ChatView {
                 0u32, children : children, } }); } if self.message_action ==
                 MessageAction::Editing { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:1172",
-                use_scope), { let mut children : Vec < wire::Node > = vec![{ let
+                use_scope), { let children : Vec < wire::Node > = vec![{ let
                 node_scope = format!("{}/message-edit", use_scope); wire::Node::Surface {
                 key : node_scope.clone(), name : String::from("chat_composer"), args :
                 ::std::vec![{ let surface_arg = & (crate
@@ -4178,8 +4156,7 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
                 3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .message_action == MessageAction::Delete { children.push({ let mut
-                children : Vec < wire::Node > = vec![{ let node_scope =
+                .message_action == MessageAction::Delete { children.push({ let children : Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/message-delete-focus", use_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Message delete focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -4198,7 +4175,7 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::container(format!("{}/@container:1218",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![native::text(format!("{}/@text:1229", use_scope),
                 "Delete this message?".to_owned().to_string(),),
                 native::padded(native::button(format!("{}/@button:1230", use_scope),
@@ -4265,8 +4242,7 @@ impl super::ChatView {
                 : 6.0f32, right : 6.0f32, bottom : 6.0f32, left : 6.0f32, }), align_x :
                 None, align_y : None, background : None, border : None, snap : None,
                 content : Box::new({ let mut children : Vec < wire::Node > = Vec::new();
-                if self.search_phase == SearchPhase::Searching { children.push({ let mut
-                children : Vec < wire::Node > = vec![self
+                if self.search_phase == SearchPhase::Searching { children.push({ let children : Vec < wire::Node > = vec![self
                 .loading_messages(format!("{}/SkeletonRow@3922", use_scope),)];
                 native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1314",
                 use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
@@ -4486,10 +4462,9 @@ impl super::ChatView {
                                 }
                             });
                             children.push({ let node_scope = format!("{}/details-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let mut
-                children : Vec < wire::Node > =
+                use_scope); native::sized(native::container(node_scope.clone(), { let children : Vec < wire::Node > =
                 vec![native::padded(native::sized(native::container(format!("{}/@container:1393",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![native::sized(native::text_options(native::text(format!("{}/@text:1405",
                 use_scope), "Channel details".to_owned().to_string(),), wire::TextOptions
                 { wrapping : Some(wire::Wrapping::None), ..Default::default() },),
@@ -4528,7 +4503,7 @@ impl super::ChatView {
                 false, bar_width : None, bar_margin : None, scroller_width : None,
                 bar_spacing : None, anchor_x : wire::ScrollAnchor::Start, anchor_y :
                 wire::ScrollAnchor::Start, auto_scroll : false, background : None, border
-                : None, content : Box::new({ let mut children : Vec < wire::Node > =
+                : None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![{ let mut children : Vec < wire::Node > = vec![{ let mut children :
                 Vec < wire::Node > = Vec::new(); if ! self.active_channel_members_only {
                 children.push(native::text_options(native::text(format!("{}/@text:1456",
@@ -4561,8 +4536,8 @@ impl super::ChatView {
                 children, } }); }
                 native::spaced(native::sized(native::column(format!("{}/@layout:1449",
                 use_scope), children,), Some(wire::Length::Fill), None,), 7.0f32,) }, {
-                let mut children : Vec < wire::Node > = vec![self
-                .name_label(format!("{}/Eyebrow@4089", use_scope)), { let mut children :
+                let children : Vec < wire::Node > = vec![self
+                .name_label(format!("{}/Eyebrow@4089", use_scope)), { let children :
                 Vec < wire::Node > = vec![{ let node_scope = format!("{}/channel-name",
                 node_scope); wire::Node::Input { options : wire::InputOptions { label :
                 "Channel name".to_owned().to_string(), description : None, disabled :
@@ -4601,7 +4576,7 @@ impl super::ChatView {
                 .network_chain_id.to_owned(),), "Channel link copied".to_owned(),),),),
                 width : Some(wire::Length::Fill), height : None, padding :
                 Some(wire::Edges::all(6.0f32)), style : wire::ButtonStyle::default(), },
-                { let mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                { let mut children : Vec < wire::Node > = vec![{ let children : Vec <
                 wire::Node > = vec![self.members_label(format!("{}/Eyebrow@4128",
                 use_scope)), wire::Node::Space { width : Some(wire::Length::Fill), height
                 : None, }, native::text_options(native::text(format!("{}/@text:1530",
@@ -4612,7 +4587,7 @@ impl super::ChatView {
                 wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
                 Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }, { let mut children : Vec < wire::Node > = vec![{ let
+                children, } }, { let children : Vec < wire::Node > = vec![{ let
                 node_scope = format!("{}/member-key", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Member account or public key"
                 .to_owned().to_string(), description : None, disabled : self.busy,
@@ -4744,8 +4719,7 @@ impl super::ChatView {
                                 }
                             });
                             children.push({ let node_scope = format!("{}/thread-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let mut
-                children : Vec < wire::Node > = vec![wire::Node::Sensor { key :
+                use_scope); native::sized(native::container(node_scope.clone(), { let children : Vec < wire::Node > = vec![wire::Node::Sensor { key :
                 format!("{}/@sensor:1631", use_scope), reset : None, on_show :
                 Some(::ducktape_view_guest::slots::handler:: < (f32, f32), Message, >
                 (Box::new({ let route = { let route_scope = use_scope.clone(); move |
@@ -4930,7 +4904,7 @@ impl super::ChatView {
                 active_thread_seq { children.push({ let thread_parent_block_scope_2747 =
                 format!("{}/ThreadParentBlock@2747", key_recon); { let node_scope =
                 format!("{}/root", thread_parent_block_scope_2747); { let mut children :
-                Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
+                Vec < wire::Node > = vec![{ let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_2430 =
                 format!("{}/PrincipalAvatar@2430", thread_parent_block_scope_2747); { let
                 node_scope = format!("{}/root", principal_avatar_scope_2430); { let mut
@@ -4977,7 +4951,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
-                } native::column(node_scope.clone(), children) } } }, { let mut children
+                } native::column(node_scope.clone(), children) } } }, { let children
                 : Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:1030",
                 thread_parent_block_scope_2747), thread_message.author.to_owned()
@@ -5006,8 +4980,7 @@ impl super::ChatView {
                 spacing : Some(6.0f32), padding : None, width : Some(wire::Length::Fill),
                 height : None, align : Some(wire::AlignX::Center), background : None,
                 border : None, children : children, } }, { let message_body_scope_2472 =
-                format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_2472); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5033,7 +5006,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -5174,7 +5147,7 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), height :
                 Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
                 Some(wire::Length::Fixed(1.0f32)),)]; if thread_message.reply_count > 0 {
-                children.push({ let mut children : Vec < wire::Node > =
+                children.push({ let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:1076",
                 thread_parent_block_scope_2747), crate ::host::plural(thread_message
                 .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
@@ -5194,8 +5167,7 @@ impl super::ChatView {
                 key_recon); { let mut children : Vec < wire::Node > = Vec::new(); if
                 thread_message.show_author { children.push(wire::Node::Space { width :
                 Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); match & crate
                 ::host::message_plate(thread_message.deleted, thread_message.seq ==
                 thread_target_seq, crate ::host::seq_in_copy_range(thread_message.seq,
@@ -5204,7 +5176,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:783",
                 thread_message_card_scope_2752), { let message_contents_scope_2207 =
                 format!("{}/MessageContents@2207", thread_message_card_scope_2752); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if thread_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2207); { let node_scope = format!("{}/root",
@@ -5212,7 +5184,7 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -5244,14 +5216,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -5276,14 +5247,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -5348,8 +5318,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2207); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2207); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5375,7 +5344,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -5508,7 +5477,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2207), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
@@ -5531,7 +5500,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -5555,7 +5524,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -5585,12 +5554,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                thread_message.reply_count > 0 { children.push({ let mut children : Vec <
+                thread_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2207), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2207), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2207), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2207); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -5629,7 +5598,7 @@ impl super::ChatView {
                 message_contents_scope_2207), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if thread_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2207), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2207), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2207), thread_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -5660,7 +5629,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:803",
                 thread_message_card_scope_2752), { let message_contents_scope_2227 =
                 format!("{}/MessageContents@2227", thread_message_card_scope_2752); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if thread_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2227); { let node_scope = format!("{}/root",
@@ -5668,7 +5637,7 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -5700,14 +5669,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -5732,14 +5700,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -5804,8 +5771,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2227); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2227); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5831,7 +5797,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -5964,7 +5930,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2227), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
@@ -5987,7 +5953,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6011,7 +5977,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6041,12 +6007,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                thread_message.reply_count > 0 { children.push({ let mut children : Vec <
+                thread_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2227), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2227), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2227), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2227); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -6085,7 +6051,7 @@ impl super::ChatView {
                 message_contents_scope_2227), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if thread_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2227), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2227), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2227), thread_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6116,7 +6082,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:823",
                 thread_message_card_scope_2752), { let message_contents_scope_2247 =
                 format!("{}/MessageContents@2247", thread_message_card_scope_2752); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if thread_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2247); { let node_scope = format!("{}/root",
@@ -6124,7 +6090,7 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -6156,14 +6122,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -6188,14 +6153,13 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -6260,8 +6224,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2247); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2247); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -6287,7 +6250,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -6420,7 +6383,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let mut children : Vec < wire::Node >
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
                 = vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2247), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
@@ -6443,7 +6406,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6467,7 +6430,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6497,12 +6460,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                thread_message.reply_count > 0 { children.push({ let mut children : Vec <
+                thread_message.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2247), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2247), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2247), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2247); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -6541,7 +6504,7 @@ impl super::ChatView {
                 message_contents_scope_2247), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if thread_message.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2247), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2247), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2247), thread_message.meta.to_owned()
                 .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -6582,7 +6545,7 @@ impl super::ChatView {
                 background : None.map(wire::Background::Color), border : None, snap :
                 None, content :
                 Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2752), { let mut children : Vec < wire::Node >
+                thread_message_card_scope_2752), { let children : Vec < wire::Node >
                 = vec![wire::Node::Button { checked : None, expanded : None, description
                 : None, key : format!("{}/@button:865", thread_message_card_scope_2752),
                 content :
@@ -6647,7 +6610,7 @@ impl super::ChatView {
                 Vec < wire::Node > = Vec::new(); if cached_reply.show_author { children
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
                 height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); match & crate
                 ::host::message_plate(cached_reply.deleted, false, crate
                 ::host::seq_in_copy_range(cached_reply.seq, copy_anchor_seq,
@@ -6656,7 +6619,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:783",
                 thread_message_card_scope_2769), { let message_contents_scope_2207 =
                 format!("{}/MessageContents@2207", thread_message_card_scope_2769); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_reply.show_author { children.push({
                 let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2207); { let node_scope = format!("{}/root",
@@ -6664,7 +6627,7 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -6696,14 +6659,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -6728,14 +6690,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -6800,8 +6761,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2207); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2207); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -6827,7 +6787,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -6960,7 +6920,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2207), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_424_6(crate
@@ -6983,7 +6943,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7007,7 +6967,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7037,12 +6997,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_reply.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_reply.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2207), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2207), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2207), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2207); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -7081,7 +7041,7 @@ impl super::ChatView {
                 message_contents_scope_2207), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_reply.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2207), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2207), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2207), cached_reply.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7112,7 +7072,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:803",
                 thread_message_card_scope_2769), { let message_contents_scope_2227 =
                 format!("{}/MessageContents@2227", thread_message_card_scope_2769); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_reply.show_author { children.push({
                 let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2227); { let node_scope = format!("{}/root",
@@ -7120,7 +7080,7 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -7152,14 +7112,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -7184,14 +7143,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -7256,8 +7214,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2227); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2227); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -7283,7 +7240,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -7416,7 +7373,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2227), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_424_6(crate
@@ -7439,7 +7396,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7463,7 +7420,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7493,12 +7450,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_reply.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_reply.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2227), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2227), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2227), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2227); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -7537,7 +7494,7 @@ impl super::ChatView {
                 message_contents_scope_2227), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_reply.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2227), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2227), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2227), cached_reply.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7568,7 +7525,7 @@ impl super::ChatView {
                 .push(native::padded(native::sized(native::container(format!("{}/@container:823",
                 thread_message_card_scope_2769), { let message_contents_scope_2247 =
                 format!("{}/MessageContents@2247", thread_message_card_scope_2769); { let
-                mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_reply.show_author { children.push({
                 let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2247); { let node_scope = format!("{}/root",
@@ -7576,7 +7533,7 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let mut children : Vec < wire::Node > =
+                person_avatar_scope_798); { let children : Vec < wire::Node > =
                 vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
@@ -7608,14 +7565,13 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -7640,14 +7596,13 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let mut
-                children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
+                principal_plate_scope_909); { let children : Vec < wire::Node > =
                 vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
@@ -7712,8 +7667,7 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2247); { let mut
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2247); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -7739,7 +7693,7 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let mut children : Vec < wire::Node > = vec![{
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
                 let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
                 children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
                 for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
@@ -7872,7 +7826,7 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_reply.id),)
-                .is_empty() { children.push({ let mut children : Vec < wire::Node > =
+                .is_empty() { children.push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2247), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_424_6(crate
@@ -7895,7 +7849,7 @@ impl super::ChatView {
                 .to_owned())), key : format!("{}/@button:218", reaction_chip_scope_1849),
                 content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:225",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:232",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7919,7 +7873,7 @@ impl super::ChatView {
                 Some(String::from(reaction.emoji.to_owned())), key :
                 format!("{}/@button:262", reaction_chip_scope_1849), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:269",
-                reaction_chip_scope_1849), { let mut children : Vec < wire::Node > =
+                reaction_chip_scope_1849), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:276",
                 reaction_chip_scope_1849), reaction.emoji.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -7949,12 +7903,12 @@ impl super::ChatView {
                 0.0f32, }), width : Some(wire::Length::Fill), height : None, max_width :
                 None, max_height : None, clip : false, surface_width : None,
                 surface_height : None, surface_max_width : None, }, } }); } if
-                cached_reply.reply_count > 0 { children.push({ let mut children : Vec <
+                cached_reply.reply_count > 0 { children.push({ let children : Vec <
                 wire::Node > = vec![wire::Node::Button { checked : None, expanded : None,
                 description : None, key : format!("{}/@button:447",
                 message_contents_scope_2247), content :
                 wire::ButtonContent::Child(Box::new(native::padded(native::container(format!("{}/@container:452",
-                message_contents_scope_2247), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2247), { let children : Vec < wire::Node > =
                 vec![{ let component_icon_scope_1872 = format!("{}/Icon@1872",
                 message_contents_scope_2247); { let node_scope = format!("{}/root",
                 component_icon_scope_1872); { let mut children : Vec < wire::Node > =
@@ -7993,7 +7947,7 @@ impl super::ChatView {
                 message_contents_scope_2247), children,), Some(wire::Length::Fill),
                 None,), 2.0f32,) }); if cached_reply.pending { children
                 .push(native::padded(native::container(format!("{}/@container:506",
-                message_contents_scope_2247), { let mut children : Vec < wire::Node > =
+                message_contents_scope_2247), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2247), cached_reply.meta.to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -8034,7 +7988,7 @@ impl super::ChatView {
                 background : None.map(wire::Background::Color), border : None, snap :
                 None, content :
                 Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2769), { let mut children : Vec < wire::Node >
+                thread_message_card_scope_2769), { let children : Vec < wire::Node >
                 = vec![wire::Node::Button { checked : None, expanded : None, description
                 : None, key : format!("{}/@button:865", thread_message_card_scope_2769),
                 content :
@@ -8153,7 +8107,7 @@ impl super::ChatView {
                 use_scope).map_or_else(| | self.chat_screen_initial.thread_height
                 .clone(), | state | state.thread_height.clone(),),) as f32,),), }), }];
                 if self.thread_message_action == MessageAction::More { children.push({
-                let mut children : Vec < wire::Node > = vec![{ let node_scope =
+                let children : Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/thread-action-focus", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Thread action focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -8172,7 +8126,7 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::sized(native::container(format!("{}/@container:1864",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:1877", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
@@ -8182,7 +8136,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@4499", use_scope), "emoji", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:1901",
                 use_scope), "Add reaction".to_owned().to_string(),), wire::TextOptions {
@@ -8208,7 +8162,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@4535", use_scope), "link", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:1937",
                 use_scope), "Copy link".to_owned().to_string(),), wire::TextOptions {
@@ -8235,7 +8189,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@4567", use_scope), "pencil", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:1969",
                 use_scope), "Edit message".to_owned().to_string(),), wire::TextOptions {
@@ -8265,7 +8219,7 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let mut children : Vec < wire::Node > =
+                None, content : Box::new({ let children : Vec < wire::Node > =
                 vec![self.icon(format!("{}/Icon@4605", use_scope), "trash", 14f32,
                 "@media:70",), native::text_options(native::text(format!("{}/@text:2007",
                 use_scope), "Delete message…".to_owned().to_string(),),
@@ -8289,7 +8243,7 @@ impl super::ChatView {
                 key : format!("{}/@layout:1853", use_scope), width : None, height : None,
                 padding : None, background : None, border : None, clip : false, under :
                 0u32, children : children, } }); } if self.thread_message_action ==
-                MessageAction::Reactions { children.push({ let mut children : Vec <
+                MessageAction::Reactions { children.push({ let children : Vec <
                 wire::Node > = vec![{ let node_scope =
                 format!("{}/thread-reaction-focus", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Thread reaction focus".to_owned()
@@ -8348,7 +8302,7 @@ impl super::ChatView {
                 0u32, children : children, } }); } if self.thread_message_action ==
                 MessageAction::Editing { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:2070",
-                use_scope), { let mut children : Vec < wire::Node > = vec![{ let
+                use_scope), { let children : Vec < wire::Node > = vec![{ let
                 node_scope = format!("{}/thread-edit", node_scope); wire::Node::Surface {
                 key : node_scope.clone(), name : String::from("chat_composer"), args :
                 ::std::vec![{ let surface_arg = & (crate
@@ -8392,8 +8346,7 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
                 3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .thread_message_action == MessageAction::Delete { children.push({ let mut
-                children : Vec < wire::Node > = vec![{ let node_scope =
+                .thread_message_action == MessageAction::Delete { children.push({ let children : Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/thread-delete-focus", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Thread delete focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -8412,7 +8365,7 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::container(format!("{}/@container:2116",
-                use_scope), { let mut children : Vec < wire::Node > =
+                use_scope), { let children : Vec < wire::Node > =
                 vec![native::text(format!("{}/@text:2127", use_scope),
                 "Delete this message?".to_owned().to_string(),),
                 native::padded(native::button(format!("{}/@button:2128", use_scope),

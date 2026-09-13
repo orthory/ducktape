@@ -190,12 +190,6 @@ impl FilesView {
 }
 #[allow(unused_parens)]
 impl FilesView {
-    fn title(&self) -> String {
-        "Files".to_owned()
-    }
-}
-#[allow(unused_parens)]
-impl FilesView {
     fn state() -> Self {
         Self {
             active_palette: AppTheme::App,
@@ -1263,5 +1257,4 @@ mod app_update;
 mod app_view;
 mod browser;
 mod files;
-mod icon;
 mod kit;

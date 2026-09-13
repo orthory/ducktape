@@ -147,12 +147,6 @@ impl ::std::fmt::Debug for Message {
 }
 #[allow(unused_parens)]
 impl ForgeView {
-    fn title(&self) -> String {
-        "Forge".to_owned()
-    }
-}
-#[allow(unused_parens)]
-impl ForgeView {
     fn state() -> Self {
         Self {
             active_palette: AppTheme::App,

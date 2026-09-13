@@ -184,7 +184,7 @@ impl super::ForgeView {
     ) -> wire::Node {
         let node_scope = format!("{}/root", use_scope);
         {
-            let mut children: Vec<wire::Node> = vec![
+            let children: Vec<wire::Node> = vec![
                 {
                     let node_scope = format!("{}/tree-pane", node_scope);
                     native::sized(
@@ -208,7 +208,7 @@ impl super::ForgeView {
                                 background: None,
                                 border: None,
                                 content: Box::new({
-                                    let mut children: Vec<wire::Node> = vec![
+                                    let children: Vec<wire::Node> = vec![
                                         native::padded(
                                             native::sized(
                                                 native::container(
@@ -432,7 +432,7 @@ impl super::ForgeView {
                     }
                 },
                 {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         self.code_header(format!("{}/ForgeCodeHeader@1442", use_scope)),
                         wire::Node::Scroll {
                             on_scroll: None,
@@ -599,7 +599,7 @@ impl super::ForgeView {
                                     && self.file_picture
                                 {
                                     children.push({
-                                        let mut children: Vec<wire::Node> = vec![
+                                        let children: Vec<wire::Node> = vec![
                                             {
                                                 let node_scope =
                                                     format!("{}/forge-picture", node_scope);
@@ -849,7 +849,7 @@ impl super::ForgeView {
         {
             let mut children: Vec<wire::Node> = vec![
                 {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:789", use_scope),
@@ -888,7 +888,7 @@ impl super::ForgeView {
                     }
                 },
                 {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:802", use_scope),
@@ -929,7 +929,7 @@ impl super::ForgeView {
             ];
             if self.forge_item_files_changed > 0 {
                 children.push({
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:816", use_scope),
@@ -1016,11 +1016,11 @@ impl super::ForgeView {
             border: None,
             snap: None,
             content: Box::new({
-                let mut children: Vec<wire::Node> = vec![
+                let children: Vec<wire::Node> = vec![
                     native::padded(
                         native::sized(
                             native::container(format!("{}/@container:858", use_scope), {
-                                let mut children: Vec<wire::Node> = vec![
+                                let children: Vec<wire::Node> = vec![
                                     native::text_options(
                                         native::text(
                                             format!("{}/@text:871", use_scope),
@@ -1112,7 +1112,7 @@ impl super::ForgeView {
         {
             let mut children: Vec<wire::Node> = vec![
                 {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:789", use_scope),
@@ -1151,7 +1151,7 @@ impl super::ForgeView {
                     }
                 },
                 {
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:802", use_scope),
@@ -1192,7 +1192,7 @@ impl super::ForgeView {
             ];
             if false {
                 children.push({
-                    let mut children: Vec<wire::Node> = vec![
+                    let children: Vec<wire::Node> = vec![
                         native::text_options(
                             native::text(
                                 format!("{}/@text:816", use_scope),
@@ -1982,11 +1982,11 @@ impl super::ForgeView {
             border: None,
             snap: None,
             content: Box::new({
-                let mut children: Vec<wire::Node> = vec![
+                let children: Vec<wire::Node> = vec![
                     native::padded(
                         native::sized(
                             native::container(format!("{}/@container:1063", use_scope), {
-                                let mut children: Vec<wire::Node> = vec![
+                                let children: Vec<wire::Node> = vec![
                                     self.icon(
                                         format!("{}/Icon@2244", use_scope),
                                         "branch",

@@ -742,11 +742,6 @@ pub fn no_fs_entry() -> FsEntry {
     FsEntry::default()
 }
 
-/// The product icon set, as the bytes the wire carries.
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
 /// A rendered button names both its document and this occurrence of the draft.
 pub fn edit_token(chain: &str, path: &str, base: &str, draft: i64) -> String {
     serde_json::to_string(&(chain, path, base, draft)).expect("edit identity encodes")

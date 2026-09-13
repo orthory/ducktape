@@ -14,8 +14,6 @@ crate-type = ["cdylib", "rlib"]
 futures.workspace = true
 # the duckfs read lane's b64 pages, and the inline bytes a commit carries
 base64.workspace = true
-# the product icon set, as bytes the wire carries
-design = { path = "../support/design" }
 serde.workspace = true
 serde_json.workspace = true
 ducktape-view-guest.workspace = true

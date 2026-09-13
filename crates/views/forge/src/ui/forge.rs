@@ -29,16 +29,15 @@ impl super::ForgeView {
                 native::container(
                     node_scope.clone(),
                     {
-                        let mut children: Vec<wire::Node> = vec![
+                        let children: Vec<wire::Node> = vec![
                             native::text_options(native::text(format!("{}/@text:778",
                             use_scope), "Linked note".to_owned().to_string(),),
                             wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                            ..Default::default() },), { let mut children : Vec <
+                            ..Default::default() },), { let children : Vec <
                             wire::Node > = vec![self
                             .message_avatar(format!("{}/MessageAvatar@3531", use_scope),
                             arg_0.initial.to_owned(), arg_0.avatar_kind.to_owned()), {
-                            let mut children : Vec < wire::Node > = vec![{ let mut
-                            children : Vec < wire::Node > =
+                            let children : Vec < wire::Node > = vec![{ let children : Vec < wire::Node > =
                             vec![native::text_options(native::text(format!("{}/@text:795",
                             use_scope), arg_0.author.to_owned().to_string(),),
                             wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -227,7 +226,7 @@ impl super::ForgeView {
                                     border: None,
                                     snap: None,
                                     content: Box::new({
-                                        let mut children: Vec<wire::Node> = vec![
+                                        let children: Vec<wire::Node> = vec![
                                             native::text(format!("{}/@text:104", use_scope),
                                             "No repos yet. Forge is a git remote — a repo appears when a push lands on it."
                                             .to_owned().to_string(),),
@@ -374,7 +373,7 @@ impl super::ForgeView {
                         : wire::FontStyle::Normal, }), handle :
                         Some(wire::PickHandle::Arrow { size : Some(11.0f32), }), on_open
                         : None, on_close : None, }), } } }]; if ! self.branches
-                        .is_empty() { children.push({ let mut children : Vec < wire::Node
+                        .is_empty() { children.push({ let children : Vec < wire::Node
                         > = vec![self.icon(format!("{}/Icon@2922", use_scope), "branch",
                         10f32, "@media:16"), { let node_scope = format!("{}/branch-pick",
                         use_scope); { let options = crate
@@ -435,7 +434,7 @@ impl super::ForgeView {
                         Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
                         Some(wire::Length::Fixed(1.0f32)),),
                         native::padded(native::sized(native::container(format!("{}/@container:227",
-                        use_scope), { let mut children : Vec < wire::Node > =
+                        use_scope), { let children : Vec < wire::Node > =
                         vec![wire::Node::Button { checked : Some(self.tab == "code"),
                         expanded : None, description : None, key :
                         format!("{}/@button:237", use_scope), content :
@@ -913,7 +912,7 @@ impl super::ForgeView {
                                                     }
                                                     children
                                                         .push({
-                                                            let mut children: Vec<wire::Node> = vec![
+                                                            let children: Vec<wire::Node> = vec![
                                                                 wire::Node::Button { checked : Some(self.review_verdict ==
                                                                 "comment"), expanded : None, description : None, key :
                                                                 format!("{}/@button:533", use_scope), content :
@@ -987,8 +986,8 @@ impl super::ForgeView {
                                                     {
                                                         children
                                                             .push({
-                                                                let mut children: Vec<wire::Node> = vec![
-                                                                    { let mut children : Vec < wire::Node > =
+                                                                let children: Vec<wire::Node> = vec![
+                                                                    { let children : Vec < wire::Node > =
                                                                     vec![native::sized(native::text_options(native::text(format!("{}/@text:579",
                                                                     use_scope), crate
                                                                     ::host::forge_comment_target(::std::convert::AsRef::as_ref(&
@@ -1007,7 +1006,7 @@ impl super::ForgeView {
                                                                     Some(7.0f32), padding : None, width :
                                                                     Some(wire::Length::Fill), height : None, align :
                                                                     Some(wire::AlignX::Center), background : None, border :
-                                                                    None, children : children, } }, { let mut children : Vec <
+                                                                    None, children : children, } }, { let children : Vec <
                                                                     wire::Node > = vec![{ let node_scope =
                                                                     format!("{}/forge-comment-body", node_scope);
                                                                     wire::Node::Input { options : wire::InputOptions { label :
@@ -1082,10 +1081,10 @@ impl super::ForgeView {
                                                                     );
                                                                     children
                                                                         .push({
-                                                                            let mut children: Vec<wire::Node> = vec![
+                                                                            let children: Vec<wire::Node> = vec![
                                                                                 native::padded(native::sized(native::container(format!("{}/@container:630",
-                                                                                for_scope), { let mut children : Vec < wire::Node > = vec![{
-                                                                                let mut children : Vec < wire::Node > =
+                                                                                for_scope), { let children : Vec < wire::Node > = vec![{
+                                                                                let children : Vec < wire::Node > =
                                                                                 vec![native::sized(native::text_options(native::text(format!("{}/@text:647",
                                                                                 for_scope), staged.anchor.to_owned().to_string(),),
                                                                                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
@@ -1150,7 +1149,7 @@ impl super::ForgeView {
                                                     }
                                                     children
                                                         .push({
-                                                            let mut children: Vec<wire::Node> = vec![
+                                                            let children: Vec<wire::Node> = vec![
                                                                 { let node_scope = format!("{}/forge-review-body",
                                                                 node_scope); wire::Node::Input { options :
                                                                 wire::InputOptions { label : "Review body".to_owned()
@@ -1339,7 +1338,7 @@ impl super::ForgeView {
                                                                             let lazy_scope = dependency.2.clone();
                                                                             let cached_note: crate::host::ChatMessage = message.clone();
                                                                             {
-                                                                                let mut children: Vec<wire::Node> = vec![
+                                                                                let children: Vec<wire::Node> = vec![
                                                                                     { let message_avatar_scope_3473 =
                                                                                     format!("{}/MessageAvatar@3473", lazy_scope); { let
                                                                                     node_scope = format!("{}/root", message_avatar_scope_3473);
@@ -1347,8 +1346,7 @@ impl super::ForgeView {
                                                                                     cached_note.avatar_kind == "human" { children.push({ let
                                                                                     person_avatar_scope_1124 = format!("{}/PersonAvatar@1124",
                                                                                     message_avatar_scope_3473); { let node_scope =
-                                                                                    format!("{}/root", person_avatar_scope_1124); { let mut
-                                                                                    children : Vec < wire::Node > = vec![{ let
+                                                                                    format!("{}/root", person_avatar_scope_1124); { let children : Vec < wire::Node > = vec![{ let
                                                                                     principal_avatar_scope_777 =
                                                                                     format!("{}/PrincipalAvatar@777", person_avatar_scope_1124);
                                                                                     { let node_scope = format!("{}/root",
@@ -1404,8 +1402,7 @@ impl super::ForgeView {
                                                                                     .avatar_kind == "agent" { children.push({ let
                                                                                     agent_avatar_scope_1130 = format!("{}/AgentAvatar@1130",
                                                                                     message_avatar_scope_3473); { let node_scope =
-                                                                                    format!("{}/root", agent_avatar_scope_1130); { let mut
-                                                                                    children : Vec < wire::Node > = vec![{ let
+                                                                                    format!("{}/root", agent_avatar_scope_1130); { let children : Vec < wire::Node > = vec![{ let
                                                                                     principal_avatar_scope_787 =
                                                                                     format!("{}/PrincipalAvatar@787", agent_avatar_scope_1130);
                                                                                     { let node_scope = format!("{}/root",
@@ -1413,8 +1410,7 @@ impl super::ForgeView {
                                                                                     wire::Node > = Vec::new(); { children.push({ let
                                                                                     principal_plate_scope_823 = format!("{}/PrincipalPlate@823",
                                                                                     principal_avatar_scope_787); { let node_scope =
-                                                                                    format!("{}/root", principal_plate_scope_823); { let mut
-                                                                                    children : Vec < wire::Node > = vec![{ let
+                                                                                    format!("{}/root", principal_plate_scope_823); { let children : Vec < wire::Node > = vec![{ let
                                                                                     agent_plate_scope_833 = format!("{}/AgentPlate@833",
                                                                                     principal_plate_scope_823); { let node_scope =
                                                                                     format!("{}/root", agent_plate_scope_833); { let mut
@@ -1514,8 +1510,7 @@ impl super::ForgeView {
                                                                                     .avatar_kind == "agent") { children.push({ let
                                                                                     agent_avatar_scope_1136 = format!("{}/AgentAvatar@1136",
                                                                                     message_avatar_scope_3473); { let node_scope =
-                                                                                    format!("{}/root", agent_avatar_scope_1136); { let mut
-                                                                                    children : Vec < wire::Node > = vec![{ let
+                                                                                    format!("{}/root", agent_avatar_scope_1136); { let children : Vec < wire::Node > = vec![{ let
                                                                                     principal_avatar_scope_787 =
                                                                                     format!("{}/PrincipalAvatar@787", agent_avatar_scope_1136);
                                                                                     { let node_scope = format!("{}/root",
@@ -1523,8 +1518,7 @@ impl super::ForgeView {
                                                                                     wire::Node > = Vec::new(); { children.push({ let
                                                                                     principal_plate_scope_823 = format!("{}/PrincipalPlate@823",
                                                                                     principal_avatar_scope_787); { let node_scope =
-                                                                                    format!("{}/root", principal_plate_scope_823); { let mut
-                                                                                    children : Vec < wire::Node > = vec![{ let
+                                                                                    format!("{}/root", principal_plate_scope_823); { let children : Vec < wire::Node > = vec![{ let
                                                                                     agent_plate_scope_833 = format!("{}/AgentPlate@833",
                                                                                     principal_plate_scope_823); { let node_scope =
                                                                                     format!("{}/root", agent_plate_scope_833); { let mut
@@ -1624,8 +1618,8 @@ impl super::ForgeView {
                                                                                     Some(wire::Length::Fixed(30.0f32)), height :
                                                                                     Some(wire::Length::Fixed(30.0f32)), padding : None,
                                                                                     background : None, border : None, clip : false, under :
-                                                                                    0u32, children : children, } } } }, { let mut children : Vec
-                                                                                    < wire::Node > = vec![{ let mut children : Vec < wire::Node
+                                                                                    0u32, children : children, } } } }, { let children : Vec
+                                                                                    < wire::Node > = vec![{ let children : Vec < wire::Node
                                                                                     > =
                                                                                     vec![native::text_options(native::text(format!("{}/@text:737",
                                                                                     lazy_scope), cached_note.author.to_owned().to_string(),),
@@ -1643,7 +1637,7 @@ impl super::ForgeView {
                                                                                     Some(wire::AlignX::Center), background : None, border :
                                                                                     None, children : children, } }, { let
                                                                                     message_body_scope_3493 = format!("{}/MessageBody@3493",
-                                                                                    lazy_scope); { let mut children : Vec < wire::Node > =
+                                                                                    lazy_scope); { let children : Vec < wire::Node > =
                                                                                     vec![{ let rich_body_scope_1146 =
                                                                                     format!("{}/RichBody@1146", message_body_scope_3493); { let
                                                                                     mut children : Vec < wire::Node > = Vec::new(); for (index,
@@ -1674,7 +1668,7 @@ impl super::ForgeView {
                                                                                     6.0f32,) },), Some(wire::Length::Fill), None,), wire::Edges
                                                                                     { top : 11.0f32, right : 11.0f32, bottom : 11.0f32, left :
                                                                                     11.0f32, },)); } if block.kind == "quote" { children.push({
-                                                                                    let mut children : Vec < wire::Node > = vec![{ let mut
+                                                                                    let children : Vec < wire::Node > = vec![{ let mut
                                                                                     children : Vec < wire::Node > = Vec::new(); if block.rich {
                                                                                     children.push({ let rich_line_scope_1083 =
                                                                                     format!("{}/RichLine@1083", for_scope); { let mut rich_spans
