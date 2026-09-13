@@ -99,7 +99,7 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
         assert_eq!(
             queued.len(),
             1,
-            "hold the real completed echo, not an invented message"
+            "hold the actual queued navigation, not an invented message"
         );
         match change {
             "connection" => {
@@ -202,15 +202,22 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
         )
     });
     view.update(&mut native, |view, cx| {
+        let generation = view.test_state(cx).bell_head_generation;
+        // Deliver through the actual completion boundary: it retires the
+        // admitted request before this UI-only test yields to its executor.
+        // Injecting the inner BellMarked alone leaves a live RPC behind.
         view.test_dispatch(
-            AppMessage::BellMarked(
-                0,
-                "4".into(),
-                backend::BellDelta {
-                    kind: "read".into(),
-                    up_to_seq: 17,
-                    ..Default::default()
-                },
+            AppMessage::BellHeadReply(
+                generation,
+                Box::new(AppMessage::BellMarked(
+                    0,
+                    "4".into(),
+                    backend::BellDelta {
+                        kind: "read".into(),
+                        up_to_seq: 17,
+                        ..Default::default()
+                    },
+                )),
             ),
             cx,
         )
@@ -218,6 +225,7 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     view.read_with(&native, |view, cx| {
         assert_eq!(view.test_state(cx).bell_unread, 0);
         assert!(view.test_state(cx).bell_items[0].read);
+        assert!(view.test_state(cx).bell_head_task.is_none());
     });
     native.update(|window, cx| window.render_frame(cx));
     click(&mut native, "notification/17");
