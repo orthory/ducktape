@@ -9,65 +9,46 @@ impl super::ChatView {
         let node_scope = format!("{}/root", use_scope);
         native::padded(
             native::sized(
-                native::container(node_scope.clone(), {
-                    let children: Vec<wire::Node> = vec![
-                        native::text_options(
-                            native::text(
-                                format!("{}/@text:200", use_scope),
-                                crate::host::copy_range_label(crate::host::copy_range_count(
-                                    ::std::convert::AsRef::as_ref(&self.messages),
-                                    self.copy_anchor_seq,
-                                    self.copy_head_seq,
-                                ))
-                                .to_string(),
-                            ),
-                            wire::TextOptions {
-                                wrapping: Some(wire::Wrapping::None),
-                                ..Default::default()
+                native::container(
+                    node_scope.clone(),
+                    {
+                        let children: Vec<wire::Node> = vec![
+                            native::text_options(native::text(format!("{}/@text:200",
+                            use_scope), crate ::host::copy_range_label(crate
+                            ::host::copy_range_count(::std::convert::AsRef::as_ref(& self
+                            .messages), self.copy_anchor_seq, self.copy_head_seq,))
+                            .to_string(),), wire::TextOptions { wrapping :
+                            Some(wire::Wrapping::None), ..Default::default() },),
+                            wire::Node::Space { width : Some(wire::Length::Fill), height
+                            : None, },
+                            native::padded(native::button(format!("{}/@button:207",
+                            use_scope), String::from("Clear"),
+                            Some(::ducktape_view_guest::slots::message(cb_13())),
+                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
+                            { let node_scope = format!("{}/copy-range", node_scope);
+                            native::padded(native::button(node_scope.clone(),
+                            String::from("Copy"),
+                            Some(::ducktape_view_guest::slots::message(cb_18())),
+                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)
                             },
-                        ),
-                        wire::Node::Space {
+                        ];
+                        wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:195", use_scope),
+                            wrap: None,
+                            axis: wire::Axis::Row,
+                            spacing: Some(9.0f32),
+                            padding: None,
                             width: Some(wire::Length::Fill),
                             height: None,
-                        },
-                        native::padded(
-                            native::button(
-                                format!("{}/@button:207", use_scope),
-                                String::from("Clear"),
-                                Some(::ducktape_view_guest::slots::message(cb_13())),
-                                wire::ButtonPreset::Secondary,
-                            ),
-                            wire::Edges::all(5.0f32),
-                        ),
-                        {
-                            let node_scope = format!("{}/copy-range", node_scope);
-                            native::padded(
-                                native::button(
-                                    node_scope.clone(),
-                                    String::from("Copy"),
-                                    Some(::ducktape_view_guest::slots::message(cb_18())),
-                                    wire::ButtonPreset::Secondary,
-                                ),
-                                wire::Edges::all(5.0f32),
-                            )
-                        },
-                    ];
-                    wire::Node::Linear {
-                        max_width: None,
-                        clip: false,
-                        key: format!("{}/@layout:195", use_scope),
-                        wrap: None,
-                        axis: wire::Axis::Row,
-                        spacing: Some(9.0f32),
-                        padding: None,
-                        width: Some(wire::Length::Fill),
-                        height: None,
-                        align: Some(wire::AlignX::Center),
-                        background: None,
-                        border: None,
-                        children: children,
-                    }
-                }),
+                            align: Some(wire::AlignX::Center),
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    },
+                ),
                 Some(wire::Length::Fill),
                 None,
             ),
@@ -88,65 +69,46 @@ impl super::ChatView {
         let node_scope = format!("{}/root", use_scope);
         native::padded(
             native::sized(
-                native::container(node_scope.clone(), {
-                    let children: Vec<wire::Node> = vec![
-                        native::text_options(
-                            native::text(
-                                format!("{}/@text:200", use_scope),
-                                crate::host::copy_range_label(crate::host::copy_range_count(
-                                    ::std::convert::AsRef::as_ref(&self.thread_messages),
-                                    self.copy_anchor_seq,
-                                    self.copy_head_seq,
-                                ))
-                                .to_string(),
-                            ),
-                            wire::TextOptions {
-                                wrapping: Some(wire::Wrapping::None),
-                                ..Default::default()
+                native::container(
+                    node_scope.clone(),
+                    {
+                        let children: Vec<wire::Node> = vec![
+                            native::text_options(native::text(format!("{}/@text:200",
+                            use_scope), crate ::host::copy_range_label(crate
+                            ::host::copy_range_count(::std::convert::AsRef::as_ref(& self
+                            .thread_messages), self.copy_anchor_seq, self
+                            .copy_head_seq,)).to_string(),), wire::TextOptions { wrapping
+                            : Some(wire::Wrapping::None), ..Default::default() },),
+                            wire::Node::Space { width : Some(wire::Length::Fill), height
+                            : None, },
+                            native::padded(native::button(format!("{}/@button:207",
+                            use_scope), String::from("Clear"),
+                            Some(::ducktape_view_guest::slots::message(cb_13())),
+                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
+                            { let node_scope = format!("{}/copy-range", node_scope);
+                            native::padded(native::button(node_scope.clone(),
+                            String::from("Copy"),
+                            Some(::ducktape_view_guest::slots::message(cb_18())),
+                            wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)
                             },
-                        ),
-                        wire::Node::Space {
+                        ];
+                        wire::Node::Linear {
+                            max_width: None,
+                            clip: false,
+                            key: format!("{}/@layout:195", use_scope),
+                            wrap: None,
+                            axis: wire::Axis::Row,
+                            spacing: Some(9.0f32),
+                            padding: None,
                             width: Some(wire::Length::Fill),
                             height: None,
-                        },
-                        native::padded(
-                            native::button(
-                                format!("{}/@button:207", use_scope),
-                                String::from("Clear"),
-                                Some(::ducktape_view_guest::slots::message(cb_13())),
-                                wire::ButtonPreset::Secondary,
-                            ),
-                            wire::Edges::all(5.0f32),
-                        ),
-                        {
-                            let node_scope = format!("{}/copy-range", node_scope);
-                            native::padded(
-                                native::button(
-                                    node_scope.clone(),
-                                    String::from("Copy"),
-                                    Some(::ducktape_view_guest::slots::message(cb_18())),
-                                    wire::ButtonPreset::Secondary,
-                                ),
-                                wire::Edges::all(5.0f32),
-                            )
-                        },
-                    ];
-                    wire::Node::Linear {
-                        max_width: None,
-                        clip: false,
-                        key: format!("{}/@layout:195", use_scope),
-                        wrap: None,
-                        axis: wire::Axis::Row,
-                        spacing: Some(9.0f32),
-                        padding: None,
-                        width: Some(wire::Length::Fill),
-                        height: None,
-                        align: Some(wire::AlignX::Center),
-                        background: None,
-                        border: None,
-                        children: children,
-                    }
-                }),
+                            align: Some(wire::AlignX::Center),
+                            background: None,
+                            border: None,
+                            children: children,
+                        }
+                    },
+                ),
                 Some(wire::Length::Fill),
                 None,
             ),
@@ -162,149 +124,59 @@ impl super::ChatView {
         if !self.connected {
             return self.disconnected(format!("{use_scope}/disconnected"));
         }
-        let _component_owner =
-            ::ducktape_view_guest::slots::component("ChatScreen", &use_scope, false);
+        let _component_owner = ::ducktape_view_guest::slots::component(
+            "ChatScreen",
+            &use_scope,
+            false,
+        );
         {
             let children: Vec<wire::Node> = vec![
-                {
-                    let node_scope = format!("{}/channel-sidebar", use_scope);
-                    wire::Node::Container {
-                        shadow: Default::default(),
-                        max_width: None,
-                        max_height: None,
-                        clip: true,
-                        key: node_scope.clone(),
-                        width: Some(wire::Length::Fixed(self.sidebar_width as f32)),
-                        height: Some(wire::Length::Fill),
-                        padding: None,
-                        align_x: None,
-                        align_y: None,
-                        background: None,
-                        border: None,
-                        snap: None,
-                        content: Box::new({
-                            let children: Vec<wire::Node> = vec![
-                                native::padded(
-                                    native::sized(
-                                        native::container(
-                                            format!("{}/@container:290", use_scope),
-                                            {
-                                                let mut children: Vec<wire::Node> =
-                                                    vec![native::text_options(
-                                                        native::text(
-                                                            format!("{}/@text:302", use_scope),
-                                                            self.network_name
-                                                                .to_owned()
-                                                                .to_string(),
-                                                        ),
-                                                        wire::TextOptions {
-                                                            wrapping: Some(wire::Wrapping::None),
-                                                            ..Default::default()
-                                                        },
-                                                    )];
-                                                if crate::host::connection_degraded(
-                                                    ::std::convert::AsRef::as_ref(&self.status),
-                                                ) {
-                                                    children.push(native::sized(
-                                                        native::container(
-                                                            format!("{}/@container:309", use_scope),
-                                                            wire::Node::Space {
-                                                                width: Some(wire::Length::Fixed(
-                                                                    1.0f32,
-                                                                )),
-                                                                height: Some(wire::Length::Fixed(
-                                                                    1.0f32,
-                                                                )),
-                                                            },
-                                                        ),
-                                                        Some(wire::Length::Fixed(7.0f32)),
-                                                        Some(wire::Length::Fixed(7.0f32)),
-                                                    ));
-                                                }
-                                                if !crate::host::connection_degraded(
-                                                    ::std::convert::AsRef::as_ref(&self.status),
-                                                ) {
-                                                    children.push(native::sized(
-                                                        native::container(
-                                                            format!("{}/@container:317", use_scope),
-                                                            wire::Node::Space {
-                                                                width: Some(wire::Length::Fixed(
-                                                                    1.0f32,
-                                                                )),
-                                                                height: Some(wire::Length::Fixed(
-                                                                    1.0f32,
-                                                                )),
-                                                            },
-                                                        ),
-                                                        Some(wire::Length::Fixed(7.0f32)),
-                                                        Some(wire::Length::Fixed(7.0f32)),
-                                                    ));
-                                                }
-                                                children.push(wire::Node::Space {
-                                                    width: Some(wire::Length::Fill),
-                                                    height: None,
-                                                });
-                                                children.push(native::text_options(
-                                                    native::text(
-                                                        format!("{}/@text:325", use_scope),
-                                                        crate::host::height_label(
-                                                            self.block_height,
-                                                        )
-                                                        .to_string(),
-                                                    ),
-                                                    wire::TextOptions {
-                                                        wrapping: Some(wire::Wrapping::None),
-                                                            ..Default::default()
-                                                    },
-                                                ));
-                                                wire::Node::Linear {
-                                                    max_width: None,
-                                                    clip: false,
-                                                    key: format!("{}/@layout:296", use_scope),
-                                                    wrap: None,
-                                                    axis: wire::Axis::Row,
-                                                    spacing: Some(8.0f32),
-                                                    padding: None,
-                                                    width: Some(wire::Length::Fill),
-                                                    height: Some(wire::Length::Fill),
-                                                    align: Some(wire::AlignX::Center),
-                                                    background: None,
-                                                    border: None,
-                                                    children: children,
-                                                }
-                                            },
-                                        ),
-                                        Some(wire::Length::Fill),
-                                        Some(wire::Length::Fixed(50.0f32)),
-                                    ),
-                                    wire::Edges {
-                                        top: 0.0f32,
-                                        right: 16.0f32,
-                                        bottom: 0.0f32,
-                                        left: 16.0f32,
-                                    },
-                                ),
-                                native::sized(
-                                    native::container(
-                                        format!("{}/@container:331", use_scope),
-                                        wire::Node::Space {
-                                            width: Some(wire::Length::Fixed(1.0f32)),
-                                            height: Some(wire::Length::Fixed(1.0f32)),
-                                        },
-                                    ),
-                                    Some(wire::Length::Fill),
-                                    Some(wire::Length::Fixed(1.0f32)),
-                                ),
-                                native::padded(
-                                    native::sized(
-                                        native::container(
-                                            format!("{}/@container:337", use_scope),
-                                            {
-                                                let mut children: Vec<wire::Node> =
-                                                    vec![{
-                                                        let node_scope =
-                                                            format!("{}/chat-search", node_scope);
-                                                        wire::Node::Input {
+                { let node_scope = format!("{}/channel-sidebar", use_scope);
+                wire::Node::Container { shadow : Default::default(), max_width : None,
+                max_height : None, clip : true, key : node_scope.clone(), width :
+                Some(wire::Length::Fixed(self.sidebar_width as f32)), height :
+                Some(wire::Length::Fill), padding : None, align_x : None, align_y : None,
+                background : None, border : None, snap : None, content : Box::new({ let
+                children : Vec < wire::Node > =
+                vec![native::padded(native::sized(native::container(format!("{}/@container:290",
+                use_scope), { let mut children : Vec < wire::Node > =
+                vec![native::text_options(native::text(format!("{}/@text:302",
+                use_scope), self.network_name.to_owned().to_string(),), wire::TextOptions
+                { wrapping : Some(wire::Wrapping::None), ..Default::default() },)]; if
+                crate ::host::connection_degraded(::std::convert::AsRef::as_ref(& self
+                .status),) { children
+                .push(native::sized(native::container(format!("{}/@container:309",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(1.0f32,)), height :
+                Some(wire::Length::Fixed(1.0f32,)), },),
+                Some(wire::Length::Fixed(7.0f32)), Some(wire::Length::Fixed(7.0f32)),));
+                } if ! crate ::host::connection_degraded(::std::convert::AsRef::as_ref(&
+                self.status),) { children
+                .push(native::sized(native::container(format!("{}/@container:317",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(1.0f32,)), height :
+                Some(wire::Length::Fixed(1.0f32,)), },),
+                Some(wire::Length::Fixed(7.0f32)), Some(wire::Length::Fixed(7.0f32)),));
+                } children.push(wire::Node::Space { width : Some(wire::Length::Fill),
+                height : None, }); children
+                .push(native::text_options(native::text(format!("{}/@text:325",
+                use_scope), crate ::host::height_label(self.block_height,).to_string(),),
+                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
+                ..Default::default() },)); wire::Node::Linear { max_width : None, clip :
+                false, key : format!("{}/@layout:296", use_scope), wrap : None, axis :
+                wire::Axis::Row, spacing : Some(8.0f32), padding : None, width :
+                Some(wire::Length::Fill), height : Some(wire::Length::Fill), align :
+                Some(wire::AlignX::Center), background : None, border : None, children :
+                children, } },), Some(wire::Length::Fill),
+                Some(wire::Length::Fixed(50.0f32)),), wire::Edges { top : 0.0f32, right :
+                16.0f32, bottom : 0.0f32, left : 16.0f32, },),
+                native::sized(native::container(format!("{}/@container:331", use_scope),
+                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
+                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
+                Some(wire::Length::Fixed(1.0f32)),),
+                native::padded(native::sized(native::container(format!("{}/@container:337",
+                use_scope), { let mut children : Vec < wire::Node > = vec![{ let
+                node_scope = format!("{}/chat-search", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Search messages".to_owned()
                 .to_string(), description : None, disabled : ! self.connected, padding :
                 Some(wire::Edges::all(6.2f32)), text_size : Some(13.0f32), line_height :
@@ -318,16 +190,8 @@ impl super::ChatView {
                 sent : String | Some(route(sent)) }),), on_submit :
                 Some(::ducktape_view_guest::slots::message(Message::SearchChatSubmit,),),
                 width : Some(wire::Length::Fill), secure : false, style :
-                Default::default(), }
-                                                    }];
-                                                if self.search_phase != SearchPhase::Idle
-                                                    || !self
-                                                        .search_draft
-                                                        .trim()
-                                                        .to_owned()
-                                                        .is_empty()
-                                                {
-                                                    children
+                Default::default(), } }]; if self.search_phase != SearchPhase::Idle || !
+                self.search_draft.trim().to_owned().is_empty() { children
                 .push(wire::Node::Button { checked : None, expanded : None, description :
                 None, key : format!("{}/@button:379", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
@@ -345,67 +209,23 @@ impl super::ChatView {
                 width : Some(wire::Length::Fixed(27.0f32)), height :
                 Some(wire::Length::Fixed(27.0f32)), padding :
                 Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                                                }
-                                                wire::Node::Linear {
-                                                    max_width: None,
-                                                    clip: false,
-                                                    key: format!("{}/@layout:347", use_scope),
-                                                    wrap: None,
-                                                    axis: wire::Axis::Row,
-                                                    spacing: Some(6.0f32),
-                                                    padding: None,
-                                                    width: Some(wire::Length::Fill),
-                                                    height: Some(wire::Length::Fixed(31.0f32)),
-                                                    align: Some(wire::AlignX::Center),
-                                                    background: None,
-                                                    border: None,
-                                                    children: children,
-                                                }
-                                            },
-                                        ),
-                                        Some(wire::Length::Fill),
-                                        None,
-                                    ),
-                                    wire::Edges {
-                                        top: 11.0f32,
-                                        right: 16.0f32,
-                                        bottom: 6.0f32,
-                                        left: 16.0f32,
-                                    },
-                                ),
-                                native::padded(
-                                    native::sized(
-                                        native::container(
-                                            format!("{}/@container:396", use_scope),
-                                            {
-                                                let mut children: Vec<wire::Node> = vec![
-                                                    native::text_options(
-                                                        native::text(
-                                                            format!("{}/@text:408", use_scope),
-                                                            "CHANNELS".to_owned().to_string(),
-                                                        ),
-                                                        wire::TextOptions {
-                                                            wrapping: Some(wire::Wrapping::None),
-                                                            ..Default::default()
-                                                        },
-                                                    ),
-                                                    wire::Node::Space {
-                                                        width: Some(wire::Length::Fill),
-                                                        height: None,
-                                                    },
-                                                    native::text_options(
-                                                        native::text(
-                                                            format!("{}/@text:415", use_scope),
-                                                            (self.rooms.len() as i64).to_string(),
-                                                        ),
-                                                        wire::TextOptions {
-                                                            wrapping: Some(wire::Wrapping::None),
-                                                            ..Default::default()
-                                                        },
-                                                    ),
-                                                ];
-                                                if !self.channel_create_open {
-                                                    children.push(wire::Node::Button { checked : None,
+                } wire::Node::Linear { max_width : None, clip : false, key :
+                format!("{}/@layout:347", use_scope), wrap : None, axis :
+                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
+                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(31.0f32)),
+                align : Some(wire::AlignX::Center), background : None, border : None,
+                children : children, } },), Some(wire::Length::Fill), None,), wire::Edges
+                { top : 11.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),
+                native::padded(native::sized(native::container(format!("{}/@container:396",
+                use_scope), { let mut children : Vec < wire::Node > =
+                vec![native::text_options(native::text(format!("{}/@text:408",
+                use_scope), "CHANNELS".to_owned().to_string(),), wire::TextOptions {
+                wrapping : Some(wire::Wrapping::None), ..Default::default() },),
+                wire::Node::Space { width : Some(wire::Length::Fill), height : None, },
+                native::text_options(native::text(format!("{}/@text:415", use_scope),
+                (self.rooms.len() as i64).to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),]; if ! self
+                .channel_create_open { children.push(wire::Node::Button { checked : None,
                 expanded : Some(self.channel_create_open), description : None, key :
                 format!("{}/@button:422", use_scope), content :
                 wire::ButtonContent::Child(Box::new({ let (hash, bytes) =
@@ -420,10 +240,8 @@ impl super::ChatView {
                 || self.busy || ! self.connected { None } else {
                 Some(::ducktape_view_guest::slots::message(Message::ToggleChannelCreate,),)
                 }, width : None, height : None, padding : Some(wire::Edges::all(0.0f32)),
-                style : wire::ButtonStyle::default(), });
-                                                }
-                                                if self.channel_create_open {
-                                                    children.push(wire::Node::Button { checked : None, expanded : Some(self
+                style : wire::ButtonStyle::default(), }); } if self.channel_create_open {
+                children.push(wire::Node::Button { checked : None, expanded : Some(self
                 .channel_create_open), description : None, key :
                 format!("{}/@button:444", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
@@ -442,71 +260,27 @@ impl super::ChatView {
                 }, width : Some(wire::Length::Fixed(24.0f32)), height :
                 Some(wire::Length::Fixed(24.0f32)), padding :
                 Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                                                }
-                                                wire::Node::Linear {
-                                                    max_width: None,
-                                                    clip: false,
-                                                    key: format!("{}/@layout:403", use_scope),
-                                                    wrap: None,
-                                                    axis: wire::Axis::Row,
-                                                    spacing: Some(6.0f32),
-                                                    padding: None,
-                                                    width: Some(wire::Length::Fill),
-                                                    height: None,
-                                                    align: Some(wire::AlignX::Center),
-                                                    background: None,
-                                                    border: None,
-                                                    children: children,
-                                                }
-                                            },
-                                        ),
-                                        Some(wire::Length::Fill),
-                                        None,
-                                    ),
-                                    wire::Edges {
-                                        top: 14.0f32,
-                                        right: 16.0f32,
-                                        bottom: 6.0f32,
-                                        left: 16.0f32,
-                                    },
-                                ),
-                                wire::Node::Scroll {
-                                    on_scroll: None,
-                                    virtual_rows: false,
-                                    key: format!("{}/@layout:463", use_scope),
-                                    direction: wire::ScrollDirection::Vertical,
-                                    width: Some(wire::Length::Fill),
-                                    height: Some(wire::Length::Fill),
-                                    bar_hidden: true,
-                                    bar_width: None,
-                                    bar_margin: None,
-                                    scroller_width: None,
-                                    bar_spacing: None,
-                                    anchor_x: wire::ScrollAnchor::Start,
-                                    anchor_y: wire::ScrollAnchor::Start,
-                                    auto_scroll: false,
-                                    background: None,
-                                    border: None,
-                                    content: Box::new({
-                                        let mut children: Vec<wire::Node> = Vec::new();
-                                        for (index, room) in self.rooms.iter().enumerate() {
-                                            let for_scope =
-                                                format!("{}/@for:3076({})", use_scope, index);
-                                            children.push(
-                                                self.channel_button(
-                                                    format!("{}/ChannelButton@3077", for_scope),
-                                                    (move |event_0| {
-                                                        Message::ChooseChannel(event_0)
-                                                    })
-                                                    .clone(),
-                                                    room.channel.clone(),
-                                                    room.channel.id == self.active_channel,
-                                                    room.unread,
-                                                ),
-                                            );
-                                        }
-                                        if !self.dm_rows.is_empty() {
-                                            children
+                } wire::Node::Linear { max_width : None, clip : false, key :
+                format!("{}/@layout:403", use_scope), wrap : None, axis :
+                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
+                Some(wire::Length::Fill), height : None, align :
+                Some(wire::AlignX::Center), background : None, border : None, children :
+                children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
+                14.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),
+                wire::Node::Scroll { on_scroll : None, virtual_rows : false, key :
+                format!("{}/@layout:463", use_scope), direction :
+                wire::ScrollDirection::Vertical, width : Some(wire::Length::Fill), height
+                : Some(wire::Length::Fill), bar_hidden : true, bar_width : None,
+                bar_margin : None, scroller_width : None, bar_spacing : None, anchor_x :
+                wire::ScrollAnchor::Start, anchor_y : wire::ScrollAnchor::Start,
+                auto_scroll : false, background : None, border : None, content :
+                Box::new({ let mut children : Vec < wire::Node > = Vec::new(); for
+                (index, room) in self.rooms.iter().enumerate() { let for_scope =
+                format!("{}/@for:3076({})", use_scope, index); children.push(self
+                .channel_button(format!("{}/ChannelButton@3077", for_scope), (move |
+                event_0 | { Message::ChooseChannel(event_0) }).clone(), room.channel
+                .clone(), room.channel.id == self.active_channel, room.unread,),); } if !
+                self.dm_rows.is_empty() { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:491",
                 use_scope), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:503",
@@ -515,119 +289,50 @@ impl super::ChatView {
                 wire::Node::Space { width : Some(wire::Length::Fill), height : None, },
                 native::text_options(native::text(format!("{}/@text:510", use_scope),
                 (self.dm_rows.len() as i64).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:498",
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:498",
                 use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(6.0f32),
                 padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
-                14.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),);
-                                        }
-                                        for (index, dm) in self.dm_rows.iter().enumerate() {
-                                            let for_scope =
-                                                format!("{}/@for:3119({})", use_scope, index);
-                                            children.push(self.direct_message(
-                                                format!("{}/DmButton@3120", for_scope),
-                                                (move |event_0| Message::ChooseDm(event_0)).clone(),
-                                                dm.peer.clone(),
-                                                dm.peer.key == self.active_dm_peer,
-                                                dm.unread,
-                                            ));
-                                        }
-                                        native::spaced(
-                                            native::sized(
-                                                native::column(
-                                                    format!("{}/@layout:469", use_scope),
-                                                    children,
-                                                ),
-                                                Some(wire::Length::Fill),
-                                                None,
-                                            ),
-                                            2.0f32,
-                                        )
-                                    }),
-                                },
-                            ];
-                            native::sized(
-                                native::column(format!("{}/@layout:289", use_scope), children),
-                                Some(wire::Length::Fill),
-                                Some(wire::Length::Fill),
-                            )
-                        }),
-                    }
-                },
-                {
-                    let node_scope = format!("{}/sidebar-resize", use_scope);
-                    wire::Node::ResizeHandle {
-                        key: node_scope.clone(),
-                        on_press: None,
-                        on_release: None,
-                        on_drag: Some(
-                            ::ducktape_view_guest::slots::handler::<(f64, f64), Message>(Box::new(
-                                {
-                                    let route = {
-                                        let _route_state_scope_0 = use_scope.clone();
-                                        let route_callback = (move |event_0, event_1| {
-                                            Message::SidebarResized(event_0, event_1)
-                                        })
-                                        .clone();
-                                        move |delta: (f64, f64)| route_callback(delta.0, delta.1)
-                                    };
-                                    move |sent: (f64, f64)| Some(route(sent))
-                                },
-                            )),
-                        ),
-                        cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-                        content: Box::new({
-                            let node_scope = format!("{}/sidebar-divider", node_scope);
-                            wire::Node::Container {
-                                shadow: Default::default(),
-                                max_width: None,
-                                max_height: None,
-                                clip: false,
-                                key: node_scope.clone(),
-                                width: Some(wire::Length::Fixed(10.0f32)),
-                                height: Some(wire::Length::Fill),
-                                padding: None,
-                                align_x: Some(wire::AlignX::Left),
-                                align_y: None,
-                                background: None.map(wire::Background::Color),
-                                border: None,
-                                snap: None,
-                                content: Box::new(native::sized(
-                                    native::container(
-                                        format!("{}/@container:534", use_scope),
-                                        wire::Node::Space {
-                                            width: Some(wire::Length::Fixed(1.0f32)),
-                                            height: Some(wire::Length::Fixed(1.0f32)),
-                                        },
-                                    ),
-                                    Some(wire::Length::Fixed(1.0f32)),
-                                    Some(wire::Length::Fill),
-                                )),
-                            }
-                        }),
-                    }
-                },
-                wire::Node::Container {
-                    shadow: Default::default(),
-                    max_width: None,
-                    max_height: None,
-                    clip: true,
-                    key: format!("{}/@container:536", use_scope),
-                    width: Some(wire::Length::Fill),
-                    height: Some(wire::Length::Fill),
-                    padding: None,
-                    align_x: None,
-                    align_y: None,
-                    background: None,
-                    border: None,
-                    snap: Some(true),
-                    content: Box::new({
-                        let mut children: Vec<wire::Node> = vec![{
-                            let mut children: Vec<wire::Node> = Vec::new();
-                            if !self.active_channel.is_empty() {
-                                children
+                14.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),); } for
+                (index, dm) in self.dm_rows.iter().enumerate() { let for_scope =
+                format!("{}/@for:3119({})", use_scope, index); children.push(self
+                .direct_message(format!("{}/DmButton@3120", for_scope), (move | event_0 |
+                Message::ChooseDm(event_0)).clone(), dm.peer.clone(), dm.peer.key == self
+                .active_dm_peer, dm.unread,)); }
+                native::spaced(native::sized(native::column(format!("{}/@layout:469",
+                use_scope), children,), Some(wire::Length::Fill), None,), 2.0f32,) }),
+                },]; native::sized(native::column(format!("{}/@layout:289", use_scope),
+                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }), } },
+                { let node_scope = format!("{}/sidebar-resize", use_scope);
+                wire::Node::ResizeHandle { key : node_scope.clone(), on_press : None,
+                on_release : None, on_drag : Some(::ducktape_view_guest::slots::handler::
+                < (f64, f64), Message > (Box::new({ let route = { let
+                _route_state_scope_0 = use_scope.clone(); let route_callback = (move |
+                event_0, event_1 | { Message::SidebarResized(event_0, event_1) })
+                .clone(); move | delta : (f64, f64) | route_callback(delta.0, delta.1) };
+                move | sent : (f64, f64) | Some(route(sent)) },)),), cursor :
+                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
+                node_scope = format!("{}/sidebar-divider", node_scope);
+                wire::Node::Container { shadow : Default::default(), max_width : None,
+                max_height : None, clip : false, key : node_scope.clone(), width :
+                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
+                padding : None, align_x : Some(wire::AlignX::Left), align_y : None,
+                background : None.map(wire::Background::Color), border : None, snap :
+                None, content :
+                Box::new(native::sized(native::container(format!("{}/@container:534",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(1.0f32)), height :
+                Some(wire::Length::Fixed(1.0f32)), },),
+                Some(wire::Length::Fixed(1.0f32)), Some(wire::Length::Fill),)), } }), }
+                }, wire::Node::Container { shadow : Default::default(), max_width : None,
+                max_height : None, clip : true, key : format!("{}/@container:536",
+                use_scope), width : Some(wire::Length::Fill), height :
+                Some(wire::Length::Fill), padding : None, align_x : None, align_y : None,
+                background : None, border : None, snap : Some(true), content : Box::new({
+                let mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                wire::Node > = Vec::new(); if ! self.active_channel.is_empty() { children
                 .push({ let children : Vec < wire::Node > =
                 vec![native::padded(native::sized(native::container(format!("{}/@container:547",
                 use_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
@@ -637,14 +342,14 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, align_x : None,
                 align_y : None, background : None.map(wire::Background::Color), border :
                 None, snap : None, content : Box::new(self
-                .direct_message_header(format!("{}/DmHeader@3185", use_scope)),), }); } if
-                self.active_dm.name.is_empty() { children
+                .direct_message_header(format!("{}/DmHeader@3185", use_scope)),), }); }
+                if self.active_dm.name.is_empty() { children
                 .push(native::text_options(native::text(format!("{}/@text:584",
                 use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if self.active_dm
-                .name.is_empty() { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : true, key
-                : format!("{}/@container:600", use_scope), width :
+                Some(wire::Wrapping::None), ..Default::default() },),); } if self
+                .active_dm.name.is_empty() { children.push(wire::Node::Container { shadow
+                : Default::default(), max_width : None, max_height : None, clip : true,
+                key : format!("{}/@container:600", use_scope), width :
                 Some(wire::Length::Fill), height : None, padding : None, align_x : None,
                 align_y : None, background : None.map(wire::Background::Color), border :
                 None, snap : None, content :
@@ -671,8 +376,8 @@ impl super::ChatView {
                 wrapping : Some(wire::Wrapping::None), ..Default::default() },),
                 native::text_options(native::text(format!("{}/@text:647", use_scope),
                 "added".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:635",
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:635",
                 use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(4.0f32),
                 padding : None, width : None, height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
@@ -707,25 +412,14 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
                 Some(wire::Length::Fixed(1.0f32)),)];
                 native::sized(native::column(format!("{}/@layout:546", use_scope),
-                children,), Some(wire::Length::Fill), None,) });
-                            }
-                            if self.copy_surface == CopySurface::Timeline
-                                && crate::host::copy_range_count(
-                                    ::std::convert::AsRef::as_ref(&self.messages),
-                                    self.copy_anchor_seq,
-                                    self.copy_head_seq,
-                                ) > 0
-                            {
-                                children.push({
-                                    let node_scope = format!("{}/timeline-selection", use_scope);
-                                    self.render_timeline_selection(
-                                        node_scope.clone(),
-                                        (move || Message::ClearCopyRange).clone(),
-                                        (move || Message::CopySelectedMessages).clone(),
-                                    )
-                                });
-                            }
-                            children.push({ let mut
+                children,), Some(wire::Length::Fill), None,) }); } if self.copy_surface
+                == CopySurface::Timeline && crate
+                ::host::copy_range_count(::std::convert::AsRef::as_ref(& self.messages),
+                self.copy_anchor_seq, self.copy_head_seq,) > 0 { children.push({ let
+                node_scope = format!("{}/timeline-selection", use_scope); self
+                .render_timeline_selection(node_scope.clone(), (move | |
+                Message::ClearCopyRange).clone(), (move | |
+                Message::CopySelectedMessages).clone(),) }); } children.push({ let mut
                 children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if ! self.connected { children.push(self
                 .disconnected(format!("{}/EmptyState@3303", use_scope),),); } if self
@@ -883,22 +577,21 @@ impl super::ChatView {
                 ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
                 .unread_boundary, self.unread_marker_seq, self.selected_message_seq, self
                 .copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .timeline_revision, node_scope.to_owned(), (),), move |
-                dependency | { let _active_channel : String = dependency.0.clone(); let
-                unread_boundary : i64 = dependency.1.clone(); let unread_marker_seq : i64
-                = dependency.2.clone(); let selected_message_seq : i64 = dependency.3
-                .clone(); let copy_anchor_seq : i64 = dependency.4.clone(); let
-                copy_head_seq : i64 = dependency.5.clone(); let copy_surface :
-                CopySurface = dependency.6.clone(); let lazy_scope = dependency.8
-                .clone(); let cached_timeline : crate ::host::Timeline = self.timeline
-                .clone(); { let message_timeline_scope_3465 =
-                format!("{}/MessageTimeline@3465", lazy_scope); { let mut children : Vec
-                < _ > = Vec::new(); for message in cached_timeline.messages.iter() { let
-                key = message.view_key; let key_recon = format!("{}/key({})",
-                message_timeline_scope_3465, key); let child : wire::Node = { let mut
-                children : Vec < wire::Node > = Vec::new(); if unread_boundary > 0 &&
-                message.seq == unread_marker_seq { children.push({ let children : Vec
-                < wire::Node > =
+                .timeline_revision, node_scope.to_owned(), (),), move | dependency | {
+                let _active_channel : String = dependency.0.clone(); let unread_boundary
+                : i64 = dependency.1.clone(); let unread_marker_seq : i64 = dependency.2
+                .clone(); let selected_message_seq : i64 = dependency.3.clone(); let
+                copy_anchor_seq : i64 = dependency.4.clone(); let copy_head_seq : i64 =
+                dependency.5.clone(); let copy_surface : CopySurface = dependency.6
+                .clone(); let lazy_scope = dependency.8.clone(); let cached_timeline :
+                crate ::host::Timeline = self.timeline.clone(); { let
+                message_timeline_scope_3465 = format!("{}/MessageTimeline@3465",
+                lazy_scope); { let mut children : Vec < _ > = Vec::new(); for message in
+                cached_timeline.messages.iter() { let key = message.view_key; let
+                key_recon = format!("{}/key({})", message_timeline_scope_3465, key); let
+                child : wire::Node = { let mut children : Vec < wire::Node > =
+                Vec::new(); if unread_boundary > 0 && message.seq == unread_marker_seq {
+                children.push({ let children : Vec < wire::Node > =
                 vec![native::sized(native::container(format!("{}/@container:50",
                 key_recon), native::text(format!("{}/@text:55", key_recon), "".to_owned()
                 .to_string(),),), Some(wire::Length::Fill),
@@ -917,8 +610,8 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }); } if message.seq == selected_message_seq { children
                 .push({ let node_scope = format!("{}/message({})", format!("{}/key({})",
-                message_timeline_scope_3465, key), message.id); { let children : Vec
-                < wire::Node > = vec![{ let message_card_scope_2680 =
+                message_timeline_scope_3465, key), message.id); { let children : Vec <
+                wire::Node > = vec![{ let message_card_scope_2680 =
                 format!("{}/MessageCard@2680", key_recon); { let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
@@ -930,7 +623,8 @@ impl super::ChatView {
                 CopySurface::Timeline,),) { RowPlate::Plain => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:571",
                 message_card_scope_2680), { let message_contents_scope_1995 =
-                format!("{}/MessageContents@1995", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@1995", message_card_scope_2680); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
@@ -938,8 +632,8 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -970,13 +664,14 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1000,13 +695,14 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1048,8 +744,9 @@ impl super::ChatView {
                 .push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_1995), crate ::host::height_label_short(message
                 .height).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
-                { children.push(native::text_options(native::text(format!("{}/@text:384",
+                Some(wire::Wrapping::None), ..Default::default() },),); } if message
+                .edited { children
+                .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_1995), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
@@ -1093,58 +790,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -1160,55 +813,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -1323,8 +933,8 @@ impl super::ChatView {
                 message_contents_scope_1995), crate ::host::plural(message.reply_count,
                 ::std::convert::AsRef::as_ref(& "reply"), ::std::convert::AsRef::as_ref(&
                 "replies"),).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:458",
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:458",
                 message_contents_scope_1995), wrap : None, axis : wire::Axis::Row,
                 spacing : Some(6.0f32), padding : None, width : None, height : None,
                 align : Some(wire::AlignX::Center), background : None, border : None,
@@ -1375,7 +985,8 @@ impl super::ChatView {
                 RowPlate::Selected => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:591",
                 message_card_scope_2680), { let message_contents_scope_2015 =
-                format!("{}/MessageContents@2015", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2015", message_card_scope_2680); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
@@ -1383,8 +994,8 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -1415,13 +1026,14 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1445,13 +1057,14 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1493,8 +1106,9 @@ impl super::ChatView {
                 .push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2015), crate ::host::height_label_short(message
                 .height).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
-                { children.push(native::text_options(native::text(format!("{}/@text:384",
+                Some(wire::Wrapping::None), ..Default::default() },),); } if message
+                .edited { children
+                .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2015), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
@@ -1538,58 +1152,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -1605,55 +1175,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -1768,8 +1295,8 @@ impl super::ChatView {
                 message_contents_scope_2015), crate ::host::plural(message.reply_count,
                 ::std::convert::AsRef::as_ref(& "reply"), ::std::convert::AsRef::as_ref(&
                 "replies"),).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:458",
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:458",
                 message_contents_scope_2015), wrap : None, axis : wire::Axis::Row,
                 spacing : Some(6.0f32), padding : None, width : None, height : None,
                 align : Some(wire::AlignX::Center), background : None, border : None,
@@ -1820,7 +1347,8 @@ impl super::ChatView {
                 RowPlate::Ranged => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:611",
                 message_card_scope_2680), { let message_contents_scope_2035 =
-                format!("{}/MessageContents@2035", message_card_scope_2680); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2035", message_card_scope_2680); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if message.show_author { children.push({ let
                 message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
@@ -1828,8 +1356,8 @@ impl super::ChatView {
                 Vec::new(); if message.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -1860,13 +1388,14 @@ impl super::ChatView {
                 .avatar_kind == "human") && message.avatar_kind == "agent" { children
                 .push({ let agent_avatar_scope_804 = format!("{}/AgentAvatar@804",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_804); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1890,13 +1419,14 @@ impl super::ChatView {
                 .avatar_kind == "human" || message.avatar_kind == "agent") { children
                 .push({ let agent_avatar_scope_810 = format!("{}/AgentAvatar@810",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
+                agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let
+                principal_avatar_scope_873 = format!("{}/PrincipalAvatar@873",
                 agent_avatar_scope_810); { let node_scope = format!("{}/root",
                 principal_avatar_scope_873); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
                 format!("{}/PrincipalPlate@909", principal_avatar_scope_873); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
+                node_scope = format!("{}/root", principal_plate_scope_909); { let
+                children : Vec < wire::Node > = vec![{ let agent_plate_scope_919 =
                 format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
                 = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
                 wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
@@ -1938,8 +1468,9 @@ impl super::ChatView {
                 .push(native::text_options(native::text(format!("{}/@text:377",
                 message_contents_scope_2035), crate ::host::height_label_short(message
                 .height).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if message.edited
-                { children.push(native::text_options(native::text(format!("{}/@text:384",
+                Some(wire::Wrapping::None), ..Default::default() },),); } if message
+                .edited { children
+                .push(native::text_options(native::text(format!("{}/@text:384",
                 message_contents_scope_2035), "· edited".to_owned().to_string(),),
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } children.push(wire::Node::Space { width :
@@ -1983,58 +1514,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -2050,55 +1537,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_543_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -2213,8 +1657,8 @@ impl super::ChatView {
                 message_contents_scope_2035), crate ::host::plural(message.reply_count,
                 ::std::convert::AsRef::as_ref(& "reply"), ::std::convert::AsRef::as_ref(&
                 "replies"),).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:458",
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:458",
                 message_contents_scope_2035), wrap : None, axis : wire::Axis::Row,
                 spacing : Some(6.0f32), padding : None, width : None, height : None,
                 align : Some(wire::AlignX::Center), background : None, border : None,
@@ -2373,18 +1817,18 @@ impl super::ChatView {
                 = format!("{}/@lazy:96", key_recon);
                 ::ducktape_view_guest::memo_lazy((message.clone(), copy_anchor_seq,
                 copy_head_seq, copy_surface.clone(), format!("{}/key({})",
-                message_timeline_scope_3465, key) .to_owned(), (),), move |
-                dependency | { let cached_message : crate ::host::ChatMessage =
-                dependency.0.clone(); let copy_anchor_seq : i64 = dependency.1.clone();
-                let copy_head_seq : i64 = dependency.2.clone(); let copy_surface :
-                CopySurface = dependency.3.clone(); let lazy_scope = dependency.4
-                .clone(); { let node_scope = format!("{}/message({})", lazy_scope,
-                cached_message.id); { let children : Vec < wire::Node > = vec![{ let
-                message_card_scope_2701 = format!("{}/MessageCard@2701", node_scope); {
-                let mut children : Vec < wire::Node > = Vec::new(); if cached_message
-                .show_author { children.push(wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                message_timeline_scope_3465, key) .to_owned(), (),), move | dependency |
+                { let cached_message : crate ::host::ChatMessage = dependency.0.clone();
+                let copy_anchor_seq : i64 = dependency.1.clone(); let copy_head_seq : i64
+                = dependency.2.clone(); let copy_surface : CopySurface = dependency.3
+                .clone(); let lazy_scope = dependency.4.clone(); { let node_scope =
+                format!("{}/message({})", lazy_scope, cached_message.id); { let children
+                : Vec < wire::Node > = vec![{ let message_card_scope_2701 =
+                format!("{}/MessageCard@2701", node_scope); { let mut children : Vec <
+                wire::Node > = Vec::new(); if cached_message.show_author { children
+                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
+                height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); match & crate
                 ::host::message_plate(cached_message.deleted, false, crate
                 ::host::seq_in_copy_range(cached_message.seq, copy_anchor_seq,
@@ -2392,7 +1836,8 @@ impl super::ChatView {
                 RowPlate::Plain => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:571",
                 message_card_scope_2701), { let message_contents_scope_1995 =
-                format!("{}/MessageContents@1995", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@1995", message_card_scope_2701); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_1995); { let node_scope = format!("{}/root",
@@ -2400,8 +1845,8 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -2432,14 +1877,15 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -2455,22 +1901,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -2486,9 +1934,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -2501,9 +1950,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_1995), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_1995),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -2534,7 +1983,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_1995); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_1995); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -2560,58 +2010,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -2627,55 +2033,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -2693,8 +2056,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_1995), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
@@ -2817,9 +2180,9 @@ impl super::ChatView {
                 message_contents_scope_1995), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_1995), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_1995), hash : hash, bytes : bytes, label : None,
@@ -2844,7 +2207,8 @@ impl super::ChatView {
                 RowPlate::Selected => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:591",
                 message_card_scope_2701), { let message_contents_scope_2015 =
-                format!("{}/MessageContents@2015", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2015", message_card_scope_2701); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2015); { let node_scope = format!("{}/root",
@@ -2852,8 +2216,8 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -2884,14 +2248,15 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -2907,22 +2272,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -2938,9 +2305,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -2953,9 +2321,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2015), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2015),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -2986,7 +2354,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2015); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2015); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -3012,58 +2381,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -3079,55 +2404,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -3145,8 +2427,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2015), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
@@ -3269,9 +2551,9 @@ impl super::ChatView {
                 message_contents_scope_2015), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2015), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_2015), hash : hash, bytes : bytes, label : None,
@@ -3296,7 +2578,8 @@ impl super::ChatView {
                 RowPlate::Ranged => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:611",
                 message_card_scope_2701), { let message_contents_scope_2035 =
-                format!("{}/MessageContents@2035", message_card_scope_2701); { let children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                format!("{}/MessageContents@2035", message_card_scope_2701); { let
+                children : Vec < wire::Node > = vec![{ let mut children : Vec <
                 wire::Node > = Vec::new(); if cached_message.show_author { children
                 .push({ let message_avatar_scope_1750 = format!("{}/MessageAvatar@1750",
                 message_contents_scope_2035); { let node_scope = format!("{}/root",
@@ -3304,8 +2587,8 @@ impl super::ChatView {
                 Vec::new(); if cached_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -3336,14 +2619,15 @@ impl super::ChatView {
                 (cached_message.avatar_kind == "human") && cached_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -3359,22 +2643,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (cached_message.avatar_kind == "human" || cached_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -3390,9 +2676,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), cached_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -3405,9 +2692,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2035), cached_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2035),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -3438,7 +2725,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2035); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2035); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -3464,58 +2752,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -3531,55 +2775,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_410_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -3597,8 +2798,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2035), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_410_6(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& cached_message
@@ -3721,9 +2922,9 @@ impl super::ChatView {
                 message_contents_scope_2035), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2035), cached_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_2035), hash : hash, bytes : bytes, label : None,
@@ -3893,8 +3094,8 @@ impl super::ChatView {
                 | state.chat_pointer_y.clone(),), self.chat_screen_states.get(&
                 use_scope).map_or_else(| | self.chat_screen_initial.chat_height.clone(),
                 | state | state.chat_height.clone(),),) as f32,),), }), }]; if self
-                .message_action == MessageAction::More { children.push({ let children
-                : Vec < wire::Node > = vec![{ let node_scope =
+                .message_action == MessageAction::More { children.push({ let children :
+                Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/message-action-focus", use_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Message action focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -3913,9 +3114,9 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::sized(native::container(format!("{}/@container:918",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:937", use_scope), content :
+                use_scope), { let children : Vec < wire::Node > = vec![wire::Node::Button
+                { checked : None, expanded : None, description : None, key :
+                format!("{}/@button:937", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
                 Default::default(), max_width : None, max_height : None, clip : false,
                 key : format!("{}/@container:944", use_scope), width :
@@ -3923,15 +3124,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@3559", use_scope), "emoji", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:961",
-                use_scope), "Add reaction".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:951", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@3559", use_scope), "emoji", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:961", use_scope),
+                "Add reaction".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:951",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Manage reactions"
                 .to_owned())), on_press :
@@ -3949,8 +3149,8 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@3591", use_scope), "nav-chat", 14f32,
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@3591", use_scope), "nav-chat", 14f32,
                 "@media:82",), native::text_options(native::text(format!("{}/@text:993",
                 use_scope), "Reply in thread".to_owned().to_string(),), wire::TextOptions
                 { wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
@@ -3974,15 +3174,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@3631", use_scope), "link", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:1033",
-                use_scope), "Copy link".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1023", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@3631", use_scope), "link", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:1033", use_scope),
+                "Copy link".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1023",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Copy message link"
                 .to_owned())), on_press :
@@ -4001,15 +3200,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@3663", use_scope), "pencil", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:1065",
-                use_scope), "Edit message".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1055", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@3663", use_scope), "pencil", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:1065", use_scope),
+                "Edit message".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1055",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Edit message"
                 .to_owned())), on_press :
@@ -4031,13 +3229,13 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@3701", use_scope), "trash", 14f32,
-                "@media:70",), native::text_options(native::text(format!("{}/@text:1103",
-                use_scope), "Delete message…".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:1093", use_scope), wrap : None, axis :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@3701", use_scope), "trash", 14f32, "@media:70",),
+                native::text_options(native::text(format!("{}/@text:1103", use_scope),
+                "Delete message…".to_owned().to_string(),), wire::TextOptions {
+                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
+                wire::Node::Linear { max_width : None, clip : false, key :
+                format!("{}/@layout:1093", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
                 Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
@@ -4113,9 +3311,9 @@ impl super::ChatView {
                 0u32, children : children, } }); } if self.message_action ==
                 MessageAction::Editing { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:1172",
-                use_scope), { let children : Vec < wire::Node > = vec![{ let
-                node_scope = format!("{}/message-edit", use_scope); wire::Node::Surface {
-                key : node_scope.clone(), name : String::from("chat_composer"), args :
+                use_scope), { let children : Vec < wire::Node > = vec![{ let node_scope =
+                format!("{}/message-edit", use_scope); wire::Node::Surface { key :
+                node_scope.clone(), name : String::from("chat_composer"), args :
                 ::std::vec![{ let surface_arg = & (crate
                 ::host::edit_scope(::std::convert::AsRef::as_ref(& (self.endpoint)),
                 ::std::convert::AsRef::as_ref(& (self.active_channel)), self
@@ -4157,7 +3355,8 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
                 3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .message_action == MessageAction::Delete { children.push({ let children : Vec < wire::Node > = vec![{ let node_scope =
+                .message_action == MessageAction::Delete { children.push({ let children :
+                Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/message-delete-focus", use_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Message delete focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -4243,7 +3442,8 @@ impl super::ChatView {
                 : 6.0f32, right : 6.0f32, bottom : 6.0f32, left : 6.0f32, }), align_x :
                 None, align_y : None, background : None, border : None, snap : None,
                 content : Box::new({ let mut children : Vec < wire::Node > = Vec::new();
-                if self.search_phase == SearchPhase::Searching { children.push({ let children : Vec < wire::Node > = vec![self
+                if self.search_phase == SearchPhase::Searching { children.push({ let
+                children : Vec < wire::Node > = vec![self
                 .loading_messages(format!("{}/SkeletonRow@3922", use_scope),)];
                 native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1314",
                 use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
@@ -4269,10 +3469,9 @@ impl super::ChatView {
                 Box::new({ let mut children : Vec < wire::Node > = Vec::new(); for
                 (index, hit) in self.search_hits.iter().enumerate() { let for_scope =
                 format!("{}/@for:3937({})", use_scope, index); children.push(self
-                .search_result(format!("{}/ChatSearchResult@3938",
-                for_scope), (move | event_0, event_1, event_2 |
-                Message::OpenChatSearchHit(event_0, event_1, event_2,)).clone(), hit
-                .clone(),),); }
+                .search_result(format!("{}/ChatSearchResult@3938", for_scope), (move |
+                event_0, event_1, event_2 | Message::OpenChatSearchHit(event_0, event_1,
+                event_2,)).clone(), hit.clone(),),); }
                 native::spaced(native::sized(native::column(format!("{}/@layout:1333",
                 use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) }),
                 }); } native::sized(native::column(format!("{}/@layout:1312", use_scope),
@@ -4280,190 +3479,66 @@ impl super::ChatView {
                 wire::Node::Stack { key : format!("{}/@layout:689", use_scope), width :
                 Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
                 None, background : None, border : None, clip : false, under : 0u32,
-                children : children, } });
-                            children.push(native::sized(
-                                native::container(
-                                    format!("{}/@container:1340", use_scope),
-                                    wire::Node::Space {
-                                        width: Some(wire::Length::Fixed(1.0f32)),
-                                        height: Some(wire::Length::Fixed(1.0f32)),
-                                    },
-                                ),
-                                Some(wire::Length::Fill),
-                                Some(wire::Length::Fixed(1.0f32)),
-                            ));
-                            if !self.post_refusal.is_empty() {
-                                children.push(native::padded(
-                                    native::sized(
-                                        native::container(
-                                            format!("{}/@container:1355", use_scope),
-                                            self.composer_gate(format!(
-                                                "{}/ComposerGate@3964",
-                                                use_scope
-                                            )),
-                                        ),
-                                        Some(wire::Length::Fill),
-                                        None,
-                                    ),
-                                    wire::Edges {
-                                        top: 12.0f32,
-                                        right: 18.0f32,
-                                        bottom: 0.0f32,
-                                        left: 18.0f32,
-                                    },
-                                ));
-                            }
-                            children.push(native::padded(
-                                native::sized(
-                                    native::container(format!("{}/@container:1362", use_scope), {
-                                        let node_scope = format!("{}/composer", use_scope);
-                                        wire::Node::Surface {
-                                            key: node_scope.clone(),
-                                            name: String::from("chat_composer"),
-                                            args: ::std::vec![
-                                                {
-                                                    let surface_arg =
-                                                        &(crate::host::composer_scope(
-                                                            ::std::convert::AsRef::as_ref(
-                                                                &(self.endpoint),
-                                                            ),
-                                                            ::std::convert::AsRef::as_ref(
-                                                                &(self.active_channel),
-                                                            ),
-                                                        ));
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Str(
-                                                        ::std::string::ToString::to_string(
-                                                            surface_arg,
-                                                        ),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg = &("message".to_owned());
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Str(
-                                                        ::std::string::ToString::to_string(
-                                                            surface_arg,
-                                                        ),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg = &(false);
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Bool(
-                                                        *(surface_arg),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg =
-                                                        &("Message the channel…".to_owned());
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Str(
-                                                        ::std::string::ToString::to_string(
-                                                            surface_arg,
-                                                        ),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg = &(((self.loading
-                                                        || (!self.connected))
-                                                        || (self.active_channel).is_empty())
-                                                        || (!(self.post_refusal).is_empty()));
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Bool(
-                                                        *(surface_arg),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg = &(self.busy);
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Bool(
-                                                        *(surface_arg),
-                                                    )
-                                                },
-                                                {
-                                                    let surface_arg =
-                                                        &("An earlier message wasn’t sent"
-                                                            .to_owned());
-                                                    ::ducktape_view_guest::wire::SurfaceValue::Str(
-                                                        ::std::string::ToString::to_string(
-                                                            surface_arg,
-                                                        ),
-                                                    )
-                                                }
-                                            ],
-                                            on_event: None,
-                                        }
-                                    }),
-                                    Some(wire::Length::Fill),
-                                    None,
-                                ),
-                                wire::Edges {
-                                    top: 12.0f32,
-                                    right: 18.0f32,
-                                    bottom: 14.0f32,
-                                    left: 18.0f32,
-                                },
-                            ));
-                            native::sized(
-                                native::column(format!("{}/@layout:544", use_scope), children),
-                                Some(wire::Length::Fill),
-                                Some(wire::Length::Fill),
-                            )
-                        }];
-                        if self.channel_settings_open && !self.active_channel.is_empty() {
-                            children.push({
-                                let node_scope = format!("{}/details-resize", use_scope);
-                                wire::Node::ResizeHandle {
-                                    key: node_scope.clone(),
-                                    on_press: None,
-                                    on_release: None,
-                                    on_drag: Some(::ducktape_view_guest::slots::handler::<
-                                        (f64, f64),
-                                        Message,
-                                    >(Box::new(
-                                        {
-                                            let route = {
-                                                let _route_state_scope_0 = use_scope.clone();
-                                                let route_callback = (move |event_0, event_1| {
-                                                    Message::DetailsResized(event_0, event_1)
-                                                })
-                                                .clone();
-                                                move |delta: (f64, f64)| {
-                                                    route_callback(delta.0, delta.1)
-                                                }
-                                            };
-                                            move |sent: (f64, f64)| Some(route(sent))
-                                        },
-                                    ))),
-                                    cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-                                    content: Box::new({
-                                        let node_scope = format!("{}/details-divider", node_scope);
-                                        wire::Node::Container {
-                                            shadow: Default::default(),
-                                            max_width: None,
-                                            max_height: None,
-                                            clip: false,
-                                            key: node_scope.clone(),
-                                            width: Some(wire::Length::Fixed(10.0f32)),
-                                            height: Some(wire::Length::Fill),
-                                            padding: None,
-                                            align_x: Some(wire::AlignX::Center),
-                                            align_y: None,
-                                            background: None,
-                                            border: None,
-                                            snap: None,
-                                            content: Box::new(native::sized(
-                                                native::container(
-                                                    format!("{}/@container:1385", use_scope),
-                                                    wire::Node::Space {
-                                                        width: Some(wire::Length::Fixed(2.0f32)),
-                                                        height: Some(wire::Length::Fixed(1.0f32)),
-                                                    },
-                                                ),
-                                                Some(wire::Length::Fixed(2.0f32)),
-                                                Some(wire::Length::Fill),
-                                            )),
-                                        }
-                                    }),
-                                }
-                            });
-                            children.push({ let node_scope = format!("{}/details-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let children : Vec < wire::Node > =
+                children : children, } }); children
+                .push(native::sized(native::container(format!("{}/@container:1340",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(1.0f32)), height :
+                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
+                Some(wire::Length::Fixed(1.0f32)),)); if ! self.post_refusal.is_empty() {
+                children
+                .push(native::padded(native::sized(native::container(format!("{}/@container:1355",
+                use_scope), self.composer_gate(format!("{}/ComposerGate@3964",
+                use_scope)),), Some(wire::Length::Fill), None,), wire::Edges { top :
+                12.0f32, right : 18.0f32, bottom : 0.0f32, left : 18.0f32, },)); }
+                children
+                .push(native::padded(native::sized(native::container(format!("{}/@container:1362",
+                use_scope), { let node_scope = format!("{}/composer", use_scope);
+                wire::Node::Surface { key : node_scope.clone(), name :
+                String::from("chat_composer"), args : ::std::vec![{ let surface_arg = &
+                (crate ::host::composer_scope(::std::convert::AsRef::as_ref(& (self
+                .endpoint),), ::std::convert::AsRef::as_ref(& (self.active_channel),),));
+                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
+                }, { let surface_arg = & ("message".to_owned());
+                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
+                }, { let surface_arg = & (false);
+                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
+                let surface_arg = & ("Message the channel…".to_owned());
+                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
+                }, { let surface_arg = & (((self.loading || (! self.connected)) || (self
+                .active_channel).is_empty()) || (! (self.post_refusal).is_empty()));
+                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
+                let surface_arg = & (self.busy);
+                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
+                let surface_arg = & ("An earlier message wasn’t sent".to_owned());
+                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
+                }], on_event : None, } }), Some(wire::Length::Fill), None,), wire::Edges
+                { top : 12.0f32, right : 18.0f32, bottom : 14.0f32, left : 18.0f32, },));
+                native::sized(native::column(format!("{}/@layout:544", use_scope),
+                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }]; if
+                self.channel_settings_open && ! self.active_channel.is_empty() { children
+                .push({ let node_scope = format!("{}/details-resize", use_scope);
+                wire::Node::ResizeHandle { key : node_scope.clone(), on_press : None,
+                on_release : None, on_drag : Some(::ducktape_view_guest::slots::handler::
+                < (f64, f64), Message, > (Box::new({ let route = { let
+                _route_state_scope_0 = use_scope.clone(); let route_callback = (move |
+                event_0, event_1 | { Message::DetailsResized(event_0, event_1) })
+                .clone(); move | delta : (f64, f64) | { route_callback(delta.0, delta.1)
+                } }; move | sent : (f64, f64) | Some(route(sent)) },))), cursor :
+                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
+                node_scope = format!("{}/details-divider", node_scope);
+                wire::Node::Container { shadow : Default::default(), max_width : None,
+                max_height : None, clip : false, key : node_scope.clone(), width :
+                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
+                padding : None, align_x : Some(wire::AlignX::Center), align_y : None,
+                background : None, border : None, snap : None, content :
+                Box::new(native::sized(native::container(format!("{}/@container:1385",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(2.0f32)), height :
+                Some(wire::Length::Fixed(1.0f32)), },),
+                Some(wire::Length::Fixed(2.0f32)), Some(wire::Length::Fill),)), } }), }
+                }); children.push({ let node_scope = format!("{}/details-pane",
+                use_scope); native::sized(native::container(node_scope.clone(), { let
+                children : Vec < wire::Node > =
                 vec![native::padded(native::sized(native::container(format!("{}/@container:1393",
                 use_scope), { let children : Vec < wire::Node > =
                 vec![native::sized(native::text_options(native::text(format!("{}/@text:1405",
@@ -4504,9 +3579,9 @@ impl super::ChatView {
                 false, bar_width : None, bar_margin : None, scroller_width : None,
                 bar_spacing : None, anchor_x : wire::ScrollAnchor::Start, anchor_y :
                 wire::ScrollAnchor::Start, auto_scroll : false, background : None, border
-                : None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![{ let mut children : Vec < wire::Node > = vec![{ let mut children :
-                Vec < wire::Node > = Vec::new(); if ! self.active_channel_members_only {
+                : None, content : Box::new({ let children : Vec < wire::Node > = vec![{
+                let mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
+                wire::Node > = Vec::new(); if ! self.active_channel_members_only {
                 children.push(native::text_options(native::text(format!("{}/@text:1456",
                 use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
                 Some(wire::Wrapping::None), ..Default::default() },),); } if self
@@ -4538,8 +3613,8 @@ impl super::ChatView {
                 native::spaced(native::sized(native::column(format!("{}/@layout:1449",
                 use_scope), children,), Some(wire::Length::Fill), None,), 7.0f32,) }, {
                 let children : Vec < wire::Node > = vec![self
-                .name_label(format!("{}/Eyebrow@4089", use_scope)), { let children :
-                Vec < wire::Node > = vec![{ let node_scope = format!("{}/channel-name",
+                .name_label(format!("{}/Eyebrow@4089", use_scope)), { let children : Vec
+                < wire::Node > = vec![{ let node_scope = format!("{}/channel-name",
                 node_scope); wire::Node::Input { options : wire::InputOptions { label :
                 "Channel name".to_owned().to_string(), description : None, disabled :
                 self.busy, padding : Some(wire::Edges::all(6.6f32)), text_size :
@@ -4582,11 +3657,11 @@ impl super::ChatView {
                 use_scope)), wire::Node::Space { width : Some(wire::Length::Fill), height
                 : None, }, native::text_options(native::text(format!("{}/@text:1530",
                 use_scope), crate ::host::count_label(self.channel_members.len() as i64,)
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:1520", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1520",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(6.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }, { let children : Vec < wire::Node > = vec![{ let
                 node_scope = format!("{}/member-key", node_scope); wire::Node::Input {
@@ -4623,9 +3698,9 @@ impl super::ChatView {
                 < wire::Node > = Vec::new(); for (index, member) in self.channel_members
                 .iter().enumerate() { let for_scope = format!("{}/@for:4173({})",
                 use_scope, index); children.push(self
-                .member_row(format!("{}/ChatMemberRow@4174", for_scope),
-                (move | event_0 | Message::RemoveChannelMemberSubmit(event_0)).clone(),
-                member.clone(),),); }
+                .member_row(format!("{}/ChatMemberRow@4174", for_scope), (move | event_0
+                | Message::RemoveChannelMemberSubmit(event_0)).clone(), member
+                .clone(),),); }
                 native::spaced(native::sized(native::column(format!("{}/@layout:1569",
                 use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) }); }
                 native::spaced(native::sized(native::column(format!("{}/@layout:1519",
@@ -4660,67 +3735,31 @@ impl super::ChatView {
                 native::sized(native::column(format!("{}/@layout:1392", use_scope),
                 children,), Some(wire::Length::Fill), Some(wire::Length::Fill),) },),
                 Some(wire::Length::Fixed(self.details_width as f32)),
-                Some(wire::Length::Fill),) });
-                        }
-                        if self.active_thread_seq > 0 && !self.channel_settings_open {
-                            children.push({
-                                let node_scope = format!("{}/thread-resize", use_scope);
-                                wire::Node::ResizeHandle {
-                                    key: node_scope.clone(),
-                                    on_press: None,
-                                    on_release: None,
-                                    on_drag: Some(::ducktape_view_guest::slots::handler::<
-                                        (f64, f64),
-                                        Message,
-                                    >(Box::new(
-                                        {
-                                            let route = {
-                                                let _route_state_scope_0 = use_scope.clone();
-                                                let route_callback = (move |event_0, event_1| {
-                                                    Message::ThreadResized(event_0, event_1)
-                                                })
-                                                .clone();
-                                                move |delta: (f64, f64)| {
-                                                    route_callback(delta.0, delta.1)
-                                                }
-                                            };
-                                            move |sent: (f64, f64)| Some(route(sent))
-                                        },
-                                    ))),
-                                    cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-                                    content: Box::new({
-                                        let node_scope = format!("{}/thread-divider", node_scope);
-                                        wire::Node::Container {
-                                            shadow: Default::default(),
-                                            max_width: None,
-                                            max_height: None,
-                                            clip: false,
-                                            key: node_scope.clone(),
-                                            width: Some(wire::Length::Fixed(10.0f32)),
-                                            height: Some(wire::Length::Fill),
-                                            padding: None,
-                                            align_x: Some(wire::AlignX::Center),
-                                            align_y: None,
-                                            background: None,
-                                            border: None,
-                                            snap: None,
-                                            content: Box::new(native::sized(
-                                                native::container(
-                                                    format!("{}/@container:1619", use_scope),
-                                                    wire::Node::Space {
-                                                        width: Some(wire::Length::Fixed(2.0f32)),
-                                                        height: Some(wire::Length::Fixed(1.0f32)),
-                                                    },
-                                                ),
-                                                Some(wire::Length::Fixed(2.0f32)),
-                                                Some(wire::Length::Fill),
-                                            )),
-                                        }
-                                    }),
-                                }
-                            });
-                            children.push({ let node_scope = format!("{}/thread-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let children : Vec < wire::Node > = vec![wire::Node::Sensor { key :
+                Some(wire::Length::Fill),) }); } if self.active_thread_seq > 0 && ! self
+                .channel_settings_open { children.push({ let node_scope =
+                format!("{}/thread-resize", use_scope); wire::Node::ResizeHandle { key :
+                node_scope.clone(), on_press : None, on_release : None, on_drag :
+                Some(::ducktape_view_guest::slots::handler:: < (f64, f64), Message, >
+                (Box::new({ let route = { let _route_state_scope_0 = use_scope.clone();
+                let route_callback = (move | event_0, event_1 | {
+                Message::ThreadResized(event_0, event_1) }).clone(); move | delta : (f64,
+                f64) | { route_callback(delta.0, delta.1) } }; move | sent : (f64, f64) |
+                Some(route(sent)) },))), cursor :
+                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
+                node_scope = format!("{}/thread-divider", node_scope);
+                wire::Node::Container { shadow : Default::default(), max_width : None,
+                max_height : None, clip : false, key : node_scope.clone(), width :
+                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
+                padding : None, align_x : Some(wire::AlignX::Center), align_y : None,
+                background : None, border : None, snap : None, content :
+                Box::new(native::sized(native::container(format!("{}/@container:1619",
+                use_scope), wire::Node::Space { width :
+                Some(wire::Length::Fixed(2.0f32)), height :
+                Some(wire::Length::Fixed(1.0f32)), },),
+                Some(wire::Length::Fixed(2.0f32)), Some(wire::Length::Fill),)), } }), }
+                }); children.push({ let node_scope = format!("{}/thread-pane",
+                use_scope); native::sized(native::container(node_scope.clone(), { let
+                children : Vec < wire::Node > = vec![wire::Node::Sensor { key :
                 format!("{}/@sensor:1631", use_scope), reset : None, on_show :
                 Some(::ducktape_view_guest::slots::handler:: < (f32, f32), Message, >
                 (Box::new({ let route = { let route_scope = use_scope.clone(); move |
@@ -4886,38 +3925,37 @@ impl super::ChatView {
                 ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
                 .active_thread_seq, self.thread_target_seq, self.thread_selected_seq,
                 self.copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .thread_messages_revision, node_scope.to_owned(), (),), move | dependency | { let _active_channel : String =
-                dependency.0.clone(); let active_thread_seq : i64 = dependency.1.clone();
-                let thread_target_seq : i64 = dependency.2.clone(); let
-                thread_selected_seq : i64 = dependency.3.clone(); let copy_anchor_seq :
-                i64 = dependency.4.clone(); let copy_head_seq : i64 = dependency.5
-                .clone(); let copy_surface : CopySurface = dependency.6.clone(); let
-                lazy_scope = dependency.8.clone(); let cached_thread_messages : Vec <
-                crate ::host::ChatMessage > = self.thread_messages.clone(); { let
-                thread_timeline_scope_4354 = format!("{}/ThreadTimeline@4354",
-                lazy_scope); { let mut children : Vec < _ > = Vec::new(); for
-                thread_message in cached_thread_messages.iter() { let key =
-                thread_message.view_key; let key_recon = format!("{}/key({})",
+                .thread_messages_revision, node_scope.to_owned(), (),), move | dependency
+                | { let _active_channel : String = dependency.0.clone(); let
+                active_thread_seq : i64 = dependency.1.clone(); let thread_target_seq :
+                i64 = dependency.2.clone(); let thread_selected_seq : i64 = dependency.3
+                .clone(); let copy_anchor_seq : i64 = dependency.4.clone(); let
+                copy_head_seq : i64 = dependency.5.clone(); let copy_surface :
+                CopySurface = dependency.6.clone(); let lazy_scope = dependency.8
+                .clone(); let cached_thread_messages : Vec < crate ::host::ChatMessage >
+                = self.thread_messages.clone(); { let thread_timeline_scope_4354 =
+                format!("{}/ThreadTimeline@4354", lazy_scope); { let mut children : Vec <
+                _ > = Vec::new(); for thread_message in cached_thread_messages.iter() {
+                let key = thread_message.view_key; let key_recon = format!("{}/key({})",
                 thread_timeline_scope_4354, key); let child : wire::Node = { let mut
                 children : Vec < wire::Node > = Vec::new(); if thread_message.seq ==
                 active_thread_seq { children.push({ let thread_parent_block_scope_2747 =
                 format!("{}/ThreadParentBlock@2747", key_recon); { let node_scope =
                 format!("{}/root", thread_parent_block_scope_2747); { let mut children :
-                Vec < wire::Node > = vec![{ let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_2430 =
-                format!("{}/PrincipalAvatar@2430", thread_parent_block_scope_2747); { let
-                node_scope = format!("{}/root", principal_avatar_scope_2430); { let mut
-                children : Vec < wire::Node > = Vec::new(); { children.push({ let
-                principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
-                principal_avatar_scope_2430); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let mut children : Vec < wire::Node > =
-                Vec::new(); if thread_message.avatar_kind == "agent" { children.push({
-                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
-                principal_plate_scope_909); { let node_scope = format!("{}/root",
-                agent_plate_scope_919); { let mut children : Vec < wire::Node > =
-                Vec::new(); { children.push({ let agent_square_scope_1174 =
-                format!("{}/AgentSquare@1174", agent_plate_scope_919); { let node_scope =
-                format!("{}/root", agent_square_scope_1174); wire::Node::Container {
+                Vec < wire::Node > = vec![{ let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_2430 = format!("{}/PrincipalAvatar@2430",
+                thread_parent_block_scope_2747); { let node_scope = format!("{}/root",
+                principal_avatar_scope_2430); { let mut children : Vec < wire::Node > =
+                Vec::new(); { children.push({ let principal_plate_scope_909 =
+                format!("{}/PrincipalPlate@909", principal_avatar_scope_2430); { let
+                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
+                children : Vec < wire::Node > = Vec::new(); if thread_message.avatar_kind
+                == "agent" { children.push({ let agent_plate_scope_919 =
+                format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
+                = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
+                wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
+                = format!("{}/AgentSquare@1174", agent_plate_scope_919); { let node_scope
+                = format!("{}/root", agent_square_scope_1174); wire::Node::Container {
                 shadow : Default::default(), max_width : None, max_height : None, clip :
                 false, key : node_scope.clone(), width :
                 Some(wire::Length::Fixed(30.0f32)), height :
@@ -4928,10 +3966,11 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }); } if ! (thread_message.avatar_kind == "agent") {
-                children.push({ let human_plate_scope_925 = format!("{}/HumanPlate@925",
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }); } if !
+                (thread_message.avatar_kind == "agent") { children.push({ let
+                human_plate_scope_925 = format!("{}/HumanPlate@925",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 human_plate_scope_925); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push(wire::Node::Container { shadow :
@@ -4950,12 +3989,13 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),), }); } native::column(node_scope.clone(),
                 children) } } }); } native::column(node_scope.clone(), children) } } });
-                } native::column(node_scope.clone(), children) } } }, { let children
-                : Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
+                } native::column(node_scope.clone(), children) } } }, { let children :
+                Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:1030",
                 thread_parent_block_scope_2747), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if thread_message.height > 0 { children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if thread_message
+                .height > 0 { children
                 .push(native::text_options(native::text(format!("{}/@text:1038",
                 thread_parent_block_scope_2747), crate
                 ::host::height_label_short(thread_message.height).to_string(),),
@@ -4979,7 +4019,8 @@ impl super::ChatView {
                 spacing : Some(6.0f32), padding : None, width : Some(wire::Length::Fill),
                 height : None, align : Some(wire::AlignX::Center), background : None,
                 border : None, children : children, } }, { let message_body_scope_2472 =
-                format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_2472); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5005,58 +4046,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5072,55 +4069,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5166,12 +4120,13 @@ impl super::ChatView {
                 key_recon); { let mut children : Vec < wire::Node > = Vec::new(); if
                 thread_message.show_author { children.push(wire::Node::Space { width :
                 Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); match & crate
-                ::host::message_plate(thread_message.deleted, thread_message.seq ==
-                thread_target_seq, crate ::host::seq_in_copy_range(thread_message.seq,
-                copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                CopySurface::Thread,),) { RowPlate::Plain => { children
+                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children :
+                Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
+                Vec::new(); match & crate ::host::message_plate(thread_message.deleted,
+                thread_message.seq == thread_target_seq, crate
+                ::host::seq_in_copy_range(thread_message.seq, copy_anchor_seq,
+                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),) {
+                RowPlate::Plain => { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:783",
                 thread_message_card_scope_2752), { let message_contents_scope_2207 =
                 format!("{}/MessageContents@2207", thread_message_card_scope_2752); { let
@@ -5183,8 +4138,8 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -5215,14 +4170,15 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -5238,22 +4194,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -5269,9 +4227,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -5284,9 +4243,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2207), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if thread_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2207),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -5317,7 +4276,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2207); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2207); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5343,58 +4303,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5410,55 +4326,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5476,8 +4349,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2207), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
@@ -5600,9 +4473,9 @@ impl super::ChatView {
                 message_contents_scope_2207), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2207), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_2207), hash : hash, bytes : bytes, label : None,
@@ -5636,8 +4509,8 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -5668,14 +4541,15 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -5691,22 +4565,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -5722,9 +4598,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -5737,9 +4614,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2227), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if thread_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2227),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -5770,7 +4647,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2227); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2227); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -5796,58 +4674,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5863,55 +4697,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -5929,8 +4720,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2227), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
@@ -6053,9 +4844,9 @@ impl super::ChatView {
                 message_contents_scope_2227), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2227), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_2227), hash : hash, bytes : bytes, label : None,
@@ -6089,8 +4880,8 @@ impl super::ChatView {
                 Vec::new(); if thread_message.avatar_kind == "human" { children.push({
                 let person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -6121,14 +4912,15 @@ impl super::ChatView {
                 (thread_message.avatar_kind == "human") && thread_message.avatar_kind ==
                 "agent" { children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -6144,22 +4936,24 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } if !
                 (thread_message.avatar_kind == "human" || thread_message.avatar_kind ==
                 "agent") { children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -6175,9 +4969,10 @@ impl super::ChatView {
                 content :
                 Box::new(native::text_options(native::text(format!("{}/@text:390",
                 agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), } } }); } native::column(node_scope.clone(),
-                children) } } }]; native::column(node_scope.clone(), children) } } }); }
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
+                native::column(node_scope.clone(), children) } } }];
+                native::column(node_scope.clone(), children) } } }); }
                 native::column(node_scope.clone(), children) } } }];
                 native::column(node_scope.clone(), children) } } }); } wire::Node::Stack
                 { key : node_scope.clone(), width : Some(wire::Length::Fixed(30.0f32)),
@@ -6190,9 +4985,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2247), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if thread_message.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if thread_message
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2247),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -6223,7 +5018,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2247); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2247); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in thread_message
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -6249,58 +5045,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -6316,55 +5068,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_720_16.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -6382,8 +5091,8 @@ impl super::ChatView {
                 wire::TextOptions { wrapping : Some(wire::Wrapping::None),
                 ..Default::default() },),); } if ! crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children.push({ let children : Vec < wire::Node >
-                = vec![native::padded(native::button(format!("{}/@button:420",
+                .id),).is_empty() { children.push({ let children : Vec < wire::Node > =
+                vec![native::padded(native::button(format!("{}/@button:420",
                 message_contents_scope_2247), String::from("View run"),
                 Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
                 ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
@@ -6506,9 +5215,9 @@ impl super::ChatView {
                 message_contents_scope_2247), { let children : Vec < wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:508",
                 message_contents_scope_2247), thread_message.meta.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), { let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },), { let (hash, bytes)
+                = ::ducktape_view_guest::slots::picture(crate
                 ::host::icon(::std::convert::AsRef::as_ref(& "dot")),); wire::Node::Svg {
                 inherit_button_ink : false, key : format!("{}/@media:514",
                 message_contents_scope_2247), hash : hash, bytes : bytes, label : None,
@@ -6544,9 +5253,9 @@ impl super::ChatView {
                 background : None.map(wire::Background::Color), border : None, snap :
                 None, content :
                 Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2752), { let children : Vec < wire::Node >
-                = vec![wire::Node::Button { checked : None, expanded : None, description
-                : None, key : format!("{}/@button:865", thread_message_card_scope_2752),
+                thread_message_card_scope_2752), { let children : Vec < wire::Node > =
+                vec![wire::Node::Button { checked : None, expanded : None, description :
+                None, key : format!("{}/@button:865", thread_message_card_scope_2752),
                 content :
                 wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:872",
                 thread_message_card_scope_2752), "♡".to_owned().to_string(),),),),
@@ -6598,11 +5307,12 @@ impl super::ChatView {
                 format!("{}/@lazy:165", key_recon);
                 ::ducktape_view_guest::memo_lazy((thread_message.clone(),
                 copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                format!("{}/key({})", thread_timeline_scope_4354, key) .to_owned(), (),), move | dependency | { let cached_reply : crate
-                ::host::ChatMessage = dependency.0.clone(); let copy_anchor_seq : i64 =
-                dependency.1.clone(); let copy_head_seq : i64 = dependency.2.clone(); let
-                copy_surface : CopySurface = dependency.3.clone(); let lazy_scope =
-                dependency.4.clone(); { let thread_message_card_scope_2769 =
+                format!("{}/key({})", thread_timeline_scope_4354, key) .to_owned(), (),),
+                move | dependency | { let cached_reply : crate ::host::ChatMessage =
+                dependency.0.clone(); let copy_anchor_seq : i64 = dependency.1.clone();
+                let copy_head_seq : i64 = dependency.2.clone(); let copy_surface :
+                CopySurface = dependency.3.clone(); let lazy_scope = dependency.4
+                .clone(); { let thread_message_card_scope_2769 =
                 format!("{}/ThreadMessageCard@2769", lazy_scope); { let mut children :
                 Vec < wire::Node > = Vec::new(); if cached_reply.show_author { children
                 .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
@@ -6624,8 +5334,8 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -6656,14 +5366,15 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -6687,14 +5398,15 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -6725,9 +5437,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2207), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_reply
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2207),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -6758,7 +5470,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2207); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2207); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -6784,58 +5497,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -6851,55 +5520,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -7077,8 +5703,8 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -7109,14 +5735,15 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -7140,14 +5767,15 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -7178,9 +5806,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2227), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_reply
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2227),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -7211,7 +5839,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2227); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2227); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -7237,58 +5866,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -7304,55 +5889,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -7530,8 +6072,8 @@ impl super::ChatView {
                 Vec::new(); if cached_reply.avatar_kind == "human" { children.push({ let
                 person_avatar_scope_798 = format!("{}/PersonAvatar@798",
                 message_avatar_scope_1750); { let node_scope = format!("{}/root",
-                person_avatar_scope_798); { let children : Vec < wire::Node > =
-                vec![{ let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
+                person_avatar_scope_798); { let children : Vec < wire::Node > = vec![{
+                let principal_avatar_scope_863 = format!("{}/PrincipalAvatar@863",
                 person_avatar_scope_798); { let node_scope = format!("{}/root",
                 principal_avatar_scope_863); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let principal_plate_scope_909 =
@@ -7562,14 +6104,15 @@ impl super::ChatView {
                 .avatar_kind == "human") && cached_reply.avatar_kind == "agent" {
                 children.push({ let agent_avatar_scope_804 =
                 format!("{}/AgentAvatar@804", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_804); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_804); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_804); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -7593,14 +6136,15 @@ impl super::ChatView {
                 .avatar_kind == "human" || cached_reply.avatar_kind == "agent") {
                 children.push({ let agent_avatar_scope_810 =
                 format!("{}/AgentAvatar@810", message_avatar_scope_1750); { let
-                node_scope = format!("{}/root", agent_avatar_scope_810); { let children : Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
+                node_scope = format!("{}/root", agent_avatar_scope_810); { let children :
+                Vec < wire::Node > = vec![{ let principal_avatar_scope_873 =
                 format!("{}/PrincipalAvatar@873", agent_avatar_scope_810); { let
                 node_scope = format!("{}/root", principal_avatar_scope_873); { let mut
                 children : Vec < wire::Node > = Vec::new(); { children.push({ let
                 principal_plate_scope_909 = format!("{}/PrincipalPlate@909",
                 principal_avatar_scope_873); { let node_scope = format!("{}/root",
-                principal_plate_scope_909); { let children : Vec < wire::Node > =
-                vec![{ let agent_plate_scope_919 = format!("{}/AgentPlate@919",
+                principal_plate_scope_909); { let children : Vec < wire::Node > = vec![{
+                let agent_plate_scope_919 = format!("{}/AgentPlate@919",
                 principal_plate_scope_909); { let node_scope = format!("{}/root",
                 agent_plate_scope_919); { let mut children : Vec < wire::Node > =
                 Vec::new(); { children.push({ let agent_square_scope_1174 =
@@ -7631,9 +6175,9 @@ impl super::ChatView {
                 wire::Node > =
                 vec![native::text_options(native::text(format!("{}/@text:347",
                 message_contents_scope_2247), cached_reply.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; if cached_reply.avatar_kind == "agent" {
-                children
+                .to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; if cached_reply
+                .avatar_kind == "agent" { children
                 .push(native::padded(native::container(format!("{}/@container:354",
                 message_contents_scope_2247),
                 native::text_options(native::text(format!("{}/@text:360",
@@ -7664,7 +6208,8 @@ impl super::ChatView {
                 on_middle_press : None, on_middle_release : None, on_enter : None,
                 on_exit : None, on_move : None, on_press_at : None, on_scroll : None,
                 content : Box::new({ let message_body_scope_1809 =
-                format!("{}/MessageBody@1809", message_contents_scope_2247); { let children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
+                format!("{}/MessageBody@1809", message_contents_scope_2247); { let
+                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
                 format!("{}/RichBody@688", message_body_scope_1809); { let mut children :
                 Vec < wire::Node > = Vec::new(); for (index, block) in cached_reply
                 .blocks.iter().enumerate() { let for_scope = format!("{}/@for:703({})",
@@ -7690,58 +6235,14 @@ impl super::ChatView {
                 for_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },),
                 Some(wire::Length::Fill), None,), wire::Edges { top : 11.0f32, right :
                 11.0f32, bottom : 11.0f32, left : 11.0f32, },),); } if block.kind ==
-                "quote" { children.push({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = Vec::new(); if block.rich {
-                children.push({ let rich_line_scope_755 = format!("{}/RichLine@755",
-                for_scope); { let mut rich_spans : Vec < wire::RichSpan > = Vec::new();
-                for span in block.spans.iter().cloned() { rich_spans.push(wire::RichSpan
-                { content : span.mention.to_owned().to_string(), size : None, line_height
-                : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.mention_link.to_owned()), background :
-                None, border : Some(wire::Border { color : None, width : None, radius :
-                Some([4.0f32, 4.0f32, 4.0f32, 4.0f32,]), }), padding : Some(wire::Edges {
-                top : 0.0f32, right : 1.0f32, bottom : 0.0f32, left : 1.0f32, }),
-                underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.link_text.to_owned().to_string(),
-                size : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Medium,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : Some(span.link.to_owned()), background : None,
-                border : None, padding : None, underline : true, strikethrough : false,
-                }); rich_spans.push(wire::RichSpan { content : span.bold_italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.bold
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Bold, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.italic
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Italic, }), color : None, link : None, background :
-                None, border : None, padding : None, underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.plain
-                .to_owned().to_string(), size : None, line_height : None, font : None,
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); }
-                wire::Node::RichText { options : wire::TextOptions { wrapping :
-                Some(wire::Wrapping::WordOrGlyph), ..Default::default() }, key :
-                format!("{}/@text:32", rich_line_scope_755), size : Some(13.5f32), color
-                : None, font : wire::Font { monospace : false, weight :
-                wire::Weight::Normal, }, width : Some(wire::Length::Fill), align_x :
-                None, spans : rich_spans, on_link :
+                "quote" { children.push({ let children : Vec < wire::Node > = vec![{ let
+                mut children : Vec < wire::Node > = Vec::new(); if block.rich { children
+                .push({ let rich_line_scope_755 = format!("{}/RichLine@755", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_755), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:137",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -7757,55 +6258,12 @@ impl super::ChatView {
                 Some(wire::Length::Fill), height : None, padding : None, background :
                 None, border : None, clip : false, under : 0u32, children : children, }
                 }); } if block.kind == "paragraph" { if block.rich { children.push({ let
-                rich_line_scope_780 = format!("{}/RichLine@780", for_scope); { let mut
-                rich_spans : Vec < wire::RichSpan > = Vec::new(); for span in block.spans
-                .iter().cloned() { rich_spans.push(wire::RichSpan { content : span
-                .mention.to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span
-                .mention_link.to_owned()), background : None, border : Some(wire::Border
-                { color : None, width : None, radius : Some([4.0f32, 4.0f32, 4.0f32,
-                4.0f32,]), }), padding : Some(wire::Edges { top : 0.0f32, right : 1.0f32,
-                bottom : 0.0f32, left : 1.0f32, }), underline : false, strikethrough :
-                false, }); rich_spans.push(wire::RichSpan { content : span.link_text
-                .to_owned().to_string(), size : None, line_height : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Medium, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), color : None, link : Some(span.link
-                .to_owned()), background : None, border : None, padding : None, underline
-                : true, strikethrough : false, }); rich_spans.push(wire::RichSpan {
-                content : span.bold_italic.to_owned().to_string(), size : None,
-                line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.bold.to_owned().to_string(), size :
-                None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Bold,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.italic.to_owned().to_string(), size
-                : None, line_height : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Italic, }),
-                color : None, link : None, background : None, border : None, padding :
-                None, underline : false, strikethrough : false, }); rich_spans
-                .push(wire::RichSpan { content : span.plain.to_owned().to_string(), size
-                : None, line_height : None, font : None, color : None, link : None,
-                background : None, border : None, padding : None, underline : false,
-                strikethrough : false, }); } wire::Node::RichText { options :
-                wire::TextOptions { wrapping : Some(wire::Wrapping::WordOrGlyph),
-                ..Default::default() }, key : format!("{}/@text:32",
-                rich_line_scope_780), size : Some(13.5f32), color : None, font :
-                wire::Font { monospace : false, weight : wire::Weight::Normal, }, width :
-                Some(wire::Length::Fill), align_x : None, spans : rich_spans, on_link :
+                rich_line_scope_780 = format!("{}/RichLine@780", for_scope);
+                Self::rich_line(format!("{}/@text:32", rich_line_scope_780), & block,
                 Some(::ducktape_view_guest::slots::handler:: < String, Message, >
                 (Box::new({ let route = { let route_callback = lazy_event_424_5.clone();
                 move | link : String | route_callback(link) }; move | sent : String |
-                Some(route(sent)) }),),), } } }); } if ! block.rich { children
+                Some(route(sent)) }),),)) }); } if ! block.rich { children
                 .push(native::sized(native::text_options(native::text(format!("{}/@text:157",
                 for_scope), block.text.to_owned().to_string(),), wire::TextOptions {
                 wrapping : Some(wire::Wrapping::WordOrGlyph), ..Default::default() },),
@@ -7985,9 +6443,9 @@ impl super::ChatView {
                 background : None.map(wire::Background::Color), border : None, snap :
                 None, content :
                 Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2769), { let children : Vec < wire::Node >
-                = vec![wire::Node::Button { checked : None, expanded : None, description
-                : None, key : format!("{}/@button:865", thread_message_card_scope_2769),
+                thread_message_card_scope_2769), { let children : Vec < wire::Node > =
+                vec![wire::Node::Button { checked : None, expanded : None, description :
+                None, key : format!("{}/@button:865", thread_message_card_scope_2769),
                 content :
                 wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:872",
                 thread_message_card_scope_2769), "♡".to_owned().to_string(),),),),
@@ -8040,8 +6498,8 @@ impl super::ChatView {
                 for_scope = format!("{}/@for:4377({})", use_scope, index); if crate
                 ::host::run_in_thread(::std::borrow::Borrow::borrow(& live), self
                 .active_thread_seq,) { children.push(self
-                .live_run_card(format!("{}/LiveRunCard@4379", for_scope), (move
-                | event_0 | Message::CancelRun(event_0)).clone(), (move | event_0 |
+                .live_run_card(format!("{}/LiveRunCard@4379", for_scope), (move | event_0
+                | Message::CancelRun(event_0)).clone(), (move | event_0 |
                 Message::OpenRun(event_0)).clone(), live.clone(),),); } } if self
                 .thread_has_more && self.thread_next_reply_seq > 0 && self.thread_loading
                 { children
@@ -8123,9 +6581,9 @@ impl super::ChatView {
                 Some(wire::Length::Fixed(1.0f32)), secure : false, style :
                 Default::default(), } },
                 native::padded(native::sized(native::container(format!("{}/@container:1864",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:1877", use_scope), content :
+                use_scope), { let children : Vec < wire::Node > = vec![wire::Node::Button
+                { checked : None, expanded : None, description : None, key :
+                format!("{}/@button:1877", use_scope), content :
                 wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
                 Default::default(), max_width : None, max_height : None, clip : false,
                 key : format!("{}/@container:1884", use_scope), width :
@@ -8133,15 +6591,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@4499", use_scope), "emoji", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:1901",
-                use_scope), "Add reaction".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1891", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@4499", use_scope), "emoji", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:1901", use_scope),
+                "Add reaction".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1891",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Manage reactions"
                 .to_owned())), on_press :
@@ -8159,15 +6616,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@4535", use_scope), "link", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:1937",
-                use_scope), "Copy link".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1927", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@4535", use_scope), "link", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:1937", use_scope),
+                "Copy link".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1927",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Copy message link"
                 .to_owned())), on_press :
@@ -8186,15 +6642,14 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@4567", use_scope), "pencil", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:1969",
-                use_scope), "Edit message".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1959", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@4567", use_scope), "pencil", 14f32, "@media:82",),
+                native::text_options(native::text(format!("{}/@text:1969", use_scope),
+                "Edit message".to_owned().to_string(),), wire::TextOptions { wrapping :
+                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
+                { max_width : None, clip : false, key : format!("{}/@layout:1959",
+                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
+                padding : None, width : Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } }), }),), label : Some(String::from("Edit message"
                 .to_owned())), on_press :
@@ -8216,13 +6671,13 @@ impl super::ChatView {
                 Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
                 9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
                 background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > =
-                vec![self.icon(format!("{}/Icon@4605", use_scope), "trash", 14f32,
-                "@media:70",), native::text_options(native::text(format!("{}/@text:2007",
-                use_scope), "Delete message…".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:1997", use_scope), wrap : None, axis :
+                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
+                .icon(format!("{}/Icon@4605", use_scope), "trash", 14f32, "@media:70",),
+                native::text_options(native::text(format!("{}/@text:2007", use_scope),
+                "Delete message…".to_owned().to_string(),), wire::TextOptions {
+                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
+                wire::Node::Linear { max_width : None, clip : false, key :
+                format!("{}/@layout:1997", use_scope), wrap : None, axis :
                 wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
                 Some(wire::Length::Fill), height : None, align :
                 Some(wire::AlignX::Center), background : None, border : None, children :
@@ -8299,9 +6754,9 @@ impl super::ChatView {
                 0u32, children : children, } }); } if self.thread_message_action ==
                 MessageAction::Editing { children
                 .push(native::padded(native::sized(native::container(format!("{}/@container:2070",
-                use_scope), { let children : Vec < wire::Node > = vec![{ let
-                node_scope = format!("{}/thread-edit", node_scope); wire::Node::Surface {
-                key : node_scope.clone(), name : String::from("chat_composer"), args :
+                use_scope), { let children : Vec < wire::Node > = vec![{ let node_scope =
+                format!("{}/thread-edit", node_scope); wire::Node::Surface { key :
+                node_scope.clone(), name : String::from("chat_composer"), args :
                 ::std::vec![{ let surface_arg = & (crate
                 ::host::edit_scope(::std::convert::AsRef::as_ref(& (self.endpoint)),
                 ::std::convert::AsRef::as_ref(& (self.active_channel)), self
@@ -8343,7 +6798,8 @@ impl super::ChatView {
                 Some(wire::AlignX::Center), background : None, border : None, children :
                 children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
                 3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .thread_message_action == MessageAction::Delete { children.push({ let children : Vec < wire::Node > = vec![{ let node_scope =
+                .thread_message_action == MessageAction::Delete { children.push({ let
+                children : Vec < wire::Node > = vec![{ let node_scope =
                 format!("{}/thread-delete-focus", node_scope); wire::Node::Input {
                 options : wire::InputOptions { label : "Thread delete focus".to_owned()
                 .to_string(), description : None, disabled : false, padding :
@@ -8393,15 +6849,9 @@ impl super::ChatView {
                 height : Some(wire::Length::Fill), padding : None, background : None,
                 border : None, clip : false, under : 0u32, children : children, } },),
                 Some(wire::Length::Fixed(self.thread_width as f32)),
-                Some(wire::Length::Fill),) });
-                        }
-                        native::sized(
-                            native::row(format!("{}/@layout:543", use_scope), children),
-                            Some(wire::Length::Fill),
-                            Some(wire::Length::Fill),
-                        )
-                    }),
-                },
+                Some(wire::Length::Fill),) }); }
+                native::sized(native::row(format!("{}/@layout:543", use_scope),
+                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }), },
             ];
             native::sized(
                 native::row(format!("{}/@layout:282", use_scope), children),

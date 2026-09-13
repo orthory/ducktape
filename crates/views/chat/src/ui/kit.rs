@@ -2,6 +2,68 @@ use super::*;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    pub(super) fn rich_line(
+        key: String,
+        block: &crate::host::ChatBlock,
+        on_link: Option<u32>,
+    ) -> wire::Node {
+        let mut spans = Vec::new();
+        for part in &block.spans {
+            for (content, link, weight, italic) in [
+                (
+                    &part.mention,
+                    Some(&part.mention_link),
+                    wire::Weight::Medium,
+                    false,
+                ),
+                (
+                    &part.link_text,
+                    Some(&part.link),
+                    wire::Weight::Medium,
+                    false,
+                ),
+                (&part.bold_italic, None, wire::Weight::Bold, true),
+                (&part.bold, None, wire::Weight::Bold, false),
+                (&part.italic, None, wire::Weight::Normal, true),
+                (&part.plain, None, wire::Weight::Normal, false),
+            ] {
+                if content.is_empty() {
+                    continue;
+                }
+                let decorated = weight != wire::Weight::Normal || italic;
+                spans.push(wire::RichSpan {
+                    content: content.clone(),
+                    link: link.cloned(),
+                    underline: link.is_some(),
+                    font: decorated.then_some(wire::NamedFont {
+                        family: wire::FontFamily::SansSerif,
+                        weight,
+                        stretch: wire::FontStretch::Normal,
+                        style: if italic {
+                            wire::FontStyle::Italic
+                        } else {
+                            wire::FontStyle::Normal
+                        },
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+        wire::Node::RichText {
+            key,
+            spans,
+            on_link,
+            options: wire::TextOptions {
+                wrapping: Some(wire::Wrapping::WordOrGlyph),
+                ..Default::default()
+            },
+            size: None,
+            color: None,
+            font: Default::default(),
+            width: Some(wire::Length::Fill),
+            align_x: None,
+        }
+    }
     pub(super) fn principal_avatar(
         &self,
         key: String,
