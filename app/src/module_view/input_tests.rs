@@ -1,7 +1,7 @@
 //! The actual staged Chat view in native GPUI windows: no Iced renderer.
 use super::*;
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{self as gpui, AppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui_kit::{self as gpui, Entity, TestAppContext, VisualTestContext};
 
 fn seated(opened: &[&str]) -> Arc<Mutex<Mounted>> {
     tests::can_the_chat_room();

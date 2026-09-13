@@ -2882,7 +2882,7 @@ mod input_tests;
 pub(crate) mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{self as gpui, AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use gpui_kit::{self as gpui, Entity, TestAppContext, VisualTestContext};
 
     pub(crate) fn close_observer_fixture() -> NativeModuleView {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
