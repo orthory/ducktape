@@ -142,11 +142,14 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
             impl<'ast> Visit<'ast> for Mounts {
                 fn visit_macro(&mut self, node: &'ast syn::Macro) {
                     use syn::parse::Parser;
+                    fn visit_expression(visitor: &mut Mounts, expression: &syn::Expr) {
+                        visitor.visit_expr(expression);
+                    }
                     let expressions =
                         syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
                     if let Ok(expressions) = expressions.parse2(node.tokens.clone()) {
                         for expression in &expressions {
-                            self.visit_expr(expression);
+                            visit_expression(self, expression);
                         }
                     }
                 }
