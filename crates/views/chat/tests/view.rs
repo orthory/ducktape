@@ -412,7 +412,7 @@ fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
 fn edited_annotations_reach_author_continuation_and_thread_rows() {
     fn annotations(node: &Node) -> usize {
         usize::from(matches!(node, Node::Text { content, .. } if content == "· edited"))
-            + node.children().map(annotations).sum::<usize>()
+            + node.children().iter().map(annotations).sum::<usize>()
     }
     on_a_deep_stack(|| {
         let mut first = row(1, "first edited"); first["edited"] = true.into();
