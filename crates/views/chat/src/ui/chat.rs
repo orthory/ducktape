@@ -1,2324 +1,783 @@
 use super::*;
-impl super::ChatView {
-    pub(super) fn render_timeline_selection(
-        &self,
-        key: String,
-        clear: impl Fn() -> Message + Clone + 'static,
-        copy: impl Fn() -> Message + Clone + 'static,
-    ) -> wire::Node {
-        self.selection_bar(key, &self.messages, clear, copy)
+use ducktape_view_guest::slots;
+
+fn action(key: String, label: &str, message: Message, disabled: bool) -> wire::Node {
+    native::button(
+        key,
+        label,
+        (!disabled).then(|| slots::message(message)),
+        wire::ButtonPreset::Secondary,
+    )
+}
+fn field(
+    key: String,
+    label: &str,
+    value: &str,
+    route: fn(String) -> Message,
+    submit: Option<Message>,
+    disabled: bool,
+) -> wire::Node {
+    let mut node = native::input(
+        key,
+        label,
+        value,
+        slots::handler::<String, Message>(Box::new(move |value| Some(route(value)))),
+        submit.map(slots::message),
+    );
+    if let wire::Node::Input { options, .. } = &mut node {
+        options.label = label.into();
+        options.disabled = disabled;
     }
-    pub(super) fn render_thread_selection(
-        &self,
-        key: String,
-        clear: impl Fn() -> Message + Clone + 'static,
-        copy: impl Fn() -> Message + Clone + 'static,
-    ) -> wire::Node {
-        self.selection_bar(key, &self.thread_messages, clear, copy)
+    node
+}
+fn divider(key: String, route: fn(f64, f64) -> Message) -> wire::Node {
+    wire::Node::ResizeHandle {
+        key,
+        on_press: None,
+        on_release: None,
+        on_drag: Some(slots::handler::<(f64, f64), Message>(Box::new(
+            move |(x, y)| Some(route(x, y)),
+        ))),
+        cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
+        content: Box::new(wire::Node::Space {
+            width: Some(wire::Length::Fixed(10.)),
+            height: Some(wire::Length::Fill),
+        }),
     }
-    fn selection_bar(
+}
+impl ChatView {
+    pub(super) fn chat_screen(&self, key: String) -> wire::Node {
+        if !self.connected {
+            return self.disconnected(format!("{key}/disconnected"));
+        }
+        let mut panes = vec![
+            self.sidebar(&key),
+            divider(format!("{key}/sidebar-resize"), Message::SidebarResized),
+            self.room(&key),
+        ];
+        if self.channel_settings_open && !self.active_channel.is_empty() {
+            panes.push(divider(
+                format!("{key}/details-resize"),
+                Message::DetailsResized,
+            ));
+            panes.push(self.channel_details(format!("{key}/details-pane")));
+        }
+        if self.active_thread_seq > 0 && !self.active_channel.is_empty() {
+            panes.push(divider(
+                format!("{key}/thread-resize"),
+                Message::ThreadResized,
+            ));
+            panes.push(self.thread(format!("{key}/thread-pane")));
+        }
+        native::sized(
+            native::row(key, panes),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )
+    }
+    fn sidebar(&self, key: &str) -> wire::Node {
+        let mut children = vec![
+            native::heading(format!("{key}/network"), &self.network_name),
+            native::text(
+                format!("{key}/status"),
+                format!(
+                    "{} · {}",
+                    self.status,
+                    crate::host::height_label(self.block_height)
+                ),
+            ),
+            field(
+                format!("{key}/channel-sidebar/chat-search"),
+                "Search messages",
+                &self.search_draft,
+                Message::SearchDraftChanged,
+                Some(Message::SearchChatSubmit),
+                false,
+            ),
+        ];
+        let search_active =
+            self.search_phase != SearchPhase::Idle || !self.search_draft.trim().is_empty();
+        if search_active {
+            children.push(action(
+                format!("{key}/clear-search"),
+                "Clear message search",
+                Message::ClearChatSearch,
+                false,
+            ));
+        }
+        children.push(native::row(
+            format!("{key}/channels-header"),
+            [
+                native::heading(format!("{key}/channels-label"), "Channels"),
+                action(
+                    format!("{key}/new-channel"),
+                    if self.channel_create_open {
+                        "Close new channel"
+                    } else {
+                        "New channel"
+                    },
+                    Message::ToggleChannelCreate,
+                    self.loading || self.busy,
+                ),
+            ],
+        ));
+        let mut rooms = Vec::new();
+        for room in &self.rooms {
+            rooms.push(self.channel_button(
+                format!("{key}/channel/{}", room.channel.id),
+                Message::ChooseChannel,
+                room.channel.clone(),
+                room.channel.id == self.active_channel,
+                room.unread,
+            ));
+        }
+        if !self.dm_rows.is_empty() {
+            rooms.push(native::heading(
+                format!("{key}/dm-heading"),
+                "Direct messages",
+            ));
+        }
+        for row in &self.dm_rows {
+            rooms.push(self.direct_message(
+                format!("{key}/dm/{}", row.peer.key),
+                Message::ChooseDm,
+                row.peer.clone(),
+                row.peer.key == self.active_dm_peer,
+                row.unread,
+            ));
+        }
+        children.push(native::scroll(
+            format!("{key}/rooms"),
+            native::column(format!("{key}/room-list"), rooms),
+        ));
+        native::sized(
+            native::container(
+                format!("{key}/channel-sidebar"),
+                native::column(format!("{key}/sidebar-content"), children),
+            ),
+            Some(wire::Length::Fixed(self.sidebar_width as f32)),
+            Some(wire::Length::Fill),
+        )
+    }
+    fn room(&self, key: &str) -> wire::Node {
+        let mut header = Vec::new();
+        if self.active_dm_peer.is_empty() {
+            header.push(native::heading(
+                format!("{key}/room-name"),
+                &self.active_channel_name,
+            ));
+        } else {
+            header.push(self.direct_message_header(format!("{key}/dm-header")));
+        }
+        if self.active_channel_archived {
+            header.push(self.archived_badge(format!("{key}/archived")));
+        }
+        if self.active_channel_members_only {
+            header.push(self.private_badge(format!("{key}/private")));
+        }
+        if self.huddle_joined {
+            header.push(self.huddle_controls(
+                format!("{key}/huddle"),
+                || Message::LeaveHuddleHere,
+                || Message::ShowHuddle,
+            ));
+        } else if !self.active_channel.is_empty() {
+            header.push(self.start_huddle(format!("{key}/huddle"), || Message::JoinHuddleSubmit));
+        }
+        header.push(action(
+            format!("{key}/details"),
+            "Channel details",
+            Message::ToggleChannelSettings,
+            self.active_channel.is_empty(),
+        ));
+        let mut children = vec![native::row(format!("{key}/header"), header)];
+        if !self.host_error.is_empty() {
+            children.push(native::text(format!("{key}/error"), &self.host_error));
+        }
+        let search_stands = self.search_phase == SearchPhase::Searching
+            || !self.search_hits.is_empty()
+            || crate::host::search_answer_stands(
+                &self.search_query,
+                &self.search_draft,
+                self.search_phase == SearchPhase::Searching,
+            );
+        if search_stands {
+            children.push(self.search_results(format!("{key}/search-results")));
+        } else {
+            if self.loading && self.messages.is_empty() {
+                children.push(self.loading_messages(format!("{key}/loading")));
+            }
+            if !self.loading && self.messages.is_empty() {
+                children.push(self.empty_messages(format!("{key}/empty")));
+            }
+            if self.has_older_history {
+                children.push(action(
+                    format!("{key}/older"),
+                    if self.history_loading {
+                        "Loading older messages…"
+                    } else {
+                        "Load older messages"
+                    },
+                    Message::LoadMoreHistory,
+                    self.loading || self.history_loading || self.busy,
+                ));
+            }
+            children.push(self.message_list(
+                format!("{key}/message-stream"),
+                &self.messages,
+                CopySurface::Timeline,
+            ));
+            if self.copy_surface == CopySurface::Timeline {
+                children.push(self.selection_bar(format!("{key}/copy-range"), &self.messages));
+            }
+            if !self.messages.is_empty() && (self.history_view || !self.at_live_tail) {
+                children.push(action(
+                    format!("{key}/latest"),
+                    "↓  Jump to latest",
+                    Message::ChooseChannel(self.active_channel.clone()),
+                    false,
+                ));
+            }
+            if self.selected_message_seq > 0 {
+                children.push(self.message_menu(key, false));
+            }
+        }
+        if !self.post_refusal.is_empty() {
+            children.push(self.composer_gate(format!("{key}/refusal")));
+        }
+        children.push(wire::Node::Surface {
+            key: format!("{key}/composer"),
+            name: "chat_composer".into(),
+            args: vec![
+                wire::SurfaceValue::Str(crate::host::composer_scope(
+                    &self.endpoint,
+                    &self.active_channel,
+                )),
+                wire::SurfaceValue::Str("message".into()),
+                wire::SurfaceValue::Bool(false),
+                wire::SurfaceValue::Str("Message the channel…".into()),
+                wire::SurfaceValue::Bool(
+                    self.loading
+                        || !self.connected
+                        || self.active_channel.is_empty()
+                        || !self.post_refusal.is_empty(),
+                ),
+                wire::SurfaceValue::Bool(self.busy),
+                wire::SurfaceValue::Str("An earlier message wasn’t sent".into()),
+            ],
+            on_event: None,
+        });
+        native::sized(
+            native::column(format!("{key}/room"), children),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )
+    }
+    fn search_results(&self, key: String) -> wire::Node {
+        let children = match self.search_phase {
+            SearchPhase::Searching => vec![self.loading_messages(format!("{key}/loading"))],
+            SearchPhase::Done if self.search_hits.is_empty() => {
+                vec![native::text(format!("{key}/empty"), "No messages match")]
+            }
+            SearchPhase::Done => self
+                .search_hits
+                .iter()
+                .map(|hit| {
+                    self.search_result(
+                        format!("{key}/{}/{}", hit.channel_id, hit.seq),
+                        Message::OpenSearchHit,
+                        hit.clone(),
+                    )
+                })
+                .collect(),
+            SearchPhase::Idle => Vec::new(),
+        };
+        native::scroll(key.clone(), native::column(format!("{key}/rows"), children))
+    }
+    fn message_list(
         &self,
         key: String,
         messages: &[crate::host::ChatMessage],
-        clear: impl Fn() -> Message + Clone + 'static,
-        copy: impl Fn() -> Message + Clone + 'static,
+        surface: CopySurface,
     ) -> wire::Node {
-        let count = crate::host::copy_range_count(
-            messages,
-            self.copy_anchor_seq,
-            self.copy_head_seq,
-        );
+        let thread = surface == CopySurface::Thread;
+        let selected = if thread {
+            self.thread_selected_seq
+        } else {
+            self.selected_message_seq
+        };
+        let mut keys = Vec::new();
+        let mut rows = Vec::new();
+        for message in messages {
+            let scope = format!("{key}/message/{}", message.view_key);
+            let ranged = crate::host::seq_in_copy_range(
+                message.seq,
+                self.copy_anchor_seq,
+                self.copy_head_seq,
+                self.copy_surface,
+                surface,
+            );
+            let target =
+                selected == message.seq || (thread && self.thread_target_seq == message.seq);
+            let plate = crate::host::message_plate(message.deleted, target, ranged);
+            let mut children = Vec::new();
+            if !thread && self.unread_boundary > 0 && message.seq == self.unread_marker_seq {
+                children.push(native::text(format!("{scope}/unread"), "New messages"));
+            }
+            children.push(self.message_card(message, surface, plate));
+            let actions = if thread {
+                [
+                    Message::OpenThreadMessageReactions(
+                        message.seq,
+                        message.body.clone(),
+                        message.rev,
+                    ),
+                    Message::OpenThreadMessageActions(
+                        message.seq,
+                        message.body.clone(),
+                        message.rev,
+                    ),
+                ]
+            } else {
+                [
+                    Message::OpenMessageReactions(message.seq, message.body.clone(), message.rev),
+                    Message::OpenMessageActions(message.seq, message.body.clone(), message.rev),
+                ]
+            };
+            let [reaction, more] = actions;
+            if !message.pending && !message.deleted {
+                children.push(native::row(
+                    format!("{scope}/actions"),
+                    [
+                        action(
+                            format!("{scope}/react"),
+                            "Manage reactions",
+                            reaction,
+                            self.active_channel_archived,
+                        ),
+                        action(
+                            format!("{scope}/more"),
+                            "More message actions",
+                            more.clone(),
+                            false,
+                        ),
+                    ],
+                ));
+                let content = native::column(format!("{scope}/content"), children);
+                rows.push(wire::Node::MouseArea {
+                    key: scope,
+                    on_press: None,
+                    on_release: None,
+                    on_double_click: None,
+                    on_right_press: Some(slots::message(more)),
+                    on_right_release: None,
+                    on_middle_press: None,
+                    on_middle_release: None,
+                    on_enter: None,
+                    on_exit: None,
+                    on_move: None,
+                    on_press_at: None,
+                    on_scroll: None,
+                    content: Box::new(content),
+                });
+            } else {
+                rows.push(native::column(scope, children));
+            }
+            keys.push(wire::ListKey::from(message.view_key));
+        }
+        if !thread {
+            for live in &self.live_agents {
+                if let Some(message) = messages
+                    .iter()
+                    .find(|message| crate::host::run_in_thread(live, message.seq))
+                {
+                    let label = crate::host::live_thread_label(&live.agent);
+                    rows.push(action(
+                        format!("{key}/run/{}", live.agent),
+                        &label,
+                        Message::OpenThreadFor(message.seq),
+                        false,
+                    ));
+                    keys.push(wire::ListKey::from(format!("run:{}", live.agent)));
+                }
+            }
+        } else {
+            for live in &self.live_agents {
+                if crate::host::run_in_thread(live, self.active_thread_seq) {
+                    rows.push(self.live_run_card(
+                        format!("{key}/run/{}", live.agent),
+                        Message::CancelRun,
+                        Message::OpenRun,
+                        live.clone(),
+                    ));
+                    keys.push(wire::ListKey::from(format!("run:{}", live.agent)));
+                }
+            }
+        }
+        let list = wire::Node::KeyedColumn {
+            key: format!("{key}/rows"),
+            keys: Some(keys),
+            children: rows,
+            background: None,
+            border: None,
+            spacing: None,
+            padding: None,
+            width: Some(wire::Length::Fill),
+            height: None,
+            max_width: None,
+            align: None,
+            virtual_row: Some(44.0f32),
+        };
+        let mut scroll = native::scroll(key, list);
+        if let wire::Node::Scroll {
+            virtual_rows,
+            anchor_y,
+            on_scroll,
+            ..
+        } = &mut scroll
+        {
+            *virtual_rows = true;
+            *anchor_y = wire::ScrollAnchor::End;
+            if !thread {
+                *on_scroll = Some(slots::handler::<(f32, f32, f32, f32), Message>(Box::new(
+                    |(x, y, rx, ry)| {
+                        Some(Message::ChatScrolled(
+                            x.into(),
+                            y.into(),
+                            rx.into(),
+                            ry.into(),
+                        ))
+                    },
+                )));
+            }
+        }
+        scroll
+    }
+    fn selection_bar(&self, key: String, messages: &[crate::host::ChatMessage]) -> wire::Node {
         native::row(
             key.clone(),
             [
                 native::text(
                     format!("{key}/count"),
-                    crate::host::copy_range_label(count),
+                    crate::host::copy_range_label(crate::host::copy_range_count(
+                        messages,
+                        self.copy_anchor_seq,
+                        self.copy_head_seq,
+                    )),
                 ),
-                native::button(
+                action(
                     format!("{key}/clear"),
                     "Clear",
-                    Some(ducktape_view_guest::slots::message(clear())),
-                    wire::ButtonPreset::Secondary,
+                    Message::ClearCopyRange,
+                    false,
                 ),
-                native::button(
-                    format!("{key}/root/copy-range"),
+                action(
+                    format!("{key}/copy-range"),
                     "Copy",
-                    Some(ducktape_view_guest::slots::message(copy())),
-                    wire::ButtonPreset::Secondary,
+                    Message::CopySelectedMessages,
+                    false,
                 ),
             ],
         )
     }
-    pub(super) fn chat_screen(&self, use_scope: String) -> wire::Node {
-        if !self.connected {
-            return self.disconnected(format!("{use_scope}/disconnected"));
+    fn thread(&self, key: String) -> wire::Node {
+        let mut children = vec![native::row(
+            format!("{key}/header"),
+            [
+                native::heading(format!("{key}/title"), "Thread"),
+                action(
+                    format!("{key}/close"),
+                    "Close thread",
+                    Message::CloseThread,
+                    false,
+                ),
+            ],
+        )];
+        if self.thread_loading && self.thread_messages.is_empty() {
+            children.push(self.loading_messages(format!("{key}/loading")));
         }
-        let _component_owner = ::ducktape_view_guest::slots::component(
-            "ChatScreen",
-            &use_scope,
-            false,
-        );
-        {
-            let children: Vec<wire::Node> = vec![
-                { let node_scope = format!("{}/channel-sidebar", use_scope);
-                wire::Node::Container { shadow : Default::default(), max_width : None,
-                max_height : None, clip : true, key : node_scope.clone(), width :
-                Some(wire::Length::Fixed(self.sidebar_width as f32)), height :
-                Some(wire::Length::Fill), padding : None, align_x : None, align_y : None,
-                background : None, border : None, snap : None, content : Box::new({ let
-                children : Vec < wire::Node > =
-                vec![native::padded(native::sized(native::container(format!("{}/@container:290",
-                use_scope), { let mut children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:302",
-                use_scope), self.network_name.to_owned().to_string(),), wire::TextOptions
-                { wrapping : Some(wire::Wrapping::None), ..Default::default() },)]; if
-                crate ::host::connection_degraded(::std::convert::AsRef::as_ref(& self
-                .status),) { children
-                .push(native::sized(native::container(format!("{}/@container:309",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32,)), height :
-                Some(wire::Length::Fixed(1.0f32,)), },),
-                Some(wire::Length::Fixed(7.0f32)), Some(wire::Length::Fixed(7.0f32)),));
-                } if ! crate ::host::connection_degraded(::std::convert::AsRef::as_ref(&
-                self.status),) { children
-                .push(native::sized(native::container(format!("{}/@container:317",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32,)), height :
-                Some(wire::Length::Fixed(1.0f32,)), },),
-                Some(wire::Length::Fixed(7.0f32)), Some(wire::Length::Fixed(7.0f32)),));
-                } children.push(wire::Node::Space { width : Some(wire::Length::Fill),
-                height : None, }); children
-                .push(native::text_options(native::text(format!("{}/@text:325",
-                use_scope), crate ::host::height_label(self.block_height,).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)); wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:296", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(8.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(50.0f32)),), wire::Edges { top : 0.0f32, right :
-                16.0f32, bottom : 0.0f32, left : 16.0f32, },),
-                native::sized(native::container(format!("{}/@container:331", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),),
-                native::padded(native::sized(native::container(format!("{}/@container:337",
-                use_scope), { let mut children : Vec < wire::Node > = vec![{ let
-                node_scope = format!("{}/chat-search", node_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Search messages".to_owned()
-                .to_string(), description : None, disabled : ! self.connected, padding :
-                Some(wire::Edges::all(6.2f32)), text_size : Some(13.0f32), line_height :
-                Some(1.2f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from("Search…"
-                .to_owned()), value : self.search_draft.to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = Message::SearchDraftChanged as fn (String) -> Message; move |
-                sent : String | Some(route(sent)) }),), on_submit :
-                Some(::ducktape_view_guest::slots::message(Message::SearchChatSubmit,),),
-                width : Some(wire::Length::Fill), secure : false, style :
-                Default::default(), } }]; if self.search_phase != SearchPhase::Idle || !
-                self.search_draft.trim().to_owned().is_empty() { children
-                .push(wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:379", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:386", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:392",
-                use_scope), "×".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),), }),), label :
-                Some(String::from("Clear message search".to_owned()),), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ClearChatSearch,),),
-                width : Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(27.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                } wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:347", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(31.0f32)),
-                align : Some(wire::AlignX::Center), background : None, border : None,
-                children : children, } },), Some(wire::Length::Fill), None,), wire::Edges
-                { top : 11.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),
-                native::padded(native::sized(native::container(format!("{}/@container:396",
-                use_scope), { let mut children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:408",
-                use_scope), "CHANNELS".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),
-                wire::Node::Space { width : Some(wire::Length::Fill), height : None, },
-                native::text_options(native::text(format!("{}/@text:415", use_scope),
-                (self.rooms.len() as i64).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),]; if ! self
-                .channel_create_open { children.push(wire::Node::Button { checked : None,
-                expanded : Some(self.channel_create_open), description : None, key :
-                format!("{}/@button:422", use_scope), content :
-                wire::ButtonContent::Child(Box::new({ let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
-                ::host::icon(::std::convert::AsRef::as_ref(& "plus")),); wire::Node::Svg
-                { inherit_button_ink : true, key : format!("{}/@media:435", use_scope),
-                hash : hash, bytes : bytes, label : None, color : None, hover : None, fit
-                : None, rotation : None, opacity : None, width :
-                Some(wire::Length::Fixed(16.0f32)), height :
-                Some(wire::Length::Fixed(16.0f32)), } }),), label :
-                Some(String::from("New channel".to_owned())), on_press : if self.loading
-                || self.busy || ! self.connected { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ToggleChannelCreate,),)
-                }, width : None, height : None, padding : Some(wire::Edges::all(0.0f32)),
-                style : wire::ButtonStyle::default(), }); } if self.channel_create_open {
-                children.push(wire::Node::Button { checked : None, expanded : Some(self
-                .channel_create_open), description : None, key :
-                format!("{}/@button:444", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:453", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:459",
-                use_scope), "×".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),), }),), label :
-                Some(String::from("Close new channel".to_owned())), on_press : if self
-                .loading || self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ToggleChannelCreate,),)
-                }, width : Some(wire::Length::Fixed(24.0f32)), height :
-                Some(wire::Length::Fixed(24.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                } wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:403", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
-                14.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),
-                wire::Node::Scroll { on_scroll : None, virtual_rows : false, key :
-                format!("{}/@layout:463", use_scope), direction :
-                wire::ScrollDirection::Vertical, width : Some(wire::Length::Fill), height
-                : Some(wire::Length::Fill), bar_hidden : true, bar_width : None,
-                bar_margin : None, scroller_width : None, bar_spacing : None, anchor_x :
-                wire::ScrollAnchor::Start, anchor_y : wire::ScrollAnchor::Start,
-                auto_scroll : false, background : None, border : None, content :
-                Box::new({ let mut children : Vec < wire::Node > = Vec::new(); for
-                (index, room) in self.rooms.iter().enumerate() { let for_scope =
-                format!("{}/@for:3076({})", use_scope, index); children.push(self
-                .channel_button(format!("{}/ChannelButton@3077", for_scope), (move |
-                event_0 | { Message::ChooseChannel(event_0) }).clone(), room.channel
-                .clone(), room.channel.id == self.active_channel, room.unread,),); } if !
-                self.dm_rows.is_empty() { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:491",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:503",
-                use_scope), "DIRECT".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),
-                wire::Node::Space { width : Some(wire::Length::Fill), height : None, },
-                native::text_options(native::text(format!("{}/@text:510", use_scope),
-                (self.dm_rows.len() as i64).to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:498",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(6.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
-                14.0f32, right : 16.0f32, bottom : 6.0f32, left : 16.0f32, },),); } for
-                (index, dm) in self.dm_rows.iter().enumerate() { let for_scope =
-                format!("{}/@for:3119({})", use_scope, index); children.push(self
-                .direct_message(format!("{}/DmButton@3120", for_scope), (move | event_0 |
-                Message::ChooseDm(event_0)).clone(), dm.peer.clone(), dm.peer.key == self
-                .active_dm_peer, dm.unread,)); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:469",
-                use_scope), children,), Some(wire::Length::Fill), None,), 2.0f32,) }),
-                },]; native::sized(native::column(format!("{}/@layout:289", use_scope),
-                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }), } },
-                { let node_scope = format!("{}/sidebar-resize", use_scope);
-                wire::Node::ResizeHandle { key : node_scope.clone(), on_press : None,
-                on_release : None, on_drag : Some(::ducktape_view_guest::slots::handler::
-                < (f64, f64), Message > (Box::new({ let route = { let
-                _route_state_scope_0 = use_scope.clone(); let route_callback = (move |
-                event_0, event_1 | { Message::SidebarResized(event_0, event_1) })
-                .clone(); move | delta : (f64, f64) | route_callback(delta.0, delta.1) };
-                move | sent : (f64, f64) | Some(route(sent)) },)),), cursor :
-                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
-                node_scope = format!("{}/sidebar-divider", node_scope);
-                wire::Node::Container { shadow : Default::default(), max_width : None,
-                max_height : None, clip : false, key : node_scope.clone(), width :
-                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
-                padding : None, align_x : Some(wire::AlignX::Left), align_y : None,
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content :
-                Box::new(native::sized(native::container(format!("{}/@container:534",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(1.0f32)), Some(wire::Length::Fill),)), } }), }
-                }, wire::Node::Container { shadow : Default::default(), max_width : None,
-                max_height : None, clip : true, key : format!("{}/@container:536",
-                use_scope), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fill), padding : None, align_x : None, align_y : None,
-                background : None, border : None, snap : Some(true), content : Box::new({
-                let mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); if ! self.active_channel.is_empty() { children
-                .push({ let children : Vec < wire::Node > =
-                vec![native::padded(native::sized(native::container(format!("{}/@container:547",
-                use_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                self.active_dm.name.is_empty() { children.push(wire::Node::Container {
-                shadow : Default::default(), max_width : None, max_height : None, clip :
-                true, key : format!("{}/@container:581", use_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, align_x : None,
-                align_y : None, background : None.map(wire::Background::Color), border :
-                None, snap : None, content : Box::new(self
-                .direct_message_header(format!("{}/DmHeader@3185", use_scope)),), }); }
-                if self.active_dm.name.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:584",
-                use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if self
-                .active_dm.name.is_empty() { children.push(wire::Node::Container { shadow
-                : Default::default(), max_width : None, max_height : None, clip : true,
-                key : format!("{}/@container:600", use_scope), width :
-                Some(wire::Length::Fill), height : None, padding : None, align_x : None,
-                align_y : None, background : None.map(wire::Background::Color), border :
-                None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:601",
-                use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), }); } if self.active_channel_archived {
-                children.push(self.archived_badge(format!("{}/Badge.Outline@3211",
-                use_scope),),); } if self.active_channel_members_only { children
-                .push(self.private_badge(format!("{}/Badge.Outline@3213", use_scope),),);
-                } if self.huddle_joined && self.huddle_channel == self.active_channel {
-                children.push(self.huddle_controls(format!("{}/HuddleLivePill@3220",
-                use_scope), (move | | Message::LeaveHuddleHere).clone(), (move | |
-                Message::ShowHuddle).clone(),),); } if ! self.huddle_joined && ! self
-                .active_channel_archived { children.push(self
-                .start_huddle(format!("{}/HuddleStart@3225", use_scope), (move | |
-                Message::JoinHuddleSubmit).clone(),),); } if ! self.channel_members
-                .is_empty() { children.push({ let children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:636",
-                use_scope), "·".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),
-                native::text_options(native::text(format!("{}/@text:641", use_scope),
-                (self.channel_members.len() as i64).to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),
-                native::text_options(native::text(format!("{}/@text:647", use_scope),
-                "added".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:635",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(4.0f32),
-                padding : None, width : None, height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }); } children.push(wire::Node::Button { checked : None,
-                expanded : Some(self.channel_settings_open), description : None, key :
-                format!("{}/@button:660", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:668", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:674",
-                use_scope), "⋯".to_owned().to_string(),), wire::TextOptions { wrapping
-                : Some(wire::Wrapping::None), ..Default::default() },),), }),), label :
-                Some(String::from("Channel details".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ToggleChannelSettings,),),
-                width : Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:553", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(50.0f32)),), wire::Edges { top : 0.0f32, right :
-                18.0f32, bottom : 0.0f32, left : 18.0f32, },),
-                native::sized(native::container(format!("{}/@container:678", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),)];
-                native::sized(native::column(format!("{}/@layout:546", use_scope),
-                children,), Some(wire::Length::Fill), None,) }); } if self.copy_surface
-                == CopySurface::Timeline && crate
-                ::host::copy_range_count(::std::convert::AsRef::as_ref(& self.messages),
-                self.copy_anchor_seq, self.copy_head_seq,) > 0 { children.push({ let
-                node_scope = format!("{}/timeline-selection", use_scope); self
-                .render_timeline_selection(node_scope.clone(), (move | |
-                Message::ClearCopyRange).clone(), (move | |
-                Message::CopySelectedMessages).clone(),) }); } children.push({ let mut
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); if ! self.connected { children.push(self
-                .disconnected(format!("{}/EmptyState@3303", use_scope),),); } if self
-                .connected && ! self.loading && self.messages.is_empty() { children
-                .push(self.empty_messages(format!("{}/EmptyState@3308", use_scope),),); }
-                if self.connected && self.loading && self.messages.is_empty() { children
-                .push({ let children : Vec < wire::Node > = vec![self
-                .loading_messages(format!("{}/SkeletonRow@3320", use_scope),), self
-                .loading_messages(format!("{}/SkeletonRow@3321", use_scope),), self
-                .loading_messages(format!("{}/SkeletonRow@3322", use_scope),)];
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:712",
-                use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 4.0f32, right : 0.0f32, bottom : 0.0f32, left : 0.0f32, },),
-                14.0f32,) }); } if self.connected && ! self.messages.is_empty() {
-                children.push({ let children : Vec < wire::Node > =
-                vec![wire::Node::Sensor { key : format!("{}/@sensor:731", use_scope),
-                reset : None, on_show : Some(::ducktape_view_guest::slots::handler:: <
-                (f32, f32), Message, > (Box::new({ let route = { let route_scope =
-                use_scope.clone(); move | size : (f64, f64) |
-                Message::ChatScreenChatResized(route_scope.clone(), size.0, size.1,) };
-                move | sent : (f32, f32) | Some(route((f64::from(sent.0), f64::from(sent
-                .1))),) }),),), on_resize : Some(::ducktape_view_guest::slots::handler::
-                < (f32, f32), Message, > (Box::new({ let route = { let route_scope =
-                use_scope.clone(); move | size : (f64, f64) |
-                Message::ChatScreenChatResized(route_scope.clone(), size.0, size.1,) };
-                move | sent : (f32, f32) | Some(route((f64::from(sent.0), f64::from(sent
-                .1))),) }),),), on_hide : None, anticipate : None, delay : None, child :
-                Box::new(wire::Node::Space { width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fill), }), }, wire::Node::MouseArea { key :
-                format!("{}/@mouse:733", use_scope), on_press : None, on_release : None,
-                on_double_click : None, on_right_press : None, on_right_release : None,
-                on_middle_press : None, on_middle_release : None, on_enter : None,
-                on_exit : None, on_move : None, on_press_at :
-                Some(::ducktape_view_guest::slots::handler:: < (f32, f32), Message, >
-                (Box::new({ let route = { let route_scope = use_scope.clone(); move |
-                point : (f64, f64) | Message::ChatScreenChatPointerPressed(route_scope
-                .clone(), point.0, point.1,) }; move | sent : (f32, f32) |
-                Some(route((f64::from(sent.0), f64::from(sent.1))),) }),),), on_scroll :
-                None, content : Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:743", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : None, align_y : Some(wire::AlignY::Bottom), background :
-                None.map(wire::Background::Color), border : None, snap : None, content :
-                Box::new({ let node_scope = format!("{}/message-stream", use_scope);
-                wire::Node::Scroll { on_scroll :
-                Some(::ducktape_view_guest::slots::handler:: < (f32, f32, f32, f32),
-                Message, > (Box::new({ let route = { let _route_state_scope_0 = use_scope
-                .clone(); let route_callback = (move | event_0, event_1, event_2, event_3
-                | Message::ChatScrolled(event_0, event_1, event_2, event_3)).clone();
-                move | offset : (f64, f64, f64, f64) | route_callback(offset.0, offset.1,
-                offset.2, offset.3,) }; move | sent : (f32, f32, f32, f32) |
-                Some(route((f64::from(sent.0), f64::from(sent.1), f64::from(sent.2),
-                f64::from(sent.3),)),) }),),), virtual_rows : true, key : node_scope
-                .clone(), direction : wire::ScrollDirection::Vertical, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Shrink), bar_hidden
-                : false, bar_width : None, bar_margin : None, scroller_width : None,
-                bar_spacing : None, anchor_x : wire::ScrollAnchor::Start, anchor_y :
-                wire::ScrollAnchor::End, auto_scroll : ! self.history_view, background :
-                None, border : None, content : Box::new({ let mut children : Vec <
-                wire::Node > = Vec::new(); if self.has_older_history && self
-                .history_loading { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:779", use_scope), width :
-                Some(wire::Length::Fill), height : None, padding : Some(wire::Edges { top
-                : 4.0f32, right : 0.0f32, bottom : 8.0f32, left : 0.0f32, }), align_x :
-                Some(wire::AlignX::Center), align_y : None, background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::padded(native::button(format!("{}/@button:785",
-                use_scope), String::from("Loading older messages…"), None,
-                wire::ButtonPreset::Secondary,), wire::Edges::all(6.0f32),),), }); } if
-                self.has_older_history && ! self.history_loading { children
-                .push(wire::Node::Container { shadow : Default::default(), max_width :
-                None, max_height : None, clip : false, key : format!("{}/@container:794",
-                use_scope), width : Some(wire::Length::Fill), height : None, padding :
-                Some(wire::Edges { top : 4.0f32, right : 0.0f32, bottom : 8.0f32, left :
-                0.0f32, }), align_x : Some(wire::AlignX::Center), align_y : None,
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content :
-                Box::new(native::padded(native::button(format!("{}/@button:800",
-                use_scope), String::from("Load older messages"), if self.busy { None }
-                else {
-                Some(::ducktape_view_guest::slots::message(Message::LoadMoreHistory,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(6.0f32),),), }); }
-                children.push({ let _lazy_context_543 = use_scope.to_owned(); let
-                _lazy_event_543_0 = (move | event_0 | Message::CancelRun(event_0,))
-                .clone(); let lazy_event_543_1 = (move | event_0, event_1 |
-                Message::PressMessage(event_0, event_1,)).clone(); let _lazy_event_543_2
-                = (move | | Message::ClearCopyRange).clone(); let _lazy_event_543_3 =
-                (move | | { Message::CopySelectedMessages }).clone(); let
-                _lazy_event_543_4 = (move | | Message::SearchChatSubmit).clone(); let
-                _lazy_event_543_5 = (move | | Message::ClearChatSearch).clone(); let
-                _lazy_event_543_6 = (move | event_0, event_1, event_2 |
-                Message::OpenChatSearchHit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_7 = (move | | { Message::ToggleChannelCreate }).clone();
-                let _lazy_event_543_8 = (move | event_0 |
-                Message::ChooseChannel(event_0,)).clone(); let _lazy_event_543_9 = (move
-                | event_0 | Message::ChooseDm(event_0,)).clone(); let _lazy_event_543_10
-                = (move | | { Message::ToggleChannelSettings }).clone(); let
-                _lazy_event_543_11 = (move | | Message::ShowHuddle).clone(); let
-                _lazy_event_543_12 = (move | | Message::LeaveHuddleHere).clone(); let
-                _lazy_event_543_13 = (move | | Message::JoinHuddleSubmit).clone(); let
-                _lazy_event_543_14 = (move | | Message::LoadMoreHistory).clone(); let
-                _lazy_event_543_15 = (move | event_0, event_1, event_2, event_3 |
-                Message::ChatScrolled(event_0, event_1, event_2, event_3)).clone(); let
-                lazy_event_543_16 = (move | event_0 | Message::OpenMessageLink(event_0,))
-                .clone(); let lazy_event_543_17 = (move | event_0 |
-                Message::OpenRun(event_0,)).clone(); let _lazy_event_543_18 = (move |
-                event_0, event_1 | Message::CopyToClipboard(event_0, event_1,)).clone();
-                let _lazy_event_543_19 = (move | event_0 |
-                Message::CopyMessageLink(event_0,)).clone(); let lazy_event_543_20 =
-                (move | event_0, event_1 | Message::AddReactionAt(event_0, event_1,))
-                .clone(); let lazy_event_543_21 = (move | event_0, event_1 |
-                Message::RemoveReactionAt(event_0, event_1,)).clone(); let
-                lazy_event_543_22 = (move | event_0 | Message::OpenThreadFor(event_0,))
-                .clone(); let lazy_event_543_23 = (move | event_0, event_1, event_2 |
-                Message::OpenMessageActions(event_0, event_1, event_2,)).clone(); let
-                lazy_event_543_24 = (move | event_0, event_1, event_2 |
-                Message::OpenMessageReactions(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_25 = (move | event_0, event_1, event_2 |
-                Message::BeginMessageEdit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_26 = (move | event_0, event_1, event_2 |
-                Message::ArmMessageDelete(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_27 = (move | | { Message::ClearMessageSelection })
-                .clone(); let _lazy_event_543_28 = (move | event_0 |
-                Message::AddReactionSubmit(event_0,)).clone(); let _lazy_event_543_29 =
-                (move | | { Message::DeleteMessageSubmit }).clone(); let
-                _lazy_event_543_30 = (move | | { Message::RenameChannelSubmit }).clone();
-                let _lazy_event_543_31 = (move | | { Message::ArchiveChannelSubmit })
-                .clone(); let _lazy_event_543_32 = (move | | {
-                Message::UnarchiveChannelSubmit }).clone(); let _lazy_event_543_33 =
-                (move | | { Message::AddChannelMemberSubmit }).clone(); let
-                _lazy_event_543_34 = (move | event_0 |
-                Message::RemoveChannelMemberSubmit(event_0,)).clone(); let
-                _lazy_event_543_35 = (move | | Message::CloseThread).clone(); let
-                _lazy_event_543_36 = (move | event_0, event_1 |
-                Message::SidebarResized(event_0, event_1,)).clone(); let
-                _lazy_event_543_37 = (move | event_0, event_1 |
-                Message::DetailsResized(event_0, event_1,)).clone(); let
-                _lazy_event_543_38 = (move | event_0, event_1 |
-                Message::ThreadResized(event_0, event_1,)).clone(); let
-                _lazy_event_543_39 = (move | event_0, event_1, event_2 |
-                Message::OpenThreadMessageActions(event_0, event_1, event_2,)).clone();
-                let _lazy_event_543_40 = (move | event_0, event_1, event_2 |
-                Message::OpenThreadMessageReactions(event_0, event_1, event_2,)).clone();
-                let _lazy_event_543_41 = (move | event_0, event_1, event_2 |
-                Message::BeginThreadMessageEdit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_42 = (move | event_0, event_1, event_2 |
-                Message::ArmThreadMessageDelete(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_543_43 = (move | | { Message::ClearThreadMessageSelection })
-                .clone(); let _lazy_event_543_44 = (move | | {
-                Message::DeleteThreadMessageSubmit }).clone(); let _lazy_event_543_45 =
-                (move | | Message::LoadMoreThread).clone(); { let lazy_key =
-                format!("{}/@lazy:861", use_scope);
-                ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
-                .unread_boundary, self.unread_marker_seq, self.selected_message_seq, self
-                .copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .timeline_revision, node_scope.to_owned(), (),), move | dependency | {
-                let _active_channel : String = dependency.0.clone(); let unread_boundary
-                : i64 = dependency.1.clone(); let unread_marker_seq : i64 = dependency.2
-                .clone(); let selected_message_seq : i64 = dependency.3.clone(); let
-                copy_anchor_seq : i64 = dependency.4.clone(); let copy_head_seq : i64 =
-                dependency.5.clone(); let copy_surface : CopySurface = dependency.6
-                .clone(); let lazy_scope = dependency.8.clone(); let cached_timeline :
-                crate ::host::Timeline = self.timeline.clone(); { let
-                message_timeline_scope_3465 = format!("{}/MessageTimeline@3465",
-                lazy_scope); { let mut children : Vec < _ > = Vec::new(); for message in
-                cached_timeline.messages.iter() { let key = message.view_key; let
-                key_recon = format!("{}/key({})", message_timeline_scope_3465, key); let
-                child : wire::Node = { let mut children : Vec < wire::Node > =
-                Vec::new(); if unread_boundary > 0 && message.seq == unread_marker_seq {
-                children.push({ let children : Vec < wire::Node > =
-                vec![native::sized(native::container(format!("{}/@container:50",
-                key_recon), native::text(format!("{}/@text:55", key_recon), "".to_owned()
-                .to_string(),),), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),),
-                native::text_options(native::text(format!("{}/@text:56", key_recon),
-                "NEW".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),
-                native::sized(native::container(format!("{}/@container:62", key_recon),
-                native::text(format!("{}/@text:67", key_recon), "".to_owned()
-                .to_string(),),), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),)]; wire::Node::Linear { max_width :
-                None, clip : false, key : format!("{}/@layout:43", key_recon), wrap :
-                None, axis : wire::Axis::Row, spacing : Some(8.0f32), padding :
-                Some(wire::Edges { top : 8.0f32, right : 0.0f32, bottom : 2.0f32, left :
-                0.0f32, }), width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }); } if message.seq == selected_message_seq { children
-                .push({ let node_scope = format!("{}/message({})", format!("{}/key({})",
-                message_timeline_scope_3465, key), message.id); { let children : Vec <
-                wire::Node > = vec![{ let message_card_scope_2680 =
-                format!("{}/MessageCard@2680", key_recon); { let mut children : Vec <
-                wire::Node > = Vec::new(); if message.show_author { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); { children.push(self.message_card(& message,
-                CopySurface::Timeline, crate ::host::message_plate(message.deleted, true,
-                crate ::host::seq_in_copy_range(message.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Timeline,),))); }
-                wire::Node::Stack { key : format!("{}/@layout:549",
-                message_card_scope_2680), width : Some(wire::Length::Fill), height :
-                None, padding : None, background : None, border : None, clip : false,
-                under : 0u32, children : children, } }, { let mut children : Vec <
-                wire::Node > = Vec::new(); if ! message.deleted && ! message.pending {
-                children.push(wire::Node::Container { shadow : Default::default(),
-                max_width : None, max_height : None, clip : false, key :
-                format!("{}/@container:632", message_card_scope_2680), width :
-                Some(wire::Length::Fill), height : None, padding : Some(wire::Edges { top
-                : 0.0f32, right : 8.0f32, bottom : 0.0f32, left : 0.0f32, }), align_x :
-                Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top), background
-                : None.map(wire::Background::Color), border : None, snap : None, content
-                : Box::new(native::padded(native::container(format!("{}/@container:640",
-                message_card_scope_2680), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:661", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:668",
-                message_card_scope_2680), "👍".to_owned().to_string(),),),), label :
-                Some(String::from("React with 👍".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_20(message.seq,
-                "👍".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)),
-                height : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:672", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:679",
-                message_card_scope_2680), "✅".to_owned().to_string(),),),), label :
-                Some(String::from("React with ✅".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_20(message.seq,
-                "✅".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)), height
-                : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:683", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:690",
-                message_card_scope_2680), "👀".to_owned().to_string(),),),), label :
-                Some(String::from("React with 👀".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_20(message.seq,
-                "👀".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)),
-                height : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                native::sized(native::container(format!("{}/@container:694",
-                message_card_scope_2680), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(1.0f32)), Some(wire::Length::Fixed(16.0f32)),),
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:700", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:707",
-                message_card_scope_2680), "♡".to_owned().to_string(),),),), label :
-                Some(String::from("Manage reactions".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_24(message.seq,
-                message.body.to_owned(), message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:711", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new({ let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
-                ::host::icon(::std::convert::AsRef::as_ref(& "nav-chat"),),);
-                wire::Node::Svg { inherit_button_ink : true, key :
-                format!("{}/@media:720", message_card_scope_2680), hash : hash, bytes :
-                bytes, label : None, color : None, hover : None, fit : None, rotation :
-                None, opacity : None, width : Some(wire::Length::Fixed(15.0f32)), height
-                : Some(wire::Length::Fixed(15.0f32)), } }),), label :
-                Some(String::from("Open thread".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_22(message
-                .seq),),), width : None, height : None, padding :
-                Some(wire::Edges::all(5.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:728", message_card_scope_2680), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:735",
-                message_card_scope_2680), "⋯".to_owned().to_string(),),),), label :
-                Some(String::from("More message actions".to_owned()),), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_23(message.seq,
-                message.body.to_owned(), message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:660", message_card_scope_2680), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(1.0f32), padding : None, width : None,
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } },), wire::Edges { top : 2.0f32,
-                right : 2.0f32, bottom : 2.0f32, left : 2.0f32, },),), }); } if message
-                .deleted || message.pending { children.push(wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), }); }
-                native::sized(native::column(format!("{}/@layout:630",
-                message_card_scope_2680), children,), Some(wire::Length::Fill), None,)
-                }]; wire::Node::Hover { key : format!("{}/@layout:544",
-                message_card_scope_2680), width : None, height : None, padding : None,
-                background : None, border : None, tint : None, radius : 9.0f32, open :
-                true, children : children, } });
-                native::sized(native::column(format!("{}/@layout:530",
-                message_card_scope_2680), children,), Some(wire::Length::Fill), None,) }
-                }]; wire::Node::Stack { key : node_scope.clone(), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, } }
-                }); } if message.seq != selected_message_seq { children.push({ let
-                _lazy_context_410 = message_timeline_scope_3465.to_owned(); let
-                lazy_event_410_0 = lazy_event_543_20.clone(); let lazy_event_410_1 =
-                lazy_event_543_21.clone(); let lazy_event_410_2 = lazy_event_543_22
-                .clone(); let lazy_event_410_3 = lazy_event_543_24.clone(); let
-                lazy_event_410_4 = lazy_event_543_23.clone(); let lazy_event_410_5 =
-                lazy_event_543_16.clone(); let lazy_event_410_6 = lazy_event_543_17
-                .clone(); let lazy_event_410_7 = lazy_event_543_1.clone(); { let lazy_key
-                = format!("{}/@lazy:96", key_recon);
-                ::ducktape_view_guest::memo_lazy((message.clone(), copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), format!("{}/key({})",
-                message_timeline_scope_3465, key) .to_owned(), (),), move | dependency |
-                { let cached_message : crate ::host::ChatMessage = dependency.0.clone();
-                let copy_anchor_seq : i64 = dependency.1.clone(); let copy_head_seq : i64
-                = dependency.2.clone(); let copy_surface : CopySurface = dependency.3
-                .clone(); let lazy_scope = dependency.4.clone(); { let node_scope =
-                format!("{}/message({})", lazy_scope, cached_message.id); { let children
-                : Vec < wire::Node > = vec![{ let message_card_scope_2701 =
-                format!("{}/MessageCard@2701", node_scope); { let mut children : Vec <
-                wire::Node > = Vec::new(); if cached_message.show_author { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); { children.push(self.message_card(& message,
-                CopySurface::Timeline, crate ::host::message_plate(cached_message
-                .deleted, false, crate ::host::seq_in_copy_range(cached_message.seq,
-                copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                CopySurface::Timeline,),))); } wire::Node::Stack { key :
-                format!("{}/@layout:549", message_card_scope_2701), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, }
-                }, { let mut children : Vec < wire::Node > = Vec::new(); if !
-                cached_message.deleted && ! cached_message.pending { children
-                .push(wire::Node::Container { shadow : Default::default(), max_width :
-                None, max_height : None, clip : false, key : format!("{}/@container:632",
-                message_card_scope_2701), width : Some(wire::Length::Fill), height :
-                None, padding : Some(wire::Edges { top : 0.0f32, right : 8.0f32, bottom :
-                0.0f32, left : 0.0f32, }), align_x : Some(wire::AlignX::Right), align_y :
-                Some(wire::AlignY::Top), background : None.map(wire::Background::Color),
-                border : None, snap : None, content :
-                Box::new(native::padded(native::container(format!("{}/@container:640",
-                message_card_scope_2701), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:661", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:668",
-                message_card_scope_2701), "👍".to_owned().to_string(),),),), label :
-                Some(String::from("React with 👍".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_0(cached_message
-                .seq, "👍".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)),
-                height : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:672", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:679",
-                message_card_scope_2701), "✅".to_owned().to_string(),),),), label :
-                Some(String::from("React with ✅".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_0(cached_message
-                .seq, "✅".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)),
-                height : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:683", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:690",
-                message_card_scope_2701), "👀".to_owned().to_string(),),),), label :
-                Some(String::from("React with 👀".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_0(cached_message
-                .seq, "👀".to_owned()),),), width : Some(wire::Length::Fixed(27.0f32)),
-                height : Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                native::sized(native::container(format!("{}/@container:694",
-                message_card_scope_2701), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(1.0f32)), Some(wire::Length::Fixed(16.0f32)),),
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:700", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:707",
-                message_card_scope_2701), "♡".to_owned().to_string(),),),), label :
-                Some(String::from("Manage reactions".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_3(cached_message
-                .seq, cached_message.body.to_owned(), cached_message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:711", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new({ let (hash, bytes) =
-                ::ducktape_view_guest::slots::picture(crate
-                ::host::icon(::std::convert::AsRef::as_ref(& "nav-chat"),),);
-                wire::Node::Svg { inherit_button_ink : true, key :
-                format!("{}/@media:720", message_card_scope_2701), hash : hash, bytes :
-                bytes, label : None, color : None, hover : None, fit : None, rotation :
-                None, opacity : None, width : Some(wire::Length::Fixed(15.0f32)), height
-                : Some(wire::Length::Fixed(15.0f32)), } }),), label :
-                Some(String::from("Open thread".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_2(cached_message
-                .seq),),), width : None, height : None, padding :
-                Some(wire::Edges::all(5.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:728", message_card_scope_2701), content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:735",
-                message_card_scope_2701), "⋯".to_owned().to_string(),),),), label :
-                Some(String::from("More message actions".to_owned()),), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_410_4(cached_message
-                .seq, cached_message.body.to_owned(), cached_message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:660", message_card_scope_2701), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(1.0f32), padding : None, width : None,
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } },), wire::Edges { top : 2.0f32,
-                right : 2.0f32, bottom : 2.0f32, left : 2.0f32, },),), }); } if
-                cached_message.deleted || cached_message.pending { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(1.0f32)), }); }
-                native::sized(native::column(format!("{}/@layout:630",
-                message_card_scope_2701), children,), Some(wire::Length::Fill), None,)
-                }]; wire::Node::Hover { key : format!("{}/@layout:544",
-                message_card_scope_2701), width : None, height : None, padding : None,
-                background : None, border : None, tint : None, radius : 9.0f32, open :
-                false, children : children, } });
-                native::sized(native::column(format!("{}/@layout:530",
-                message_card_scope_2701), children,), Some(wire::Length::Fill), None,) }
-                }]; wire::Node::Stack { key : node_scope.clone(), width :
-                Some(wire::Length::Fill), height : None, padding : None, background :
-                None, border : None, clip : false, under : 0u32, children : children, } }
-                } }, 410u64, & key_recon, lazy_key,) } }); } for (index, live) in
-                cached_timeline.live_agents.iter().enumerate() { let for_scope =
-                format!("{}/@for:2718({})", key_recon, index); if crate
-                ::host::run_in_thread(::std::borrow::Borrow::borrow(& live), message
-                .seq,) { children.push(wire::Node::Button { checked : None, expanded :
-                None, description : None, key : format!("{}/@button:117", for_scope),
-                content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:122",
-                for_scope), crate
-                ::host::live_thread_label(::std::convert::AsRef::as_ref(& live.agent),)
-                .to_string(),),),), label : Some(String::from(crate
-                ::host::live_thread_label(::std::convert::AsRef::as_ref(& live
-                .agent),),),), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_543_22(message
-                .seq),),), width : None, height : None, padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), });
-                } } native::spaced(native::sized(native::column(format!("{}/@layout:41",
-                key_recon), children,), Some(wire::Length::Fill), None,), 0.0f32,) };
-                children.push((key, child)); } let (keys, children) = children
-                .into_iter().map(| (key, child) | (wire::ListKey::from(key), child))
-                .unzip(); wire::Node::KeyedColumn { key : format!("{}/@keyed:36",
-                message_timeline_scope_3465), keys : Some(keys), children, background :
-                None, border : None, spacing : Some(3.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, max_width : None, align : None,
-                virtual_row : Some(44.0f32), } } } }, 543u64, & use_scope, lazy_key,) }
-                });
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:769",
-                use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 0.0f32, right : 6.0f32, bottom : 0.0f32, left : 0.0f32, },),
-                3.0f32,) }), } }), }), }, { let mut children =
-                vec![::ducktape_view_guest::wire::Node::Space { width :
-                Some(::ducktape_view_guest::wire::Length::Fill), height :
-                Some(::ducktape_view_guest::wire::Length::Fill) }]; if self
-                .selected_message_seq > 0 && self.message_action !=
-                MessageAction::Toolbar { children.push({ let mut children : Vec <
-                wire::Node > = vec![wire::Node::MouseArea { key :
-                format!("{}/@mouse:901", use_scope), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ClearMessageSelection,),),
-                on_release : None, on_double_click : None, on_right_press : None,
-                on_right_release : None, on_middle_press : None, on_middle_release :
-                None, on_enter : None, on_exit : None, on_move : None, on_press_at :
-                None, on_scroll : None, content : Box::new(wire::Node::Space { width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(crate
-                ::host::block_action_menu_y(self.chat_screen_states.get(& use_scope)
-                .map_or_else(| | self.chat_screen_initial.chat_pointer_y.clone(), | state
-                | state.chat_pointer_y.clone(),), self.chat_screen_states.get(&
-                use_scope).map_or_else(| | self.chat_screen_initial.chat_height.clone(),
-                | state | state.chat_height.clone(),),) as f32,),), }), }]; if self
-                .message_action == MessageAction::More { children.push({ let children :
-                Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/message-action-focus", use_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Message action focus".to_owned()
-                .to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::sized(native::container(format!("{}/@container:918",
-                use_scope), { let children : Vec < wire::Node > = vec![wire::Node::Button
-                { checked : None, expanded : None, description : None, key :
-                format!("{}/@button:937", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:944", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@3559", use_scope), "emoji", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:961", use_scope),
-                "Add reaction".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:951",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Manage reactions"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::OpenMessageReactions(self
-                .selected_message_seq, self.message_edit_draft.to_owned(), self
-                .selected_message_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:969", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:976", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@3591", use_scope), "nav-chat", 14f32,
-                "@media:82",), native::text_options(native::text(format!("{}/@text:993",
-                use_scope), "Reply in thread".to_owned().to_string(),), wire::TextOptions
-                { wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:983", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Reply in thread"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::OpenThreadFor(self
-                .selected_message_seq),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:1009", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1016", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@3631", use_scope), "link", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:1033", use_scope),
-                "Copy link".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1023",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Copy message link"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::CopyMessageLink(crate
-                ::host::duck_channel_message_link(self.active_channel.to_owned(), self
-                .selected_message_seq, self.network_chain_id.to_owned(),),),),), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(30.0f32)),
-                padding : Some(wire::Edges::all(0.0f32)), style :
-                wire::ButtonStyle::default(), }, wire::Node::Button { checked : None,
-                expanded : None, description : None, key : format!("{}/@button:1041",
-                use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1048", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@3663", use_scope), "pencil", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:1065", use_scope),
-                "Edit message".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1055",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Edit message"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::BeginMessageEdit(self
-                .selected_message_seq, self.message_edit_draft.to_owned(), self
-                .selected_message_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), },
-                native::sized(native::container(format!("{}/@container:1073", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),), wire::Node::Button { checked : None,
-                expanded : None, description : None, key : format!("{}/@button:1079",
-                use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1086", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@3701", use_scope), "trash", 14f32, "@media:70",),
-                native::text_options(native::text(format!("{}/@text:1103", use_scope),
-                "Delete message…".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1093", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Delete message"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ArmMessageDelete(self
-                .selected_message_seq, self.message_edit_draft.to_owned(), self
-                .selected_message_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), }];
-                native::spaced(native::sized(native::column(format!("{}/@layout:929",
-                use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) },),
-                Some(wire::Length::Fixed(200.0f32)), None,), wire::Edges { top : 5.0f32,
-                right : 5.0f32, bottom : 5.0f32, left : 5.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:904", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); } if self.message_action ==
-                MessageAction::Reactions { children.push({ let children : Vec <
-                wire::Node > = vec![{ let node_scope =
-                format!("{}/message-reaction-focus", use_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Message reaction focus"
-                .to_owned().to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::container(format!("{}/@container:1126",
-                use_scope), { let mut items = Vec::new(); for (index, emoji) in crate
-                ::host::reaction_palette().iter().enumerate() { let for_scope =
-                format!("{}/@for:3746({})", use_scope, index); let flex_child :
-                wire::Node = wire::Node::Button { checked : None, expanded : None,
-                description : Some(String::from(emoji.to_owned())), key :
-                format!("{}/@button:1144", for_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1153", for_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:1159",
-                for_scope), emoji.to_owned().to_string(),), wire::TextOptions { wrapping
-                : Some(wire::Wrapping::None), ..Default::default() },),), }),), label :
-                Some(String::from("Add reaction".to_owned())), on_press : if self
-                .active_channel_archived { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::AddReactionSubmit(emoji
-                .to_owned()),),) }, width : Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(27.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), };
-                items.push((wire::FlexItem::default(), flex_child)); } let (items,
-                children) = items.into_iter().unzip(); wire::Node::Flex { key :
-                format!("{}/@layout:1136", use_scope), items, children, background :
-                None, border : None, layout : wire::FlexLayout { direction :
-                wire::FlexDirection::Row, wrap : wire::FlexWrap::Wrap, justify : None,
-                items : Some(wire::FlexItemAlignment::Start), content : None, row_gap :
-                Some(2.0f32), column_gap : Some(2.0f32), padding : None, width :
-                Some(wire::Length::Fixed(234.0f32)), height : None, max_width : None,
-                max_height : None, clip : false, surface_width : None, surface_height :
-                None, surface_max_width : None, }, } },), wire::Edges { top : 8.0f32,
-                right : 8.0f32, bottom : 8.0f32, left : 8.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:1112", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); } if self.message_action ==
-                MessageAction::Editing { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:1172",
-                use_scope), { let children : Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/message-edit", use_scope); wire::Node::Surface { key :
-                node_scope.clone(), name : String::from("chat_composer"), args :
-                ::std::vec![{ let surface_arg = & (crate
-                ::host::edit_scope(::std::convert::AsRef::as_ref(& (self.endpoint)),
-                ::std::convert::AsRef::as_ref(& (self.active_channel)), self
-                .selected_message_seq));
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & ("edit".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (true);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Edit message".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (self.busy);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & (false);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Could not save changes".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }], on_event : None, } }, wire::Node::Button { checked : None, expanded :
-                None, description : None, key : format!("{}/@button:1189", use_scope),
-                content : wire::ButtonContent::Child(Box::new(wire::Node::Container {
-                shadow : Default::default(), max_width : None, max_height : None, clip :
-                false, key : format!("{}/@container:1197", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text(format!("{}/@text:1203", use_scope), "×"
-                .to_owned().to_string(),),), }),), label :
-                Some(String::from("Cancel message edit".to_owned())), on_press : if self
-                .busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ClearMessageSelection,),)
-                }, width : Some(wire::Length::Fixed(28.0f32)), height :
-                Some(wire::Length::Fixed(28.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1183", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(4.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
-                3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .message_action == MessageAction::Delete { children.push({ let children :
-                Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/message-delete-focus", use_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Message delete focus".to_owned()
-                .to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::container(format!("{}/@container:1218",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![native::text(format!("{}/@text:1229", use_scope),
-                "Delete this message?".to_owned().to_string(),),
-                native::padded(native::button(format!("{}/@button:1230", use_scope),
-                String::from("Delete"), if self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::DeleteMessageSubmit,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
-                native::padded(native::button(format!("{}/@button:1235", use_scope),
-                String::from("Cancel"), if self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ClearMessageSelection,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1228", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(5.0f32), padding : None, width : None,
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } },), wire::Edges { top : 3.0f32,
-                right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:1208", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); }
-                native::column(format!("{}/@layout:900", use_scope), children,) }); }
-                wire::Node::Overlay { key : format!("{}/@overlay:881", use_scope),
-                padding : 8.0f32, backdrop : wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 /
-                255.0, 0.000000,]), align_x : wire::AlignX::Right, align_y :
-                wire::AlignY::Top, on_dismiss :
-                Some(::ducktape_view_guest::slots::message(Message::ClearMessageSelection,),),
-                children : children, } }]; wire::Node::Stack { key :
-                format!("{}/@layout:730", use_scope), width : Some(wire::Length::Fill),
-                height : Some(wire::Length::Fill), padding : None, background : None,
-                border : None, clip : false, under : 0u32, children : children, } }); }
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:690",
-                use_scope), children,), Some(wire::Length::Fill),
-                Some(wire::Length::Fill),), wire::Edges { top : 16.0f32, right : 12.0f32,
-                bottom : 8.0f32, left : 18.0f32, },), 9.0f32,) }]; if ! self.messages
-                .is_empty() && (self.history_view || ! self.at_live_tail) { children
-                .push(wire::Node::Container { shadow : Default::default(), max_width :
-                None, max_height : None, clip : false, key :
-                format!("{}/@container:1257", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 18.0f32, bottom : 10.0f32, left
-                : 18.0f32, }), align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Bottom), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::padded(native::button(format!("{}/@button:1266",
-                use_scope), String::from("↓  Jump to latest"),
-                Some(::ducktape_view_guest::slots::message(Message::ChooseChannel(self
-                .active_channel.to_owned()),),), wire::ButtonPreset::Secondary,),
-                wire::Edges { top : 5f32, right : 10f32, bottom : 5f32, left : 10f32,
-                },),), }); } if self.search_phase == SearchPhase::Searching || ! self
-                .search_hits.is_empty() || crate
-                ::host::search_answer_stands(::std::convert::AsRef::as_ref(& self
-                .search_query), ::std::convert::AsRef::as_ref(& self.search_draft), self
-                .search_phase == SearchPhase::Searching,) { children
-                .push(wire::Node::Container { shadow : Default::default(), max_width :
-                None, max_height : None, clip : false, key :
-                format!("{}/@container:1292", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 16.0f32, right : 18.0f32, bottom : 0.0f32, left
-                : 18.0f32, }), align_x : None, align_y : Some(wire::AlignY::Top),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : Some(260.0f32), clip :
-                false, key : format!("{}/@container:1300", use_scope), width :
-                Some(wire::Length::Fill), height : None, padding : Some(wire::Edges { top
-                : 6.0f32, right : 6.0f32, bottom : 6.0f32, left : 6.0f32, }), align_x :
-                None, align_y : None, background : None, border : None, snap : None,
-                content : Box::new({ let mut children : Vec < wire::Node > = Vec::new();
-                if self.search_phase == SearchPhase::Searching { children.push({ let
-                children : Vec < wire::Node > = vec![self
-                .loading_messages(format!("{}/SkeletonRow@3922", use_scope),)];
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1314",
-                use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 8.0f32, right : 8.0f32, bottom : 8.0f32, left : 8.0f32, },),
-                14.0f32,) }); } if self.search_phase == SearchPhase::Done && self
-                .search_hits.is_empty() { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1321", use_scope), width :
-                Some(wire::Length::Fill), height : None, padding : Some(wire::Edges { top
-                : 14.0f32, right : 14.0f32, bottom : 14.0f32, left : 14.0f32, }), align_x
-                : Some(wire::AlignX::Center), align_y : None, background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text(format!("{}/@text:1326", use_scope),
-                "No messages match".to_owned().to_string(),),), }); } if self
-                .search_phase == SearchPhase::Done && ! self.search_hits.is_empty() {
-                children.push(wire::Node::Scroll { on_scroll : None, virtual_rows :
-                false, key : format!("{}/@layout:1328", use_scope), direction :
-                wire::ScrollDirection::Vertical, width : Some(wire::Length::Fill), height
-                : Some(wire::Length::Shrink), bar_hidden : false, bar_width : None,
-                bar_margin : None, scroller_width : None, bar_spacing : None, anchor_x :
-                wire::ScrollAnchor::Start, anchor_y : wire::ScrollAnchor::Start,
-                auto_scroll : false, background : None, border : None, content :
-                Box::new({ let mut children : Vec < wire::Node > = Vec::new(); for
-                (index, hit) in self.search_hits.iter().enumerate() { let for_scope =
-                format!("{}/@for:3937({})", use_scope, index); children.push(self
-                .search_result(format!("{}/ChatSearchResult@3938", for_scope), (move |
-                event_0, event_1, event_2 | Message::OpenChatSearchHit(event_0, event_1,
-                event_2,)).clone(), hit.clone(),),); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:1333",
-                use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) }),
-                }); } native::sized(native::column(format!("{}/@layout:1312", use_scope),
-                children,), Some(wire::Length::Fill), None,) }), }), }); }
-                wire::Node::Stack { key : format!("{}/@layout:689", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, background : None, border : None, clip : false, under : 0u32,
-                children : children, } }); children
-                .push(native::sized(native::container(format!("{}/@container:1340",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),)); if ! self.post_refusal.is_empty() {
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:1355",
-                use_scope), self.composer_gate(format!("{}/ComposerGate@3964",
-                use_scope)),), Some(wire::Length::Fill), None,), wire::Edges { top :
-                12.0f32, right : 18.0f32, bottom : 0.0f32, left : 18.0f32, },)); }
-                children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:1362",
-                use_scope), { let node_scope = format!("{}/composer", use_scope);
-                wire::Node::Surface { key : node_scope.clone(), name :
-                String::from("chat_composer"), args : ::std::vec![{ let surface_arg = &
-                (crate ::host::composer_scope(::std::convert::AsRef::as_ref(& (self
-                .endpoint),), ::std::convert::AsRef::as_ref(& (self.active_channel),),));
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
-                }, { let surface_arg = & ("message".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
-                }, { let surface_arg = & (false);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
-                let surface_arg = & ("Message the channel…".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
-                }, { let surface_arg = & (((self.loading || (! self.connected)) || (self
-                .active_channel).is_empty()) || (! (self.post_refusal).is_empty()));
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
-                let surface_arg = & (self.busy);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg),) }, {
-                let surface_arg = & ("An earlier message wasn’t sent".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg,),)
-                }], on_event : None, } }), Some(wire::Length::Fill), None,), wire::Edges
-                { top : 12.0f32, right : 18.0f32, bottom : 14.0f32, left : 18.0f32, },));
-                native::sized(native::column(format!("{}/@layout:544", use_scope),
-                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }]; if
-                self.channel_settings_open && ! self.active_channel.is_empty() { children
-                .push({ let node_scope = format!("{}/details-resize", use_scope);
-                wire::Node::ResizeHandle { key : node_scope.clone(), on_press : None,
-                on_release : None, on_drag : Some(::ducktape_view_guest::slots::handler::
-                < (f64, f64), Message, > (Box::new({ let route = { let
-                _route_state_scope_0 = use_scope.clone(); let route_callback = (move |
-                event_0, event_1 | { Message::DetailsResized(event_0, event_1) })
-                .clone(); move | delta : (f64, f64) | { route_callback(delta.0, delta.1)
-                } }; move | sent : (f64, f64) | Some(route(sent)) },))), cursor :
-                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
-                node_scope = format!("{}/details-divider", node_scope);
-                wire::Node::Container { shadow : Default::default(), max_width : None,
-                max_height : None, clip : false, key : node_scope.clone(), width :
-                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
-                padding : None, align_x : Some(wire::AlignX::Center), align_y : None,
-                background : None, border : None, snap : None, content :
-                Box::new(native::sized(native::container(format!("{}/@container:1385",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(2.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(2.0f32)), Some(wire::Length::Fill),)), } }), }
-                }); children.push({ let node_scope = format!("{}/details-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let
-                children : Vec < wire::Node > =
-                vec![native::padded(native::sized(native::container(format!("{}/@container:1393",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![native::sized(native::text_options(native::text(format!("{}/@text:1405",
-                use_scope), "Channel details".to_owned().to_string(),), wire::TextOptions
-                { wrapping : Some(wire::Wrapping::None), ..Default::default() },),
-                Some(wire::Length::Fill), None,), wire::Node::Button { checked : None,
-                expanded : Some(self.channel_settings_open), description : None, key :
-                format!("{}/@button:1412", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1420", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text(format!("{}/@text:1426", use_scope), "×"
-                .to_owned().to_string(),),), }),), label :
-                Some(String::from("Close channel details".to_owned()),), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ToggleChannelSettings,),),
-                width : Some(wire::Length::Fixed(28.0f32)), height :
-                Some(wire::Length::Fixed(28.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1399", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(50.0f32)),), wire::Edges { top : 0.0f32, right :
-                10.0f32, bottom : 0.0f32, left : 16.0f32, },),
-                native::sized(native::container(format!("{}/@container:1430", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),), wire::Node::Scroll { on_scroll :
-                None, virtual_rows : false, key : format!("{}/@layout:1436", use_scope),
-                direction : wire::ScrollDirection::Vertical, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), bar_hidden :
-                false, bar_width : None, bar_margin : None, scroller_width : None,
-                bar_spacing : None, anchor_x : wire::ScrollAnchor::Start, anchor_y :
-                wire::ScrollAnchor::Start, auto_scroll : false, background : None, border
-                : None, content : Box::new({ let children : Vec < wire::Node > = vec![{
-                let mut children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); if ! self.active_channel_members_only {
-                children.push(native::text_options(native::text(format!("{}/@text:1456",
-                use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } if self
-                .active_channel_members_only { children
-                .push(native::text_options(native::text(format!("{}/@text:1463",
-                use_scope), "◆".to_owned().to_string(),), wire::TextOptions { wrapping
-                : Some(wire::Wrapping::None), ..Default::default() },),); } children
-                .push(native::sized(native::text_options(native::text(format!("{}/@text:1468",
-                use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },), Some(wire::Length::Fill), None,),);
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1450", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(7.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }]; if self.active_channel_archived || self
-                .active_channel_members_only { children.push({ let mut children : Vec <
-                wire::Node > = Vec::new(); if self.active_channel_archived { children
-                .push(self.archived_badge(format!("{}/Badge.Outline@4085",
-                use_scope),),); } if self.active_channel_members_only { children
-                .push(self.private_badge(format!("{}/Badge.Outline@4087", use_scope),),);
-                } wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1476", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(5.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:1449",
-                use_scope), children,), Some(wire::Length::Fill), None,), 7.0f32,) }, {
-                let children : Vec < wire::Node > = vec![self
-                .name_label(format!("{}/Eyebrow@4089", use_scope)), { let children : Vec
-                < wire::Node > = vec![{ let node_scope = format!("{}/channel-name",
-                node_scope); wire::Node::Input { options : wire::InputOptions { label :
-                "Channel name".to_owned().to_string(), description : None, disabled :
-                self.busy, padding : Some(wire::Edges::all(6.6f32)), text_size :
-                Some(13.0f32), line_height : Some(1.2f32), align : None, font :
-                Some(wire::NamedFont { family : wire::FontFamily::Named("Geist".into()),
-                weight : wire::Weight::Normal, stretch : wire::FontStretch::Normal, style
-                : wire::FontStyle::Normal, }), }, key : node_scope.clone(), placeholder :
-                String::from("Channel name".to_owned()), value : self.channel_name_draft
-                .to_string(), on_input : ::ducktape_view_guest::slots::handler:: <
-                String, Message, > (Box::new({ let route =
-                Message::ChannelNameDraftChanged as fn (String) -> Message; move | sent :
-                String | Some(route(sent)) }),), on_submit :
-                Some(::ducktape_view_guest::slots::message(Message::RenameChannelSubmit,),),
-                width : Some(wire::Length::Fill), secure : false, style :
-                Default::default(), } },
-                native::padded(native::button(format!("{}/@button:1506", use_scope),
-                String::from("Rename"), if self.busy || self.channel_name_draft.trim()
-                .to_owned().is_empty() { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::RenameChannelSubmit,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(6.0f32),)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1487", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }];
-                native::spaced(native::sized(native::column(format!("{}/@layout:1485",
-                use_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:1513", use_scope), content :
-                wire::ButtonContent::Label(String::from("Copy channel link"),), label :
-                Some(String::from("Copy channel link".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::CopyToClipboard(crate
-                ::host::duck_channel_link(self.active_channel.to_owned(), self
-                .network_chain_id.to_owned(),), "Channel link copied".to_owned(),),),),
-                width : Some(wire::Length::Fill), height : None, padding :
-                Some(wire::Edges::all(6.0f32)), style : wire::ButtonStyle::default(), },
-                { let mut children : Vec < wire::Node > = vec![{ let children : Vec <
-                wire::Node > = vec![self.members_label(format!("{}/Eyebrow@4128",
-                use_scope)), wire::Node::Space { width : Some(wire::Length::Fill), height
-                : None, }, native::text_options(native::text(format!("{}/@text:1530",
-                use_scope), crate ::host::count_label(self.channel_members.len() as i64,)
-                .to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1520",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(6.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }, { let children : Vec < wire::Node > = vec![{ let
-                node_scope = format!("{}/member-key", node_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Member account or public key"
-                .to_owned().to_string(), description : None, disabled : self.busy,
-                padding : Some(wire::Edges::all(7.4f32)), text_size : Some(11.5f32),
-                line_height : Some(1.2f32), align : None, font : Some(wire::NamedFont {
-                family : wire::FontFamily::Named("Geist Mono".into()), weight :
-                wire::Weight::Normal, stretch : wire::FontStretch::Normal, style :
-                wire::FontStyle::Normal, }), }, key : node_scope.clone(), placeholder :
-                String::from("acct:123 or public key".to_owned(),), value : self
-                .member_key_draft.to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = Message::MemberKeyDraftChanged as fn (String) -> Message;
-                move | sent : String | Some(route(sent)) }),), on_submit :
-                Some(::ducktape_view_guest::slots::message(Message::AddChannelMemberSubmit,),),
-                width : Some(wire::Length::Fill), secure : false, style :
-                Default::default(), } },
-                native::padded(native::button(format!("{}/@button:1556", use_scope),
-                String::from("Add"), if self.busy || self.member_key_draft.trim()
-                .to_owned().is_empty() { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::AddChannelMemberSubmit,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(6.0f32),)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1536", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(6.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }]; if self.channel_members.is_empty() { children
-                .push(native::sized(native::text(format!("{}/@text:1562", use_scope),
-                "No members added. An Open channel needs none — membership only gates posting in a members-only channel."
-                .to_owned().to_string(),), Some(wire::Length::Fill), None,),); } if !
-                self.channel_members.is_empty() { children.push({ let mut children : Vec
-                < wire::Node > = Vec::new(); for (index, member) in self.channel_members
-                .iter().enumerate() { let for_scope = format!("{}/@for:4173({})",
-                use_scope, index); children.push(self
-                .member_row(format!("{}/ChatMemberRow@4174", for_scope), (move | event_0
-                | Message::RemoveChannelMemberSubmit(event_0)).clone(), member
-                .clone(),),); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:1569",
-                use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) }); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:1519",
-                use_scope), children,), Some(wire::Length::Fill), None,), 6.0f32,) }];
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1441",
-                use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 14.0f32, right : 16.0f32, bottom : 14.0f32, left : 16.0f32, },),
-                16.0f32,) }), },
-                native::sized(native::container(format!("{}/@container:1574", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),),
-                native::padded(native::sized(native::container(format!("{}/@container:1580",
-                use_scope), { let mut children : Vec < wire::Node > = Vec::new(); if !
-                self.active_channel_archived { children
-                .push(native::padded(native::sized(native::button(format!("{}/@button:1595",
-                use_scope), String::from("Archive channel"), if self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ArchiveChannelSubmit,),)
-                }, wire::ButtonPreset::Secondary,), Some(wire::Length::Fill), None,),
-                wire::Edges::all(6.0f32),),); } if self.active_channel_archived {
-                children
-                .push(native::padded(native::sized(native::button(format!("{}/@button:1605",
-                use_scope), String::from("Unarchive channel"), if self.busy { None } else
-                {
-                Some(::ducktape_view_guest::slots::message(Message::UnarchiveChannelSubmit,),)
-                }, wire::ButtonPreset::Secondary,), Some(wire::Length::Fill), None,),
-                wire::Edges::all(6.0f32),),); }
-                native::sized(native::column(format!("{}/@layout:1587", use_scope),
-                children,), Some(wire::Length::Fill), None,) },),
-                Some(wire::Length::Fill), None,), wire::Edges { top : 10.0f32, right :
-                16.0f32, bottom : 12.0f32, left : 16.0f32, },)];
-                native::sized(native::column(format!("{}/@layout:1392", use_scope),
-                children,), Some(wire::Length::Fill), Some(wire::Length::Fill),) },),
-                Some(wire::Length::Fixed(self.details_width as f32)),
-                Some(wire::Length::Fill),) }); } if self.active_thread_seq > 0 && ! self
-                .channel_settings_open { children.push({ let node_scope =
-                format!("{}/thread-resize", use_scope); wire::Node::ResizeHandle { key :
-                node_scope.clone(), on_press : None, on_release : None, on_drag :
-                Some(::ducktape_view_guest::slots::handler:: < (f64, f64), Message, >
-                (Box::new({ let route = { let _route_state_scope_0 = use_scope.clone();
-                let route_callback = (move | event_0, event_1 | {
-                Message::ThreadResized(event_0, event_1) }).clone(); move | delta : (f64,
-                f64) | { route_callback(delta.0, delta.1) } }; move | sent : (f64, f64) |
-                Some(route(sent)) },))), cursor :
-                Some(wire::mouse::Cursor::ResizingHorizontally), content : Box::new({ let
-                node_scope = format!("{}/thread-divider", node_scope);
-                wire::Node::Container { shadow : Default::default(), max_width : None,
-                max_height : None, clip : false, key : node_scope.clone(), width :
-                Some(wire::Length::Fixed(10.0f32)), height : Some(wire::Length::Fill),
-                padding : None, align_x : Some(wire::AlignX::Center), align_y : None,
-                background : None, border : None, snap : None, content :
-                Box::new(native::sized(native::container(format!("{}/@container:1619",
-                use_scope), wire::Node::Space { width :
-                Some(wire::Length::Fixed(2.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },),
-                Some(wire::Length::Fixed(2.0f32)), Some(wire::Length::Fill),)), } }), }
-                }); children.push({ let node_scope = format!("{}/thread-pane",
-                use_scope); native::sized(native::container(node_scope.clone(), { let
-                children : Vec < wire::Node > = vec![wire::Node::Sensor { key :
-                format!("{}/@sensor:1631", use_scope), reset : None, on_show :
-                Some(::ducktape_view_guest::slots::handler:: < (f32, f32), Message, >
-                (Box::new({ let route = { let route_scope = use_scope.clone(); move |
-                size : (f64, f64) | Message::ChatScreenThreadResized(route_scope.clone(),
-                size.0, size.1,) }; move | sent : (f32, f32) | Some(route((f64::from(sent
-                .0), f64::from(sent.1))),) }),),), on_resize :
-                Some(::ducktape_view_guest::slots::handler:: < (f32, f32), Message, >
-                (Box::new({ let route = { let route_scope = use_scope.clone(); move |
-                size : (f64, f64) | Message::ChatScreenThreadResized(route_scope.clone(),
-                size.0, size.1,) }; move | sent : (f32, f32) | Some(route((f64::from(sent
-                .0), f64::from(sent.1))),) }),),), on_hide : None, anticipate : None,
-                delay : None, child : Box::new(wire::Node::Space { width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), }), },
-                wire::Node::MouseArea { key : format!("{}/@mouse:1633", use_scope),
-                on_press : None, on_release : None, on_double_click : None,
-                on_right_press : None, on_right_release : None, on_middle_press : None,
-                on_middle_release : None, on_enter : None, on_exit : None, on_move :
-                None, on_press_at : Some(::ducktape_view_guest::slots::handler:: < (f32,
-                f32), Message, > (Box::new({ let route = { let route_scope = use_scope
-                .clone(); move | point : (f64, f64) |
-                Message::ChatScreenThreadPointerPressed(route_scope.clone(), point.0,
-                point.1,) }; move | sent : (f32, f32) | Some(route((f64::from(sent.0),
-                f64::from(sent.1))),) }),),), on_scroll : None, content : Box::new({ let
-                mut children : Vec < wire::Node > =
-                vec![native::padded(native::sized(native::container(format!("{}/@container:1640",
-                use_scope), { let mut children : Vec < wire::Node > = Vec::new(); if self
-                .thread_target_seq <= 0 { children
-                .push(native::text_options(native::text(format!("{}/@text:1653",
-                use_scope), "Thread".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); } if
-                self.thread_target_seq > 0 { children
-                .push(native::text_options(native::text(format!("{}/@text:1660",
-                use_scope), "Thread result".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },),); }
-                children.push({ let mut children : Vec < wire::Node > = Vec::new(); if
-                self.active_dm.name.is_empty() { children
-                .push(native::text_options(native::text(format!("{}/@text:1671",
-                use_scope), "#".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),); } children
-                .push(native::text_options(native::text(format!("{}/@text:1676",
-                use_scope), self.active_channel_name.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),); wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:1666", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(2.0f32), padding : None, width : None,
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } }); children.push(wire::Node::Space
-                { width : Some(wire::Length::Fill), height : None, }); children
-                .push(wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:1682", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1690", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text(format!("{}/@text:1696", use_scope), "×"
-                .to_owned().to_string(),),), }),), label :
-                Some(String::from("Close thread".to_owned())), on_press : if self.busy {
-                None } else {
-                Some(::ducktape_view_guest::slots::message(Message::CloseThread),) },
-                width : Some(wire::Length::Fixed(24.0f32)), height :
-                Some(wire::Length::Fixed(24.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), });
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1646", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(7.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(50.0f32)),), wire::Edges { top : 0.0f32, right :
-                16.0f32, bottom : 0.0f32, left : 16.0f32, },),
-                native::sized(native::container(format!("{}/@container:1700", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),)]; if self.copy_surface ==
-                CopySurface::Thread && crate
-                ::host::copy_range_count(::std::convert::AsRef::as_ref(& self
-                .thread_messages), self.copy_anchor_seq, self.copy_head_seq,) > 0 {
-                children.push({ let node_scope = format!("{}/thread-selection",
-                node_scope); self.render_thread_selection(node_scope.clone(), (move | |
-                Message::ClearCopyRange).clone(), (move | |
-                Message::CopySelectedMessages).clone(),) }); } children.push({ let
-                node_scope = format!("{}/thread-stream", node_scope); wire::Node::Scroll
-                { on_scroll : None, virtual_rows : true, key : node_scope.clone(),
-                direction : wire::ScrollDirection::Vertical, width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), bar_hidden :
-                false, bar_width : None, bar_margin : None, scroller_width : None,
-                bar_spacing : None, anchor_x : wire::ScrollAnchor::Start, anchor_y :
-                wire::ScrollAnchor::End, auto_scroll : self.thread_target_seq <= 0,
-                background : None, border : None, content : Box::new({ let mut children :
-                Vec < wire::Node > = vec![{ let _lazy_context_720 = use_scope.to_owned();
-                let _lazy_event_720_0 = (move | event_0 | Message::CancelRun(event_0,))
-                .clone(); let lazy_event_720_1 = (move | event_0, event_1 |
-                Message::PressMessage(event_0, event_1,)).clone(); let _lazy_event_720_2
-                = (move | | Message::ClearCopyRange).clone(); let _lazy_event_720_3 =
-                (move | | { Message::CopySelectedMessages }).clone(); let
-                _lazy_event_720_4 = (move | | Message::SearchChatSubmit).clone(); let
-                _lazy_event_720_5 = (move | | Message::ClearChatSearch).clone(); let
-                _lazy_event_720_6 = (move | event_0, event_1, event_2 |
-                Message::OpenChatSearchHit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_7 = (move | | { Message::ToggleChannelCreate }).clone();
-                let _lazy_event_720_8 = (move | event_0 |
-                Message::ChooseChannel(event_0,)).clone(); let _lazy_event_720_9 = (move
-                | event_0 | Message::ChooseDm(event_0,)).clone(); let _lazy_event_720_10
-                = (move | | { Message::ToggleChannelSettings }).clone(); let
-                _lazy_event_720_11 = (move | | Message::ShowHuddle).clone(); let
-                _lazy_event_720_12 = (move | | Message::LeaveHuddleHere).clone(); let
-                _lazy_event_720_13 = (move | | Message::JoinHuddleSubmit).clone(); let
-                _lazy_event_720_14 = (move | | Message::LoadMoreHistory).clone(); let
-                _lazy_event_720_15 = (move | event_0, event_1, event_2, event_3 |
-                Message::ChatScrolled(event_0, event_1, event_2, event_3)).clone(); let
-                lazy_event_720_16 = (move | event_0 | Message::OpenMessageLink(event_0,))
-                .clone(); let lazy_event_720_17 = (move | event_0 |
-                Message::OpenRun(event_0,)).clone(); let _lazy_event_720_18 = (move |
-                event_0, event_1 | Message::CopyToClipboard(event_0, event_1,)).clone();
-                let _lazy_event_720_19 = (move | event_0 |
-                Message::CopyMessageLink(event_0,)).clone(); let lazy_event_720_20 =
-                (move | event_0, event_1 | Message::AddReactionAt(event_0, event_1,))
-                .clone(); let lazy_event_720_21 = (move | event_0, event_1 |
-                Message::RemoveReactionAt(event_0, event_1,)).clone(); let
-                lazy_event_720_22 = (move | event_0 | Message::OpenThreadFor(event_0,))
-                .clone(); let _lazy_event_720_23 = (move | event_0, event_1, event_2 |
-                Message::OpenMessageActions(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_24 = (move | event_0, event_1, event_2 |
-                Message::OpenMessageReactions(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_25 = (move | event_0, event_1, event_2 |
-                Message::BeginMessageEdit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_26 = (move | event_0, event_1, event_2 |
-                Message::ArmMessageDelete(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_27 = (move | | { Message::ClearMessageSelection })
-                .clone(); let _lazy_event_720_28 = (move | event_0 |
-                Message::AddReactionSubmit(event_0,)).clone(); let _lazy_event_720_29 =
-                (move | | { Message::DeleteMessageSubmit }).clone(); let
-                _lazy_event_720_30 = (move | | { Message::RenameChannelSubmit }).clone();
-                let _lazy_event_720_31 = (move | | { Message::ArchiveChannelSubmit })
-                .clone(); let _lazy_event_720_32 = (move | | {
-                Message::UnarchiveChannelSubmit }).clone(); let _lazy_event_720_33 =
-                (move | | { Message::AddChannelMemberSubmit }).clone(); let
-                _lazy_event_720_34 = (move | event_0 |
-                Message::RemoveChannelMemberSubmit(event_0,)).clone(); let
-                _lazy_event_720_35 = (move | | Message::CloseThread).clone(); let
-                _lazy_event_720_36 = (move | event_0, event_1 |
-                Message::SidebarResized(event_0, event_1,)).clone(); let
-                _lazy_event_720_37 = (move | event_0, event_1 |
-                Message::DetailsResized(event_0, event_1,)).clone(); let
-                _lazy_event_720_38 = (move | event_0, event_1 |
-                Message::ThreadResized(event_0, event_1,)).clone(); let lazy_event_720_39
-                = (move | event_0, event_1, event_2 |
-                Message::OpenThreadMessageActions(event_0, event_1, event_2,)).clone();
-                let lazy_event_720_40 = (move | event_0, event_1, event_2 |
-                Message::OpenThreadMessageReactions(event_0, event_1, event_2,)).clone();
-                let _lazy_event_720_41 = (move | event_0, event_1, event_2 |
-                Message::BeginThreadMessageEdit(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_42 = (move | event_0, event_1, event_2 |
-                Message::ArmThreadMessageDelete(event_0, event_1, event_2,)).clone(); let
-                _lazy_event_720_43 = (move | | { Message::ClearThreadMessageSelection })
-                .clone(); let _lazy_event_720_44 = (move | | {
-                Message::DeleteThreadMessageSubmit }).clone(); let _lazy_event_720_45 =
-                (move | | Message::LoadMoreThread).clone(); { let lazy_key =
-                format!("{}/@lazy:1750", use_scope);
-                ::ducktape_view_guest::memo_lazy((self.active_channel.to_owned(), self
-                .active_thread_seq, self.thread_target_seq, self.thread_selected_seq,
-                self.copy_anchor_seq, self.copy_head_seq, self.copy_surface.clone(), self
-                .thread_messages_revision, node_scope.to_owned(), (),), move | dependency
-                | { let _active_channel : String = dependency.0.clone(); let
-                active_thread_seq : i64 = dependency.1.clone(); let thread_target_seq :
-                i64 = dependency.2.clone(); let thread_selected_seq : i64 = dependency.3
-                .clone(); let copy_anchor_seq : i64 = dependency.4.clone(); let
-                copy_head_seq : i64 = dependency.5.clone(); let copy_surface :
-                CopySurface = dependency.6.clone(); let lazy_scope = dependency.8
-                .clone(); let cached_thread_messages : Vec < crate ::host::ChatMessage >
-                = self.thread_messages.clone(); { let thread_timeline_scope_4354 =
-                format!("{}/ThreadTimeline@4354", lazy_scope); { let mut children : Vec <
-                _ > = Vec::new(); for thread_message in cached_thread_messages.iter() {
-                let key = thread_message.view_key; let key_recon = format!("{}/key({})",
-                thread_timeline_scope_4354, key); let child : wire::Node = { let mut
-                children : Vec < wire::Node > = Vec::new(); if thread_message.seq ==
-                active_thread_seq { children.push({ let thread_parent_block_scope_2747 =
-                format!("{}/ThreadParentBlock@2747", key_recon); { let node_scope =
-                format!("{}/root", thread_parent_block_scope_2747); { let mut children :
-                Vec < wire::Node > = vec![{ let children : Vec < wire::Node > = vec![{
-                let principal_avatar_scope_2430 = format!("{}/PrincipalAvatar@2430",
-                thread_parent_block_scope_2747); { let node_scope = format!("{}/root",
-                principal_avatar_scope_2430); { let mut children : Vec < wire::Node > =
-                Vec::new(); { children.push({ let principal_plate_scope_909 =
-                format!("{}/PrincipalPlate@909", principal_avatar_scope_2430); { let
-                node_scope = format!("{}/root", principal_plate_scope_909); { let mut
-                children : Vec < wire::Node > = Vec::new(); if thread_message.avatar_kind
-                == "agent" { children.push({ let agent_plate_scope_919 =
-                format!("{}/AgentPlate@919", principal_plate_scope_909); { let node_scope
-                = format!("{}/root", agent_plate_scope_919); { let mut children : Vec <
-                wire::Node > = Vec::new(); { children.push({ let agent_square_scope_1174
-                = format!("{}/AgentSquare@1174", agent_plate_scope_919); { let node_scope
-                = format!("{}/root", agent_square_scope_1174); wire::Node::Container {
-                shadow : Default::default(), max_width : None, max_height : None, clip :
-                false, key : node_scope.clone(), width :
-                Some(wire::Length::Fixed(30.0f32)), height :
-                Some(wire::Length::Fixed(30.0f32)), padding : None, align_x :
-                Some(wire::AlignX::Center), align_y : Some(wire::AlignY::Center),
-                background : None, border : Some(wire::Border { color : None, width :
-                None, radius : Some([8.0f32, 8.0f32, 8.0f32, 8.0f32,]), }), snap : None,
-                content :
-                Box::new(native::text_options(native::text(format!("{}/@text:390",
-                agent_square_scope_1174), thread_message.initial.to_owned()
-                .to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },),), } } }); }
-                native::column(node_scope.clone(), children) } } }); } if !
-                (thread_message.avatar_kind == "agent") { children.push({ let
-                human_plate_scope_925 = format!("{}/HumanPlate@925",
-                principal_plate_scope_909); { let node_scope = format!("{}/root",
-                human_plate_scope_925); { let mut children : Vec < wire::Node > =
-                Vec::new(); { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:328", human_plate_scope_925), width :
-                Some(wire::Length::Fixed(30.0f32)), height :
-                Some(wire::Length::Fixed(30.0f32)), padding : None, align_x :
-                Some(wire::AlignX::Center), align_y : Some(wire::AlignY::Center),
-                background : None, border : Some(wire::Border { color : None, width :
-                None, radius : Some([((30.0 / 2.0) as f32).max(0.0).min(f32::MAX), ((30.0
-                / 2.0) as f32).max(0.0).min(f32::MAX), ((30.0 / 2.0) as f32).max(0.0)
-                .min(f32::MAX), ((30.0 / 2.0) as f32).max(0.0).min(f32::MAX),]), }), snap
-                : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:336",
-                human_plate_scope_925), thread_message.initial.to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),), }); } native::column(node_scope.clone(),
-                children) } } }); } native::column(node_scope.clone(), children) } } });
-                } native::column(node_scope.clone(), children) } } }, { let children :
-                Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:1030",
-                thread_parent_block_scope_2747), thread_message.author.to_owned()
-                .to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; if thread_message
-                .height > 0 { children
-                .push(native::text_options(native::text(format!("{}/@text:1038",
-                thread_parent_block_scope_2747), crate
-                ::host::height_label_short(thread_message.height).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),); } if thread_message.edited { children
-                .push(native::text_options(native::text(format!("{}/@text:1047",
-                thread_parent_block_scope_2747), "· edited".to_owned().to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },),); } if ! crate
-                ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),).is_empty() { children
-                .push(native::padded(native::button(format!("{}/@button:1054",
-                thread_parent_block_scope_2747), String::from("View run"),
-                Some(::ducktape_view_guest::slots::message(lazy_event_720_17(crate
-                ::host::run_of_message(::std::convert::AsRef::as_ref(& thread_message
-                .id),),),),), wire::ButtonPreset::Secondary,),
-                wire::Edges::all(3.0f32),),); } children.push(wire::Node::Space { width :
-                Some(wire::Length::Fill), height : None, }); wire::Node::Linear {
-                max_width : None, clip : false, key : format!("{}/@layout:1025",
-                thread_parent_block_scope_2747), wrap : None, axis : wire::Axis::Row,
-                spacing : Some(6.0f32), padding : None, width : Some(wire::Length::Fill),
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } }, { let message_body_scope_2472 =
-                format!("{}/MessageBody@2472", thread_parent_block_scope_2747); { let
-                children : Vec < wire::Node > = vec![{ let rich_body_scope_688 =
-                format!("{}/RichBody@688", message_body_scope_2472);
-                Self::message_body(format!("{}/@layout:75", rich_body_scope_688), &
-                thread_message.blocks, Some(::ducktape_view_guest::slots::handler:: <
-                String, Message, > (Box::new({ let route = { let route_callback =
-                lazy_event_720_16.clone(); move | link : String | route_callback(link) };
-                move | sent : String | Some(route(sent)) }),),)) }]; wire::Node::Linear {
-                max_width : Some(760.0f32), clip : false, key : format!("{}/@layout:60",
-                message_body_scope_2472), wrap : None, axis : wire::Axis::Column, spacing
-                : None, padding : None, width : Some(wire::Length::Fill), height : None,
-                align : None, background : None, border : None, children : children, } }
-                }];
-                native::spaced(native::sized(native::column(format!("{}/@layout:1024",
-                thread_parent_block_scope_2747), children,), Some(wire::Length::Fill),
-                None,), 2.0f32,) }]; wire::Node::Linear { max_width : None, clip : false,
-                key : format!("{}/@layout:1006", thread_parent_block_scope_2747), wrap :
-                None, axis : wire::Axis::Row, spacing : Some(11.0f32), padding :
-                Some(wire::Edges { top : 0.0f32, right : 0.0f32, bottom : 14.0f32, left :
-                0.0f32, }), width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Left), background : None, border : None, children :
-                children, } },
-                native::sized(native::container(format!("{}/@container:1062",
-                thread_parent_block_scope_2747), wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),)]; if thread_message.reply_count > 0 {
-                children.push({ let children : Vec < wire::Node > =
-                vec![native::text_options(native::text(format!("{}/@text:1076",
-                thread_parent_block_scope_2747), crate ::host::plural(thread_message
-                .reply_count, ::std::convert::AsRef::as_ref(& "reply"),
-                ::std::convert::AsRef::as_ref(& "replies"),).to_string(),),
-                wire::TextOptions { wrapping : Some(wire::Wrapping::None),
-                ..Default::default() },)]; wire::Node::Linear { max_width : None, clip :
-                false, key : format!("{}/@layout:1069", thread_parent_block_scope_2747),
-                wrap : None, axis : wire::Axis::Row, spacing : Some(4.0f32), padding :
-                Some(wire::Edges { top : 13.0f32, right : 0.0f32, bottom : 4.0f32, left :
-                0.0f32, }), width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }); } native::sized(native::column(node_scope.clone(),
-                children), Some(wire::Length::Fill), None,) } } }); } if thread_message
-                .seq != active_thread_seq && (thread_message.seq == thread_target_seq ||
-                thread_message.seq == thread_selected_seq) { children.push({ let
-                thread_message_card_scope_2752 = format!("{}/ThreadMessageCard@2752",
-                key_recon); { let mut children : Vec < wire::Node > = Vec::new(); if
-                thread_message.show_author { children.push(wire::Node::Space { width :
-                Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let children :
-                Vec < wire::Node > = vec![{ let mut children : Vec < wire::Node > =
-                Vec::new(); { children.push(self.message_card(& thread_message,
-                CopySurface::Thread, crate ::host::message_plate(thread_message.deleted,
-                thread_message.seq == thread_target_seq, crate
-                ::host::seq_in_copy_range(thread_message.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),))); }
-                wire::Node::Stack { key : format!("{}/@layout:778",
-                thread_message_card_scope_2752), width : Some(wire::Length::Fill), height
-                : None, padding : None, background : None, border : None, clip : false,
-                under : 0u32, children : children, } }, { let mut children : Vec <
-                wire::Node > = Vec::new(); if ! thread_message.deleted && !
-                thread_message.pending { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:844", thread_message_card_scope_2752), width
-                : Some(wire::Length::Fill), height : None, padding : Some(wire::Edges {
-                top : 0.0f32, right : 8.0f32, bottom : 0.0f32, left : 0.0f32, }), align_x
-                : Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content :
-                Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2752), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:865", thread_message_card_scope_2752),
-                content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:872",
-                thread_message_card_scope_2752), "♡".to_owned().to_string(),),),),
-                label : Some(String::from("Manage reactions".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_720_40(thread_message
-                .seq, thread_message.body.to_owned(), thread_message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:876", thread_message_card_scope_2752), content
-                :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:883",
-                thread_message_card_scope_2752), "⋯".to_owned().to_string(),),),),
-                label : Some(String::from("More message actions".to_owned()),), on_press
-                :
-                Some(::ducktape_view_guest::slots::message(lazy_event_720_39(thread_message
-                .seq, thread_message.body.to_owned(), thread_message.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:864", thread_message_card_scope_2752), wrap : None,
-                axis : wire::Axis::Row, spacing : Some(1.0f32), padding : None, width :
-                None, height : None, align : Some(wire::AlignX::Center), background :
-                None, border : None, children : children, } },), wire::Edges { top :
-                2.0f32, right : 2.0f32, bottom : 2.0f32, left : 2.0f32, },),), }); } if
-                thread_message.deleted || thread_message.pending { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(1.0f32)), }); }
-                native::sized(native::column(format!("{}/@layout:842",
-                thread_message_card_scope_2752), children,), Some(wire::Length::Fill),
-                None,) }]; wire::Node::Hover { key : format!("{}/@layout:773",
-                thread_message_card_scope_2752), width : None, height : None, padding :
-                None, background : None, border : None, tint : None, radius : 9.0f32,
-                open : thread_message.seq == thread_selected_seq, children : children, }
-                }); native::sized(native::column(format!("{}/@layout:767",
-                thread_message_card_scope_2752), children,), Some(wire::Length::Fill),
-                None,) } }); } if thread_message.seq != active_thread_seq &&
-                thread_message.seq != thread_target_seq && thread_message.seq !=
-                thread_selected_seq { children.push({ let _lazy_context_424 =
-                thread_timeline_scope_4354.to_owned(); let lazy_event_424_0 =
-                lazy_event_720_20.clone(); let lazy_event_424_1 = lazy_event_720_21
-                .clone(); let lazy_event_424_2 = lazy_event_720_22.clone(); let
-                lazy_event_424_3 = lazy_event_720_39.clone(); let lazy_event_424_4 =
-                lazy_event_720_40.clone(); let lazy_event_424_5 = lazy_event_720_16
-                .clone(); let lazy_event_424_6 = lazy_event_720_17.clone(); let
-                lazy_event_424_7 = lazy_event_720_1.clone(); { let lazy_key =
-                format!("{}/@lazy:165", key_recon);
-                ::ducktape_view_guest::memo_lazy((thread_message.clone(),
-                copy_anchor_seq, copy_head_seq, copy_surface.clone(),
-                format!("{}/key({})", thread_timeline_scope_4354, key) .to_owned(), (),),
-                move | dependency | { let cached_reply : crate ::host::ChatMessage =
-                dependency.0.clone(); let copy_anchor_seq : i64 = dependency.1.clone();
-                let copy_head_seq : i64 = dependency.2.clone(); let copy_surface :
-                CopySurface = dependency.3.clone(); let lazy_scope = dependency.4
-                .clone(); { let thread_message_card_scope_2769 =
-                format!("{}/ThreadMessageCard@2769", lazy_scope); { let mut children :
-                Vec < wire::Node > = Vec::new(); if cached_reply.show_author { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(14.0f32)), }); } children.push({ let
-                children : Vec < wire::Node > = vec![{ let mut children : Vec <
-                wire::Node > = Vec::new(); { children.push(self.message_card(&
-                thread_message, CopySurface::Thread, crate
-                ::host::message_plate(cached_reply.deleted, false, crate
-                ::host::seq_in_copy_range(cached_reply.seq, copy_anchor_seq,
-                copy_head_seq, copy_surface.clone(), CopySurface::Thread,),))); }
-                wire::Node::Stack { key : format!("{}/@layout:778",
-                thread_message_card_scope_2769), width : Some(wire::Length::Fill), height
-                : None, padding : None, background : None, border : None, clip : false,
-                under : 0u32, children : children, } }, { let mut children : Vec <
-                wire::Node > = Vec::new(); if ! cached_reply.deleted && ! cached_reply
-                .pending { children.push(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:844", thread_message_card_scope_2769), width
-                : Some(wire::Length::Fill), height : None, padding : Some(wire::Edges {
-                top : 0.0f32, right : 8.0f32, bottom : 0.0f32, left : 0.0f32, }), align_x
-                : Some(wire::AlignX::Right), align_y : Some(wire::AlignY::Top),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content :
-                Box::new(native::padded(native::container(format!("{}/@container:854",
-                thread_message_card_scope_2769), { let children : Vec < wire::Node > =
-                vec![wire::Node::Button { checked : None, expanded : None, description :
-                None, key : format!("{}/@button:865", thread_message_card_scope_2769),
-                content :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:872",
-                thread_message_card_scope_2769), "♡".to_owned().to_string(),),),),
-                label : Some(String::from("Manage reactions".to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(lazy_event_424_4(cached_reply
-                .seq, cached_reply.body.to_owned(), cached_reply.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:876", thread_message_card_scope_2769), content
-                :
-                wire::ButtonContent::Child(Box::new(native::text(format!("{}/@text:883",
-                thread_message_card_scope_2769), "⋯".to_owned().to_string(),),),),
-                label : Some(String::from("More message actions".to_owned()),), on_press
-                :
-                Some(::ducktape_view_guest::slots::message(lazy_event_424_3(cached_reply
-                .seq, cached_reply.body.to_owned(), cached_reply.rev,),),), width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(25.0f32)), padding :
-                Some(wire::Edges::all(4.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:864", thread_message_card_scope_2769), wrap : None,
-                axis : wire::Axis::Row, spacing : Some(1.0f32), padding : None, width :
-                None, height : None, align : Some(wire::AlignX::Center), background :
-                None, border : None, children : children, } },), wire::Edges { top :
-                2.0f32, right : 2.0f32, bottom : 2.0f32, left : 2.0f32, },),), }); } if
-                cached_reply.deleted || cached_reply.pending { children
-                .push(wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)),
-                height : Some(wire::Length::Fixed(1.0f32)), }); }
-                native::sized(native::column(format!("{}/@layout:842",
-                thread_message_card_scope_2769), children,), Some(wire::Length::Fill),
-                None,) }]; wire::Node::Hover { key : format!("{}/@layout:773",
-                thread_message_card_scope_2769), width : None, height : None, padding :
-                None, background : None, border : None, tint : None, radius : 9.0f32,
-                open : false, children : children, } });
-                native::sized(native::column(format!("{}/@layout:767",
-                thread_message_card_scope_2769), children,), Some(wire::Length::Fill),
-                None,) } } }, 424u64, & key_recon, lazy_key,) } }); }
-                native::spaced(native::sized(native::column(format!("{}/@layout:142",
-                key_recon), children,), Some(wire::Length::Fill), None,), 0.0f32,) };
-                children.push((key, child)); } let (keys, children) = children
-                .into_iter().map(| (key, child) | (wire::ListKey::from(key), child))
-                .unzip(); wire::Node::KeyedColumn { key : format!("{}/@keyed:137",
-                thread_timeline_scope_4354), keys : Some(keys), children, background :
-                None, border : None, spacing : Some(3.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, max_width : None, align : None,
-                virtual_row : Some(44.0f32), } } } }, 720u64, & use_scope, lazy_key,) }
-                }]; for (index, live) in self.live_agents.iter().enumerate() { let
-                for_scope = format!("{}/@for:4377({})", use_scope, index); if crate
-                ::host::run_in_thread(::std::borrow::Borrow::borrow(& live), self
-                .active_thread_seq,) { children.push(self
-                .live_run_card(format!("{}/LiveRunCard@4379", for_scope), (move | event_0
-                | Message::CancelRun(event_0)).clone(), (move | event_0 |
-                Message::OpenRun(event_0)).clone(), live.clone(),),); } } if self
-                .thread_has_more && self.thread_next_reply_seq > 0 && self.thread_loading
-                { children
-                .push(native::padded(native::sized(native::button(format!("{}/@button:1781",
-                use_scope), String::from("Loading replies…"), None,
-                wire::ButtonPreset::Secondary,), Some(wire::Length::Fill), None,),
-                wire::Edges::all(5.0f32),),); } if self.thread_has_more && self
-                .thread_next_reply_seq > 0 && ! self.thread_loading { children
-                .push(native::padded(native::sized(native::button(format!("{}/@button:1791",
-                use_scope), String::from("Load more replies"), if self.busy { None } else
-                { Some(::ducktape_view_guest::slots::message(Message::LoadMoreThread,),)
-                }, wire::ButtonPreset::Secondary,), Some(wire::Length::Fill), None,),
-                wire::Edges::all(5.0f32),),); }
-                native::spaced(native::padded(native::sized(native::column(format!("{}/@layout:1735",
-                use_scope), children,), Some(wire::Length::Fill), None,), wire::Edges {
-                top : 12.0f32, right : 16.0f32, bottom : 8.0f32, left : 16.0f32, },),
-                3.0f32,) }), } }); children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:1823",
-                use_scope), { let node_scope = format!("{}/reply_composer", node_scope);
-                wire::Node::Surface { key : node_scope.clone(), name :
-                String::from("chat_composer"), args : ::std::vec![{ let surface_arg = &
-                (crate ::host::thread_scope(::std::convert::AsRef::as_ref(& (self
-                .endpoint)), ::std::convert::AsRef::as_ref(& (self.active_channel)), self
-                .active_thread_seq));
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & ("reply".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (true);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Reply…".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (((self.thread_loading || (! self.connected)) ||
-                (! (self.post_refusal).is_empty())));
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & (false);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Unsent reply".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }], on_event : None, } },), Some(wire::Length::Fill), None,), wire::Edges
-                { top : 10.0f32, right : 16.0f32, bottom : 14.0f32, left : 16.0f32,
-                },),); native::sized(native::column(format!("{}/@layout:1634",
-                use_scope), children,), Some(wire::Length::Fill),
-                Some(wire::Length::Fill),) }), }, { let mut children =
-                vec![::ducktape_view_guest::wire::Node::Space { width :
-                Some(::ducktape_view_guest::wire::Length::Fill), height :
-                Some(::ducktape_view_guest::wire::Length::Fill) }]; if self
-                .thread_selected_seq > 0 && self.thread_message_action !=
-                MessageAction::Toolbar { children.push({ let mut children : Vec <
-                wire::Node > = vec![wire::Node::MouseArea { key :
-                format!("{}/@mouse:1850", use_scope), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ClearThreadMessageSelection,),),
-                on_release : None, on_double_click : None, on_right_press : None,
-                on_right_release : None, on_middle_press : None, on_middle_release :
-                None, on_enter : None, on_exit : None, on_move : None, on_press_at :
-                None, on_scroll : None, content : Box::new(wire::Node::Space { width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(crate
-                ::host::block_action_menu_y(self.chat_screen_states.get(& use_scope)
-                .map_or_else(| | self.chat_screen_initial.thread_pointer_y.clone(), |
-                state | state.thread_pointer_y.clone(),), self.chat_screen_states.get(&
-                use_scope).map_or_else(| | self.chat_screen_initial.thread_height
-                .clone(), | state | state.thread_height.clone(),),) as f32,),), }), }];
-                if self.thread_message_action == MessageAction::More { children.push({
-                let children : Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/thread-action-focus", node_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Thread action focus".to_owned()
-                .to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::sized(native::container(format!("{}/@container:1864",
-                use_scope), { let children : Vec < wire::Node > = vec![wire::Node::Button
-                { checked : None, expanded : None, description : None, key :
-                format!("{}/@button:1877", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1884", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@4499", use_scope), "emoji", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:1901", use_scope),
-                "Add reaction".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1891",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Manage reactions"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::OpenThreadMessageReactions(self
-                .thread_selected_seq, self.thread_edit_draft.to_owned(), self
-                .thread_selected_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), },
-                wire::Node::Button { checked : None, expanded : None, description : None,
-                key : format!("{}/@button:1913", use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1920", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@4535", use_scope), "link", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:1937", use_scope),
-                "Copy link".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1927",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Copy message link"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::CopyMessageLink(crate
-                ::host::duck_channel_message_link(self.active_channel.to_owned(), self
-                .thread_selected_seq, self.network_chain_id.to_owned(),),),),), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fixed(30.0f32)),
-                padding : Some(wire::Edges::all(0.0f32)), style :
-                wire::ButtonStyle::default(), }, wire::Node::Button { checked : None,
-                expanded : None, description : None, key : format!("{}/@button:1945",
-                use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1952", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@4567", use_scope), "pencil", 14f32, "@media:82",),
-                native::text_options(native::text(format!("{}/@text:1969", use_scope),
-                "Edit message".to_owned().to_string(),), wire::TextOptions { wrapping :
-                Some(wire::Wrapping::None), ..Default::default() },)]; wire::Node::Linear
-                { max_width : None, clip : false, key : format!("{}/@layout:1959",
-                use_scope), wrap : None, axis : wire::Axis::Row, spacing : Some(9.0f32),
-                padding : None, width : Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Edit message"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::BeginThreadMessageEdit(self
-                .thread_selected_seq, self.thread_edit_draft.to_owned(), self
-                .thread_selected_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), },
-                native::sized(native::container(format!("{}/@container:1977", use_scope),
-                wire::Node::Space { width : Some(wire::Length::Fixed(1.0f32)), height :
-                Some(wire::Length::Fixed(1.0f32)), },), Some(wire::Length::Fill),
-                Some(wire::Length::Fixed(1.0f32)),), wire::Node::Button { checked : None,
-                expanded : None, description : None, key : format!("{}/@button:1983",
-                use_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:1990", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                Some(wire::Edges { top : 0.0f32, right : 9.0f32, bottom : 0.0f32, left :
-                9.0f32, }), align_x : None, align_y : Some(wire::AlignY::Center),
-                background : None.map(wire::Background::Color), border : None, snap :
-                None, content : Box::new({ let children : Vec < wire::Node > = vec![self
-                .icon(format!("{}/Icon@4605", use_scope), "trash", 14f32, "@media:70",),
-                native::text_options(native::text(format!("{}/@text:2007", use_scope),
-                "Delete message…".to_owned().to_string(),), wire::TextOptions {
-                wrapping : Some(wire::Wrapping::None), ..Default::default() },)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:1997", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(9.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } }), }),), label : Some(String::from("Delete message"
-                .to_owned())), on_press :
-                Some(::ducktape_view_guest::slots::message(Message::ArmThreadMessageDelete(self
-                .thread_selected_seq, self.thread_edit_draft.to_owned(), self
-                .thread_selected_rev,),),), width : Some(wire::Length::Fill), height :
-                Some(wire::Length::Fixed(30.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), }];
-                native::spaced(native::sized(native::column(format!("{}/@layout:1875",
-                use_scope), children,), Some(wire::Length::Fill), None,), 1.0f32,) },),
-                Some(wire::Length::Fixed(200.0f32)), None,), wire::Edges { top : 5.0f32,
-                right : 5.0f32, bottom : 5.0f32, left : 5.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:1853", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); } if self.thread_message_action ==
-                MessageAction::Reactions { children.push({ let children : Vec <
-                wire::Node > = vec![{ let node_scope =
-                format!("{}/thread-reaction-focus", node_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Thread reaction focus".to_owned()
-                .to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::container(format!("{}/@container:2028",
-                use_scope), { let mut items = Vec::new(); for (index, emoji) in crate
-                ::host::reaction_palette().iter().enumerate() { let for_scope =
-                format!("{}/@for:4648({})", use_scope, index); let flex_child :
-                wire::Node = wire::Node::Button { checked : None, expanded : None,
-                description : Some(String::from(emoji.to_owned())), key :
-                format!("{}/@button:2046", for_scope), content :
-                wire::ButtonContent::Child(Box::new(wire::Node::Container { shadow :
-                Default::default(), max_width : None, max_height : None, clip : false,
-                key : format!("{}/@container:2055", for_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text_options(native::text(format!("{}/@text:2061",
-                for_scope), emoji.to_owned().to_string(),), wire::TextOptions { wrapping
-                : Some(wire::Wrapping::None), ..Default::default() },),), }),), label :
-                Some(String::from("Add reaction".to_owned())), on_press : if self
-                .active_channel_archived { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::AddReactionAt(self
-                .thread_selected_seq, emoji.to_owned(),),),) }, width :
-                Some(wire::Length::Fixed(27.0f32)), height :
-                Some(wire::Length::Fixed(27.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), };
-                items.push((wire::FlexItem::default(), flex_child)); } let (items,
-                children) = items.into_iter().unzip(); wire::Node::Flex { key :
-                format!("{}/@layout:2038", use_scope), items, children, background :
-                None, border : None, layout : wire::FlexLayout { direction :
-                wire::FlexDirection::Row, wrap : wire::FlexWrap::Wrap, justify : None,
-                items : Some(wire::FlexItemAlignment::Start), content : None, row_gap :
-                Some(2.0f32), column_gap : Some(2.0f32), padding : None, width :
-                Some(wire::Length::Fixed(234.0f32)), height : None, max_width : None,
-                max_height : None, clip : false, surface_width : None, surface_height :
-                None, surface_max_width : None, }, } },), wire::Edges { top : 8.0f32,
-                right : 8.0f32, bottom : 8.0f32, left : 8.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:2016", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); } if self.thread_message_action ==
-                MessageAction::Editing { children
-                .push(native::padded(native::sized(native::container(format!("{}/@container:2070",
-                use_scope), { let children : Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/thread-edit", node_scope); wire::Node::Surface { key :
-                node_scope.clone(), name : String::from("chat_composer"), args :
-                ::std::vec![{ let surface_arg = & (crate
-                ::host::edit_scope(::std::convert::AsRef::as_ref(& (self.endpoint)),
-                ::std::convert::AsRef::as_ref(& (self.active_channel)), self
-                .thread_selected_seq));
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & ("thread_edit".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (true);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Edit message".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }, { let surface_arg = & (self.busy);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & (false);
-                ::ducktape_view_guest::wire::SurfaceValue::Bool(* (surface_arg)) }, { let
-                surface_arg = & ("Could not save changes".to_owned());
-                ::ducktape_view_guest::wire::SurfaceValue::Str(::std::string::ToString::to_string(surface_arg))
-                }], on_event : None, } }, wire::Node::Button { checked : None, expanded :
-                None, description : None, key : format!("{}/@button:2087", use_scope),
-                content : wire::ButtonContent::Child(Box::new(wire::Node::Container {
-                shadow : Default::default(), max_width : None, max_height : None, clip :
-                false, key : format!("{}/@container:2095", use_scope), width :
-                Some(wire::Length::Fill), height : Some(wire::Length::Fill), padding :
-                None, align_x : Some(wire::AlignX::Center), align_y :
-                Some(wire::AlignY::Center), background : None
-                .map(wire::Background::Color), border : None, snap : None, content :
-                Box::new(native::text(format!("{}/@text:2101", use_scope), "×"
-                .to_owned().to_string(),),), }),), label :
-                Some(String::from("Cancel message edit".to_owned())), on_press : if self
-                .busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ClearThreadMessageSelection,),)
-                }, width : Some(wire::Length::Fixed(28.0f32)), height :
-                Some(wire::Length::Fixed(28.0f32)), padding :
-                Some(wire::Edges::all(0.0f32)), style : wire::ButtonStyle::default(), }];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:2081", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(4.0f32), padding : None, width :
-                Some(wire::Length::Fill), height : None, align :
-                Some(wire::AlignX::Center), background : None, border : None, children :
-                children, } },), Some(wire::Length::Fill), None,), wire::Edges { top :
-                3.0f32, right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },),); } if self
-                .thread_message_action == MessageAction::Delete { children.push({ let
-                children : Vec < wire::Node > = vec![{ let node_scope =
-                format!("{}/thread-delete-focus", node_scope); wire::Node::Input {
-                options : wire::InputOptions { label : "Thread delete focus".to_owned()
-                .to_string(), description : None, disabled : false, padding :
-                Some(wire::Edges::all(0.0f32)), text_size : Some(1.0f32), line_height :
-                Some(1.0f32), align : None, font : Some(wire::NamedFont { family :
-                wire::FontFamily::Named("Geist".into()), weight : wire::Weight::Normal,
-                stretch : wire::FontStretch::Normal, style : wire::FontStyle::Normal, }),
-                }, key : node_scope.clone(), placeholder : String::from(""), value : self
-                .chat_screen_states.get(& use_scope).map_or_else(| | self
-                .chat_screen_initial.message_action_focus.clone(), | state | state
-                .message_action_focus.clone(),).to_string(), on_input :
-                ::ducktape_view_guest::slots::handler:: < String, Message, > (Box::new({
-                let route = { let scope = use_scope.clone(); move | value |
-                Message::ChatScreenMessageActionFocusChanged(scope.clone(), value,) };
-                move | sent : String | Some(route(sent)) }),), on_submit : None, width :
-                Some(wire::Length::Fixed(1.0f32)), secure : false, style :
-                Default::default(), } },
-                native::padded(native::container(format!("{}/@container:2116",
-                use_scope), { let children : Vec < wire::Node > =
-                vec![native::text(format!("{}/@text:2127", use_scope),
-                "Delete this message?".to_owned().to_string(),),
-                native::padded(native::button(format!("{}/@button:2128", use_scope),
-                String::from("Delete"), if self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::DeleteThreadMessageSubmit,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),),
-                native::padded(native::button(format!("{}/@button:2133", use_scope),
-                String::from("Cancel"), if self.busy { None } else {
-                Some(::ducktape_view_guest::slots::message(Message::ClearThreadMessageSelection,),)
-                }, wire::ButtonPreset::Secondary,), wire::Edges::all(5.0f32),)];
-                wire::Node::Linear { max_width : None, clip : false, key :
-                format!("{}/@layout:2126", use_scope), wrap : None, axis :
-                wire::Axis::Row, spacing : Some(5.0f32), padding : None, width : None,
-                height : None, align : Some(wire::AlignX::Center), background : None,
-                border : None, children : children, } },), wire::Edges { top : 3.0f32,
-                right : 3.0f32, bottom : 3.0f32, left : 3.0f32, },)]; wire::Node::Stack {
-                key : format!("{}/@layout:2106", use_scope), width : None, height : None,
-                padding : None, background : None, border : None, clip : false, under :
-                0u32, children : children, } }); }
-                native::column(format!("{}/@layout:1849", use_scope), children,) }); }
-                wire::Node::Overlay { key : format!("{}/@overlay:1836", use_scope),
-                padding : 8.0f32, backdrop : wire::Rgba([0.0 / 255.0, 0.0 / 255.0, 0.0 /
-                255.0, 0.000000,]), align_x : wire::AlignX::Right, align_y :
-                wire::AlignY::Top, on_dismiss :
-                Some(::ducktape_view_guest::slots::message(Message::ClearThreadMessageSelection,),),
-                children : children, } }]; wire::Node::Stack { key :
-                format!("{}/@layout:1630", use_scope), width : Some(wire::Length::Fill),
-                height : Some(wire::Length::Fill), padding : None, background : None,
-                border : None, clip : false, under : 0u32, children : children, } },),
-                Some(wire::Length::Fixed(self.thread_width as f32)),
-                Some(wire::Length::Fill),) }); }
-                native::sized(native::row(format!("{}/@layout:543", use_scope),
-                children), Some(wire::Length::Fill), Some(wire::Length::Fill),) }), },
-            ];
-            native::sized(
-                native::row(format!("{}/@layout:282", use_scope), children),
-                Some(wire::Length::Fill),
-                Some(wire::Length::Fill),
+        if self.thread_has_more {
+            children.push(action(
+                format!("{key}/older"),
+                "Load more replies",
+                Message::LoadMoreThread,
+                self.thread_loading || self.busy,
+            ));
+        }
+        children.push(self.message_list(
+            format!("{key}/thread-stream"),
+            &self.thread_messages,
+            CopySurface::Thread,
+        ));
+        if self.copy_surface == CopySurface::Thread {
+            children.push(self.selection_bar(format!("{key}/copy-range"), &self.thread_messages));
+        }
+        if self.thread_selected_seq > 0 {
+            children.push(self.message_menu("ChatView/chat", true));
+        }
+        children.push(wire::Node::Surface {
+            key: format!("{key}/reply_composer"),
+            name: "chat_composer".into(),
+            args: vec![
+                wire::SurfaceValue::Str(crate::host::thread_scope(
+                    &self.endpoint,
+                    &self.active_channel,
+                    self.active_thread_seq,
+                )),
+                wire::SurfaceValue::Str("reply".into()),
+                wire::SurfaceValue::Bool(true),
+                wire::SurfaceValue::Str("Reply…".into()),
+                wire::SurfaceValue::Bool(
+                    self.thread_loading || !self.connected || !self.post_refusal.is_empty(),
+                ),
+                wire::SurfaceValue::Bool(false),
+                wire::SurfaceValue::Str("Unsent reply".into()),
+            ],
+            on_event: None,
+        });
+        native::sized(
+            native::column(key, children),
+            Some(wire::Length::Fixed(self.thread_width as f32)),
+            Some(wire::Length::Fill),
+        )
+    }
+    fn channel_details(&self, key: String) -> wire::Node {
+        let mut children = vec![
+            native::row(
+                format!("{key}/header"),
+                [
+                    native::heading(format!("{key}/title"), "Channel details"),
+                    action(
+                        format!("{key}/close"),
+                        "Close channel details",
+                        Message::ToggleChannelSettings,
+                        false,
+                    ),
+                ],
+            ),
+            native::text(format!("{key}/name"), &self.active_channel_name),
+            self.name_label(format!("{key}/name-label")),
+            field(
+                format!("{key}/name-input"),
+                "Channel name",
+                &self.channel_name_draft,
+                Message::ChannelNameDraftChanged,
+                Some(Message::RenameChannelSubmit),
+                self.busy,
+            ),
+            action(
+                format!("{key}/rename"),
+                "Rename",
+                Message::RenameChannelSubmit,
+                self.busy || self.channel_name_draft.trim().is_empty(),
+            ),
+            action(
+                format!("{key}/link"),
+                "Copy channel link",
+                Message::CopyToClipboard(
+                    crate::host::duck_channel_link(
+                        self.active_channel.clone(),
+                        self.network_chain_id.clone(),
+                    ),
+                    "Channel link copied".into(),
+                ),
+                false,
+            ),
+            self.members_label(format!("{key}/members-label")),
+            field(
+                format!("{key}/member-input"),
+                "Member account or public key",
+                &self.member_key_draft,
+                Message::MemberKeyDraftChanged,
+                Some(Message::AddChannelMemberSubmit),
+                self.busy,
+            ),
+            action(
+                format!("{key}/add-member"),
+                "Add",
+                Message::AddChannelMemberSubmit,
+                self.busy || self.member_key_draft.trim().is_empty(),
+            ),
+        ];
+        if self.active_channel_archived {
+            children.push(self.archived_badge(format!("{key}/archived")));
+        }
+        if self.active_channel_members_only {
+            children.push(self.private_badge(format!("{key}/private")));
+        }
+        if self.channel_members.is_empty() {
+            children.push(native::text(format!("{key}/no-members"), "No members added. An Open channel needs none — membership only gates posting in a members-only channel."));
+        }
+        for member in &self.channel_members {
+            children.push(self.member_row(
+                format!("{key}/member/{}", member.key),
+                Message::RemoveChannelMemberSubmit,
+                member.clone(),
+            ));
+        }
+        let (label, message) = if self.active_channel_archived {
+            ("Unarchive channel", Message::UnarchiveChannelSubmit)
+        } else {
+            ("Archive channel", Message::ArchiveChannelSubmit)
+        };
+        children.push(action(format!("{key}/archive"), label, message, self.busy));
+        native::sized(
+            native::container(
+                key.clone(),
+                native::scroll(
+                    format!("{key}/scroll"),
+                    native::column(format!("{key}/content"), children),
+                ),
+            ),
+            Some(wire::Length::Fixed(self.details_width as f32)),
+            Some(wire::Length::Fill),
+        )
+    }
+    fn message_menu(&self, key: &str, thread: bool) -> wire::Node {
+        let (seq, rev, body, mode, close) = if thread {
+            (
+                self.thread_selected_seq,
+                self.thread_selected_rev,
+                &self.thread_edit_draft,
+                self.thread_message_action,
+                Message::ClearThreadMessageSelection,
             )
+        } else {
+            (
+                self.selected_message_seq,
+                self.selected_message_rev,
+                &self.message_edit_draft,
+                self.message_action,
+                Message::ClearMessageSelection,
+            )
+        };
+        let prefix = if thread { "thread-" } else { "message-" };
+        let focus = match mode {
+            MessageAction::Reactions => "reaction-focus",
+            MessageAction::Delete => "delete-focus",
+            _ => "action-focus",
+        };
+        let mut children = vec![field(
+            format!("{key}/{prefix}{focus}"),
+            "Message action focus",
+            "",
+            |_| Message::Ignore,
+            None,
+            false,
+        )];
+        match mode {
+            MessageAction::Toolbar | MessageAction::More => {
+                let reaction = if thread {
+                    Message::OpenThreadMessageReactions(seq, body.clone(), rev)
+                } else {
+                    Message::OpenMessageReactions(seq, body.clone(), rev)
+                };
+                let edit = if thread {
+                    Message::BeginThreadMessageEdit(seq, body.clone(), rev)
+                } else {
+                    Message::BeginMessageEdit(seq, body.clone(), rev)
+                };
+                let delete = if thread {
+                    Message::ArmThreadMessageDelete(seq, body.clone(), rev)
+                } else {
+                    Message::ArmMessageDelete(seq, body.clone(), rev)
+                };
+                children.extend([
+                    action(
+                        format!("{key}/{prefix}add-reaction"),
+                        "Add reaction",
+                        reaction,
+                        self.active_channel_archived,
+                    ),
+                    action(
+                        format!("{key}/{prefix}copy-link"),
+                        "Copy message link",
+                        Message::CopyMessageLink(crate::host::duck_channel_message_link(
+                            self.active_channel.clone(),
+                            seq,
+                            self.network_chain_id.clone(),
+                        )),
+                        false,
+                    ),
+                    action(
+                        format!("{key}/{prefix}edit"),
+                        "Edit message",
+                        edit,
+                        self.active_channel_archived,
+                    ),
+                    action(
+                        format!("{key}/{prefix}delete"),
+                        "Delete message",
+                        delete,
+                        self.active_channel_archived,
+                    ),
+                ]);
+            }
+            MessageAction::Reactions => {
+                for emoji in crate::host::reaction_palette() {
+                    let mut button = action(
+                        format!("{key}/{prefix}reaction/{emoji}"),
+                        &emoji,
+                        Message::AddReactionAt(seq, emoji.clone()),
+                        self.active_channel_archived,
+                    );
+                    if let wire::Node::Button {
+                        label, description, ..
+                    } = &mut button
+                    {
+                        *label = Some("Add reaction".into());
+                        *description = Some(emoji);
+                    }
+                    children.push(button);
+                }
+            }
+            MessageAction::Editing => {
+                children.push(wire::Node::Surface {
+                    key: format!("{key}/{prefix}edit-composer"),
+                    name: "chat_composer".into(),
+                    args: vec![
+                        wire::SurfaceValue::Str(crate::host::edit_scope(
+                            &self.endpoint,
+                            &self.active_channel,
+                            seq,
+                        )),
+                        wire::SurfaceValue::Str(if thread { "thread_edit" } else { "edit" }.into()),
+                        wire::SurfaceValue::Bool(true),
+                        wire::SurfaceValue::Str("Edit message".into()),
+                        wire::SurfaceValue::Bool(self.busy),
+                        wire::SurfaceValue::Bool(false),
+                        wire::SurfaceValue::Str("Could not save changes".into()),
+                    ],
+                    on_event: None,
+                });
+            }
+            MessageAction::Delete => {
+                children.push(native::text(
+                    format!("{key}/{prefix}confirm"),
+                    "Delete this message?",
+                ));
+                children.push(action(
+                    format!("{key}/{prefix}confirm-delete"),
+                    "Delete",
+                    if thread {
+                        Message::DeleteThreadMessageSubmit
+                    } else {
+                        Message::DeleteMessageSubmit
+                    },
+                    self.busy,
+                ));
+            }
         }
+        children.push(action(
+            format!("{key}/{prefix}close"),
+            if mode == MessageAction::Editing {
+                "Cancel message edit"
+            } else {
+                "Cancel"
+            },
+            close,
+            self.busy && mode == MessageAction::Editing,
+        ));
+        native::column(format!("{key}/{prefix}menu"), children)
     }
 }
