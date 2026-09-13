@@ -19,9 +19,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// One page of roots, replies or hits — chat's own index page size.
 const PAGE_LIMIT: usize = 64;
@@ -250,8 +250,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -431,7 +431,7 @@ async fn view(variant: &str, query: serde_json::Value) -> Result<serde_json::Val
 }
 
 /// What the room subscription is keyed by: a fresh key re-reads the room.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomKey {
     pub serial: i64,
     pub names: i64,
@@ -469,8 +469,8 @@ pub struct RoomItem {
 
 /// The room now and after every chat block: read once per key, then again on
 /// each `rpc.live` hit for the chat plane.
-pub fn room(key: RoomKey) -> iced::Subscription<RoomItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn room(key: RoomKey) -> ducktape_view_guest::Subscription<RoomItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_room(key.clone());
@@ -606,10 +606,7 @@ async fn older_roots_exist(channel: &str, floor: u64) -> Result<bool, String> {
         }),
     )
     .await?;
-    Ok(!page["roots"]
-        .as_array()
-        .map(Vec::is_empty)
-        .unwrap_or(true))
+    Ok(!page["roots"].as_array().map(Vec::is_empty).unwrap_or(true))
 }
 
 async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
@@ -642,7 +639,7 @@ async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, S
 }
 
 /// What the thread subscription is keyed by.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadKey {
     pub serial: i64,
     pub names: i64,
@@ -684,8 +681,8 @@ pub struct ThreadItem {
 }
 
 /// The open thread now and after every chat block.
-pub fn thread(key: ThreadKey) -> iced::Subscription<ThreadItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn thread(key: ThreadKey) -> ducktape_view_guest::Subscription<ThreadItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_thread(key.clone());
@@ -759,7 +756,7 @@ async fn read_thread_now(key: &ThreadKey, names: &Names) -> Result<ThreadItem, S
 }
 
 /// What the search subscription is keyed by: an empty query reads nothing.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchKey {
     pub serial: i64,
     pub names: i64,
@@ -782,8 +779,8 @@ pub struct SearchItem {
 }
 
 /// One workspace-wide message search, run once per query.
-pub fn search(key: SearchKey) -> iced::Subscription<SearchItem> {
-    iced::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
+pub fn search(key: SearchKey) -> ducktape_view_guest::Subscription<SearchItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
 }
 
 async fn read_search(key: SearchKey) -> SearchItem {
@@ -1300,7 +1297,10 @@ fn avatar_initial(author: &str, names: &Names) -> String {
     source
         .chars()
         .find(char::is_ascii_alphanumeric)
-        .map_or_else(|| "•".into(), |glyph| glyph.to_ascii_uppercase().to_string())
+        .map_or_else(
+            || "•".into(),
+            |glyph| glyph.to_ascii_uppercase().to_string(),
+        )
 }
 
 /// A person's key or account is `human`; a program account (an agent's) and
@@ -1345,8 +1345,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
-    let looks_hex =
-        !hex.is_empty() && hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    let looks_hex = !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit());
     if !looks_hex {
         return Vec::new();
     }
@@ -1392,8 +1393,8 @@ fn submit(message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1673,7 +1674,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 }
 
 /// Is the reader AT the live tail — the other end of the same offset. A NaN
-/// offset (content that fits, which iced reports as `0/0`) reads as AT THE
+/// offset (`0/0` when content fits) reads as AT THE
 /// TAIL, and NaN compares false against everything, so the band is written as
 /// the comparison plus that case.
 pub fn near_scroll_tail(relative_offset: f64) -> bool {
@@ -1711,10 +1712,6 @@ pub(crate) fn copy_range_after_press(
         head: seq,
         surface: surface_name(pressed_in),
     }
-}
-
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
 }
 
 pub fn connection_degraded(status: &str) -> bool {
@@ -1763,23 +1760,6 @@ pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
 /// `chiefduck · View thread` — the live run card's one label.
 pub fn live_thread_label(agent: &str) -> String {
     format!("{agent} · View thread")
-}
-
-/// The stream and the runs live in it, as one value: the timeline memo hashes
-/// its one dependency, so the two lists that draw together must cross the
-/// boundary together — a run's status folded into `live_agents` alone would
-/// leave the memo's key unmoved and the hint would never repaint.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct Timeline {
-    pub messages: Vec<ChatMessage>,
-    pub live_agents: Vec<LiveRunHint>,
-}
-
-pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveRunHint]) -> Timeline {
-    Timeline {
-        messages: messages.to_vec(),
-        live_agents: live_agents.to_vec(),
-    }
 }
 
 /// The rows the sends in flight add at the tail of `messages`.
@@ -2083,14 +2063,6 @@ pub(crate) fn surface_name(surface: crate::CopySurface) -> String {
         crate::CopySurface::Nowhere => "nowhere",
     }
     .to_owned()
-}
-
-pub(crate) fn tone_of(dark: bool) -> crate::Tone {
-    if dark {
-        crate::Tone::Dark
-    } else {
-        crate::Tone::Light
-    }
 }
 
 pub fn no_dm_peer() -> DmPeer {

@@ -21,9 +21,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// The planes the register follows: `runs` carries every model record and
 /// every run fact, `identity` the controllers and their names.
@@ -77,7 +77,6 @@ pub struct AgentSkill {
 pub struct AgentRow {
     pub id: String,
     pub name: String,
-    pub initials: String,
     pub capability: String,
     pub status: String,
     pub owner_handle: String,
@@ -180,8 +179,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("agents.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -359,8 +358,8 @@ pub struct RegisterItem {
 /// The register now and after every block that moved it: read once at
 /// start, then again on each `rpc.live` hit for the `runs` or `identity`
 /// plane — the two planes an agent record is folded from.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = stream::select(
             host::subscribe("rpc.live", RUNS_PLANE),
             host::subscribe("rpc.live", IDENTITY_PLANE),
@@ -380,7 +379,11 @@ async fn load_register() -> RegisterItem {
 }
 
 async fn read_register() -> Result<RegisterItem, String> {
-    let reply = query("runs", serde_json::json!({ "model": { "query": "agents" } })).await?;
+    let reply = query(
+        "runs",
+        serde_json::json!({ "model": { "query": "agents" } }),
+    )
+    .await?;
     let records = reply["model"]["agents"]
         .as_array()
         .cloned()
@@ -464,10 +467,12 @@ fn fold_agents(
                 .controllers
                 .get(&account)
                 .ok_or_else(|| "the model account has no program controller".to_string())?;
-            let name = record["display_name"].as_str().unwrap_or_default().to_owned();
+            let name = record["display_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             Ok(AgentRow {
                 id: record["agent_id"].as_str().unwrap_or_default().to_owned(),
-                initials: initials_of(&name),
                 capability: record["capability"].as_str().unwrap_or_default().to_owned(),
                 status: tagged_name(&record["status"]),
                 owner_handle: names.account_label(*controller),
@@ -503,10 +508,7 @@ fn fold_skills(skills: &serde_json::Value) -> Vec<AgentSkill> {
 
 /// The tracker's rows. A chat-born run is named by its room, which costs
 /// one channel read per distinct room in the list.
-async fn fold_runs(
-    runs: Vec<serde_json::Value>,
-    named: &BTreeMap<String, String>,
-) -> Vec<RunRow> {
+async fn fold_runs(runs: Vec<serde_json::Value>, named: &BTreeMap<String, String>) -> Vec<RunRow> {
     let mut rooms: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut rows = Vec::with_capacity(runs.len());
     for run in runs {
@@ -572,7 +574,10 @@ fn fold_run(run: &serde_json::Value, named: &BTreeMap<String, String>) -> RunRow
             row.holder = short_pubkey(settled["executing_node"].as_str().unwrap_or_default());
             row.degraded = settled["degraded"].as_bool().unwrap_or(false);
             row.reason = settled["reason"].as_str().unwrap_or_default().to_owned();
-            row.output_ref = settled["output_ref"].as_str().unwrap_or_default().to_owned();
+            row.output_ref = settled["output_ref"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
         }
         _ => {}
     }
@@ -620,13 +625,15 @@ pub struct JournalItem {
 
 /// The open run's journal now, and again on every `runs` block: the facts
 /// it committed and the chips of every place it touched.
-pub fn run_journal(open_run: String, connection: i64) -> iced::Subscription<JournalItem> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn run_journal(
+    open_run: String,
+    connection: i64,
+) -> ducktape_view_guest::Subscription<JournalItem> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let open_run = open_run.clone();
         let again = open_run.clone();
         let live = host::subscribe("rpc.live", RUNS_PLANE);
-        stream::once(load_journal(open_run))
-            .chain(live.then(move |_| load_journal(again.clone())))
+        stream::once(load_journal(open_run)).chain(live.then(move |_| load_journal(again.clone())))
     })
 }
 
@@ -826,7 +833,11 @@ impl Chips {
                 duck_link(&format!("page/{}", text("page_id")), &self.chain),
             ),
             "job" => link("job", "Job discussion".into(), String::new()),
-            "task" => link("task", self.task_label(&text("task_id")).await, String::new()),
+            "task" => link(
+                "task",
+                self.task_label(&text("task_id")).await,
+                String::new(),
+            ),
             "file" => link("file", chip_label(&text("path")), String::new()),
             "module" => link(
                 "module",
@@ -959,7 +970,9 @@ impl Chips {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .find(|row| row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq))
+            .find(|row| {
+                row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq)
+            })
     }
 
     fn message_label(
@@ -992,11 +1005,14 @@ impl Chips {
     }
 
     async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {
-        let found = view("chat", serde_json::json!({ "message": { "message_id": id } }))
-            .await
-            .ok()
-            .map(|reply| reply["message"].clone())
-            .filter(serde_json::Value::is_object);
+        let found = view(
+            "chat",
+            serde_json::json!({ "message": { "message_id": id } }),
+        )
+        .await
+        .ok()
+        .map(|reply| reply["message"].clone())
+        .filter(serde_json::Value::is_object);
         let Some(row) = found else {
             let mut destination = self.chat(channel, thread, None).await;
             destination.label = format!("Destination · {}", destination.label);
@@ -1031,7 +1047,10 @@ impl Chips {
             let same_branches = item["source_branch"].as_str() == Some(source.as_str())
                 && item["target_branch"].as_str() == Some(target.as_str());
             if same_branches {
-                matching.push((number, item["title"].as_str().unwrap_or_default().to_owned()));
+                matching.push((
+                    number,
+                    item["title"].as_str().unwrap_or_default().to_owned(),
+                ));
             }
         }
         match matching.as_slice() {
@@ -1197,9 +1216,8 @@ fn journal_fact(fact: &serde_json::Value) -> (&'static str, String) {
         ),
         "settled" => {
             let settled = &fact["settled"];
-            let mut parts = vec![
-                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
-            ];
+            let mut parts =
+                vec![outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned()];
             if settled["degraded"].as_bool().unwrap_or(false) {
                 parts.push("degraded".into());
             }
@@ -1355,12 +1373,7 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<Target> 
         }),
         "reply" => {
             let destination = result.get("destination")?;
-            let at = |key: &str| {
-                destination[key]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            };
+            let at = |key: &str| destination[key].as_str().unwrap_or_default().to_owned();
             match destination["kind"].as_str().unwrap_or_default() {
                 "chat" => Some(Target::Message {
                     channel: at("channel_id"),
@@ -1470,8 +1483,8 @@ pub fn empty_live() -> LiveRun {
 /// key that asked for the run and nobody else — and hands the view every
 /// frame verbatim. Every reading below is folded HERE; the kernel carries
 /// bytes and knows nothing about a run.
-pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subscription<LiveRun> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let topic = format!("run-output:{open_run}");
         let ask = serde_json::json!({
             "topic": topic,
@@ -1611,7 +1624,10 @@ fn provider_output(line: &str) -> Option<Output> {
         "mcp_tool_call" => {
             let server = item["server"].as_str().unwrap_or("tool");
             let tool = item["tool"].as_str().unwrap_or("call");
-            (format!("{server} · {tool}"), json_text(item.get("arguments")))
+            (
+                format!("{server} · {tool}"),
+                json_text(item.get("arguments")),
+            )
         }
         "web_search" => ("Web search".to_owned(), json_text(item.get("query"))),
         _ => return None,
@@ -1730,8 +1746,8 @@ fn skills_wire(skills: &[AgentSkill]) -> serde_json::Value {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1897,24 +1913,6 @@ pub fn empty_journal() -> RunJournal {
     RunJournal::default()
 }
 
-/// The glyph a chip wears for the kind of place it names.
-pub fn link_glyph(kind: &str) -> String {
-    match kind {
-        "chat" => "#",
-        "page" => "¶",
-        "forge" => "⎇",
-        "file" => "▤",
-        "task" => "☐",
-        "job" => "⚙",
-        "module" => "⬡",
-        "conversation" => "✉",
-        "run" => "▶",
-        "output" => "⇣",
-        _ => "·",
-    }
-    .to_owned()
-}
-
 pub fn empty_run() -> RunRow {
     RunRow::default()
 }
@@ -2024,10 +2022,6 @@ pub fn some_str(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-pub fn skill_count(skills: &[AgentSkill]) -> i64 {
-    count_i64(skills.len())
-}
-
 /// What the pane on screen IS, stated where a reader lands rather than
 /// discovered by using it.
 pub fn pane_note(pane: &str) -> String {
@@ -2043,10 +2037,6 @@ pub fn pane_note(pane: &str) -> String {
 
 pub fn or_empty(value: &Option<String>) -> String {
     value.clone().unwrap_or_default()
-}
-
-pub fn pick_list(condition: bool, then: &[String], or: &[String]) -> Vec<String> {
-    if condition { then } else { or }.to_vec()
 }
 
 pub fn pick_skills(condition: bool, then: &[AgentSkill], or: &[AgentSkill]) -> Vec<AgentSkill> {
@@ -2148,29 +2138,6 @@ fn short_pubkey(pubkey: &str) -> String {
 /// it a chip shows is the view's call, not a count picked here.
 fn chip_label(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// The avatar text of a display name: two letters, or one glyph.
-fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
-    }
 }
 
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.

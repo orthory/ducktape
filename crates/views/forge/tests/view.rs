@@ -4,10 +4,10 @@
 //! read HERE through `rpc.query` / `rpc.view`, re-read on every `rpc.live`
 //! hit. A review and a merge leave as `op.submit`.
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use forge_view::host::Session;
 use forge_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
 
 fn node_ending(frame: &Frame, suffix: &str) -> Node {
     fn find(node: &Node, suffix: &str) -> Option<Node> {
@@ -336,7 +336,10 @@ fn a_conflicting_merge_submits_nothing() {
         kinds(&drive.frame.requests)
     );
     assert!(
-        has_text(&drive.frame, "Merge conflicts — resolve on the branch and push again:"),
+        has_text(
+            &drive.frame,
+            "Merge conflicts — resolve on the branch and push again:"
+        ),
         "{:?}",
         texts(&drive.frame)
     );
@@ -344,7 +347,7 @@ fn a_conflicting_merge_submits_nothing() {
 
 #[test]
 fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
-    use ui_lang_guest::wire::{Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
 
     let (drive, _) = namespace("duck://forge/core");
     let width = |frame: &Frame| match node_ending(frame, "/tree-pane") {
@@ -370,4 +373,28 @@ fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
         dy: 0.0,
     }]);
     assert_eq!(width(&frame), 300.0);
+}
+
+#[test]
+fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
+    let mut drive = open_item("duck://forge/core/7");
+    drive.tick(press(&drive.frame, "Comment on this line"));
+    drive.tick(type_into(
+        &drive.frame,
+        "Comment on this line…",
+        "Keep this guard",
+    ));
+    drive.tick(press(&drive.frame, "Add comment"));
+    assert!(has_text(&drive.frame, "not sent yet"));
+    assert!(has_text(&drive.frame, "Keep this guard"));
+    drive.tick(press(&drive.frame, "Pick approve verdict"));
+    drive.tick(press(&drive.frame, "Submit review"));
+    let op: serde_json::Value =
+        serde_json::from_slice(&request(&drive.frame, "op.submit").payload).unwrap();
+    let review = &op["payload"]["submit_review"];
+    assert_eq!(review["verdict"], "approve");
+    assert_eq!(review["body"], "");
+    assert_eq!(review["comments"][0]["path"], "main.rs");
+    assert_eq!(review["comments"][0]["line"], 1);
+    assert_eq!(review["comments"][0]["body"], "Keep this guard");
 }

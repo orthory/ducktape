@@ -7,10 +7,10 @@
 use agents_view::host::{Draft, OpenLink, OpenRun, Session};
 use agents_view::{boot_native, tick_native};
 use serde_json::{Value, json};
-use ui_lang_guest::testing::{
+use ducktape_view_guest::testing::{
     answer, has_text, item, pick, press, texts, toggle, type_into,
 };
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 
 /// Inputs are found by placeholder and pick lists by key.
 const AGENT_ID_HINT: &str = "a-dns-label, e.g. chiefduck";
@@ -564,7 +564,7 @@ fn the_open_run_draws_its_places_as_chips() {
 /// stay behind the disclosure.
 #[test]
 fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
-    use ui_lang_guest::wire::{Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
     let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
     assert!(!has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "Run details"));
@@ -614,7 +614,7 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
 
 #[test]
 fn the_agent_editor_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
-    use ui_lang_guest::wire::{Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
 
     fn node_ending(frame: &Frame, suffix: &str) -> Node {
         fn find(node: &Node, suffix: &str) -> Option<Node> {

@@ -21,7 +21,7 @@
 //! blank the cards the current one just installed.
 
 use super::*;
-use iced::futures::SinkExt as _;
+use futures::SinkExt as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -128,7 +128,7 @@ pub struct LiveAgentNotice {
 /// node, what a reading was entitled to read is the SEATED KEY's
 /// (`Reach::Signed`) — and a Settings unlock or lock moves that seat with the
 /// endpoint, the chain and the connect attempt all unchanged
-/// (`handlers/node.ice` SettingsIntent.unlock/.lock bump no generation). Without
+/// (Settings unlock/lock does not bump the connect generation). Without
 /// this term, a reading taken under the previous key stays "current" across a
 /// key switch.
 pub fn live_agents_stale(
@@ -142,25 +142,6 @@ pub fn live_agents_stale(
         || notice.chain_id != chain_id
         || notice.generation != generation
         || notice.signer_key != signer_key
-}
-
-/// Test seam: Ice reads extern structs but cannot construct one, so a scenario
-/// that needs a run already on screen has no other way to seat one.
-pub fn live_agent_row(
-    channel_id: String,
-    anchor_seq: i64,
-    run_id: String,
-    agent: String,
-    status: String,
-) -> LiveAgentRow {
-    LiveAgentRow {
-        channel_id,
-        anchor_seq,
-        run_id,
-        agent,
-        status,
-        ..LiveAgentRow::default()
-    }
 }
 
 /// Fold one parsed output event into the row. Status lines replace the status;
@@ -373,8 +354,8 @@ pub fn chat_live_agents(
     chain_id: String,
     generation: i64,
     signer_key: String,
-) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
-    use iced::futures::StreamExt as _;
+) -> futures::stream::BoxStream<'static, LiveAgentNotice> {
+    use futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
         let Ok(client) = rpc_client(&rpc) else {
@@ -580,7 +561,7 @@ pub fn chat_live_agents(
             watcher.handle.abort();
         }
     });
-    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+    futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     })
     .boxed()
@@ -724,7 +705,7 @@ async fn watch_live_output(
     sender: tokio::sync::mpsc::Sender<LiveAgentNotice>,
 ) {
     let rpc = taken.rpc.clone();
-    use iced::futures::StreamExt as _;
+    use futures::StreamExt as _;
     let fold = |event: &AgentChatEvent| {
         let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(row) = rows.get_mut(&dispatch) {

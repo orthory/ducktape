@@ -16,9 +16,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// How far back the op feed is scanned for a settled proposal's execute
 /// height.
@@ -61,8 +61,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("governance.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -102,8 +102,8 @@ pub struct RegisterItem {
 
 /// The register now and after every governance block: read once at start,
 /// then again on each `rpc.live` hit for the governance plane.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"governance");
         stream::once(load()).chain(live.then(|_| load()))
     })
@@ -373,8 +373,8 @@ fn submit(proposal_id: String, message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -436,33 +436,9 @@ pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
     rows.iter().filter(|row| !row.open).cloned().collect()
 }
 
-/// One seat per REQUIRED signature, filled for each approval already in —
-/// the quorum dots. Capped so a large threshold does not overflow the card.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct QuorumSeat {
-    pub filled: bool,
-}
-
-pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
-    let seats = required.clamp(0, 12) as usize;
-    (0..seats)
-        .map(|seat| QuorumSeat {
-            filled: (seat as i64) < approvals,
-        })
-        .collect()
-}
-
 /// `3 / 4` — the tally, one mono run.
 pub fn tally_label(approvals: i64, required: i64) -> String {
     format!("{approvals} / {required}")
-}
-
-/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
-pub fn tally_tone(approvals: i64, required: i64) -> String {
-    match approvals >= required.saturating_sub(1) {
-        true => "near".into(),
-        false => "far".into(),
-    }
 }
 
 /// `3 approvals · 1 more for quorum`, or `quorum met`.
@@ -475,23 +451,11 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     format!("{have} · {remaining} more for quorum")
 }
 
-/// The approve button leans forward at the last vote: `Approve →`.
+/// The approval action distinguishes the last vote needed for quorum.
 pub fn approve_label(approvals: i64, required: i64) -> String {
     match approvals + 1 >= required {
         true => "Approve →".into(),
         false => "Approve".into(),
-    }
-}
-
-/// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: &str) -> String {
-    let access = matches!(
-        action,
-        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
-    );
-    match access {
-        true => "access".into(),
-        false => "neutral".into(),
     }
 }
 

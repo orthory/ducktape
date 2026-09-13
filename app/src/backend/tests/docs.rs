@@ -9,16 +9,6 @@ fn empty_pages_probe() -> serde_json::Value {
     serde_json::json!({ "threads_for_targets": { "targets": [] } })
 }
 
-#[test]
-fn an_unnamed_principal_gets_a_bare_plate() {
-    // Never a `?` — that glyph in the rail's corner reads as HELP, not as
-    // "nobody has named this account".
-    assert_eq!(initial_of(""), "");
-    assert_eq!(initial_of("   "), "");
-    assert_eq!(initial_of("quackbot"), "Q");
-}
-
-
 /// A PAGE HIT NAMES ITS PAGE, AND SAYS EACH THING ONCE. The index's hit row
 /// carries a `page_id` and no title, so nothing downstream could name the page
 /// a match came from: the Explorer set BOTH its row title and its snippet to
@@ -99,15 +89,35 @@ fn a_page_search_hit_names_the_page_it_came_from() {
 
     // The palette and the pages search panel render the same hit type; #997's
     // lesson is that a fix at one surface leaves the siblings broken.
-    const PALETTE: &str = include_str!("../../ui/screens/overlays.ice");
-    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.ice");
+    const PALETTE: &str = include_str!("../../shell.rs");
+    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.rs");
     assert!(
-        PALETTE.contains("text hit.page_title"),
+        PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
     );
+    struct TextValues(Vec<String>);
+    impl<'ast> syn::visit::Visit<'ast> for TextValues {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            use quote::ToTokens;
+            let kit_text = matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.iter().map(|part| part.ident.to_string()).collect::<Vec<_>>() == ["kit", "text"]);
+            if kit_text {
+                if let Some(value) = call.args.iter().nth(1) {
+                    self.0
+                        .push(value.to_token_stream().to_string().replace(' ', ""));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    use syn::visit::Visit as _;
+    let mut panel = TextValues(Vec::new());
+    panel.visit_file(&syn::parse_file(PANEL).expect("Pages composition parses"));
+    assert!(panel.0.iter().any(|value| value == "&hit.page_title"));
+    assert!(panel.0.iter().any(|value| value == "&hit.text"));
     assert!(
-        PANEL.contains("text hit.page_title") && !PANEL.contains("text hit.block_id"),
-        "the pages search panel names the page instead of printing a raw block id"
+        panel.0.iter().all(|value| !value.contains("hit.block_id")),
+        "block ids identify actions, not visible search titles"
     );
 }
 

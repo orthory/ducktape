@@ -22,14 +22,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 pub use crate::blocks::{ChatBlock, ChatSpan};
 use crate::blocks::{
     Names, author_display, avatar_initial, avatar_kind, blocks_of_json, blocks_view, body_blocks,
-    deleted_block, message_body, party_handle, party_of_json,
+    deleted_block, party_handle, party_of_json,
 };
 
 /// The module this view reads and writes: its query target, its live plane,
@@ -97,7 +97,6 @@ pub struct ChatMessage {
     pub blocks: Vec<ChatBlock>,
     pub initial: String,
     pub avatar_kind: String,
-    pub render_rev: i64,
 }
 
 /// One line comment a review carried, anchored `path:line (side)`.
@@ -184,8 +183,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("forge.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -274,8 +273,8 @@ pub struct RepoListItem {
 }
 
 /// The repo namespace now and after every forge block.
-pub fn repos(connection: i64) -> iced::Subscription<RepoListItem> {
-    iced::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
+pub fn repos(connection: i64) -> ducktape_view_guest::Subscription<RepoListItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
 }
 
 async fn load_repos() -> RepoListItem {
@@ -324,8 +323,8 @@ pub struct RepoItem {
 
 /// The open repo's branches and tracker items, re-read on every forge
 /// block. No repo open reads nothing.
-pub fn repo(connection: i64, repo: String) -> iced::Subscription<RepoItem> {
-    iced::Subscription::run_with((connection, repo), |(_, repo)| {
+pub fn repo(connection: i64, repo: String) -> ducktape_view_guest::Subscription<RepoItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo), |(_, repo)| {
         let repo = repo.clone();
         on_forge_blocks(move || load_repo(repo.clone()))
     })
@@ -424,8 +423,12 @@ pub struct ItemItem {
 }
 
 /// The open item in full, re-read on every forge block.
-pub fn item(connection: i64, repo: String, number: i64) -> iced::Subscription<ItemItem> {
-    iced::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
+pub fn item(
+    connection: i64,
+    repo: String,
+    number: i64,
+) -> ducktape_view_guest::Subscription<ItemItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
         let (repo, number) = (repo.clone(), *number);
         on_forge_blocks(move || load_item(repo.clone(), number))
     })
@@ -538,11 +541,7 @@ fn tally(reviews: &[ForgeReview]) -> (i64, i64) {
     )
 }
 
-fn fold_reviews(
-    reviews: &serde_json::Value,
-    source_oid: &str,
-    names: &Names,
-) -> Vec<ForgeReview> {
+fn fold_reviews(reviews: &serde_json::Value, source_oid: &str, names: &Names) -> Vec<ForgeReview> {
     reviews
         .as_array()
         .cloned()
@@ -614,8 +613,11 @@ pub struct DiscussionItem {
 
 /// The item's hidden `forge:<repo>:<n>` channel, re-read on every chat
 /// block — a note posted anywhere lands here the same way it does in Chat.
-pub fn discussion(connection: i64, channel_id: String) -> iced::Subscription<DiscussionItem> {
-    iced::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
+pub fn discussion(
+    connection: i64,
+    channel_id: String,
+) -> ducktape_view_guest::Subscription<DiscussionItem> {
+    ducktape_view_guest::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
         let channel_id = channel_id.clone();
         let live = host::subscribe("rpc.live", CHAT.as_bytes());
         let load = move || load_discussion(channel_id.clone());
@@ -685,36 +687,14 @@ fn fold_message(row: &serde_json::Value, names: &Names) -> ChatMessage {
         true => format!("#{seq} · edited"),
         false => format!("#{seq}"),
     };
-    let message = ChatMessage {
+    ChatMessage {
         seq,
         author: author_display(author, names),
         meta,
         blocks,
         initial: avatar_initial(author, names),
         avatar_kind: avatar_kind(author, names),
-        render_rev: 0,
-    };
-    let body = match deleted {
-        true => "Message deleted".to_owned(),
-        false => message_body(&wire, names),
-    };
-    seed_render_rev(message, &body)
-}
-
-/// The keyed lazy repaints a row exactly when this (or `seq`) moves, so the
-/// seed hashes everything the row draws with.
-fn seed_render_rev(mut message: ChatMessage, body: &str) -> ChatMessage {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    message.seq.hash(&mut hasher);
-    message.author.hash(&mut hasher);
-    message.meta.hash(&mut hasher);
-    message.initial.hash(&mut hasher);
-    message.avatar_kind.hash(&mut hasher);
-    body.hash(&mut hasher);
-    message.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
-    message
+    }
 }
 
 /// The composer's mention vocabulary: the channel's members by the label
@@ -774,10 +754,16 @@ pub struct TreeItem {
 
 /// One directory listing, pinned to the commit the root listing answered
 /// with. Keyed by what it names, so a move re-reads and nothing else does.
-pub fn tree(connection: i64, repo: String, rev: String, path: String) -> iced::Subscription<TreeItem> {
-    iced::Subscription::run_with((connection, repo, rev, path), |(_, repo, rev, path)| {
-        stream::once(load_tree(repo.clone(), rev.clone(), path.clone()))
-    })
+pub fn tree(
+    connection: i64,
+    repo: String,
+    rev: String,
+    path: String,
+) -> ducktape_view_guest::Subscription<TreeItem> {
+    ducktape_view_guest::Subscription::run_with(
+        (connection, repo, rev, path),
+        |(_, repo, rev, path)| stream::once(load_tree(repo.clone(), rev.clone(), path.clone())),
+    )
 }
 
 async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
@@ -852,8 +838,8 @@ pub fn blob(
     rev: String,
     path: String,
     net: String,
-) -> iced::Subscription<BlobItem> {
-    iced::Subscription::run_with(
+) -> ducktape_view_guest::Subscription<BlobItem> {
+    ducktape_view_guest::Subscription::run_with(
         (connection, repo, rev, path, net),
         |(_, repo, rev, path, net)| {
             stream::once(load_blob(
@@ -919,13 +905,21 @@ async fn read_text(repo: &str, rev: &str, path: &str, net: &str) -> Result<BlobI
 /// the addresses are `duck://` refs, repo-relative paths and web URLs, and
 /// only the app's one open plane knows how to fetch each kind.
 async fn park_inline_pictures(item: &BlobItem, repo: &str, rev: &str, net: &str) {
-    let base = format!("duck://forge/{repo}/blob/{}@{rev}{}", item.path, net_query(net));
+    let base = format!(
+        "duck://forge/{repo}/blob/{}@{rev}{}",
+        item.path,
+        net_query(net)
+    );
     let ask = serde_json::json!({
         "doc": &item.path,
         "source": &item.text,
         "base": base,
     });
-    let _ = host::request("picture.inline", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let _ = host::request(
+        "picture.inline",
+        &serde_json::to_vec(&ask).expect("encodes"),
+    )
+    .await;
 }
 
 /// A picture blob: page it in, hand it to the host's picture store, draw
@@ -951,8 +945,7 @@ async fn read_picture(repo: &str, rev: &str, path: &str) -> Result<BlobItem, Str
         )));
     };
     let ask = serde_json::json!({ "surface": PICTURE_SURFACE, "path": path, "pages": pages });
-    let parked =
-        host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let parked = host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
     let parked = parked.and_then(|reply| {
         serde_json::from_slice::<serde_json::Value>(&reply).map_err(|error| error.to_string())
     });
@@ -1070,8 +1063,8 @@ fn start(act: impl Future<Output = ActItem> + 'static) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1172,7 +1165,15 @@ pub fn merge(
     prev_target_oid: String,
 ) -> bool {
     start(async move {
-        match merge_pr(repo, number, source_branch, expected_source_oid, prev_target_oid).await {
+        match merge_pr(
+            repo,
+            number,
+            source_branch,
+            expected_source_oid,
+            prev_target_oid,
+        )
+        .await
+        {
             Ok(item) => item,
             Err(error) => ActItem {
                 kind: "merge".to_owned(),
@@ -1328,10 +1329,6 @@ pub fn forge_link(url: &str) -> ForgeLink {
 
 // ---------- the readings ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
 pub fn plural(count: i64, one: &str, many: &str) -> String {
     let noun = if count == 1 { one } else { many };
     format!("{count} {noun}")
@@ -1391,14 +1388,6 @@ pub fn verdict_label(verdict: &str) -> String {
         "approve" => "approved".into(),
         "request_changes" => "requested changes".into(),
         _ => "commented".into(),
-    }
-}
-
-/// A verdict picker label, dotted when it is the current pick.
-pub fn verdict_pick_label(current: &str, key: &str, label: &str) -> String {
-    match current == key {
-        true => format!("● {label}"),
-        false => label.to_owned(),
     }
 }
 
@@ -1479,13 +1468,6 @@ pub fn repo_names(repos: &[ForgeRepo]) -> Vec<String> {
 /// The branch selector's options: the open repo's born branches by name.
 pub fn branch_names(branches: &[ForgeBranch]) -> Vec<String> {
     branches.iter().map(|branch| branch.name.clone()).collect()
-}
-
-/// The branch selector's selection: the branch standing at the browse's
-/// commit, or none once every branch has moved past it.
-pub fn pinned_branch(tree_branch: &str) -> Option<String> {
-    let a_branch_stands_at_the_commit = !tree_branch.is_empty();
-    a_branch_stands_at_the_commit.then(|| tree_branch.to_owned())
 }
 
 /// The commit a branch's head stood on when the repo slice was read, or
@@ -1592,10 +1574,7 @@ pub fn stage_forge_comment(
 }
 
 /// Drop the comment staged at one anchor. A miss leaves the list alone.
-pub fn drop_forge_comment(
-    staged: Vec<ForgeDraftComment>,
-    anchor: &str,
-) -> Vec<ForgeDraftComment> {
+pub fn drop_forge_comment(staged: Vec<ForgeDraftComment>, anchor: &str) -> Vec<ForgeDraftComment> {
     let mut staged = staged;
     staged.retain(|row| row.anchor != anchor);
     staged
@@ -1691,15 +1670,6 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     }
 }
 
-/// The appearance as the word the handler matches on.
-pub(crate) fn appearance_of(dark: bool) -> crate::Appearance {
-    if dark {
-        crate::Appearance::Dark
-    } else {
-        crate::Appearance::Light
-    }
-}
-
 // ---------- the patch, painted ----------
 
 /// A unified patch as the rows the diff pane draws.
@@ -1743,7 +1713,15 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
                 new_no = span.new_start;
                 old_left = span.old_len;
                 new_left = span.new_len;
-                rows.push(diff_row("hunk", String::new(), String::new(), "", line, "", ""));
+                rows.push(diff_row(
+                    "hunk",
+                    String::new(),
+                    String::new(),
+                    "",
+                    line,
+                    "",
+                    "",
+                ));
                 continue;
             }
         }

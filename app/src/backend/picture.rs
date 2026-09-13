@@ -1,21 +1,14 @@
-//! The picture viewer: one decoded image per surface, drawn by one extern.
-//!
-//! A picture is decoded ONCE, off the runtime, into an RGBA
-//! [`iced::widget::image::Handle`] and parked under its surface's slot; the
-//! `picture` extern hands the SAME handle to every view rebuild, so iced_wgpu
-//! keeps hitting its upload cache instead of re-uploading per frame (the
-//! lesson `video.rs` paid for — a `Handle::from_rgba` per view is a fresh id,
-//! and a fresh id above 2 MiB draws nothing on its first frame). Two surfaces
-//! exist — the Files preview and the forge reader — and each keeps exactly one
-//! picture, so the store's memory is bounded by the side cap, not by history.
-//!
-//! The loaders (`files_preview`, `forge_blob`) decide by path whether a file
-//! is a picture and page its bytes in; this module only decodes and draws.
+//! Decoded pictures shared by native GPUI surfaces; decoding stays off-thread.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use iced::widget::image::Handle;
+use gpui_kit::StyledImage;
+use gpui_kit::{
+    AnyElement, Context, Image, ImageFormat, ImageSource, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Window, div, img, point, px, relative,
+};
 
 /// Source-byte ceiling: a file past it is shown as "too large", never
 /// decoded. ponytail: 16 MiB holds every screenshot and most photos; raise
@@ -38,8 +31,8 @@ pub const MAX_INLINE_PICTURES: usize = 8;
 /// downscaled — it has no pixels to lose).
 #[derive(Clone, Debug)]
 pub enum PictureHandle {
-    Raster(Handle),
-    Vector(iced::widget::svg::Handle),
+    Raster(Arc<RenderImage>),
+    Vector(Arc<Image>),
 }
 
 /// A decoded picture: its drawn dimensions (post-downscale for a raster, the
@@ -52,45 +45,16 @@ pub struct Picture {
 }
 
 impl Picture {
-    /// The picture as a widget: contained to the pane's width at its own
-    /// aspect, `Shrink` tall — every mount sits in a scroll column, where a
-    /// `Fill` height has nothing to fill.
-    pub fn element<Message: 'static>(&self) -> iced::Element<'static, Message> {
-        use iced::ContentFit::Contain;
-        use iced::Length::{Fill, Shrink};
-        use iced::widget::{image, svg};
-        match &self.handle {
-            PictureHandle::Raster(handle) => image(handle.clone())
-                .width(Fill)
-                .height(Shrink)
-                .content_fit(Contain)
-                .into(),
-            PictureHandle::Vector(handle) => svg(handle.clone())
-                .width(Fill)
-                .height(Shrink)
-                .content_fit(Contain)
-                .into(),
-        }
+    pub fn element(&self) -> AnyElement {
+        let source: ImageSource = match &self.handle {
+            PictureHandle::Raster(image) => image.clone().into(),
+            PictureHandle::Vector(image) => image.clone().into(),
+        };
+        img(source)
+            .size_full()
+            .object_fit(ObjectFit::Contain)
+            .into_any_element()
     }
-}
-
-/// Does the path name a picture the viewer decodes? The extension is the
-/// path's call — the wires only say binary-or-text. SVG is a different
-/// widget and is left out on purpose.
-pub fn picture_path(path: String) -> bool {
-    let name = path.rsplit('/').next().unwrap_or_default();
-    let Some((_, extension)) = name.rsplit_once('.') else {
-        return false;
-    };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
-    )
-}
-
-/// `1024 × 768` — the caption under a drawn picture.
-pub fn picture_caption(width: i64, height: i64) -> String {
-    format!("{width} × {height}")
 }
 
 /// Decode source bytes into a picture: an SVG document (by its first tag —
@@ -120,7 +84,10 @@ fn decode_vector(bytes: &[u8]) -> Result<Picture, String> {
     Ok(Picture {
         width: size.width().round() as u32,
         height: size.height().round() as u32,
-        handle: PictureHandle::Vector(iced::widget::svg::Handle::from_memory(bytes.to_vec())),
+        handle: PictureHandle::Vector(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            bytes.to_vec(),
+        ))),
     })
 }
 
@@ -160,7 +127,7 @@ fn decode_raster(bytes: &[u8]) -> Result<Picture, String> {
     Ok(Picture {
         width,
         height,
-        handle: PictureHandle::Raster(Handle::from_rgba(width, height, rgba.into_raw())),
+        handle: PictureHandle::Raster(render_rgba(rgba)),
     })
 }
 
@@ -277,43 +244,93 @@ pub fn inline_picture(doc: &str, path: &str) -> Option<Picture> {
 /// pane; a wrapper that gates the wheel on Ctrl would lift it.
 const MAX_VIEWER_HEIGHT: f32 = 560.0;
 
-/// The viewer itself: the surface's picture, centred in the pane. A raster
-/// zooms under the wheel and pans under a drag (iced's `image::viewer`); a
-/// vector is drawn contained — the viewer is raster-only. The viewer's
-/// zoom/pan state lives in the widget tree, so the element is keyed by the
-/// path: the next file opens at its own size, not at the last one's zoom.
-pub fn picture(surface: String, path: String) -> iced::Element<'static, ()> {
-    use iced::ContentFit::Contain;
-    use iced::Length::{Fill, Shrink};
-    use iced::widget::{container, image, keyed_column, text};
-    let Some(picture) = stored_picture(&surface, &path) else {
-        return container(text("")).into();
-    };
-    let element = match &picture.handle {
-        PictureHandle::Raster(handle) => container(
-            image::viewer(handle.clone())
-                .width(Fill)
-                .height(Shrink)
-                .content_fit(Contain),
-        )
-        .max_height(MAX_VIEWER_HEIGHT)
-        .into(),
-        PictureHandle::Vector(_) => picture.element(),
-    };
-    container(keyed_column([(path_key(&path), element)]))
-        .width(Fill)
-        .center_x(Fill)
-        .into()
+/// Convert once at decode time; GPUI expects BGRA rather than RGBA pixels.
+pub(crate) fn render_rgba(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
+    for pixel in pixels.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))
 }
 
-/// The path as a `keyed_column` key — a 64-bit hash, since iced keys are
-/// `Copy`. A collision between two paths open in one session would only
-/// carry a zoom across; it is not worth a longer key.
-fn path_key(path: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
+pub struct PictureView {
+    surface: String,
+    path: String,
+    scale: f32,
+    offset: Point<Pixels>,
+    drag: Option<Point<Pixels>>,
+}
+impl PictureView {
+    pub fn new(surface: String, path: String) -> Self {
+        Self {
+            surface,
+            path,
+            scale: 1.0,
+            offset: point(px(0.0), px(0.0)),
+            drag: None,
+        }
+    }
+    pub fn replace(&mut self, surface: String, path: String, cx: &mut Context<Self>) {
+        if self.surface == surface && self.path == path {
+            cx.notify();
+            return;
+        }
+        *self = Self::new(surface, path);
+        cx.notify();
+    }
+}
+impl Render for PictureView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let picture = stored_picture(&self.surface, &self.path);
+        let aspect = picture.as_ref().map_or(1., |picture| {
+            picture.width as f32 / picture.height.max(1) as f32
+        });
+        let content = picture.map(|picture| {
+            div()
+                .absolute()
+                .left(self.offset.x)
+                .top(self.offset.y)
+                .w(relative(self.scale))
+                .h(relative(self.scale))
+                .child(picture.element())
+        });
+        div()
+            .id("picture-viewer")
+            .relative()
+            .w_full()
+            .aspect_ratio(aspect)
+            .max_h(px(MAX_VIEWER_HEIGHT))
+            .overflow_hidden()
+            .children(content)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                let delta = match event.delta {
+                    ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                    ScrollDelta::Lines(delta) => delta.y,
+                };
+                this.scale = (this.scale * 1.1_f32.powf(delta.signum())).clamp(0.25, 10.0);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, _| this.drag = Some(event.position)),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let Some(previous) = this.drag else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    this.drag = None;
+                    return;
+                }
+                this.offset += event.position - previous;
+                this.drag = Some(event.position);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag = None),
+            )
+    }
 }
 
 #[cfg(test)]
@@ -330,16 +347,6 @@ mod tests {
         .write_to(&mut out, image::ImageFormat::Png)
         .expect("encode");
         out.into_inner()
-    }
-
-    #[test]
-    fn the_extension_is_the_paths_call() {
-        for yes in ["a.png", "dir/b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp", "g.svg"] {
-            assert!(picture_path(yes.into()), "{yes}");
-        }
-        for no in ["README.md", "logo", "png", "dir.png/file", "x.png.txt", "a.xml"] {
-            assert!(!picture_path(no.into()), "{no}");
-        }
     }
 
     /// A JPEG tagged EXIF orientation 6 (stored rotated 90° CCW, to be shown
@@ -435,10 +442,20 @@ mod tests {
         let picture = decode_picture(&svg(10, 4, "red")).expect("decodes");
         assert_eq!((picture.width, picture.height), (10, 4));
         assert!(matches!(picture.handle, PictureHandle::Vector(_)));
-        let prologue = [b"\xef\xbb\xbf<?xml version=\"1.0\"?>".as_slice(), &svg(3, 3, "blue")].concat();
-        assert!(decode_picture(&prologue).is_ok(), "a BOM and an XML prologue are still an SVG");
+        let prologue = [
+            b"\xef\xbb\xbf<?xml version=\"1.0\"?>".as_slice(),
+            &svg(3, 3, "blue"),
+        ]
+        .concat();
+        assert!(
+            decode_picture(&prologue).is_ok(),
+            "a BOM and an XML prologue are still an SVG"
+        );
         let padded = [b"  \n".as_slice(), &svg(3, 3, "blue")].concat();
-        assert!(decode_picture(&padded).is_ok(), "leading whitespace is still an SVG");
+        assert!(
+            decode_picture(&padded).is_ok(),
+            "leading whitespace is still an SVG"
+        );
         let raster = decode_picture(&png(2, 2)).expect("decodes");
         assert!(matches!(raster.handle, PictureHandle::Raster(_)));
     }
@@ -460,7 +477,11 @@ mod tests {
         let cases = [
             ("docs/README.md", "img/a.png", Some("docs/img/a.png")),
             ("README.md", "./a.png", Some("a.png")),
-            ("docs/guide/x.md", "../assets/b.jpg", Some("docs/assets/b.jpg")),
+            (
+                "docs/guide/x.md",
+                "../assets/b.jpg",
+                Some("docs/assets/b.jpg"),
+            ),
             ("docs/x.md", "/logo.png", Some("logo.png")),
             ("x.md", "a.png?raw=1#frag", Some("a.png")),
             ("x.md", "https://host/a.png", None),
@@ -470,19 +491,32 @@ mod tests {
             ("x.md", "./", None),
         ];
         for (doc, url, want) in cases {
-            assert_eq!(resolve_repo_path(doc, url).as_deref(), want, "{doc} + {url}");
+            assert_eq!(
+                resolve_repo_path(doc, url).as_deref(),
+                want,
+                "{doc} + {url}"
+            );
         }
     }
 
     #[test]
     fn a_documents_inline_pictures_answer_only_under_that_document() {
         let picture = decode_picture(&png(2, 2)).expect("decodes");
-        park_inline_pictures("README.md".into(), HashMap::from([("a.png".to_string(), picture)]));
+        park_inline_pictures(
+            "README.md".into(),
+            HashMap::from([("a.png".to_string(), picture)]),
+        );
         assert!(inline_picture("README.md", "a.png").is_some());
         assert!(inline_picture("README.md", "b.png").is_none());
-        assert!(inline_picture("docs/README.md", "a.png").is_none(), "another document's set never answers");
+        assert!(
+            inline_picture("docs/README.md", "a.png").is_none(),
+            "another document's set never answers"
+        );
         park_inline_pictures("docs/README.md".into(), HashMap::new());
-        assert!(inline_picture("README.md", "a.png").is_none(), "the next document replaces the set");
+        assert!(
+            inline_picture("README.md", "a.png").is_none(),
+            "the next document replaces the set"
+        );
     }
 
     #[test]
@@ -496,11 +530,17 @@ mod tests {
             .expect("stored");
         assert_eq!(dims, (4, 4));
         assert!(stored_picture("test", "a.png").is_some());
-        assert!(stored_picture("test", "b.png").is_none(), "a stale slot never draws under a new path");
+        assert!(
+            stored_picture("test", "b.png").is_none(),
+            "a stale slot never draws under a new path"
+        );
         runtime
             .block_on(store_picture("test", "b.png".into(), png(2, 2)))
             .expect("stored");
-        assert!(stored_picture("test", "a.png").is_none(), "one slot per surface");
+        assert!(
+            stored_picture("test", "a.png").is_none(),
+            "one slot per surface"
+        );
         assert_eq!(stored_picture("test", "b.png").map(|p| p.width), Some(2));
     }
 }

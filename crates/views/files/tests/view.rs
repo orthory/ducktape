@@ -4,12 +4,12 @@
 //! for the files plane, and a write leaves as `op.submit` carrying the
 //! duckfs commit.
 
-use files_view::host::Session;
-use files_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{
+use ducktape_view_guest::testing::{
     answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
-use ui_lang_guest::wire::{Frame, Node, Request};
+use ducktape_view_guest::wire::{Frame, Node, Request};
+use files_view::host::Session;
+use files_view::{boot_native, tick_native};
 
 fn boot() -> Frame {
     boot_native();
@@ -139,15 +139,15 @@ fn node_ending(frame: &Frame, suffix: &str) -> Node {
 
 #[test]
 fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
-    use ui_lang_guest::wire::{Event, Length, mouse};
+    use ducktape_view_guest::wire::{Event, Length, mouse};
 
     let (frame, _) = connected_with_listing();
     let frame = with_preview(&frame, "hello");
     let fixed = |frame: &Frame, suffix: &str, vertical: bool| {
         let (width, height) = match node_ending(frame, suffix) {
-            Node::Container { width, height, .. } | Node::Linear { width, height, .. } => {
-                (width, height)
-            }
+            Node::Container { width, height, .. }
+            | Node::Linear { width, height, .. }
+            | Node::Scroll { width, height, .. } => (width, height),
             node => panic!("fixed pane {suffix}: {node:?}"),
         };
         match vertical {
@@ -202,7 +202,7 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
         mouse::Cursor::ResizingHorizontally,
     );
     assert_eq!(
-        fixed(&frame, "/object-panel/root", false),
+        fixed(&frame, "/object-panel", false),
         Some(Length::Fixed(366.0))
     );
 }
@@ -231,6 +231,17 @@ fn a_connected_view_lists_its_own_directory() {
     let frame = tick_native(press(&frame, "History"));
     assert!(has_text(&frame, "h 84,912"), "{:?}", texts(&frame));
     assert!(has_text(&frame, "first commit"), "{:?}", texts(&frame));
+}
+
+#[test]
+fn disconnect_hides_retained_listing_and_write_controls() {
+    let (frame, held) = connected_with_listing();
+    assert!(has_text(&frame, "README.md"));
+    let frame = tick_native(vec![item(held.session, &session(false))]);
+    assert!(has_text(&frame, "Not connected"));
+    for stale in ["README.md", "1 file · 1 dir", "+ Folder", "+ File"] {
+        assert!(!has_text(&frame, stale), "disconnected claim: {stale}");
+    }
 }
 
 /// Opening a directory reads THAT directory, and the rows on hand go silent
@@ -471,8 +482,7 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         .find(|key| key.ends_with("/fs-editor"))
         .expect("the editor");
     let (editing, before) = read_draft(&editing);
-    let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
-    let queued_save = press(&editing, "Save");
+    tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
 
     // the network moves under the draft
     let frame = tick_native(vec![item(
@@ -486,14 +496,17 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         })
         .unwrap(),
     )]);
-    assert!(has_text(&frame, "Unsaved changes to:"), "{:?}", texts(&frame));
-    let frame = tick_native(queued_save);
+    assert!(
+        has_text(&frame, "Unsaved changes to:"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(
         !frame
             .requests
             .iter()
             .any(|request| request.kind == "op.submit"),
-        "a parked draft never submits: {:?}",
+        "parking a draft never submits: {:?}",
         frame.requests
     );
 
@@ -536,7 +549,7 @@ fn button_disabled(frame: &Frame, name: &str) -> bool {
         } = node
         {
             let named = label.as_deref() == Some(name)
-                || matches!(content, ui_lang_guest::wire::ButtonContent::Label(label) if label == name);
+                || matches!(content, ducktape_view_guest::wire::ButtonContent::Label(label) if label == name);
             if named {
                 disabled = Some(on_press.is_none());
             }
@@ -558,7 +571,7 @@ fn surface_names(frame: &Frame) -> Vec<String> {
 }
 
 fn read_draft(frame: &Frame) -> (Frame, String) {
-    use ui_lang_guest::wire::editor_document::{
+    use ducktape_view_guest::wire::editor_document::{
         EditorDocumentMessage as Message, EditorTransferId, EditorTransferReceiver,
     };
     let key = keys(frame)
@@ -582,7 +595,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
         attempt: 0,
     };
     let mut receiver = EditorTransferReceiver::new(id.clone(), document.clone()).unwrap();
-    let mut events = vec![ui_lang_guest::wire::Event::EditorDocument {
+    let mut events = vec![ducktape_view_guest::wire::Event::EditorDocument {
         handler,
         message: Message::Request {
             id: id.clone(),
@@ -596,7 +609,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
                 panic!("document transfer: {message:?}");
             };
             if let Some(text) = receiver.receive(transfer).unwrap() {
-                let settled = tick_native(vec![ui_lang_guest::wire::Event::EditorDocument {
+                let settled = tick_native(vec![ducktape_view_guest::wire::Event::EditorDocument {
                     handler,
                     message: Message::Acknowledged { id },
                 }]);

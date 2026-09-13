@@ -680,4 +680,3 @@ pub fn commented_lines(blocks: &[PageBlock], targets: &[String]) -> Vec<i64> {
 pub fn subpages(blocks: &[PageBlock]) -> Vec<&PageBlock> {
     blocks.iter().filter(|block| !is_prose(block)).collect()
 }
-

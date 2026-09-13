@@ -20,9 +20,9 @@ pub mod markdown;
 #[path = "editor_presentation.rs"]
 pub mod presentation;
 
-ui_lang::include_app!("src/ui/app.ice");
+include!("ui/view.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     PagesView,
     "Pages",
     "The workspace's pages: the sidebar, the document header, the tab strip and the comments rail.",

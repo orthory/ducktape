@@ -13,9 +13,11 @@
 
 pub mod host;
 
-ui_lang::include_app!("src/ui/app.ice");
+#[path = "ui/app.rs"]
+mod app;
+pub use app::{FilesView, Message};
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     FilesView,
     "Files",
     "The duckfs browser: one directory at a time, its preview, its history and its writes.",

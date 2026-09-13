@@ -1,7 +1,6 @@
 //! Compare the flattened wire paint with the existing native Markdown policy.
-use iced::advanced::text::Highlighter;
 use pages_view::{editor_binding, editor_menu, editor_view, editor_view::EditorReserve, markdown};
-use ui_lang_guest::{Editor, wire};
+use ducktape_view_guest::{Editor, wire};
 #[path = "../src/editor_presentation.rs"]
 pub mod presentation;
 
@@ -17,7 +16,7 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
             dark,
             commented: vec![1],
         };
-        let state = ui_lang_guest::EditorStateView {
+        let state = ducktape_view_guest::EditorStateView {
             cursor: wire::EditorCursor {
                 position: wire::EditorPosition { line: 2, column: 0 },
                 selection: None,
@@ -42,7 +41,7 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
                     .iter()
                     .rev()
                     .find(|(range, _)| range.contains(&byte))
-                    .map(|(_, mark)| presentation::convert(markdown::format(mark, dark)).unwrap());
+                    .map(|(_, mark)| markdown::format(mark, dark));
                 let actual = actual
                     .spans
                     .iter()
@@ -66,7 +65,7 @@ fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret(
     let line = "앞 [작업 보기](duck://agents/runs/abc) 뒤";
     let text = format!("Title\n{line}");
     let editor = Editor::new(&text);
-    let state = ui_lang_guest::EditorStateView {
+    let state = ducktape_view_guest::EditorStateView {
         cursor: wire::EditorCursor {
             position: wire::EditorPosition { line: 1, column: 8 },
             selection: None,

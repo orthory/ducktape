@@ -9,19 +9,20 @@
 //!
 //! Inline emphasis uses the Chat grammar; Pages additionally conceals named
 //! link syntax outside the active editing line, without rewriting the source.
-//! Unlike the reference, there are no `iced_highlighter` language tokens inside
+//! There are no language tokens inside
 //! fences. `PageBlock` carries no language field, so a fence body is one mono
 //! plate.
 //!
-//! The line metrics are the Pages design tokens from the pages view's `rows.ice`
+//! The line metrics are the Pages design tokens
 //! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.65, quote 14/1.6, code 12/1.6,
 //! callout 13/1.6), so a saved document reads at exactly the size it was typed.
 
-use iced::advanced::text::{Highlight as TextHighlight, Highlighter, LineHeight};
-use iced::font::{Family, Style as FontStyle, Weight};
-use iced::{Border, Color, Font, Padding, Pixels};
+use ducktape_view_guest::wire::editor_presentation::EditorFormat as Format;
+use ducktape_view_guest::wire::{
+    self, Edges as Padding, FontStyle, LineHeight, NamedFont as Font, Rgba as Color, Weight,
+};
 use std::ops::Range;
-use ui_lang_runtime::editor_format::Format;
+const TRANSPARENT: Color = Color([0.0; 4]);
 
 use super::inline::{Inline, document_marks};
 
@@ -236,12 +237,8 @@ pub struct DocumentHighlighter {
     caret: Caret,
 }
 
-impl Highlighter for DocumentHighlighter {
-    type Settings = Caret;
-    type Highlight = Mark;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Mark)>;
-
-    fn new(caret: &Self::Settings) -> Self {
+impl DocumentHighlighter {
+    pub fn new(caret: &Caret) -> Self {
         Self {
             current_line: 0,
             fences: vec![false],
@@ -249,7 +246,7 @@ impl Highlighter for DocumentHighlighter {
         }
     }
 
-    fn update(&mut self, caret: &Self::Settings) {
+    pub fn update(&mut self, caret: &Caret) {
         // A palette flip restyles every line; a caret move only restyles the
         // line it left and the line it landed on.
         let restyle_everything =
@@ -265,7 +262,7 @@ impl Highlighter for DocumentHighlighter {
         self.change_line(earliest);
     }
 
-    fn change_line(&mut self, line: usize) {
+    pub fn change_line(&mut self, line: usize) {
         if line >= self.fences.len() {
             self.fences.truncate(1);
             self.current_line = 0;
@@ -275,7 +272,7 @@ impl Highlighter for DocumentHighlighter {
         self.current_line = line;
     }
 
-    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+    pub fn highlight_line(&mut self, line: &str) -> std::vec::IntoIter<(Range<usize>, Mark)> {
         let index = self.current_line;
         let inside_code = self.fences[index];
         let on_caret_line = self.caret.focused && index == self.caret.line;
@@ -293,7 +290,7 @@ impl Highlighter for DocumentHighlighter {
         marks.into_iter()
     }
 
-    fn current_line(&self) -> usize {
+    pub fn current_line(&self) -> usize {
         self.current_line
     }
 }
@@ -444,10 +441,8 @@ fn highlight(
     (marks, false)
 }
 
-/// The document ink, one set per palette reading of `theme.ice`.
+/// The document ink, one set per light/dark palette.
 struct Ink {
-    body: Color,
-    strong: Color,
     muted: Color,
     marker: Color,
     link: Color,
@@ -464,25 +459,14 @@ struct Ink {
 }
 
 const fn rgb8(r: u8, g: u8, b: u8) -> Color {
-    Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a: 1.0,
-    }
+    wash(r, g, b, 1.0)
 }
 
-/// A plate color MUST be translucent: the runtime draws an opaque
-/// `line_highlight` above the glyphs (ducktape-ui bug, reproduced in the
-/// pinned `markdown-editor` example by making its wash opaque), so every
-/// plate here is a wash over the page instead of a solid.
 const fn wash(r: u8, g: u8, b: u8, a: f32) -> Color {
-    Color { a, ..rgb8(r, g, b) }
+    Color([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a])
 }
 
 const LIGHT: Ink = Ink {
-    body: rgb8(0x3a, 0x38, 0x33),
-    strong: rgb8(0x26, 0x25, 0x1f),
     muted: rgb8(0x6b, 0x69, 0x62),
     marker: rgb8(0xb3, 0xb1, 0xa8),
     link: rgb8(0x5f, 0x7a, 0x9e),
@@ -501,8 +485,6 @@ const LIGHT: Ink = Ink {
 };
 
 const DARK: Ink = Ink {
-    body: rgb8(0xd4, 0xd2, 0xca),
-    strong: rgb8(0xe8, 0xe6, 0xdf),
     muted: rgb8(0xa8, 0xa6, 0x9c),
     marker: rgb8(0x6b, 0x6a, 0x61),
     link: rgb8(0x8f, 0xa9, 0xc9),
@@ -526,52 +508,28 @@ fn ink(dark: bool) -> &'static Ink {
 
 fn body_font(weight: Weight, style: FontStyle) -> Font {
     Font {
+        family: wire::FontFamily::Named(design::fonts::FAMILY_UI.into()),
         weight,
+        stretch: wire::FontStretch::Normal,
         style,
-        ..Font {
-            family: Family::Name(design::fonts::FAMILY_UI),
-            ..Font::DEFAULT
-        }
     }
 }
 
 fn code_font() -> Font {
     Font {
-        family: Family::Name(design::fonts::FAMILY_MONO),
-        ..Font {
-            family: Family::Name(design::fonts::FAMILY_UI),
-            ..Font::DEFAULT
-        }
+        family: wire::FontFamily::Named(design::fonts::FAMILY_MONO.into()),
+        ..body_font(Weight::Normal, FontStyle::Normal)
     }
 }
 
-/// The callout tile — the `card_wash` plate the block widget used to draw,
-/// painted by the highlighter now that the callout is a line of the document.
-fn callout_plate(ink: &Ink) -> TextHighlight {
-    TextHighlight {
-        background: ink.callout_plate.into(),
-        border: Border {
-            color: ink.callout_line,
-            width: 1.0,
-            radius: 11.0.into(),
-        },
+fn border(color: Color, width: f32, radius: f32) -> wire::Border {
+    wire::Border {
+        color: Some(color),
+        width: Some(width),
+        radius: Some([radius; 4]),
     }
 }
 
-/// The code plate: one continuous background across every visual line of the
-/// fence, which is what `line_highlight` (as opposed to `highlight`) buys.
-fn code_plate(ink: &Ink) -> TextHighlight {
-    TextHighlight {
-        background: ink.code_plate.into(),
-        border: Border {
-            color: ink.code_line,
-            width: 1.0,
-            radius: 10.0.into(),
-        },
-    }
-}
-
-/// What the tick glyph itself measures: a space, or the `x` that replaces it.
 fn tick_advance(checked: bool) -> f32 {
     match checked {
         true => TICK_ADVANCE,
@@ -641,10 +599,9 @@ fn paint(mark: &Mark, dark: bool) -> Format {
     let ink = ink(dark);
     match *mark {
         Mark::Title => Format {
-            color: Some(ink.strong),
             font: Some(body_font(Weight::Semibold, FontStyle::Normal)),
-            size: Some(Pixels(TITLE_SIZE)),
-            line_height: Some(LineHeight::Absolute(Pixels(TITLE_SIZE * TITLE_LINE_HEIGHT))),
+            size: Some(TITLE_SIZE),
+            line_height: Some(LineHeight::Absolute(TITLE_SIZE * TITLE_LINE_HEIGHT)),
             ..Format::default()
         },
         Mark::Marker { hidden, style } => {
@@ -653,7 +610,7 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             // its bullet — a struck collapsed bullet paints a floating dash.
             format.strikethrough = None;
             format.color = Some(match hidden {
-                true => Color::TRANSPARENT,
+                true => TRANSPARENT,
                 false => ink.marker,
             });
             if hidden && style.divider {
@@ -668,7 +625,7 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             if hidden {
                 // Collapse the glyphs without collapsing the LINE: the body run
                 // beside them still carries the real line height.
-                format.size = Some(Pixels(HIDDEN_SIZE));
+                format.size = Some(HIDDEN_SIZE);
                 format.line_height = None;
             }
             format
@@ -680,12 +637,12 @@ fn paint(mark: &Mark, dark: bool) -> Format {
         Mark::Indent(style) => {
             let mut format = body_format(style, ink);
             format.strikethrough = None;
-            format.color = Some(Color::TRANSPARENT);
-            format.size = Some(Pixels(HIDDEN_SIZE));
+            format.color = Some(TRANSPARENT);
+            format.size = Some(HIDDEN_SIZE);
             // A line that is NOTHING but indent has no other run to carry its
             // height, so this one holds the body metrics absolutely — the same
             // job the tick does beside a collapsed bullet.
-            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
+            format.line_height = Some(LineHeight::Absolute(BODY_SIZE * BODY_LINE_HEIGHT));
             format
         }
         Mark::Tick { checked, style } => {
@@ -696,25 +653,19 @@ fn paint(mark: &Mark, dark: bool) -> Format {
             format.strikethrough = None;
             format.color = Some(match checked {
                 true => ink.tick_mark,
-                false => Color::TRANSPARENT,
+                false => TRANSPARENT,
             });
             // The collapsed `- ` bullet beside this run cannot carry the line,
             // so the tick holds the body metrics ABSOLUTELY — the same job the
             // body run does for a heading's hidden marker.
-            format.size = Some(Pixels(BODY_SIZE));
-            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
+            format.size = Some(BODY_SIZE);
+            format.line_height = Some(LineHeight::Absolute(BODY_SIZE * BODY_LINE_HEIGHT));
             let (fill, line) = match checked {
                 true => (ink.tick_fill, ink.tick_fill),
-                false => (Color::TRANSPARENT, ink.marker),
+                false => (TRANSPARENT, ink.marker),
             };
-            format.highlight = Some(TextHighlight {
-                background: fill.into(),
-                border: Border {
-                    color: line,
-                    width: 1.4,
-                    radius: 3.0.into(),
-                },
-            });
+            format.background = Some(fill);
+            format.border = Some(border(line, 1.4, 3.0));
             // Paint-only padding, and the whole reason the box is square: the
             // span is ONE glyph and the highlight grows from its advance, so
             // each side takes half of what the glyph leaves of the box. The
@@ -732,38 +683,48 @@ fn paint(mark: &Mark, dark: bool) -> Format {
         Mark::TickEdge { checked, style } => {
             let mut format = body_format(style, ink);
             format.strikethrough = None;
-            format.color = Some(Color::TRANSPARENT);
-            format.size = Some(Pixels(bracket_size(checked)));
-            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
+            format.color = Some(TRANSPARENT);
+            format.size = Some(bracket_size(checked));
+            format.line_height = Some(LineHeight::Absolute(BODY_SIZE * BODY_LINE_HEIGHT));
             format
         }
         Mark::Body(style) => body_format(style, ink),
         Mark::Fence { hidden } => Format {
             color: Some(match hidden {
-                true => Color::TRANSPARENT,
+                true => TRANSPARENT,
                 false => ink.marker,
             }),
             font: Some(code_font()),
-            size: Some(Pixels(match hidden {
+            size: Some(match hidden {
                 true => HIDDEN_SIZE,
                 false => CODE_SIZE,
-            })),
-            line_height: Some(LineHeight::Absolute(Pixels(match hidden {
+            }),
+            line_height: Some(LineHeight::Absolute(match hidden {
                 // The hidden fence row is the plate's own vertical inset.
                 true => CODE_PLATE_PAD,
                 false => CODE_SIZE * CODE_LINE_HEIGHT,
-            }))),
-            line_highlight: Some(code_plate(ink)),
-            line_padding: Padding::from([0.0, CODE_PLATE_PAD]),
+            })),
+            line_background: Some(ink.code_plate),
+            line_border: Some(border(ink.code_line, 1.0, 10.0)),
+            line_padding: Padding {
+                left: CODE_PLATE_PAD,
+                right: CODE_PLATE_PAD,
+                ..Padding::default()
+            },
             ..Format::default()
         },
         Mark::CodeBody => Format {
             color: Some(ink.code_ink),
             font: Some(code_font()),
-            size: Some(Pixels(CODE_SIZE)),
-            line_height: Some(LineHeight::Absolute(Pixels(CODE_SIZE * CODE_LINE_HEIGHT))),
-            line_highlight: Some(code_plate(ink)),
-            line_padding: Padding::from([0.0, CODE_PLATE_PAD]),
+            size: Some(CODE_SIZE),
+            line_height: Some(LineHeight::Absolute(CODE_SIZE * CODE_LINE_HEIGHT)),
+            line_background: Some(ink.code_plate),
+            line_border: Some(border(ink.code_line, 1.0, 10.0)),
+            line_padding: Padding {
+                left: CODE_PLATE_PAD,
+                right: CODE_PLATE_PAD,
+                ..Padding::default()
+            },
             ..Format::default()
         },
     }
@@ -779,16 +740,14 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         false => FontStyle::Normal,
     };
     let color = if style.link {
-        ink.link
+        Some(ink.link)
     } else if style.done || style.quote || style.divider {
-        ink.muted
-    } else if style.heading.is_some() {
-        ink.strong
+        Some(ink.muted)
     } else {
-        ink.body
+        None
     };
     let mut format = Format {
-        color: Some(color),
+        color,
         font: Some(body_font(weight, italic)),
         strikethrough: style.done.then_some(ink.marker),
         ..Format::default()
@@ -797,35 +756,31 @@ fn body_format(style: Style, ink: &Ink) -> Format {
     // in-document anchor for the rail's threads. The callout keeps its own
     // tile (the stronger plate already marks the line).
     if style.commented && !style.callout {
-        format.line_highlight = Some(TextHighlight {
-            background: ink.comment_wash.into(),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 6.0.into(),
-            },
-        });
+        format.line_background = Some(ink.comment_wash);
+        format.line_border = Some(border(TRANSPARENT, 0.0, 6.0));
     }
     if let Some(level) = style.heading {
         let step = usize::from(level).saturating_sub(1).min(2);
         let size = HEADING_SIZE[step];
-        format.size = Some(Pixels(size));
-        format.line_height = Some(LineHeight::Absolute(Pixels(
-            size * HEADING_LINE_HEIGHT[step],
-        )));
+        format.size = Some(size);
+        format.line_height = Some(LineHeight::Absolute(size * HEADING_LINE_HEIGHT[step]));
         return format;
     }
     if style.callout {
-        format.size = Some(Pixels(CALLOUT_SIZE));
-        format.line_height = Some(LineHeight::Absolute(Pixels(
-            CALLOUT_SIZE * CALLOUT_LINE_HEIGHT,
-        )));
-        format.line_highlight = Some(callout_plate(ink));
-        format.line_padding = Padding::from([9.0, 14.0]);
+        format.size = Some(CALLOUT_SIZE);
+        format.line_height = Some(LineHeight::Absolute(CALLOUT_SIZE * CALLOUT_LINE_HEIGHT));
+        format.line_background = Some(ink.callout_plate);
+        format.line_border = Some(border(ink.callout_line, 1.0, 11.0));
+        format.line_padding = Padding {
+            top: 9.0,
+            bottom: 9.0,
+            left: 14.0,
+            right: 14.0,
+        };
         return format;
     }
     if style.quote {
-        format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * QUOTE_LINE_HEIGHT)));
+        format.line_height = Some(LineHeight::Absolute(BODY_SIZE * QUOTE_LINE_HEIGHT));
     }
     format
 }
@@ -833,6 +788,51 @@ fn body_format(style: Style, ink: &Ink) -> Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_text_inherits_native_ink_without_erasing_semantic_marks() {
+        for dark in [false, true] {
+            for mark in [
+                Mark::Title,
+                Mark::Body(Style::default()),
+                Mark::Body(Style {
+                    strong: true,
+                    ..Style::default()
+                }),
+                Mark::Body(Style {
+                    heading: Some(1),
+                    ..Style::default()
+                }),
+            ] {
+                assert_eq!(format(&mark, dark).color, None);
+            }
+            assert!(
+                format(
+                    &Mark::Body(Style {
+                        link: true,
+                        ..Style::default()
+                    }),
+                    dark
+                )
+                .color
+                .is_some()
+            );
+            assert!(
+                format(
+                    &Mark::Body(Style {
+                        commented: true,
+                        ..Style::default()
+                    }),
+                    dark
+                )
+                .line_background
+                .is_some()
+            );
+            let code = format(&Mark::CodeBody, dark);
+            assert!(code.color.is_some());
+            assert!(code.line_background.is_some());
+        }
+    }
 
     fn shapes(line: &str) -> (Prefix, usize) {
         prefix_of(line)
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn line_zero_is_the_title_and_nothing_in_it_is_markdown() {
-        let mut highlighter = <DocumentHighlighter as Highlighter>::new(&Caret {
+        let mut highlighter = DocumentHighlighter::new(&Caret {
             focused: true,
             line: 0,
             column: 0,
@@ -952,7 +952,7 @@ mod tests {
         let (away, _) = highlight("---", false, false, false);
         assert!(matches!(away[0].1, Mark::Marker { hidden: true, .. }));
         let painted = format(&away[0].1, false);
-        assert_eq!(painted.color, Some(Color::TRANSPARENT));
+        assert_eq!(painted.color, Some(TRANSPARENT));
         assert!(painted.line_rule.is_some());
         // Full size: the line keeps its height and its click target.
         assert!(painted.size.is_none());
@@ -960,7 +960,7 @@ mod tests {
         let (under, _) = highlight("---", false, true, false);
         let editable = format(&under[0].1, false);
         assert!(editable.line_rule.is_none());
-        assert_ne!(editable.color, Some(Color::TRANSPARENT));
+        assert_ne!(editable.color, Some(TRANSPARENT));
     }
 
     #[test]
@@ -981,9 +981,9 @@ mod tests {
         assert!(matches!(marks[4].1, Mark::Body(_)));
         // An empty box is an outline around an invisible space.
         let tick = format(&marks[2].1, false);
-        assert_eq!(tick.color, Some(Color::TRANSPARENT));
-        assert!(tick.highlight.is_some());
-        assert_eq!(format(&marks[1].1, false).color, Some(Color::TRANSPARENT));
+        assert_eq!(tick.color, Some(TRANSPARENT));
+        assert!(tick.background.is_some());
+        assert_eq!(format(&marks[1].1, false).color, Some(TRANSPARENT));
         // A plain bullet keeps its visible marker, exactly as before.
         let (bullet, _) = highlight("- plain", false, false, false);
         assert!(matches!(bullet[0].1, Mark::ListMarker(_)));
@@ -997,10 +997,7 @@ mod tests {
         // fill reads as a swatch, not as a ticked box.
         let tick = format(&marks[2].1, false);
         assert_eq!(tick.color, Some(LIGHT.tick_mark));
-        assert_eq!(
-            tick.highlight.expect("a filled box").background,
-            LIGHT.tick_fill.into()
-        );
+        assert_eq!(tick.background.expect("a filled box"), LIGHT.tick_fill);
         assert!(tick.strikethrough.is_none());
         let Mark::Body(style) = marks[4].1 else {
             unreachable!("a body run")
@@ -1058,7 +1055,7 @@ mod tests {
                 .find(|(range, _)| *range == (0..2))
                 .expect("an indent run");
             let format = format(&indent.1, false);
-            assert_eq!(format.size, Some(Pixels(HIDDEN_SIZE)), "{marks:?}");
+            assert_eq!(format.size, Some(HIDDEN_SIZE), "{marks:?}");
             assert_eq!(format.line_padding.left, steps * NEST_STEP, "{marks:?}");
         };
 
@@ -1101,8 +1098,8 @@ mod tests {
             },
             false,
         );
-        assert_eq!(hidden.color, Some(Color::TRANSPARENT));
-        assert!(hidden.size.expect("a size").0 > 0.0);
+        assert_eq!(hidden.color, Some(TRANSPARENT));
+        assert!(hidden.size.expect("a size") > 0.0);
     }
 }
 
@@ -1112,7 +1109,7 @@ mod plate_probe {
 
     #[test]
     fn the_code_body_line_keeps_full_size_ink() {
-        let mut hl = <DocumentHighlighter as Highlighter>::new(&Caret {
+        let mut hl = DocumentHighlighter::new(&Caret {
             focused: true,
             line: 0,
             column: 0,
@@ -1138,9 +1135,9 @@ mod plate_probe {
         assert_eq!(cargo.len(), 1, "{cargo:?}");
         assert!(matches!(cargo[0].1, Mark::CodeBody), "{cargo:?}");
         let f = format(&cargo[0].1, false);
-        assert_eq!(f.size.map(|s| s.0), Some(CODE_SIZE));
-        assert!(f.color.expect("ink").a > 0.9, "opaque ink");
-        assert!(f.line_highlight.is_some());
+        assert_eq!(f.size, Some(CODE_SIZE));
+        assert!(f.color.expect("ink").0[3] > 0.9, "opaque ink");
+        assert!(f.line_background.is_some());
     }
 
     /// A block is inset above and below so paragraphs sit apart, not
@@ -1156,7 +1153,13 @@ mod plate_probe {
         );
 
         let (code, _) = highlight("let x = 1;", true, false, false);
-        assert_eq!(format(&code[0].1, false).line_padding.y(), 0.0);
+        assert_eq!(
+            {
+                let pad = format(&code[0].1, false).line_padding;
+                pad.top + pad.bottom
+            },
+            0.0
+        );
 
         let (callout, _) = highlight("!> note", false, false, false);
         for (_, mark) in &callout {
