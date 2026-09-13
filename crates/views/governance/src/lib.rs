@@ -10,6 +10,7 @@
 //! the key and the password never cross: a guest that sees no key cannot
 //! leak one.
 pub mod host;
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GovernanceView {
     pub(crate) rows: Vec<crate::host::ProposalRow>,
     pub(crate) voting: String,
@@ -18,7 +19,6 @@ pub struct GovernanceView {
     pub(crate) connection_serial: i64,
     pub(crate) answered: bool,
     pub(crate) host_error: String,
-    pub(crate) badge_sent: bool,
 }
 impl ::std::fmt::Debug for GovernanceView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -49,7 +49,6 @@ impl GovernanceView {
             connection_serial: 0,
             answered: false,
             host_error: "".to_owned(),
-            badge_sent: false,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
@@ -58,389 +57,28 @@ impl GovernanceView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "7c12db27b05b027805b40f4d493f95bcbf83f7b71fb9a350d90ef241043cbc72";
+}
+#[allow(unused_parens)]
+impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        ::ducktape_view_guest::wire::Snapshot {
-            schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name: String::from("GovernanceView"),
-                fields: vec![
-                    (
-                        String::from("rows"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.rows)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("ProposalRow"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("id"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).id)
-                                            )
-                                        ),
-                                        (
-                                            String::from("action"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).action)
-                                            )
-                                        ),
-                                        (
-                                            String::from("detail"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).detail)
-                                            )
-                                        ),
-                                        (
-                                            String::from("proposer"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(
-                                                    &(item).proposer
-                                                )
-                                            )
-                                        ),
-                                        (
-                                            String::from("status"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).status)
-                                            )
-                                        ),
-                                        (
-                                            String::from("deadline"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).deadline)
-                                            )
-                                        ),
-                                        (
-                                            String::from("approvals"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).approvals)
-                                            )
-                                        ),
-                                        (
-                                            String::from("rejections"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).rejections)
-                                            )
-                                        ),
-                                        (
-                                            String::from("rule"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).rule)
-                                            )
-                                        ),
-                                        (
-                                            String::from("required_yes"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).required_yes)
-                                            )
-                                        ),
-                                        (
-                                            String::from("electorate"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).electorate)
-                                            )
-                                        ),
-                                        (
-                                            String::from("open"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                                *(&(item).open)
-                                            )
-                                        ),
-                                        (
-                                            String::from("settled_height"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).settled_height)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("voting"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.voting),
-                        ),
-                    ),
-                    (
-                        String::from("admin"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.admin)),
-                    ),
-                    (
-                        String::from("connected"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.connected)),
-                    ),
-                    (
-                        String::from("connection_serial"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.connection_serial)),
-                    ),
-                    (
-                        String::from("answered"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.answered)),
-                    ),
-                    (
-                        String::from("host_error"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.host_error),
-                        ),
-                    ),
-                    (
-                        String::from("badge_sent"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.badge_sent)),
-                    ),
-                ],
-            },
+        use ducktape_view_guest::wire;
+        wire::Snapshot {
+            schema: Self::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(self)),
         }
         .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot = ::ducktape_view_guest::wire::Snapshot::decode(bytes)?;
+        use ducktape_view_guest::wire;
+        let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
-            return Err(String::from("snapshot schema mismatch"));
+            return Err("invalid Governance snapshot schema".into());
         }
-        let value = snapshot.state;
-        ((|| {
-            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name: name,
-                fields: fields,
-            } = value
-            else {
-                return None;
-            };
-            if name != "GovernanceView" || fields.len() != 8 {
-                return None;
-            }
-            let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "rows" {
-                return None;
-            }
-            let rows: Vec<crate::host::ProposalRow> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => items
-                    .into_iter()
-                    .map(|item| {
-                        (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: name,
-                                fields: fields,
-                            } = item
-                            else {
-                                return None;
-                            };
-                            if name != "ProposalRow" || fields.len() != 13 {
-                                return None;
-                            }
-                            let mut fields = fields.into_iter();
-                            let (name, field_0) = fields.next()?;
-                            if name != "id" {
-                                return None;
-                            }
-                            let (name, field_1) = fields.next()?;
-                            if name != "action" {
-                                return None;
-                            }
-                            let (name, field_2) = fields.next()?;
-                            if name != "detail" {
-                                return None;
-                            }
-                            let (name, field_3) = fields.next()?;
-                            if name != "proposer" {
-                                return None;
-                            }
-                            let (name, field_4) = fields.next()?;
-                            if name != "status" {
-                                return None;
-                            }
-                            let (name, field_5) = fields.next()?;
-                            if name != "deadline" {
-                                return None;
-                            }
-                            let (name, field_6) = fields.next()?;
-                            if name != "approvals" {
-                                return None;
-                            }
-                            let (name, field_7) = fields.next()?;
-                            if name != "rejections" {
-                                return None;
-                            }
-                            let (name, field_8) = fields.next()?;
-                            if name != "rule" {
-                                return None;
-                            }
-                            let (name, field_9) = fields.next()?;
-                            if name != "required_yes" {
-                                return None;
-                            }
-                            let (name, field_10) = fields.next()?;
-                            if name != "electorate" {
-                                return None;
-                            }
-                            let (name, field_11) = fields.next()?;
-                            if name != "open" {
-                                return None;
-                            }
-                            let (name, field_12) = fields.next()?;
-                            if name != "settled_height" {
-                                return None;
-                            }
-                            Some(crate::host::ProposalRow {
-                                id: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                action: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                detail: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                proposer: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                status: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                deadline: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                approvals: (match field_6 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                rejections: (match field_7 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                rule: (match field_8 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                required_yes: (match field_9 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                electorate: (match field_10 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                open: (match field_11 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                settled_height: (match field_12 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                            })
-                        })()
-                    })
-                    .collect::<Option<Vec<_>>>(),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "voting" {
-                return None;
-            }
-            let voting: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "admin" {
-                return None;
-            }
-            let admin: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "connected" {
-                return None;
-            }
-            let connected: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "connection_serial" {
-                return None;
-            }
-            let connection_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "answered" {
-                return None;
-            }
-            let answered: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "host_error" {
-                return None;
-            }
-            let host_error: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "badge_sent" {
-                return None;
-            }
-            let badge_sent: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            Some(Self {
-                rows: rows,
-                voting: voting,
-                admin: admin,
-                connected: connected,
-                connection_serial: connection_serial,
-                answered: answered,
-                host_error: host_error,
-                badge_sent: badge_sent,
-            })
-        })())
-        .ok_or_else(|| String::from("snapshot state mismatch"))
+        let wire::SnapshotValue::Bytes(state) = snapshot.state else {
+            return Err("invalid Governance snapshot".into());
+        };
+        wire::decode(&state)
     }
-}
-#[allow(unused_parens)]
-impl GovernanceView {
     fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(move |value| Message::SessionArrived(value)),
@@ -555,9 +193,7 @@ impl GovernanceView {
                 return ::ducktape_view_guest::Task::none();
             }
             self.rows = item.rows.clone();
-            self.badge_sent = (crate::host::badge(crate::host::open_proposals(
-                ::std::convert::AsRef::as_ref(&(self.rows)),
-            )));
+            crate::host::badge(crate::host::open_proposals(&self.rows));
             ::ducktape_view_guest::Task::none()
         }
     }

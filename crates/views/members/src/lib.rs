@@ -10,13 +10,14 @@
 //! The endpoint, the key and the password never cross: a guest that sees no
 //! key cannot leak one.
 pub mod host;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum MembersFilter {
     All,
     Humans,
     Agents,
     Validators,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MembersView {
     pub(crate) rows: Vec<crate::host::MemberRow>,
     pub(crate) admin: bool,
@@ -28,7 +29,6 @@ pub struct MembersView {
     pub(crate) selected: String,
     pub(crate) height: i64,
     pub(crate) acting: String,
-    pub(crate) sent: bool,
     pub(crate) viewport_width: f64,
     pub(crate) member_width: f64,
 }
@@ -69,7 +69,6 @@ impl MembersView {
             selected: "".to_owned(),
             height: 0,
             acting: "".to_owned(),
-            sent: false,
             viewport_width: 1280.0,
             member_width: 312.0,
         }
@@ -80,421 +79,28 @@ impl MembersView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
         "c5b4c71dda09d5a068e1b5197b676ac214130791d9b62a6629ac8f67428df93e";
+}
+#[allow(unused_parens)]
+impl MembersView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        ::ducktape_view_guest::wire::Snapshot {
-            schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name: String::from("MembersView"),
-                fields: vec![
-                    (
-                        String::from("rows"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.rows)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("MemberRow"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("key"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).key)
-                                            )
-                                        ),
-                                        (
-                                            String::from("label"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).label)
-                                            )
-                                        ),
-                                        (
-                                            String::from("role"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).role)
-                                            )
-                                        ),
-                                        (
-                                            String::from("is_this_node"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                                *(&(item).is_this_node)
-                                            )
-                                        ),
-                                        (
-                                            String::from("is_agent"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                                *(&(item).is_agent)
-                                            )
-                                        ),
-                                        (
-                                            String::from("model"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).model)
-                                            )
-                                        ),
-                                        (
-                                            String::from("live"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                                *(&(item).live)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("admin"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.admin)),
-                    ),
-                    (
-                        String::from("connected"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.connected)),
-                    ),
-                    (
-                        String::from("connection_serial"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.connection_serial)),
-                    ),
-                    (
-                        String::from("answered"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.answered)),
-                    ),
-                    (
-                        String::from("host_error"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.host_error),
-                        ),
-                    ),
-                    (
-                        String::from("filter"),
-                        match &self.filter {
-                            MembersFilter::All => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("MembersFilter"),
-                                    fields: vec![(
-                                        String::from("all"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                            MembersFilter::Humans => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("MembersFilter"),
-                                    fields: vec![(
-                                        String::from("humans"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                            MembersFilter::Agents => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("MembersFilter"),
-                                    fields: vec![(
-                                        String::from("agents"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                            MembersFilter::Validators => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("MembersFilter"),
-                                    fields: vec![(
-                                        String::from("validators"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                        },
-                    ),
-                    (
-                        String::from("selected"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.selected),
-                        ),
-                    ),
-                    (
-                        String::from("height"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.height)),
-                    ),
-                    (
-                        String::from("acting"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.acting),
-                        ),
-                    ),
-                    (
-                        String::from("sent"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.sent)),
-                    ),
-                    (
-                        String::from("viewport_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.viewport_width)),
-                    ),
-                    (
-                        String::from("member_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.member_width)),
-                    ),
-                ],
-            },
+        use ducktape_view_guest::wire;
+        wire::Snapshot {
+            schema: Self::SNAPSHOT_SCHEMA.into(),
+            state: wire::SnapshotValue::Bytes(wire::encode(self)),
         }
         .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot = ::ducktape_view_guest::wire::Snapshot::decode(bytes)?;
+        use ducktape_view_guest::wire;
+        let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
-            return Err(String::from("snapshot schema mismatch"));
+            return Err("invalid Members snapshot schema".into());
         }
-        let value = snapshot.state;
-        ((|| {
-            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name: name,
-                fields: fields,
-            } = value
-            else {
-                return None;
-            };
-            if name != "MembersView" || fields.len() != 13 {
-                return None;
-            }
-            let mut fields = fields.into_iter();
-            let (name, value) = fields.next()?;
-            if name != "rows" {
-                return None;
-            }
-            let rows: Vec<crate::host::MemberRow> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => items
-                    .into_iter()
-                    .map(|item| {
-                        (|| {
-                            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: name,
-                                fields: fields,
-                            } = item
-                            else {
-                                return None;
-                            };
-                            if name != "MemberRow" || fields.len() != 7 {
-                                return None;
-                            }
-                            let mut fields = fields.into_iter();
-                            let (name, field_0) = fields.next()?;
-                            if name != "key" {
-                                return None;
-                            }
-                            let (name, field_1) = fields.next()?;
-                            if name != "label" {
-                                return None;
-                            }
-                            let (name, field_2) = fields.next()?;
-                            if name != "role" {
-                                return None;
-                            }
-                            let (name, field_3) = fields.next()?;
-                            if name != "is_this_node" {
-                                return None;
-                            }
-                            let (name, field_4) = fields.next()?;
-                            if name != "is_agent" {
-                                return None;
-                            }
-                            let (name, field_5) = fields.next()?;
-                            if name != "model" {
-                                return None;
-                            }
-                            let (name, field_6) = fields.next()?;
-                            if name != "live" {
-                                return None;
-                            }
-                            Some(crate::host::MemberRow {
-                                key: (match field_0 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                label: (match field_1 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                role: (match field_2 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                is_this_node: (match field_3 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                is_agent: (match field_4 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                model: (match field_5 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                                live: (match field_6 {
-                                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                        Some(item)
-                                    }
-                                    _ => None,
-                                })?,
-                            })
-                        })()
-                    })
-                    .collect::<Option<Vec<_>>>(),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "admin" {
-                return None;
-            }
-            let admin: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "connected" {
-                return None;
-            }
-            let connected: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "connection_serial" {
-                return None;
-            }
-            let connection_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "answered" {
-                return None;
-            }
-            let answered: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "host_error" {
-                return None;
-            }
-            let host_error: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "filter" {
-                return None;
-            }
-            let filter: MembersFilter = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name: name,
-                    fields: fields,
-                } = value
-                else {
-                    return None;
-                };
-                if name != "MembersFilter" || fields.len() != 1 {
-                    return None;
-                }
-                let (variant, payload) = fields.into_iter().next()?;
-                match variant.as_str() {
-                    "all" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(MembersFilter::All),
-                    "humans" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(MembersFilter::Humans),
-                    "agents" => matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                        .then_some(MembersFilter::Agents),
-                    "validators" => {
-                        matches!(payload, ::ducktape_view_guest::wire::SnapshotValue::Unit)
-                            .then_some(MembersFilter::Validators)
-                    }
-                    _ => None,
-                }
-            })())?;
-            let (name, value) = fields.next()?;
-            if name != "selected" {
-                return None;
-            }
-            let selected: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "height" {
-                return None;
-            }
-            let height: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "acting" {
-                return None;
-            }
-            let acting: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "sent" {
-                return None;
-            }
-            let sent: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "viewport_width" {
-                return None;
-            }
-            let viewport_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(item) if item.is_finite() => {
-                    Some(item)
-                }
-                _ => None,
-            })?;
-            let (name, value) = fields.next()?;
-            if name != "member_width" {
-                return None;
-            }
-            let member_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(item) if item.is_finite() => {
-                    Some(item)
-                }
-                _ => None,
-            })?;
-            Some(Self {
-                rows: rows,
-                admin: admin,
-                connected: connected,
-                connection_serial: connection_serial,
-                answered: answered,
-                host_error: host_error,
-                filter: filter,
-                selected: selected,
-                height: height,
-                acting: acting,
-                sent: sent,
-                viewport_width: viewport_width,
-                member_width: member_width,
-            })
-        })())
-        .ok_or_else(|| String::from("snapshot state mismatch"))
+        let wire::SnapshotValue::Bytes(state) = snapshot.state else {
+            return Err("invalid Members snapshot".into());
+        };
+        wire::decode(&state)
     }
-}
-#[allow(unused_parens)]
-impl MembersView {
     fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(move |value| Message::SessionArrived(value)),
@@ -632,10 +238,7 @@ impl MembersView {
     }
     fn on_copy_key(&mut self, text: String, label: String) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.sent = (crate::host::copy(
-                ::std::convert::AsRef::as_ref(&(text)),
-                ::std::convert::AsRef::as_ref(&(label)),
-            ));
+            crate::host::copy(&text, &label);
             ::ducktape_view_guest::Task::none()
         }
     }
