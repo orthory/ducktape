@@ -1,13 +1,9 @@
+use ducktape_view_guest::{kit as native, wire};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AppTheme {
     App,
     AppDark,
-}
-#[derive(Clone, Copy)]
-struct Palette {
-    name: &'static str,
-    colors: [::ducktape_view_guest::wire::Rgba; 128],
 }
 #[derive(Default)]
 struct DerivedCache {
@@ -29,9 +25,7 @@ pub(crate) struct FilesScreenState {
 }
 impl ::std::default::Default for FilesScreenState {
     fn default() -> Self {
-        Self {
-            history_open: false,
-        }
+        Self { history_open: false }
     }
 }
 #[cfg(test)]
@@ -43,7 +37,10 @@ pub(crate) struct FilesScreenStateSnapshot {
 #[cfg(test)]
 #[allow(dead_code)]
 impl FilesView {
-    pub(crate) fn test_state_files_screen(&self, scope: &str) -> Option<FilesScreenStateSnapshot> {
+    pub(crate) fn test_state_files_screen(
+        &self,
+        scope: &str,
+    ) -> Option<FilesScreenStateSnapshot> {
         let view = |state: &FilesScreenState| FilesScreenStateSnapshot {
             history_open: state.history_open.clone(),
         };
@@ -100,7 +97,10 @@ pub struct FilesView {
     pub(crate) object_width: f64,
     pub(crate) derived: DerivedCache,
     pub(crate) preview_text_revision: u64,
-    pub(crate) files_screen_states: ::std::collections::HashMap<String, FilesScreenState>,
+    pub(crate) files_screen_states: ::std::collections::HashMap<
+        String,
+        FilesScreenState,
+    >,
     pub(crate) files_screen_initial: FilesScreenState,
 }
 impl ::std::fmt::Debug for FilesView {
@@ -151,18 +151,24 @@ impl FilesView {
     fn derived_refusal(&self) -> &String {
         self.derived
             .refusal
-            .get_or_init(|| crate::host::write_refusal(::std::convert::AsRef::as_ref(&(self.path))))
+            .get_or_init(|| crate::host::write_refusal(
+                ::std::convert::AsRef::as_ref(&(self.path)),
+            ))
     }
     fn derived_loading(&self) -> &bool {
         self.derived
             .loading
-            .get_or_init(|| ((self.acting || self.saving) || (self.connected && (!self.listed))))
+            .get_or_init(|| {
+                ((self.acting || self.saving) || (self.connected && (!self.listed)))
+            })
     }
     fn derived_draft_here(&self) -> &bool {
-        self.derived.draft_here.get_or_init(|| {
-            ((self.editing && (self.draft_path == self.preview_path))
-                && (self.draft_chain == self.chain))
-        })
+        self.derived
+            .draft_here
+            .get_or_init(|| {
+                ((self.editing && (self.draft_path == self.preview_path))
+                    && (self.draft_chain == self.chain))
+            })
     }
     fn derived_draft_parked(&self) -> &bool {
         self.derived
@@ -170,1568 +176,20 @@ impl FilesView {
             .get_or_init(|| (self.editing && (!(*self.derived_draft_here()))))
     }
     fn derived_edit_context(&self) -> &String {
-        self.derived.edit_context.get_or_init(|| {
-            crate::host::edit_token(
-                ::std::convert::AsRef::as_ref(&(self.chain)),
-                ::std::convert::AsRef::as_ref(&(self.preview_path)),
-                ::std::convert::AsRef::as_ref(&(self.preview_base)),
-                self.draft_id,
-            )
-        })
+        self.derived
+            .edit_context
+            .get_or_init(|| {
+                crate::host::edit_token(
+                    ::std::convert::AsRef::as_ref(&(self.chain)),
+                    ::std::convert::AsRef::as_ref(&(self.preview_path)),
+                    ::std::convert::AsRef::as_ref(&(self.preview_base)),
+                    self.draft_id,
+                )
+            })
     }
 }
 #[allow(unused_parens)]
 impl FilesView {
-    fn palette(&self) -> Palette {
-        match self.active_palette.clone() {
-            AppTheme::App => Palette {
-                name: "app",
-                colors: [
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        56.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        210.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        253.0 / 255.0,
-                        251.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        44.0 / 255.0,
-                        43.0 / 255.0,
-                        39.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        105.0 / 255.0,
-                        98.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        246.0 / 255.0,
-                        245.0 / 255.0,
-                        242.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        47.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        235.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        179.0 / 255.0,
-                        177.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        94.0 / 255.0,
-                        92.0 / 255.0,
-                        85.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        242.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        63.0 / 255.0,
-                        62.0 / 255.0,
-                        57.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        90.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        249.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        231.0 / 255.0,
-                        210.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        184.0 / 255.0,
-                        84.0 / 255.0,
-                        76.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        244.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        239.0 / 255.0,
-                        214.0 / 255.0,
-                        211.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        101.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        158.0 / 255.0,
-                        116.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        245.0 / 255.0,
-                        240.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        227.0 / 255.0,
-                        215.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        92.0 / 255.0,
-                        180.0 / 255.0,
-                        95.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        123.0 / 255.0,
-                        50.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        244.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        220.0 / 255.0,
-                        174.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        180.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        210.0 / 255.0,
-                        208.0 / 255.0,
-                        199.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        79.0 / 255.0,
-                        77.0 / 255.0,
-                        71.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        231.0 / 255.0,
-                        230.0 / 255.0,
-                        226.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        223.0 / 255.0,
-                        215.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        138.0 / 255.0,
-                        137.0 / 255.0,
-                        131.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.619608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        252.0 / 255.0,
-                        250.0 / 255.0,
-                        0.858824,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.129412,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.219608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.301961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.219608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.101961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        225.0 / 255.0,
-                        217.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        234.0 / 255.0,
-                        227.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        250.0 / 255.0,
-                        248.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        251.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        242.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        235.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        248.0 / 255.0,
-                        247.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        239.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        214.0 / 255.0,
-                        212.0 / 255.0,
-                        204.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        239.0 / 255.0,
-                        238.0 / 255.0,
-                        233.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        9.0 / 255.0,
-                        11.0 / 255.0,
-                        14.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        42.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        233.0 / 255.0,
-                        225.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        214.0 / 255.0,
-                        208.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        246.0 / 255.0,
-                        244.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        82.0 / 255.0,
-                        72.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        70.0 / 255.0,
-                        61.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        47.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        57.0 / 255.0,
-                        52.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        154.0 / 255.0,
-                        152.0 / 255.0,
-                        143.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        167.0 / 255.0,
-                        165.0 / 255.0,
-                        155.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        179.0 / 255.0,
-                        177.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        189.0 / 255.0,
-                        187.0 / 255.0,
-                        177.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        203.0 / 255.0,
-                        201.0 / 255.0,
-                        191.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        123.0 / 255.0,
-                        167.0 / 255.0,
-                        140.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        122.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        242.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        218.0 / 255.0,
-                        226.0 / 255.0,
-                        236.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        82.0 / 255.0,
-                        72.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        236.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        236.0 / 255.0,
-                        207.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        106.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        248.0 / 255.0,
-                        240.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        38.0 / 255.0,
-                        34.0 / 255.0,
-                        0.341176,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        247.0 / 255.0,
-                        246.0 / 255.0,
-                        242.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        249.0 / 255.0,
-                        246.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        252.0 / 255.0,
-                        251.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        250.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        253.0 / 255.0,
-                        248.0 / 255.0,
-                        243.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        236.0 / 255.0,
-                        225.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        231.0 / 255.0,
-                        200.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        217.0 / 255.0,
-                        216.0 / 255.0,
-                        208.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        213.0 / 255.0,
-                        211.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        182.0 / 255.0,
-                        180.0 / 255.0,
-                        168.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        200.0 / 255.0,
-                        198.0 / 255.0,
-                        188.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        194.0 / 255.0,
-                        192.0 / 255.0,
-                        182.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        208.0 / 255.0,
-                        206.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        219.0 / 255.0,
-                        212.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        120.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        126.0 / 255.0,
-                        158.0 / 255.0,
-                        136.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        102.0 / 255.0,
-                        100.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        111.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        241.0 / 255.0,
-                        237.0 / 255.0,
-                        245.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        221.0 / 255.0,
-                        210.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        240.0 / 255.0,
-                        245.0 / 255.0,
-                        241.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        235.0 / 255.0,
-                        224.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        238.0 / 255.0,
-                        246.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        225.0 / 255.0,
-                        239.0 / 255.0,
-                        227.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        47.0 / 255.0,
-                        107.0 / 255.0,
-                        65.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        251.0 / 255.0,
-                        238.0 / 255.0,
-                        236.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        221.0 / 255.0,
-                        216.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        161.0 / 255.0,
-                        67.0 / 255.0,
-                        56.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        246.0 / 255.0,
-                        243.0 / 255.0,
-                        249.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        72.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        145.0 / 255.0,
-                        138.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        138.0 / 255.0,
-                        90.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        95.0 / 255.0,
-                        138.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        237.0 / 255.0,
-                        244.0 / 255.0,
-                        239.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        122.0 / 255.0,
-                        111.0 / 255.0,
-                        158.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        241.0 / 255.0,
-                        239.0 / 255.0,
-                        247.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        72.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        242.0 / 255.0,
-                        241.0 / 255.0,
-                        237.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        185.0 / 255.0,
-                        113.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        240.0 / 255.0,
-                        233.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        192.0 / 255.0,
-                        138.0 / 255.0,
-                        62.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        250.0 / 255.0,
-                        243.0 / 255.0,
-                        230.0 / 255.0,
-                        1.000000,
-                    ]),
-                ],
-            },
-            AppTheme::AppDark => Palette {
-                name: "app_dark",
-                colors: [
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        210.0 / 255.0,
-                        202.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        34.0 / 255.0,
-                        33.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        166.0 / 255.0,
-                        156.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        242.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        50.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        106.0 / 255.0,
-                        97.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        41.0 / 255.0,
-                        37.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        181.0 / 255.0,
-                        179.0 / 255.0,
-                        169.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        39.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        201.0 / 255.0,
-                        138.0 / 255.0,
-                        99.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        38.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        56.0 / 255.0,
-                        43.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        217.0 / 255.0,
-                        123.0 / 255.0,
-                        114.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        33.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        224.0 / 255.0,
-                        101.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        184.0 / 255.0,
-                        148.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        71.0 / 255.0,
-                        58.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        92.0 / 255.0,
-                        180.0 / 255.0,
-                        95.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        169.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        21.0 / 255.0,
-                        20.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        39.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        63.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        227.0 / 255.0,
-                        180.0 / 255.0,
-                        67.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        58.0 / 255.0,
-                        57.0 / 255.0,
-                        49.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        243.0 / 255.0,
-                        241.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        31.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        53.0 / 255.0,
-                        52.0 / 255.0,
-                        46.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        59.0 / 255.0,
-                        58.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        133.0 / 255.0,
-                        131.0 / 255.0,
-                        123.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        232.0 / 255.0,
-                        230.0 / 255.0,
-                        223.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.619608,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        27.0 / 255.0,
-                        26.0 / 255.0,
-                        22.0 / 255.0,
-                        0.858824,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.250980,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.349020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.450980,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.349020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.149020,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        18.0 / 255.0,
-                        17.0 / 255.0,
-                        16.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        25.0 / 255.0,
-                        24.0 / 255.0,
-                        21.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        32.0 / 255.0,
-                        31.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        29.0 / 255.0,
-                        25.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        41.0 / 255.0,
-                        37.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        49.0 / 255.0,
-                        48.0 / 255.0,
-                        43.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        35.0 / 255.0,
-                        30.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        40.0 / 255.0,
-                        39.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        14.0 / 255.0,
-                        13.0 / 255.0,
-                        11.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        44.0 / 255.0,
-                        43.0 / 255.0,
-                        38.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        9.0 / 255.0,
-                        11.0 / 255.0,
-                        14.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        42.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        47.0 / 255.0,
-                        41.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        29.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        194.0 / 255.0,
-                        90.0 / 255.0,
-                        79.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        211.0 / 255.0,
-                        104.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        244.0 / 255.0,
-                        242.0 / 255.0,
-                        234.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        220.0 / 255.0,
-                        218.0 / 255.0,
-                        210.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        141.0 / 255.0,
-                        132.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        124.0 / 255.0,
-                        122.0 / 255.0,
-                        113.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        107.0 / 255.0,
-                        106.0 / 255.0,
-                        97.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        96.0 / 255.0,
-                        95.0 / 255.0,
-                        86.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        85.0 / 255.0,
-                        84.0 / 255.0,
-                        76.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        123.0 / 255.0,
-                        167.0 / 255.0,
-                        140.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        37.0 / 255.0,
-                        48.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        62.0 / 255.0,
-                        82.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        154.0 / 255.0,
-                        184.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        211.0 / 255.0,
-                        104.0 / 255.0,
-                        92.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        48.0 / 255.0,
-                        31.0 / 255.0,
-                        28.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        77.0 / 255.0,
-                        47.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        106.0 / 255.0,
-                        94.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        37.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.0 / 255.0,
-                        0.501961,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        32.0 / 255.0,
-                        31.0 / 255.0,
-                        26.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        35.0 / 255.0,
-                        34.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        37.0 / 255.0,
-                        32.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        36.0 / 255.0,
-                        24.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        27.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        53.0 / 255.0,
-                        50.0 / 255.0,
-                        42.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        58.0 / 255.0,
-                        30.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        63.0 / 255.0,
-                        62.0 / 255.0,
-                        54.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        69.0 / 255.0,
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        110.0 / 255.0,
-                        109.0 / 255.0,
-                        99.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        91.0 / 255.0,
-                        90.0 / 255.0,
-                        82.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        98.0 / 255.0,
-                        97.0 / 255.0,
-                        90.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        74.0 / 255.0,
-                        73.0 / 255.0,
-                        65.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        50.0 / 255.0,
-                        44.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        163.0 / 255.0,
-                        161.0 / 255.0,
-                        152.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        126.0 / 255.0,
-                        158.0 / 255.0,
-                        136.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        157.0 / 255.0,
-                        155.0 / 255.0,
-                        146.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        154.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        38.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        68.0 / 255.0,
-                        60.0 / 255.0,
-                        87.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        50.0 / 255.0,
-                        71.0 / 255.0,
-                        58.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        29.0 / 255.0,
-                        42.0 / 255.0,
-                        32.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        36.0 / 255.0,
-                        53.0 / 255.0,
-                        42.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        143.0 / 255.0,
-                        201.0 / 255.0,
-                        162.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        47.0 / 255.0,
-                        31.0 / 255.0,
-                        28.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        61.0 / 255.0,
-                        39.0 / 255.0,
-                        35.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        222.0 / 255.0,
-                        139.0 / 255.0,
-                        127.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        38.0 / 255.0,
-                        35.0 / 255.0,
-                        48.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        160.0 / 255.0,
-                        92.0 / 255.0,
-                        85.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        192.0 / 255.0,
-                        168.0 / 255.0,
-                        110.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        127.0 / 255.0,
-                        184.0 / 255.0,
-                        148.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        30.0 / 255.0,
-                        42.0 / 255.0,
-                        34.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        168.0 / 255.0,
-                        154.0 / 255.0,
-                        201.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        42.0 / 255.0,
-                        38.0 / 255.0,
-                        51.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        207.0 / 255.0,
-                        205.0 / 255.0,
-                        196.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        45.0 / 255.0,
-                        40.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        208.0 / 255.0,
-                        144.0 / 255.0,
-                        104.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        51.0 / 255.0,
-                        38.0 / 255.0,
-                        29.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        212.0 / 255.0,
-                        169.0 / 255.0,
-                        78.0 / 255.0,
-                        1.000000,
-                    ]),
-                    ::ducktape_view_guest::wire::Rgba([
-                        46.0 / 255.0,
-                        39.0 / 255.0,
-                        23.0 / 255.0,
-                        1.000000,
-                    ]),
-                ],
-            },
-        }
-    }
     fn title(&self) -> String {
         "Files".to_owned()
     }
@@ -1793,487 +251,195 @@ impl FilesView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
-    pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "524542bd8f5b55e48d5274087dd4997a644784746056385b50157aadfe239bba";
+    pub(crate) const SNAPSHOT_SCHEMA: &'static str = "524542bd8f5b55e48d5274087dd4997a644784746056385b50157aadfe239bba";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
-        ::ducktape_view_guest::wire::Snapshot {
+        wire::Snapshot {
             schema: String::from(Self::SNAPSHOT_SCHEMA),
-            state: ::ducktape_view_guest::wire::SnapshotValue::Record {
+            state: wire::SnapshotValue::Record {
                 name: String::from("FilesView"),
                 fields: vec![
-                    (
-                        String::from("active_palette"),
-                        match &self.active_palette {
-                            AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                name: String::from("AppTheme"),
-                                fields: vec![(
-                                    String::from("app"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                )],
-                            },
-                            AppTheme::AppDark => {
-                                ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("AppTheme"),
-                                    fields: vec![(
-                                        String::from("app_dark"),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Unit,
-                                    )],
-                                }
-                            }
-                        },
-                    ),
-                    (
-                        String::from("connected"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.connected)),
-                    ),
-                    (
-                        String::from("dark"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.dark)),
-                    ),
-                    (
-                        String::from("chain"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.chain),
-                        ),
-                    ),
-                    (
-                        String::from("generation"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.generation)),
-                    ),
-                    (
-                        String::from("route_serial"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.route_serial)),
-                    ),
-                    (
-                        String::from("path"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.path),
-                        ),
-                    ),
-                    (
-                        String::from("listed"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.listed)),
-                    ),
-                    (
-                        String::from("entries"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.entries)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("FsEntry"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("key"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).key)
-                                            )
-                                        ),
-                                        (
-                                            String::from("path"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).path)
-                                            )
-                                        ),
-                                        (
-                                            String::from("name"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).name)
-                                            )
-                                        ),
-                                        (
-                                            String::from("kind"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).kind)
-                                            )
-                                        ),
-                                        (
-                                            String::from("size"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).size)
-                                            )
-                                        ),
-                                        (
-                                            String::from("object"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).object)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("directories"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.directories)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("FsEntry"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("key"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).key)
-                                            )
-                                        ),
-                                        (
-                                            String::from("path"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).path)
-                                            )
-                                        ),
-                                        (
-                                            String::from("name"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).name)
-                                            )
-                                        ),
-                                        (
-                                            String::from("kind"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).kind)
-                                            )
-                                        ),
-                                        (
-                                            String::from("size"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).size)
-                                            )
-                                        ),
-                                        (
-                                            String::from("object"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).object)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("history"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.history)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("FsSnapshot"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("id"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).id)
-                                            )
-                                        ),
-                                        (
-                                            String::from("short_id"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(
-                                                    &(item).short_id
-                                                )
-                                            )
-                                        ),
-                                        (
-                                            String::from("author"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).author)
-                                            )
-                                        ),
-                                        (
-                                            String::from("height"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                                *(&(item).height)
-                                            )
-                                        ),
-                                        (
-                                            String::from("message"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).message)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("omitted"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.omitted)),
-                    ),
-                    (
-                        String::from("diff_omitted"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.diff_omitted)),
-                    ),
-                    (
-                        String::from("preview_path"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.preview_path),
-                        ),
-                    ),
-                    (
-                        String::from("preview_entry"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("FsEntry"),
-                            fields: ::std::vec![
-                                (
-                                    String::from("key"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                        *(&(&self.preview_entry).key)
-                                    )
-                                ),
-                                (
-                                    String::from("path"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                        ::std::string::ToString::to_string(
-                                            &(&self.preview_entry).path
-                                        )
-                                    )
-                                ),
-                                (
-                                    String::from("name"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                        ::std::string::ToString::to_string(
-                                            &(&self.preview_entry).name
-                                        )
-                                    )
-                                ),
-                                (
-                                    String::from("kind"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                        ::std::string::ToString::to_string(
-                                            &(&self.preview_entry).kind
-                                        )
-                                    )
-                                ),
-                                (
-                                    String::from("size"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::I64(
-                                        *(&(&self.preview_entry).size)
-                                    )
-                                ),
-                                (
-                                    String::from("object"),
-                                    ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                        ::std::string::ToString::to_string(
-                                            &(&self.preview_entry).object
-                                        )
-                                    )
-                                )
-                            ],
-                        },
-                    ),
-                    (
-                        String::from("preview_base"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.preview_base),
-                        ),
-                    ),
-                    (
-                        String::from("preview_text"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.preview_text),
-                        ),
-                    ),
-                    (
-                        String::from("preview_display_text"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.preview_display_text),
-                        ),
-                    ),
-                    (
-                        String::from("preview_clipped"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_clipped)),
-                    ),
-                    (
-                        String::from("preview_truncated"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                            *(&self.preview_truncated),
-                        ),
-                    ),
-                    (
-                        String::from("preview_binary"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_binary)),
-                    ),
-                    (
-                        String::from("preview_picture"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.preview_picture)),
-                    ),
-                    (
-                        String::from("preview_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.preview_width)),
-                    ),
-                    (
-                        String::from("preview_height"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.preview_height)),
-                    ),
-                    (
-                        String::from("delete_target"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.delete_target),
-                        ),
-                    ),
-                    (
-                        String::from("diff_from"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.diff_from),
-                        ),
-                    ),
-                    (
-                        String::from("diff"),
-                        ::ducktape_view_guest::wire::SnapshotValue::List(
-                            (&self.diff)
-                                .iter()
-                                .map(|item| ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name: String::from("FsDiffEntry"),
-                                    fields: ::std::vec![
-                                        (
-                                            String::from("path"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).path)
-                                            )
-                                        ),
-                                        (
-                                            String::from("kind"),
-                                            ::ducktape_view_guest::wire::SnapshotValue::Str(
-                                                ::std::string::ToString::to_string(&(item).kind)
-                                            )
-                                        )
-                                    ],
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        String::from("acting"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.acting)),
-                    ),
-                    (
-                        String::from("saving"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.saving)),
-                    ),
-                    (
-                        String::from("notice"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.notice),
-                        ),
-                    ),
-                    (
-                        String::from("new_name"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.new_name),
-                        ),
-                    ),
-                    (
-                        String::from("draft"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bytes((&self.draft).snapshot()),
-                    ),
-                    (
-                        String::from("editing"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.editing)),
-                    ),
-                    (
-                        String::from("draft_chain"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.draft_chain),
-                        ),
-                    ),
-                    (
-                        String::from("draft_path"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.draft_path),
-                        ),
-                    ),
-                    (
-                        String::from("draft_base"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(
-                            ::std::string::ToString::to_string(&self.draft_base),
-                        ),
-                    ),
-                    (
-                        String::from("draft_id"),
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(*(&self.draft_id)),
-                    ),
-                    (
-                        String::from("sent"),
-                        ::ducktape_view_guest::wire::SnapshotValue::Bool(*(&self.sent)),
-                    ),
-                    (
-                        String::from("viewport_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.viewport_width)),
-                    ),
-                    (
-                        String::from("viewport_height"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.viewport_height)),
-                    ),
-                    (
-                        String::from("tree_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.tree_width)),
-                    ),
-                    (
-                        String::from("preview_pane_height"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(
-                            *(&self.preview_pane_height),
-                        ),
-                    ),
-                    (
-                        String::from("object_width"),
-                        ::ducktape_view_guest::wire::SnapshotValue::F64(*(&self.object_width)),
-                    ),
-                    (String::from("files_screen_states"), {
-                        let values = &self.files_screen_states;
-                        let mut scopes = values.keys().collect::<Vec<_>>();
-                        scopes.sort();
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("FilesScreen instances"),
-                            fields: scopes
-                                .into_iter()
-                                .map(|scope| {
-                                    let component = &values[scope];
-                                    (
-                                        scope.clone(),
-                                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                            name: String::from("FilesScreen"),
-                                            fields: vec![(
-                                                String::from("history_open"),
-                                                ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                                    *(&component.history_open),
-                                                ),
-                                            )],
-                                        },
-                                    )
-                                })
-                                .collect(),
-                        }
-                    }),
-                    (String::from("files_screen_initial"), {
-                        let component = &self.files_screen_initial;
-                        ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name: String::from("FilesScreen"),
-                            fields: vec![(
-                                String::from("history_open"),
-                                ::ducktape_view_guest::wire::SnapshotValue::Bool(
-                                    *(&component.history_open),
-                                ),
-                            )],
-                        }
-                    }),
+                    (String::from("active_palette"), match & self.active_palette {
+                    AppTheme::App => ::ducktape_view_guest::wire::SnapshotValue::Record {
+                    name : String::from("AppTheme"), fields : vec![(String::from("app"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Unit,)], },
+                    AppTheme::AppDark => {
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("AppTheme"), fields : vec![(String::from("app_dark"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Unit,)], } } },),
+                    (String::from("connected"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .connected)),), (String::from("dark"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self.dark)),),
+                    (String::from("chain"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.chain),),), (String::from("generation"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .generation)),), (String::from("route_serial"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .route_serial)),), (String::from("path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.path),),), (String::from("listed"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .listed)),), (String::from("entries"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.entries)
+                    .iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).key))),
+                    (String::from("path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).path))), (String::from("name"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).name))), (String::from("kind"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).kind))), (String::from("size"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).size))),
+                    (String::from("object"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).object)))], }).collect(),),), (String::from("directories"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.directories)
+                    .iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).key))),
+                    (String::from("path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).path))), (String::from("name"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).name))), (String::from("kind"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).kind))), (String::from("size"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item).size))),
+                    (String::from("object"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).object)))], }).collect(),),), (String::from("history"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.history)
+                    .iter().map(| item |
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FsSnapshot"), fields : ::std::vec![(String::from("id"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).id))), (String::from("short_id"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).short_id))), (String::from("author"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).author))), (String::from("height"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (item)
+                    .height))), (String::from("message"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).message)))], }).collect(),),), (String::from("omitted"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .omitted)),), (String::from("diff_omitted"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .diff_omitted)),), (String::from("preview_path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.preview_path),),), (String::from("preview_entry"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FsEntry"), fields : ::std::vec![(String::from("key"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
+                    .preview_entry).key))), (String::from("path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (& self.preview_entry).path))), (String::from("name"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (& self.preview_entry).name))), (String::from("kind"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (& self.preview_entry).kind))), (String::from("size"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& (& self
+                    .preview_entry).size))), (String::from("object"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (& self.preview_entry).object)))], },),
+                    (String::from("preview_base"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.preview_base),),), (String::from("preview_text"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.preview_text),),), (String::from("preview_display_text"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.preview_display_text),),), (String::from("preview_clipped"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .preview_clipped)),), (String::from("preview_truncated"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .preview_truncated),),), (String::from("preview_binary"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .preview_binary)),), (String::from("preview_picture"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .preview_picture)),), (String::from("preview_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .preview_width)),), (String::from("preview_height"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .preview_height)),), (String::from("delete_target"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.delete_target),),), (String::from("diff_from"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.diff_from),),), (String::from("diff"),
+                    ::ducktape_view_guest::wire::SnapshotValue::List((& self.diff).iter()
+                    .map(| item | ::ducktape_view_guest::wire::SnapshotValue::Record {
+                    name : String::from("FsDiffEntry"), fields :
+                    ::std::vec![(String::from("path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).path))), (String::from("kind"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    (item).kind)))], }).collect(),),), (String::from("acting"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .acting)),), (String::from("saving"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .saving)),), (String::from("notice"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.notice),),), (String::from("new_name"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.new_name),),), (String::from("draft"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bytes((& self.draft)
+                    .snapshot()),), (String::from("editing"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self
+                    .editing)),), (String::from("draft_chain"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.draft_chain),),), (String::from("draft_path"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.draft_path),),), (String::from("draft_base"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Str(::std::string::ToString::to_string(&
+                    self.draft_base),),), (String::from("draft_id"),
+                    ::ducktape_view_guest::wire::SnapshotValue::I64(* (& self
+                    .draft_id)),), (String::from("sent"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& self.sent)),),
+                    (String::from("viewport_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
+                    .viewport_width)),), (String::from("viewport_height"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
+                    .viewport_height)),), (String::from("tree_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
+                    .tree_width)),), (String::from("preview_pane_height"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
+                    .preview_pane_height),),), (String::from("object_width"),
+                    ::ducktape_view_guest::wire::SnapshotValue::F64(* (& self
+                    .object_width)),), (String::from("files_screen_states"), { let values
+                    = & self.files_screen_states; let mut scopes = values.keys()
+                    .collect::< Vec < _ >> (); scopes.sort();
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FilesScreen instances"), fields : scopes.into_iter()
+                    .map(| scope | { let component = & values[scope]; (scope.clone(),
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FilesScreen"), fields :
+                    vec![(String::from("history_open"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& component
+                    .history_open),),)], },) }).collect(), } }),
+                    (String::from("files_screen_initial"), { let component = & self
+                    .files_screen_initial;
+                    ::ducktape_view_guest::wire::SnapshotValue::Record { name :
+                    String::from("FilesScreen"), fields :
+                    vec![(String::from("history_open"),
+                    ::ducktape_view_guest::wire::SnapshotValue::Bool(* (& component
+                    .history_open),),)], } }),
                 ],
             },
         }
-        .encode()
+            .encode()
     }
     pub(crate) fn restore(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot = ::ducktape_view_guest::wire::Snapshot::decode(bytes)?;
+        let snapshot = wire::Snapshot::decode(bytes)?;
         if snapshot.schema != Self::SNAPSHOT_SCHEMA {
             return Err(String::from("snapshot schema mismatch"));
         }
         let value = snapshot.state;
         ((|| {
-            let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                name,
-                fields,
-            } = value else {
+            let wire::SnapshotValue::Record { name, fields } = value else {
                 return None;
             };
             if name != "FilesView" || fields.len() != 45 {
@@ -2285,10 +451,7 @@ impl FilesView {
                 return None;
             }
             let active_palette: AppTheme = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "AppTheme" || fields.len() != 1 {
@@ -2316,7 +479,7 @@ impl FilesView {
                 return None;
             }
             let connected: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2324,7 +487,7 @@ impl FilesView {
                 return None;
             }
             let dark: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2332,7 +495,7 @@ impl FilesView {
                 return None;
             }
             let chain: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2340,7 +503,7 @@ impl FilesView {
                 return None;
             }
             let generation: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2348,7 +511,7 @@ impl FilesView {
                 return None;
             }
             let route_serial: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2356,7 +519,7 @@ impl FilesView {
                 return None;
             }
             let path: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2364,7 +527,7 @@ impl FilesView {
                 return None;
             }
             let listed: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2372,15 +535,13 @@ impl FilesView {
                 return None;
             }
             let entries: Vec<crate::host::FsEntry> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| {
                             (|| {
-                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name,
-                                    fields,
-                                } = item else {
+                                let wire::SnapshotValue::Record { name, fields } = item
+                                else {
                                     return None;
                                 };
                                 if name != "FsEntry" || fields.len() != 6 {
@@ -2413,39 +574,27 @@ impl FilesView {
                                 }
                                 Some(crate::host::FsEntry {
                                     key: (match field_0 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::I64(item) => Some(item),
                                         _ => None,
                                     })?,
                                     path: (match field_1 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     name: (match field_2 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     kind: (match field_3 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     size: (match field_4 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::I64(item) => Some(item),
                                         _ => None,
                                     })?,
                                     object: (match field_5 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                 })
@@ -2460,15 +609,13 @@ impl FilesView {
                 return None;
             }
             let directories: Vec<crate::host::FsEntry> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| {
                             (|| {
-                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name,
-                                    fields,
-                                } = item else {
+                                let wire::SnapshotValue::Record { name, fields } = item
+                                else {
                                     return None;
                                 };
                                 if name != "FsEntry" || fields.len() != 6 {
@@ -2501,39 +648,27 @@ impl FilesView {
                                 }
                                 Some(crate::host::FsEntry {
                                     key: (match field_0 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::I64(item) => Some(item),
                                         _ => None,
                                     })?,
                                     path: (match field_1 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     name: (match field_2 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     kind: (match field_3 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     size: (match field_4 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::I64(item) => Some(item),
                                         _ => None,
                                     })?,
                                     object: (match field_5 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                 })
@@ -2548,15 +683,13 @@ impl FilesView {
                 return None;
             }
             let history: Vec<crate::host::FsSnapshot> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| {
                             (|| {
-                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name,
-                                    fields,
-                                } = item else {
+                                let wire::SnapshotValue::Record { name, fields } = item
+                                else {
                                     return None;
                                 };
                                 if name != "FsSnapshot" || fields.len() != 5 {
@@ -2585,33 +718,23 @@ impl FilesView {
                                 }
                                 Some(crate::host::FsSnapshot {
                                     id: (match field_0 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     short_id: (match field_1 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     author: (match field_2 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     height: (match field_3 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::I64(item) => Some(item),
                                         _ => None,
                                     })?,
                                     message: (match field_4 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                 })
@@ -2626,7 +749,7 @@ impl FilesView {
                 return None;
             }
             let omitted: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2634,7 +757,7 @@ impl FilesView {
                 return None;
             }
             let diff_omitted: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2642,7 +765,7 @@ impl FilesView {
                 return None;
             }
             let preview_path: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2650,10 +773,7 @@ impl FilesView {
                 return None;
             }
             let preview_entry: crate::host::FsEntry = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "FsEntry" || fields.len() != 6 {
@@ -2686,39 +806,27 @@ impl FilesView {
                 }
                 Some(crate::host::FsEntry {
                     key: (match field_0 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     path: (match field_1 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     name: (match field_2 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     kind: (match field_3 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                     size: (match field_4 {
-                        ::ducktape_view_guest::wire::SnapshotValue::I64(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::I64(item) => Some(item),
                         _ => None,
                     })?,
                     object: (match field_5 {
-                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                            Some(item)
-                        }
+                        wire::SnapshotValue::Str(item) => Some(item),
                         _ => None,
                     })?,
                 })
@@ -2728,7 +836,7 @@ impl FilesView {
                 return None;
             }
             let preview_base: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2736,7 +844,7 @@ impl FilesView {
                 return None;
             }
             let preview_text: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2744,7 +852,7 @@ impl FilesView {
                 return None;
             }
             let preview_display_text: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2752,7 +860,7 @@ impl FilesView {
                 return None;
             }
             let preview_clipped: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2760,7 +868,7 @@ impl FilesView {
                 return None;
             }
             let preview_truncated: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2768,7 +876,7 @@ impl FilesView {
                 return None;
             }
             let preview_binary: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2776,7 +884,7 @@ impl FilesView {
                 return None;
             }
             let preview_picture: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2784,7 +892,7 @@ impl FilesView {
                 return None;
             }
             let preview_width: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2792,7 +900,7 @@ impl FilesView {
                 return None;
             }
             let preview_height: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2800,7 +908,7 @@ impl FilesView {
                 return None;
             }
             let delete_target: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2808,7 +916,7 @@ impl FilesView {
                 return None;
             }
             let diff_from: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2816,15 +924,13 @@ impl FilesView {
                 return None;
             }
             let diff: Vec<crate::host::FsDiffEntry> = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::List(items) => {
+                wire::SnapshotValue::List(items) => {
                     items
                         .into_iter()
                         .map(|item| {
                             (|| {
-                                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                                    name,
-                                    fields,
-                                } = item else {
+                                let wire::SnapshotValue::Record { name, fields } = item
+                                else {
                                     return None;
                                 };
                                 if name != "FsDiffEntry" || fields.len() != 2 {
@@ -2841,15 +947,11 @@ impl FilesView {
                                 }
                                 Some(crate::host::FsDiffEntry {
                                     path: (match field_0 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                     kind: (match field_1 {
-                                        ::ducktape_view_guest::wire::SnapshotValue::Str(item) => {
-                                            Some(item)
-                                        }
+                                        wire::SnapshotValue::Str(item) => Some(item),
                                         _ => None,
                                     })?,
                                 })
@@ -2864,7 +966,7 @@ impl FilesView {
                 return None;
             }
             let acting: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2872,7 +974,7 @@ impl FilesView {
                 return None;
             }
             let saving: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2880,7 +982,7 @@ impl FilesView {
                 return None;
             }
             let notice: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2888,7 +990,7 @@ impl FilesView {
                 return None;
             }
             let new_name: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2896,7 +998,7 @@ impl FilesView {
                 return None;
             }
             let draft: ::ducktape_view_guest::Editor = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bytes(bytes) => {
+                wire::SnapshotValue::Bytes(bytes) => {
                     ::ducktape_view_guest::Editor::restore(&bytes)
                 }
                 _ => None,
@@ -2906,7 +1008,7 @@ impl FilesView {
                 return None;
             }
             let editing: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2914,7 +1016,7 @@ impl FilesView {
                 return None;
             }
             let draft_chain: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2922,7 +1024,7 @@ impl FilesView {
                 return None;
             }
             let draft_path: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2930,7 +1032,7 @@ impl FilesView {
                 return None;
             }
             let draft_base: String = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Str(item) => Some(item),
+                wire::SnapshotValue::Str(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2938,7 +1040,7 @@ impl FilesView {
                 return None;
             }
             let draft_id: i64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::I64(item) => Some(item),
+                wire::SnapshotValue::I64(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2946,7 +1048,7 @@ impl FilesView {
                 return None;
             }
             let sent: bool = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                wire::SnapshotValue::Bool(item) => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2954,9 +1056,7 @@ impl FilesView {
                 return None;
             }
             let viewport_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2964,9 +1064,7 @@ impl FilesView {
                 return None;
             }
             let viewport_height: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2974,9 +1072,7 @@ impl FilesView {
                 return None;
             }
             let tree_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2984,9 +1080,7 @@ impl FilesView {
                 return None;
             }
             let preview_pane_height: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -2994,9 +1088,7 @@ impl FilesView {
                 return None;
             }
             let object_width: f64 = (match value {
-                ::ducktape_view_guest::wire::SnapshotValue::F64(
-                    item,
-                ) if item.is_finite() => Some(item),
+                wire::SnapshotValue::F64(item) if item.is_finite() => Some(item),
                 _ => None,
             })?;
             let (name, value) = fields.next()?;
@@ -3007,10 +1099,7 @@ impl FilesView {
                 String,
                 FilesScreenState,
             > = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "FilesScreen instances" {
@@ -3019,10 +1108,7 @@ impl FilesView {
                 let mut values = ::std::collections::HashMap::new();
                 for (scope, value) in fields {
                     let component = ((|| {
-                        let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                            name,
-                            fields,
-                        } = value else {
+                        let wire::SnapshotValue::Record { name, fields } = value else {
                             return None;
                         };
                         if name != "FilesScreen" || fields.len() != 1 {
@@ -3034,9 +1120,7 @@ impl FilesView {
                             return None;
                         }
                         let history_open: bool = (match value {
-                            ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => {
-                                Some(item)
-                            }
+                            wire::SnapshotValue::Bool(item) => Some(item),
                             _ => None,
                         })?;
                         Some(FilesScreenState {
@@ -3054,10 +1138,7 @@ impl FilesView {
                 return None;
             }
             let files_screen_initial: FilesScreenState = ((|| {
-                let ::ducktape_view_guest::wire::SnapshotValue::Record {
-                    name,
-                    fields,
-                } = value else {
+                let wire::SnapshotValue::Record { name, fields } = value else {
                     return None;
                 };
                 if name != "FilesScreen" || fields.len() != 1 {
@@ -3069,7 +1150,7 @@ impl FilesView {
                     return None;
                 }
                 let history_open: bool = (match value {
-                    ::ducktape_view_guest::wire::SnapshotValue::Bool(item) => Some(item),
+                    wire::SnapshotValue::Bool(item) => Some(item),
                     _ => None,
                 })?;
                 Some(FilesScreenState {
@@ -3135,29 +1216,26 @@ impl FilesView {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(move |value| Message::SessionArrived(value)),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([crate::host::listing(
-                    self.generation,
-                    self.path.to_owned(),
-                )
-                .map(move |value| Message::ListingArrived(value))])
+                ::ducktape_view_guest::Subscription::batch([
+                    crate::host::listing(self.generation, self.path.to_owned())
+                        .map(move |value| Message::ListingArrived(value)),
+                ])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if (self.connected && (!(self.preview_path).is_empty())) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::preview(
-                    self.generation,
-                    self.preview_path.to_owned(),
-                )
-                .map(move |value| Message::PreviewArrived(value))])
+                ::ducktape_view_guest::Subscription::batch([
+                    crate::host::preview(self.generation, self.preview_path.to_owned())
+                        .map(move |value| Message::PreviewArrived(value)),
+                ])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
             if (self.connected && (!(self.diff_from).is_empty())) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::diff(
-                    self.generation,
-                    self.diff_from.to_owned(),
-                )
-                .map(move |value| Message::DiffArrived(value))])
+                ::ducktape_view_guest::Subscription::batch([
+                    crate::host::diff(self.generation, self.diff_from.to_owned())
+                        .map(move |value| Message::DiffArrived(value)),
+                ])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
