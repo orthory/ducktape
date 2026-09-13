@@ -194,11 +194,6 @@ pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
     format!("duck://forge/{repo}{}", net_query(&chain_id))
 }
 
-/// `duck://channel/<id>?net=…` — likewise the only handle on a channel.
-pub fn duck_channel_link(channel: String, chain_id: String) -> String {
-    format!("duck://channel/{channel}{}", net_query(&chain_id))
-}
-
 /// `duck://channel/<id>?net=…#<seq>` — one message. The query precedes the
 /// fragment, as in every other URI.
 pub fn duck_channel_message_link(channel: String, seq: i64, chain_id: String) -> String {
@@ -393,7 +388,6 @@ fn classify_channel(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
         ..DuckLink::of(DuckKind::ChannelMessage)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -634,17 +628,13 @@ mod tests {
             "duck://channel/general?net=d0cdf950#42"
         );
         assert_eq!(
-            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
-            "duck://channel/c1?net=d0cdf950"
-        );
-        assert_eq!(
             duck_page_link("p1".into(), String::new()),
             "duck://page/p1",
             "no chain id yet, no query — never a `?net=` naming nothing"
         );
         for built in [
             duck_page_link("p1".into(), "mynet#d0cdf950".into()),
-            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
+            "duck://channel/c1?net=d0cdf950".into(),
             duck_channel_message_link("c1".into(), 3, "mynet#d0cdf950".into()),
         ] {
             let link = resolve_duck_link(built.clone(), "mynet#d0cdf950".into());

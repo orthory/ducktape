@@ -1,47 +1,5 @@
 use super::*;
 
-/// One shell navigation entry. `live` is the capsule's pulse dot.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavItem {
-    pub id: crate::ShellTab,
-    pub title: String,
-    pub icon: String,
-    pub badge: i64,
-    pub active: bool,
-    pub live: bool,
-}
-
-/// The rail's navigation: nine collaboration surfaces plus the node operator
-/// surface, with the active pane flagged. `settings` is not here because the
-/// rail pins it to its own footer beside the account avatar.
-pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
-    [
-        (crate::ShellTab::Chat, "Chat", "nav-chat"),
-        (crate::ShellTab::Pages, "Pages", "nav-pages"),
-        (crate::ShellTab::Forge, "Forge", "nav-forge"),
-        (crate::ShellTab::Agents, "Agents", "nav-agents"),
-        (crate::ShellTab::Files, "Files", "nav-files"),
-        (crate::ShellTab::Explorer, "Explorer", "nav-explorer"),
-        (crate::ShellTab::Node, "Node", "node"),
-        (crate::ShellTab::Members, "Members", "nav-members"),
-        (crate::ShellTab::Governance, "Approvals", "shield-check"),
-    ]
-    .into_iter()
-    .map(|(id, title, icon)| NavItem {
-        id,
-        title: title.into(),
-        icon: icon.into(),
-        badge: if id == crate::ShellTab::Governance {
-            approvals
-        } else {
-            0
-        },
-        active: id == tab,
-        live: id == crate::ShellTab::Forge && agent_live,
-    })
-    .collect()
-}
-
 /// Does the pane `tab` mounts actually read `plane`'s rows?
 ///
 /// THE TAB-SWITCH GATE. Every tab move used to refetch members, governance,
@@ -438,58 +396,6 @@ pub fn tray_choice_row(label: String, chosen: bool) -> String {
     }
 }
 
-/// A consensus stamp at or above this is unix MILLIS, not a block height.
-///
-/// `consensus_time` is stamped `= height` by the validator lane
-/// (crates/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
-/// (bin/noded/src/main.rs), and every module record time is that value. No
-/// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
-/// so the two lanes are told apart by the magnitude alone. Rendering the millis
-/// lane as a height is how `h 1,753,622,400,000` reaches the screen.
-const MILLIS_LANE_FLOOR: i64 = 1_000_000_000_000;
-
-/// The wall clock a stamp carries when it came off the unix-millis lane.
-fn wall_clock_seconds(stamp: i64) -> Option<i64> {
-    match stamp >= MILLIS_LANE_FLOOR {
-        true => Some(stamp / 1_000),
-        false => None,
-    }
-}
-
-/// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`.
-pub fn height_label(height: i64) -> String {
-    if height < 0 {
-        return "h —".into();
-    }
-    format!("h {}", grouped_digits(height))
-}
-
-/// The same `h 84,912` run under the name the record-meta call sites use, where
-/// the artifact printed a wall clock the validator lane cannot supply. One
-/// renderer on purpose — the two names mark the two slots, not two formats.
-pub fn height_label_short(height: i64) -> String {
-    height_label(height)
-}
-
-/// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
-/// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
-/// wall clock. A record with no stamp prints nothing.
-pub fn height_ago(then_height: i64, now_height: i64, wall_now: i64) -> String {
-    if then_height <= 0 {
-        return String::new();
-    }
-    if let Some(seconds) = wall_clock_seconds(then_height) {
-        return relative_time(seconds, wall_now);
-    }
-    let elapsed = now_height.saturating_sub(then_height);
-    match elapsed {
-        blocks if blocks <= 0 => "this block".into(),
-        1 => "1 block ago".into(),
-        blocks => format!("{} blocks ago", grouped_digits(blocks)),
-    }
-}
-
 /// A non-negative count with thousands separators: `84,912`.
 pub(crate) fn grouped_digits(value: i64) -> String {
     let digits = value.max(0).to_string();
@@ -528,72 +434,6 @@ pub fn initials_of(name: &str) -> String {
     }
 }
 
-/// `2h ago` / `40m ago` / `just now`, for a genuine UNIX-SECONDS stamp.
-///
-/// In this app exactly two values qualify, both off `/v1/status`:
-/// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
-/// a module record's time — the consensus validator stamps `consensus_time =
-/// height` (crates/noded/src/index.rs) and a single-writer noded stamps unix
-/// MILLIS, so a record time is a block height, not seconds. Render those with
-/// [`height_ago`] / [`height_label_short`].
-pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {
-    // [`UNMEASURED`] and "this record carries no stamp" are different facts and
-    // print differently: the first is a reading the node never published and
-    // owes the reader a `—`, the second is a record that legitimately has no
-    // time and prints nothing rather than an em dash on every row.
-    if unix_seconds < 0 {
-        return "—".into();
-    }
-    if unix_seconds == 0 {
-        return String::new();
-    }
-    let elapsed = wall_now.saturating_sub(unix_seconds);
-    if elapsed < 60 {
-        return "just now".into();
-    }
-    let (value, unit) = duration_parts(elapsed);
-    format!("{value}{unit} ago")
-}
-
-/// `expires in 412 blocks`; a passed deadline reads `expired`. A governance
-/// deadline is `consensus_time + voting_period`, so on the validator lane it is
-/// a HEIGHT and the remaining span is counted in blocks — never in hours. On
-/// the unix-millis lane the same field genuinely is a clock, and `height` is
-/// not comparable to it at all, so that lane is counted against the wall.
-pub fn expires_in_blocks(deadline_height: i64, height: i64, wall_now: i64) -> String {
-    if let Some(seconds) = wall_clock_seconds(deadline_height) {
-        let remaining = seconds.saturating_sub(wall_now);
-        if remaining <= 0 {
-            return "expired".into();
-        }
-        let (value, unit) = duration_parts(remaining);
-        return format!("expires in {value}{unit}");
-    }
-    let remaining = deadline_height.saturating_sub(height);
-    match remaining {
-        blocks if blocks <= 0 => "expired".into(),
-        1 => "expires in 1 block".into(),
-        blocks => format!("expires in {} blocks", grouped_digits(blocks)),
-    }
-}
-
-/// A span in seconds as its largest whole unit: `(45, "m")`, `(23, "h")`.
-fn duration_parts(seconds: i64) -> (i64, &'static str) {
-    const MINUTE: i64 = 60;
-    const HOUR: i64 = 60 * MINUTE;
-    const DAY: i64 = 24 * HOUR;
-    match seconds {
-        span if span < HOUR => (span / MINUTE, "m"),
-        span if span < DAY => (span / HOUR, "h"),
-        span => (span / DAY, "d"),
-    }
-}
-
-// A wall clock (`14:32`) and a day divider (`Today`) are DELIBERATELY absent:
-// a module record's stamp is a block height on a validator network and unix
-// millis on a single-writer node, so neither could be rendered honestly. The
-// artifact's clock is divergence, not a gap — see height_ago/height_label_short.
-
 /// Elapsed `mm:ss` for the huddle pills and panel.
 pub fn mmss(seconds: i64) -> String {
     let seconds = seconds.max(0);
@@ -622,22 +462,6 @@ pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
                 .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
                 .collect()
         })
-        .unwrap_or_default()
-}
-
-/// The first grapheme of a display name, upper-cased, for an avatar plate.
-/// The single-glyph avatar label for a name — EMPTY when there is no name.
-///
-/// It used to fall back to `?`, and the only principal that reaches the
-/// fallback is an account nobody has named yet: its avatar sits in the corner
-/// of the module rail, and a `?` in a circle there does not read as "unnamed",
-/// it reads as HELP. `PrincipalPlate` draws an empty string as a bare plate,
-/// which is what an identity with no name looks like.
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
         .unwrap_or_default()
 }
 

@@ -619,49 +619,6 @@ pub fn bell_title(kind: &str) -> String {
     }
 }
 
-/// Source-defined reason names may carry a severity; unclassified reasons
-/// stay informational. This does not infer severity from opaque source detail.
-pub fn bell_severity(kind: &str) -> String {
-    const WARN: &[&str] = &[
-        "review_requested",
-        "changes_requested",
-        "proposal_opened",
-        "vote_needed",
-        "run_cancelled",
-        "quota",
-    ];
-    const ERROR: &[&str] = &["failed", "error", "rejected", "conflict", "revoked"];
-    let kind = kind.to_lowercase();
-    let names_error = ERROR.iter().any(|token| kind.contains(token));
-    let names_warning = WARN.iter().any(|token| kind.contains(token));
-    // These three strings ARE the tone vocabulary `PulseDot`, `StillDot` and
-    // `BellBadge` match on. They used to be `error`/`warn`, which no arm of
-    // `BellBadge` carried, so a failed run painted the badge info-blue through
-    // the fallthrough. One name per severity, spoken everywhere.
-    match (names_error, names_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
-    }
-}
-
-/// The worst severity among the UNREAD rows, for the bell badge's tint —
-/// `info` when nothing is unread.
-pub fn bell_worst_severity(items: &[BellItem]) -> String {
-    let severities: Vec<String> = items
-        .iter()
-        .filter(|item| !item.read)
-        .map(|item| bell_severity(&item.reason))
-        .collect();
-    let any_error = severities.iter().any(|severity| severity == "danger");
-    let any_warning = severities.iter().any(|severity| severity == "warning");
-    match (any_error, any_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
-    }
-}
-
 #[cfg(test)]
 #[path = "bell_tests.rs"]
 mod tests;

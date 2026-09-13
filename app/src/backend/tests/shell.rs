@@ -1,42 +1,6 @@
 use super::*;
 
 #[test]
-fn the_rail_seats_collaboration_and_node_operations_separately() {
-    let nav = shell_nav(ShellTab::Chat, 3, true);
-    let ids: Vec<ShellTab> = nav.iter().map(|item| item.id).collect();
-    assert_eq!(
-        ids,
-        [
-            ShellTab::Chat,
-            ShellTab::Pages,
-            ShellTab::Forge,
-            ShellTab::Agents,
-            ShellTab::Files,
-            ShellTab::Explorer,
-            ShellTab::Node,
-            ShellTab::Members,
-            ShellTab::Governance
-        ]
-    );
-    let forge = nav.iter().find(|item| item.id == ShellTab::Forge).unwrap();
-    assert!(forge.live, "an engaged agent pulses the forge seat");
-    assert_eq!(
-        nav.iter()
-            .find(|item| item.id == ShellTab::Node)
-            .unwrap()
-            .title,
-        "Node"
-    );
-    assert_eq!(
-        nav.iter()
-            .find(|item| item.id == ShellTab::Governance)
-            .unwrap()
-            .badge,
-        3
-    );
-}
-
-#[test]
 fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() {
     let member = |is_you: bool| HuddleParticipant {
         key: "aa".into(),
@@ -147,7 +111,6 @@ fn the_roster_answers_admin_tier_and_filters() {
     answered_without_this_node[0].is_this_node = false;
     assert_eq!(member_tier(&answered_without_this_node), "guest");
 }
-
 
 #[test]
 fn the_huddle_roster_marks_the_row_this_device_holds() {
@@ -300,8 +263,11 @@ fn huddle_recipient_nodes_keeps_the_readers_other_device() {
 #[test]
 fn palette_keys_use_native_platform_shortcuts() {
     let plain = gpui_kit::Modifiers::default();
-    let command = gpui_kit::Modifiers { platform: cfg!(target_os = "macos"),
-        control: !cfg!(target_os = "macos"), ..Default::default() };
+    let command = gpui_kit::Modifiers {
+        platform: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        ..Default::default()
+    };
     assert_eq!(palette_key_action("escape".into(), plain, true), "close");
     assert_eq!(palette_key_action("escape".into(), plain, false), "none");
     assert_eq!(palette_key_action("k".into(), command, false), "open");
@@ -313,14 +279,12 @@ fn palette_keys_use_native_platform_shortcuts() {
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
     let escape = String::from("escape");
-    let target =
-        |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
+    let target = |palette: bool, bell: bool, create: bool| {
+        escape_target(escape.clone(), palette, bell, create)
+    };
 
     // Not Escape -> nothing, whatever is open.
-    assert_eq!(
-        escape_target(String::from("x"), false, true, true),
-        ""
-    );
+    assert_eq!(escape_target(String::from("x"), false, true, true), "");
     // An open palette swallows Escape — palette_key_action owns it.
     assert_eq!(target(true, true, true), "");
     // The ladder order is the z-order: bell over the create modal.
@@ -343,8 +307,9 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 #[test]
 fn the_two_ladder_readers_enumerate_the_same_layers() {
     let escape = String::from("escape");
-    let target =
-        |palette: bool, bell: bool, create: bool| escape_target(escape.clone(), palette, bell, create);
+    let target = |palette: bool, bell: bool, create: bool| {
+        escape_target(escape.clone(), palette, bell, create)
+    };
 
     for (palette, bell, create, layer) in [
         (false, true, true, "bell"),
@@ -394,53 +359,24 @@ fn files_base64_round_trips() {
     }
 }
 
-#[test]
-fn bell_severity_projects_the_kind_and_defaults_to_info() {
-    assert_eq!(bell_severity("run_failed"), "danger");
-    assert_eq!(bell_severity("review_requested"), "warning");
-    assert_eq!(bell_severity("mentioned"), "info");
-    // an unnamed kind is a notice, never an alarm.
-    assert_eq!(bell_severity("brand_new_kind"), "info");
-}
-
-#[test]
-fn bell_badge_takes_the_worst_unread_severity() {
-    let item = |seq: i64, kind: &str, read: bool| BellItem {
-        seq,
-        reason: kind.into(),
-        read,
-        ..BellItem::default()
-    };
-
-    assert_eq!(
-        bell_worst_severity(&[item(1, "mentioned", false), item(2, "run_failed", false)]),
-        "danger"
-    );
-    // a READ error does not keep the badge red.
-    assert_eq!(
-        bell_worst_severity(&[
-            item(1, "run_failed", true),
-            item(2, "review_requested", false)
-        ]),
-        "warning"
-    );
-    assert_eq!(bell_worst_severity(&[]), "info");
-}
-
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
 /// members, governance, agents, account — regardless of the destination, so a
 /// click into Files paid four `/v1/query` round trips for rows nothing on
 /// screen reads.
 #[test]
 fn a_tab_move_only_refetches_what_its_destination_draws() {
-    // EVERY tab, taken from the rail itself plus the footer's Settings, so a
-    // new seat lands in this sweep instead of quietly defaulting to "reads
-    // nothing" behind a hand-written negative list.
-    let mut tabs: Vec<ShellTab> = shell_nav(ShellTab::Chat, 0, false)
-        .into_iter()
-        .map(|seat| seat.id)
-        .collect();
-    tabs.push(ShellTab::Settings);
+    let tabs = [
+        ShellTab::Chat,
+        ShellTab::Pages,
+        ShellTab::Forge,
+        ShellTab::Agents,
+        ShellTab::Files,
+        ShellTab::Explorer,
+        ShellTab::Node,
+        ShellTab::Members,
+        ShellTab::Governance,
+        ShellTab::Settings,
+    ];
 
     // the roster is drawn by five panes: its own, the admin gate under
     // Approvals, the forge write gate, the Node permissions, and the Settings
@@ -556,5 +492,4 @@ fn bell_renders_attribution_relation_and_change_actor() {
         bell_presentation(&item, std::slice::from_ref(&context)),
         context
     );
-    assert_eq!(bell_worst_severity(&[item]), "info");
 }

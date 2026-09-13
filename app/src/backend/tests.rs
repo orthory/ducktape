@@ -104,9 +104,7 @@ async fn node_that_serves_its_status_once(status_body: &'static str) -> String {
 /// the `block_rx` arm), so the head for block N is on the wire before N's ops
 /// are. A test that asserts on `live.next()` directly is asserting on that
 /// heartbeat, not on its own submit.
-async fn next_change(
-    live: &mut futures::stream::BoxStream<'static, LiveUpdate>,
-) -> LiveUpdate {
+async fn next_change(live: &mut futures::stream::BoxStream<'static, LiveUpdate>) -> LiveUpdate {
     loop {
         let update = live.next().await.expect("live stream ended");
         if update.kind != crate::LiveKind::Tip {
@@ -306,4 +304,61 @@ async fn node_scripting_its_fold_watermark(
         }
     });
     (origin, served)
+}
+
+// Test fixture reads: production timelines are owned by WASM guests.
+async fn query_roots(
+    rpc: &RpcClient,
+    channel_id: &str,
+    before_seq: Option<u64>,
+) -> Result<Vec<MsgRow>, String> {
+    let reply: ChatViewReply = rpc
+        .view(
+            "chat",
+            &ChatViewQuery::Roots {
+                channel_id: channel_id.to_string(),
+                before_seq,
+                limit: Some(CHAT_HOT_WINDOW_LIMIT),
+            },
+        )
+        .await?;
+    let ChatViewReply::Roots {
+        roots,
+        has_more,
+        next_before_seq,
+    } = reply
+    else {
+        return Err("node returned an invalid root page".into());
+    };
+    let expected_cursor = if has_more {
+        roots.first().map(|row| row.seq)
+    } else {
+        None
+    };
+    let roots_are_strictly_ordered = roots.windows(2).all(|pair| pair[0].seq < pair[1].seq);
+    let roots_precede_request =
+        before_seq.is_none_or(|before| roots.iter().all(|row| row.seq < before));
+    let roots_are_timeline_rows = roots.iter().all(|row| row.thread.is_none());
+    let page_has_a_cursor_source = !has_more || !roots.is_empty();
+    let cursor_is_valid = next_before_seq == expected_cursor;
+    if !roots_are_strictly_ordered
+        || !roots_precede_request
+        || !roots_are_timeline_rows
+        || !page_has_a_cursor_source
+        || !cursor_is_valid
+    {
+        return Err("node returned an invalid root cursor".into());
+    }
+    Ok(roots)
+}
+
+async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
+    let roots = query_roots(rpc, channel_id, None).await?;
+    let facts = ReaderFacts::current().await;
+    let mut messages: Vec<ChatMessage> = roots
+        .into_iter()
+        .map(|row| chat_message(row, facts.reader()))
+        .collect();
+    mark_message_groups(&mut messages);
+    Ok(messages)
 }

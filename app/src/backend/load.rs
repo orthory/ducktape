@@ -315,69 +315,6 @@ pub(crate) fn member_id(user: &str) -> &str {
     user.strip_prefix("user:").unwrap_or(user)
 }
 
-/// ONE ROOT-INDEX PAGE, with the cursor the node handed back verified against
-/// the rows it came with. The chat TAB reads its own windows now; what is left
-/// on this side is the forge item's discussion, which is a channel's newest
-/// page and nothing else.
-async fn query_roots(
-    rpc: &RpcClient,
-    channel_id: &str,
-    before_seq: Option<u64>,
-) -> Result<Vec<MsgRow>, String> {
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::Roots {
-                channel_id: channel_id.to_string(),
-                before_seq,
-                limit: Some(CHAT_VIEW_PAGE_LIMIT),
-            },
-        )
-        .await?;
-    let ChatViewReply::Roots {
-        roots,
-        has_more,
-        next_before_seq,
-    } = reply
-    else {
-        return Err("node returned an invalid root page".into());
-    };
-    let expected_cursor = if has_more {
-        roots.first().map(|row| row.seq)
-    } else {
-        None
-    };
-    let roots_are_strictly_ordered = roots.windows(2).all(|pair| pair[0].seq < pair[1].seq);
-    let roots_precede_request =
-        before_seq.is_none_or(|before| roots.iter().all(|row| row.seq < before));
-    let roots_are_timeline_rows = roots.iter().all(|row| row.thread.is_none());
-    let page_has_a_cursor_source = !has_more || !roots.is_empty();
-    let cursor_is_valid = next_before_seq == expected_cursor;
-    if !roots_are_strictly_ordered
-        || !roots_precede_request
-        || !roots_are_timeline_rows
-        || !page_has_a_cursor_source
-        || !cursor_is_valid
-    {
-        return Err("node returned an invalid root cursor".into());
-    }
-    Ok(roots)
-}
-
-pub(crate) async fn load_messages(
-    rpc: &RpcClient,
-    channel_id: &str,
-) -> Result<Vec<ChatMessage>, String> {
-    let roots = query_roots(rpc, channel_id, None).await?;
-    let facts = ReaderFacts::current().await;
-    let mut messages: Vec<ChatMessage> = roots
-        .into_iter()
-        .map(|row| chat_message(row, facts.reader()))
-        .collect();
-    mark_message_groups(&mut messages);
-    Ok(messages)
-}
-
 pub(crate) async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
     let mut pages = Vec::new();
     let mut after: Option<String> = None;

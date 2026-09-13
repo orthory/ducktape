@@ -116,9 +116,8 @@ pub struct NodeFacts {
 /// [`UNMEASURED`] and not zero.
 ///
 /// `derive(Default)` gave them `0`, which is the one value this whole file
-/// exists to keep off the screen: `height_label(0)` renders `h 0` and
-/// `relative_time(0)` renders nothing, so a defaulted document prints a
-/// measured head and a measured checkpoint for a node that has served neither.
+/// exists to keep off the screen: a defaulted document must not report a
+/// measured head and checkpoint for a node that has served neither.
 /// It is inert today: both arms of `overview_from` construct a default (the
 /// struct literal is evaluated before the status arm overwrites `facts`), but
 /// only the peers frame's copy survives, and every one of the six `keep_i64` /
@@ -265,9 +264,7 @@ fn served_height(height: &serde_json::Value) -> i64 {
 /// An absent reading must display `—`, never a measured `0`: zero is a
 /// legal height and timestamp.
 ///
-/// NEGATIVE is that way: `height_label` already renders `< 0` as `h —`, so
-/// this reuses a contract the renderer had rather than inventing one. Naming
-/// it keeps the `-1` from reading as arithmetic at the fill site.
+/// A negative sentinel distinguishes absence from every valid measurement.
 pub const UNMEASURED: i64 = -1;
 
 /// A consensus fact the node did not publish for this role reads `—`, never a

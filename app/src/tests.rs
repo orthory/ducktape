@@ -49,7 +49,7 @@ fn reply_composer_scope(app: &Ducktape, thread_seq: i64) -> String {
 }
 
 fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
-    let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
+    let id = backend::fresh_operation_id(composer_op_prefix(kind));
     let scope = match kind {
         ComposerKind::Message => composer_scope(app),
         ComposerKind::Reply => reply_composer_scope(app, RAIL_THREAD_SEQ),
@@ -186,7 +186,7 @@ fn restore_composer(scope: &str, blocked: bool) {
     composer::restore(scope, blocked);
 }
 fn submit_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, blocked: bool) {
-    let Some(value) = composer::submit(scope, &backend::composer_op_prefix(kind), blocked) else {
+    let Some(value) = composer::submit(scope, &composer_op_prefix(kind), blocked) else {
         return;
     };
     let event = composer_surface::intent(&value).expect("native composer submit intent");
@@ -317,4 +317,13 @@ pub(crate) fn handler_body(variant: &str) -> String {
         .unwrap_or_else(|| panic!("missing native handler {variant}"));
     assert!(found.next().is_none(), "one handler per message variant");
     body
+}
+
+fn composer_op_prefix(kind: ComposerKind) -> String {
+    match kind {
+        ComposerKind::Message => "message",
+        ComposerKind::Reply => "reply",
+        ComposerKind::Edit | ComposerKind::ThreadEdit => "edit",
+    }
+    .into()
 }

@@ -9,15 +9,6 @@ fn empty_pages_probe() -> serde_json::Value {
     serde_json::json!({ "threads_for_targets": { "targets": [] } })
 }
 
-#[test]
-fn an_unnamed_principal_gets_a_bare_plate() {
-    // Never a `?` — that glyph in the rail's corner reads as HELP, not as
-    // "nobody has named this account".
-    assert_eq!(initial_of(""), "");
-    assert_eq!(initial_of("   "), "");
-    assert_eq!(initial_of("quackbot"), "Q");
-}
-
 /// A PAGE HIT NAMES ITS PAGE, AND SAYS EACH THING ONCE. The index's hit row
 /// carries a `page_id` and no title, so nothing downstream could name the page
 /// a match came from: the Explorer set BOTH its row title and its snippet to

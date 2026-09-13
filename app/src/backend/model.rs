@@ -70,20 +70,12 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         return false;
     }
     match phase {
-        crate::MutationPhase::MessageDelete | crate::MutationPhase::MessageEdit => true,
+        crate::MutationPhase::MessageEdit => true,
         crate::MutationPhase::Idle
         | crate::MutationPhase::Recovering
-        | crate::MutationPhase::BlockComment
         | crate::MutationPhase::Channel
-        | crate::MutationPhase::ChannelArchive
-        | crate::MutationPhase::ChannelMember
-        | crate::MutationPhase::ChannelRename
-        | crate::MutationPhase::ChannelUnarchive
-        | crate::MutationPhase::CommentResolve
         | crate::MutationPhase::Huddle
-        | crate::MutationPhase::Onboarding
-        | crate::MutationPhase::Page
-        | crate::MutationPhase::PageDelete => false,
+        | crate::MutationPhase::Onboarding => false,
     }
 }
 
@@ -281,16 +273,6 @@ pub fn submit_verdict(
         crate::SubmitVerdict::Refused
     } else {
         crate::SubmitVerdict::Admitted
-    }
-}
-
-/// The operation-id prefix each composer mints under, so a pending message and
-/// a pending reply never share an id space.
-pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
-    match kind {
-        crate::ComposerKind::Message => "message".to_owned(),
-        crate::ComposerKind::Reply => "reply".to_owned(),
-        crate::ComposerKind::Edit | crate::ComposerKind::ThreadEdit => "edit".to_owned(),
     }
 }
 

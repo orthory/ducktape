@@ -37,10 +37,6 @@ const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
-/// One index view page fills the entire bounded render window. Timeline roots
-/// have their own index keyspace, so this is always one RPC regardless of how
-/// many thread replies sit between roots.
-const CHAT_VIEW_PAGE_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT;
 
 /// Client-local read cursor for one channel: the newest `seq` this device has
 /// "seen". There is no wire read-cursor — this list lives only in app state and

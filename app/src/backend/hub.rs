@@ -53,25 +53,6 @@ pub struct WalletInfo {
     pub active: bool,
 }
 
-/// Build a wallet row for launch-window fixtures.
-pub fn wallet_info(name: String, pubkey: String, state: String, active: bool) -> WalletInfo {
-    WalletInfo {
-        name,
-        pubkey,
-        state,
-        active,
-    }
-}
-
-/// Build a keystore answer for network-picker fixtures.
-pub fn wallet_list(wallets: Vec<WalletInfo>, error: String, keystore: bool) -> WalletList {
-    WalletList {
-        wallets,
-        error,
-        keystore,
-    }
-}
-
 /// The launch window's boot read: the known-network list and the row it
 /// opens on. No wallets here — a wallet is an identity ON a network, kept in
 /// that network's workspace, so the keystore is read once a network is picked
@@ -998,15 +979,27 @@ mod tests {
     #[test]
     fn the_wallet_door_follows_the_picked_keystore() {
         assert!(matches!(
-            wallet_door(&wallet_list(rows(&[("a", true)]), String::new(), true)),
+            wallet_door(&WalletList {
+                wallets: rows(&[("a", true)]),
+                error: String::new(),
+                keystore: true
+            }),
             crate::WalletDoor::Wallets
         ));
         assert!(matches!(
-            wallet_door(&wallet_list(vec![], String::new(), true)),
+            wallet_door(&WalletList {
+                wallets: vec![],
+                error: String::new(),
+                keystore: true
+            }),
             crate::WalletDoor::Password
         ));
         assert!(matches!(
-            wallet_door(&wallet_list(vec![], "unreachable".into(), false)),
+            wallet_door(&WalletList {
+                wallets: vec![],
+                error: "unreachable".into(),
+                keystore: false
+            }),
             crate::WalletDoor::Unreached
         ));
     }

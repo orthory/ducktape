@@ -182,19 +182,10 @@ pub(crate) enum ChatIntent {
 pub(crate) enum MutationPhase {
     Idle,
     Recovering,
-    BlockComment,
     Channel,
-    ChannelArchive,
-    ChannelMember,
-    ChannelRename,
-    ChannelUnarchive,
-    CommentResolve,
     Huddle,
-    MessageDelete,
     MessageEdit,
     Onboarding,
-    Page,
-    PageDelete,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CeremonyRetirement {
@@ -988,18 +979,18 @@ impl Ducktape {
         state.rpc = "http://127.0.0.1:1".to_owned();
         state.password = "hunter2-hunter2".to_owned();
         state.hub_wallets = vec![
-            crate::backend::wallet_info(
-                "alice".to_owned(),
-                "aabbccddeeff00112233".to_owned(),
-                "encrypted".to_owned(),
-                false,
-            ),
-            crate::backend::wallet_info(
-                "demo".to_owned(),
-                "eeff0011".to_owned(),
-                "encrypted".to_owned(),
-                true,
-            ),
+            crate::backend::WalletInfo {
+                name: "alice".to_owned(),
+                pubkey: "aabbccddeeff00112233".to_owned(),
+                state: "encrypted".to_owned(),
+                active: false,
+            },
+            crate::backend::WalletInfo {
+                name: "demo".to_owned(),
+                pubkey: "eeff0011".to_owned(),
+                state: "encrypted".to_owned(),
+                active: true,
+            },
         ];
         state.hub_wallet_selected = "demo".to_owned();
         (state, Task::none())
@@ -1093,13 +1084,14 @@ impl Ducktape {
         state.connect_generation = 7;
         state.signer_key = "aa11".to_owned();
         state.shell_tab = ShellTab::Chat;
-        state.live_agents = vec![crate::backend::live_agent_row(
-            "channel-a".to_owned(),
-            2,
-            "chat:2:agent-1".to_owned(),
-            "Chief Duck".to_owned(),
-            "Reading the repo".to_owned(),
-        )];
+        state.live_agents = vec![crate::backend::LiveAgentRow {
+            channel_id: "channel-a".to_owned(),
+            anchor_seq: 2,
+            run_id: "chat:2:agent-1".to_owned(),
+            agent: "Chief Duck".to_owned(),
+            status: "Reading the repo".to_owned(),
+            ..Default::default()
+        }];
         (state, Task::none())
     }
     #[cfg(test)]

@@ -144,24 +144,6 @@ pub fn live_agents_stale(
         || notice.signer_key != signer_key
 }
 
-/// Construct an active agent row for app fixtures.
-pub fn live_agent_row(
-    channel_id: String,
-    anchor_seq: i64,
-    run_id: String,
-    agent: String,
-    status: String,
-) -> LiveAgentRow {
-    LiveAgentRow {
-        channel_id,
-        anchor_seq,
-        run_id,
-        agent,
-        status,
-        ..LiveAgentRow::default()
-    }
-}
-
 /// Fold one parsed output event into the row. Status lines replace the status;
 /// activities upsert by label and mark done; previews and answers replace the
 /// preview; errors become the status.

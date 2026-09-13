@@ -1,21 +1,5 @@
 use super::*;
 
-/// DOES THE ANSWER A SEARCH WAS SENT FOR STILL SPEAK FOR WHAT IS IN THE BOX?
-///
-/// Every search surface is ENTER-TO-SUBMIT and two-way bound with no
-/// `change=` route, so a keystroke writes the draft and runs no handler at
-/// all: nothing but this comparison can retire an answer as the reader types
-/// on. `query` is the string a search was actually SENT for and is empty when
-/// no answer is standing; `searching` covers the round trip the submit opened,
-/// during which no answer exists yet.
-///
-/// It replaces the hand-synced conjunct arms pages and chat each carried. A
-/// module-owned view carries the same reading in its own crate — the view
-/// wire carries words, not functions.
-pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
-    !searching && !query.is_empty() && draft.trim() == query
-}
-
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PaletteSearchData {
     pub chat_hits: Vec<ChatSearchHit>,
