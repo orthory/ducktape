@@ -258,6 +258,7 @@ impl ExplorerView {
         let matches_kind = |hit: &&host::ExplorerHit| self.kind == "all" || hit.kind == self.kind;
         let hits: Vec<_> = self.hits.iter().filter(matches_kind).collect();
         let empty_answer = hits.is_empty()
+            && self.partial.is_empty()
             && host::search_answer_stands(&self.sent_query, &self.query, self.searching);
         if empty_answer {
             content.push(kit::text("explorer/no-results", "No matching results."));

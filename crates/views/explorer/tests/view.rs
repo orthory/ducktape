@@ -309,6 +309,30 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 }
 
+#[test]
+fn unavailable_sources_do_not_claim_that_nothing_matched() {
+    let (frame, _) = connected_with_ledger();
+    let frame = tick_native(type_into(
+        &frame,
+        "Search messages, pages, issues, files, runs…",
+        "needle",
+    ));
+    let frame = tick_native(submit(
+        &frame,
+        "Search messages, pages, issues, files, runs…",
+    ));
+    let searches: Vec<_> = frame.requests.iter().filter(|request| {
+        matches!(request.kind.as_str(), "rpc.query" | "rpc.view")
+    }).collect();
+    assert_eq!(searches.len(), 8, "tasks reads three status pages");
+    let failures = searches.into_iter().map(|request| refuse(request.id, "unavailable")).collect();
+    let frame = tick_native(failures);
+    assert!(texts(&frame).iter().any(|text| text.contains("incomplete")));
+    assert!(!has_text(&frame, "No matching results."));
+    let frame = tick_native(press(&frame, "Clear workspace search"));
+    assert!(!texts(&frame).iter().any(|text| text.contains("incomplete")));
+}
+
 /// THE EYE GETS `0x`, THE CLIPBOARD GETS THE KEY. An op hash is the
 /// `GET /v1/files/blob/{op_hash}` key and what every CLI that takes a digest
 /// wants, so the copy carries it bare and whole — a paste that has to be
