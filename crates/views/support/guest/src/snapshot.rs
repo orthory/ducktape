@@ -1,7 +1,7 @@
 //! Quiescent state transfer into a fresh driver, without replaying app boot.
 use super::*;
 
-/// Generated Tree apps with a complete owned state codec.
+/// Applications with a complete owned state codec.
 /// Unsupported state reports an error instead of partially restoring an app.
 pub trait SnapshotApp: App {
     fn snapshot(&self) -> Result<Vec<u8>, String>;

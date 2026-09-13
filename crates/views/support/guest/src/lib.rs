@@ -42,7 +42,7 @@ pub mod window;
 pub use snapshot::SnapshotApp;
 mod snapshot;
 
-/// What `export_app!` needs from the generated application.
+/// The application contract consumed by `export_app!`.
 pub trait App: Sized + 'static {
     type Message: Clone + 'static;
     fn boot() -> (Self, Task<Self::Message>);
@@ -56,11 +56,11 @@ pub trait App: Sized + 'static {
 /// its `String -> Message` constructor, a checkbox's `on_toggle` that of a
 /// `bool -> Message` one, a slider's `f32`, a pick list's `u32`, a
 /// sensor's and a mouse area's `(f32, f32)` size or position, a mouse
-/// area's `(f32, f32, bool)` scroll. The host
+/// area's `(f32, f32, bool)` scroll, and a resize handle's `(f64, f64)` drag. The host
 /// echoes an index back with the value; the driver looks the handler up in
 /// the table of the frame it echoed and runs it.
 ///
-/// The tables are untyped so the generated code can push through this
+/// The tables are untyped so each guest can use this
 /// crate without naming the app's message type; the driver downcasts, by
 /// argument and message type both, so an index the host sends with the
 /// wrong kind of value finds nothing.
@@ -485,7 +485,7 @@ pub fn panic_line(message: &str, at: &str) -> String {
     line
 }
 
-/// Appends the generated window size and current wire epoch at compile time.
+/// Appends the preferred window size and current wire epoch at compile time.
 pub const fn manifest_bytes<const N: usize>(text: &str, preferred_size: &str) -> [u8; N] {
     let bytes = text.as_bytes();
     let size = preferred_size.as_bytes();
