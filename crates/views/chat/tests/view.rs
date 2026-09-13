@@ -255,7 +255,7 @@ fn a_connected_view_reads_its_own_room() {
         for expected in [
             "testnet",
             "general",
-            "ops",
+            "# ops · Unread",
             "first light",
             "second wind",
             "mallard",
