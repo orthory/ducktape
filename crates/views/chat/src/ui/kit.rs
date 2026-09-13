@@ -2,6 +2,133 @@ use super::*;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    pub(super) fn message_contents(
+        &self,
+        key: String,
+        message: &crate::host::ChatMessage,
+        surface: CopySurface,
+    ) -> wire::Node {
+        use ducktape_view_guest::slots;
+        let mut children = Vec::new();
+        if message.show_author {
+            let mut header = vec![
+                self.principal_avatar(
+                    format!("{key}/avatar"),
+                    message.initial.clone(),
+                    message.avatar_kind != "human",
+                ),
+                native::text(format!("{key}/author"), &message.author),
+            ];
+            if message.avatar_kind == "agent" {
+                header.push(native::text(format!("{key}/agent"), "AGENT"));
+            }
+            if message.height > 0 {
+                header.push(native::text(
+                    format!("{key}/height"),
+                    crate::host::height_label_short(message.height),
+                ));
+            }
+            children.push(native::row(format!("{key}/header"), header));
+        }
+        children.push(wire::Node::MouseArea {
+            key: format!("{key}/select"),
+            on_press: Some(slots::message(Message::PressMessage(message.seq, surface))),
+            on_release: None,
+            on_double_click: None,
+            on_right_press: None,
+            on_right_release: None,
+            on_middle_press: None,
+            on_middle_release: None,
+            on_enter: None,
+            on_exit: None,
+            on_move: None,
+            on_press_at: None,
+            on_scroll: None,
+            content: Box::new(Self::message_body(
+                format!("{key}/body"),
+                &message.blocks,
+                Some(slots::handler::<String, Message>(Box::new(|link| {
+                    Some(Message::OpenMessageLink(link))
+                }))),
+            )),
+        });
+        if message.edited {
+            children.push(native::text(format!("{key}/edited"), "· edited"));
+        }
+        let run = crate::host::run_of_message(&message.id);
+        if !run.is_empty() {
+            children.push(native::button(
+                format!("{key}/run"),
+                "View run",
+                Some(slots::message(Message::OpenRun(run))),
+                wire::ButtonPreset::Secondary,
+            ));
+        }
+        let mut reactions = Vec::new();
+        for reaction in &message.reactions {
+            let event = if reaction.reacted_by_me {
+                Message::RemoveReactionAt(message.seq, reaction.emoji.clone())
+            } else {
+                Message::AddReactionAt(message.seq, reaction.emoji.clone())
+            };
+            let mut button = native::button_child(
+                format!("{key}/reaction/{}", reaction.emoji),
+                native::row(
+                    format!("{key}/reaction/{}/label", reaction.emoji),
+                    [
+                        native::text(
+                            format!("{key}/reaction/{}/emoji", reaction.emoji),
+                            &reaction.emoji,
+                        ),
+                        native::text(
+                            format!("{key}/reaction/{}/count", reaction.emoji),
+                            reaction.count.to_string(),
+                        ),
+                    ],
+                ),
+                Some(slots::message(event)),
+                wire::ButtonPreset::Secondary,
+            );
+            if let wire::Node::Button {
+                checked,
+                label,
+                description,
+                ..
+            } = &mut button
+            {
+                *checked = Some(reaction.reacted_by_me);
+                *label = Some(
+                    if reaction.reacted_by_me {
+                        "Remove reaction"
+                    } else {
+                        "Add reaction"
+                    }
+                    .into(),
+                );
+                *description = Some(reaction.emoji.clone());
+            }
+            reactions.push(button);
+        }
+        if !reactions.is_empty() {
+            children.push(native::row(format!("{key}/reactions"), reactions));
+        }
+        if message.reply_count > 0 {
+            let mut button = native::button(
+                format!("{key}/thread"),
+                crate::host::plural(message.reply_count, "reply", "replies"),
+                Some(slots::message(Message::OpenThreadFor(message.seq))),
+                wire::ButtonPreset::Secondary,
+            );
+            if let wire::Node::Button { label, .. } = &mut button {
+                *label = Some("Open thread".into());
+            }
+            children.push(button);
+        }
+        if message.pending {
+            children.push(native::text(format!("{key}/pending"), &message.meta));
+        }
+        native::column(key, children)
+    }
     pub(super) fn message_body(
         key: String,
         blocks: &[crate::host::ChatBlock],
