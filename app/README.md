@@ -184,22 +184,23 @@ button variant; muted surfaces and text distinguish context from actions, and
 the destructive color identifies errors. These roles follow the active theme
 rather than a separate fixed shell palette.
 
-WASM views retain their authored light and dark faces across the wire boundary.
-The renderer maps their layout and presentation onto native controls; their
-module-specific styling is separate from the shell's theme tokens.
+WASM views own layout, document presentation and interaction routes. Shared guest
+kit constructors describe semantic controls through the wire boundary; the
+native renderer applies gpui-kit's active theme and control presets. Document
+formatting, such as links and code marks, remains part of the guest presentation.
 
 ## Design system
 
-The native shell and wire renderer use `gpui-kit`. WASM views describe their own faces,
-layout and editor presentation through the shared wire vocabulary. The local
-`design` crate owns application font assets and the product type scale.
+The native shell and wire renderer use `gpui-kit`. WASM views inherit its native
+control styling while describing layout and editor presentation through the
+shared wire vocabulary. The local `design` crate owns bundled font assets and
+the native shell's default text size.
 
 - Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
   labels, and badges).
   The files are embedded from `crates/views/support/design/assets/fonts/` at build time.
-- Guest type scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
-  body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field
-  label · 9.5 navigation · 9 badge.
+- Native shell default text size: 13.5px; native components and document
+  presentation choose their own semantic sizes.
 - Console frame: 1280×800 default, a 184px permanent rail and a 72px workspace
   header. Content fills the remaining space; individual WASM views own their
   sidebars and split panes.

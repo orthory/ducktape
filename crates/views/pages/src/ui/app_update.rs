@@ -290,7 +290,7 @@ impl PagesView {
         }
         self.autosave = "saving".to_owned();
         self.page_inflight_text = text.to_owned();
-        self.sent = crate::host::save(&(self.active_page), &(text), &(self.page_saved_text));
+        crate::host::save(&(self.active_page), &(text), &(self.page_saved_text));
         Task::none()
     }
     fn on_toggle_page_create(&mut self) -> Task<Message> {
@@ -312,7 +312,7 @@ impl PagesView {
         self.busy = true;
         self.pending_page = (self.page_draft).trim().to_owned();
         self.page_draft = "".to_owned();
-        self.sent = crate::host::create(&(self.pending_page));
+        crate::host::create(&(self.pending_page));
         Task::none()
     }
     fn on_arm_page_delete(&mut self) -> Task<Message> {
@@ -346,7 +346,7 @@ impl PagesView {
             &(self.block_comment_draft),
         );
         self.block_comment_draft = "".to_owned();
-        self.sent = crate::host::delete(&(self.active_page));
+        crate::host::delete(&(self.active_page));
         Task::none()
     }
     fn on_search_pages_submit(&mut self) -> Task<Message> {
@@ -505,7 +505,7 @@ impl PagesView {
         }
         self.busy = true;
         self.threads_loading = true;
-        self.sent = crate::host::resolve(&(id), resolved);
+        crate::host::resolve(&(id), resolved);
         Task::none()
     }
     fn on_select_reply_thread(&mut self, id: String) -> Task<Message> {
@@ -540,7 +540,7 @@ impl PagesView {
         self.threads_loading = true;
         self.pending_comment = (self.reply_draft).trim().to_owned();
         self.reply_draft = "".to_owned();
-        self.sent = crate::host::post(&(self.pending_comment), &(reply_target), &(id));
+        crate::host::post(&(self.pending_comment), &(reply_target), &(id));
         Task::none()
     }
     fn on_post_block_comment_submit(&mut self) -> Task<Message> {
@@ -562,11 +562,11 @@ impl PagesView {
         self.threads_loading = true;
         self.pending_comment = (self.block_comment_draft).trim().to_owned();
         self.block_comment_draft = "".to_owned();
-        self.sent = crate::host::post(&(self.pending_comment), &(fresh_target), "");
+        crate::host::post(&(self.pending_comment), &(fresh_target), "");
         Task::none()
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
-        self.sent = crate::host::copy(&(text), &(label));
+        crate::host::copy(&(text), &(label));
         Task::none()
     }
     fn on_document_pointer_released(&mut self, _button: wire::mouse::Button) -> Task<Message> {
@@ -669,8 +669,7 @@ impl PagesView {
         self.refresh_document_presentation();
         let comment_line = crate::host::navigation_comment_line(next.interaction.clone());
         self.page_refusal = "".to_owned();
-        self.sent =
-            crate::host::open_link(&(crate::host::navigation_link(next.interaction.clone())));
+        crate::host::open_link(&(crate::host::navigation_link(next.interaction.clone())));
         if (((comment_line < 0) || self.loading) || self.busy) || (self.active_page).is_empty() {
             return Task::none();
         }

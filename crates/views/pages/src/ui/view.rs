@@ -71,7 +71,6 @@ pub struct PagesView {
     pub(crate) page_saved_text: String,
     pub(crate) buffer_page: String,
     pub(crate) page_inflight_text: String,
-    pub(crate) sent: bool,
 }
 impl ::std::fmt::Debug for PagesView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -198,7 +197,6 @@ impl PagesView {
             page_saved_text: "".to_owned(),
             buffer_page: "".to_owned(),
             page_inflight_text: "".to_owned(),
-            sent: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -206,7 +204,7 @@ impl PagesView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     const SNAPSHOT_SCHEMA: &'static str =
-        "87cd7a014db885c60adf9b912eec1110214698b6aa8a191805f8458a9b326c7b";
+        "ddab2698f12a601ef232bf2cb53ee7cb4618866c31a238b9f25208c4ea70af56";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
