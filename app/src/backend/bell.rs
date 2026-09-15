@@ -265,10 +265,6 @@ fn bell_summary(item: &BellItem, actor: &str) -> BellPresentation {
     }
 }
 
-pub fn bell_label(item: &BellItem, presentations: &[BellPresentation]) -> String {
-    bell_presentation(item, presentations).title
-}
-
 pub fn bell_openable(item: &BellItem, presentations: &[BellPresentation]) -> bool {
     presentations.iter().any(|entry| {
         entry.seq == item.seq && entry.target != BellTarget::Unavailable && !entry.object.is_empty()
@@ -364,6 +360,75 @@ async fn view_block(
         ::pages::index::PagesViewReply::Block(block) => Ok(block),
         _ => Ok(None),
     }
+}
+
+async fn bell_job(
+    rpc: &RpcClient,
+    job_id: &str,
+    entry: &mut BellPresentation,
+) -> Result<(), String> {
+    let reply: ::tasks::WorkReply = rpc
+        .query(
+            "tasks",
+            &::tasks::WorkQuery::Job(::tasks::JobsQuery::Get {
+                job_id: job_id.into(),
+            }),
+        )
+        .await?;
+    let ::tasks::WorkReply::Job(::tasks::JobsReply::Job(Some(job))) = reply else {
+        entry.detail = "Job not found".into();
+        return Ok(());
+    };
+    let matches_job = job.job_id == job_id;
+    if !matches_job {
+        return Err("wrong job".into());
+    }
+    let status = match job.status {
+        ::tasks::JobStatus::Pending => "Pending",
+        ::tasks::JobStatus::Processing => "In progress",
+        ::tasks::JobStatus::Done => "Done",
+        ::tasks::JobStatus::Failed => "Failed",
+        ::tasks::JobStatus::Cancelled => "Cancelled",
+    };
+    entry.detail = format!("{} · {status}", bell_title(&job.kind));
+    Ok(())
+}
+
+async fn bell_job_event(
+    rpc: &RpcClient,
+    item: &BellItem,
+    object: &str,
+    entry: &mut BellPresentation,
+) -> Result<(), String> {
+    let seq = u64::try_from(item.change_seq).map_err(|_| "invalid change sequence")?;
+    let after = seq.checked_sub(1).ok_or("invalid change sequence")?;
+    let reply: attribution::AttributionReply = rpc
+        .query(
+            "attribution",
+            &attribution::AttributionQuery::Changes { after, limit: 1 },
+        )
+        .await?;
+    let attribution::AttributionReply::Changes(changes) = reply else {
+        return Err("wrong attribution reply".into());
+    };
+    let [record] = changes.as_slice() else {
+        return Err("change not found".into());
+    };
+    let change = &record.change;
+    let expected_source = attribution::Source {
+        module: "tasks".into(),
+        kind: "job_event".into(),
+        object: object.into(),
+    };
+    let matches_source = change.source == expected_source;
+    let matches_sequence = record.at == seq && change.seq == seq;
+    let matches_change = matches_sequence && matches_source;
+    if !matches_change {
+        return Err("wrong change".into());
+    }
+    // The immutable source object is an event hash, never a job ID.
+    let detail: ::tasks::JobEventDetail = sdk::wire::decode(&change.detail)?;
+    bell_job(rpc, &detail.job_id, entry).await
 }
 
 async fn bell_source(
@@ -516,31 +581,8 @@ async fn bell_source(
             };
             entry.detail = format!("{} · {status}", bell_preview(&task.title));
         }
-        ("tasks", "job") => {
-            let reply: ::tasks::WorkReply = rpc
-                .query(
-                    "tasks",
-                    &::tasks::WorkQuery::Job(::tasks::JobsQuery::Get {
-                        job_id: object.into(),
-                    }),
-                )
-                .await?;
-            let ::tasks::WorkReply::Job(::tasks::JobsReply::Job(Some(job))) = reply else {
-                entry.detail = "Job not found".into();
-                return Ok(());
-            };
-            if job.job_id != object {
-                return Err("wrong job".into());
-            }
-            let status = match job.status {
-                ::tasks::JobStatus::Pending => "Pending",
-                ::tasks::JobStatus::Processing => "In progress",
-                ::tasks::JobStatus::Done => "Done",
-                ::tasks::JobStatus::Failed => "Failed",
-                ::tasks::JobStatus::Cancelled => "Cancelled",
-            };
-            entry.detail = format!("{} · {status}", bell_title(&job.kind));
-        }
+        ("tasks", "job") => bell_job(rpc, object, entry).await?,
+        ("tasks", "job_event") => bell_job_event(rpc, item, object, entry).await?,
         ("runs", "action_request") => {
             let reply: ::runs::RunsReply = rpc
                 .query(
@@ -577,7 +619,7 @@ async fn bell_source(
 }
 
 async fn enrich_bell(rpc: &RpcClient, items: Vec<BellItem>) -> Vec<BellPresentation> {
-    use iced::futures::{StreamExt, stream};
+    use futures::{StreamExt, stream};
     let facts = ReaderFacts::current().await;
     stream::iter(items)
         .map(|item| {
@@ -620,49 +662,6 @@ pub fn bell_title(kind: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => words,
-    }
-}
-
-/// Source-defined reason names may carry a severity; unclassified reasons
-/// stay informational. This does not infer severity from opaque source detail.
-pub fn bell_severity(kind: &str) -> String {
-    const WARN: &[&str] = &[
-        "review_requested",
-        "changes_requested",
-        "proposal_opened",
-        "vote_needed",
-        "run_cancelled",
-        "quota",
-    ];
-    const ERROR: &[&str] = &["failed", "error", "rejected", "conflict", "revoked"];
-    let kind = kind.to_lowercase();
-    let names_error = ERROR.iter().any(|token| kind.contains(token));
-    let names_warning = WARN.iter().any(|token| kind.contains(token));
-    // These three strings ARE the tone vocabulary `PulseDot`, `StillDot` and
-    // `BellBadge` match on. They used to be `error`/`warn`, which no arm of
-    // `BellBadge` carried, so a failed run painted the badge info-blue through
-    // the fallthrough. One name per severity, spoken everywhere.
-    match (names_error, names_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
-    }
-}
-
-/// The worst severity among the UNREAD rows, for the bell badge's tint —
-/// `info` when nothing is unread.
-pub fn bell_worst_severity(items: &[BellItem]) -> String {
-    let severities: Vec<String> = items
-        .iter()
-        .filter(|item| !item.read)
-        .map(|item| bell_severity(&item.reason))
-        .collect();
-    let any_error = severities.iter().any(|severity| severity == "danger");
-    let any_warning = severities.iter().any(|severity| severity == "warning");
-    match (any_error, any_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
     }
 }
 

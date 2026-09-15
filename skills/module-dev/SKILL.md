@@ -28,8 +28,18 @@ network:
 ```
 ducktape module register <id> <component.wasm> [--index <index.wasm>] [--after N]  # admit a new id
 ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N]  # swap live code
-ducktape module status                                      # the registry
+ducktape module register <id> --view target/views/<id>_view.wasm [--assets crates/views/<id>/assets] [--after N]  # admit a VIEW-ONLY entry (kind `view`: a UI with no core, built by `ops/build-views.sh -p <id>-view`; the app draws its tab off the registry)
+ducktape module status                                      # the registry, plus the open code proposals (tasteable)
 ```
+
+While a code proposal is open (and once it is scheduled), every member may
+TASTE its view: `module update <id> <active core> --view <new wasm>` opens the
+ballot and fans the bytes out; the app's Governance card and Settings →
+Proposed views offer "Try this view" for a frame whose core is byte-identical
+to the active one (a `View`-kind frame always), seating it on that device
+alone with the tab reading "· proposed"; withdrawal returns the seat,
+activation keeps it. A proposal that changes the core is listed as
+`core_changes_too` with nothing to try.
 
 `register`/`update` drive the governance proposal that schedules the
 admission/swap FIRST, then stage the component at this node's owner-gated admin
@@ -42,9 +52,9 @@ a refusal to propose: the swap activates at `height + N` (`N > MIN_SWAP_LEAD`,
 i.e. `> 3`; default 50 to leave room for the ceremony's own blocks) only once
 every validator holds the code and signals ready, and a holdout fetches the
 committed artifact off a peer before that boundary. `status` prints one row per
-module — `id  active
-pending`, a pending swap carrying `ready k` (validators that signalled) or
-`ready ✓`. Restore and state sync compose the wasm set from the registry's
+entry — `id  kind  active  pending` (`kind` is `module` or `view`: what the
+registry says the artifact is, fixed at admission), a pending swap carrying
+`ready k` (validators that signalled) or `ready ✓`. Restore and state sync compose the wasm set from the registry's
 roster at the boundary (`noded::compose`, `Boot::Reopen`), so an admitted id
 composes like a genesis one; a module admitted after the last checkpoint
 starts fresh and is rebuilt by replay (`seat_at`, unit-pinned in

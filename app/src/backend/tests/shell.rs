@@ -1,42 +1,6 @@
 use super::*;
 
 #[test]
-fn the_rail_seats_collaboration_and_node_operations_separately() {
-    let nav = shell_nav(ShellTab::Chat, 3, true);
-    let ids: Vec<ShellTab> = nav.iter().map(|item| item.id).collect();
-    assert_eq!(
-        ids,
-        [
-            ShellTab::Chat,
-            ShellTab::Pages,
-            ShellTab::Forge,
-            ShellTab::Agents,
-            ShellTab::Files,
-            ShellTab::Explorer,
-            ShellTab::Node,
-            ShellTab::Members,
-            ShellTab::Governance
-        ]
-    );
-    let forge = nav.iter().find(|item| item.id == ShellTab::Forge).unwrap();
-    assert!(forge.live, "an engaged agent pulses the forge seat");
-    assert_eq!(
-        nav.iter()
-            .find(|item| item.id == ShellTab::Node)
-            .unwrap()
-            .title,
-        "Node"
-    );
-    assert_eq!(
-        nav.iter()
-            .find(|item| item.id == ShellTab::Governance)
-            .unwrap()
-            .badge,
-        3
-    );
-}
-
-#[test]
 fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() {
     let member = |is_you: bool| HuddleParticipant {
         key: "aa".into(),
@@ -146,47 +110,6 @@ fn the_roster_answers_admin_tier_and_filters() {
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
     assert_eq!(member_tier(&answered_without_this_node), "guest");
-}
-
-/// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
-/// two VALSET queries — validators and residents — while the roster under it
-/// also draws every registered agent, which holds no valset standing at all. On
-/// the demo workspace that printed `1 validator · 0 residents` over two rows:
-/// both numbers true, the sentence not, because it measured a different set
-/// than the one on screen. The subtitle now splits the rows on `is_agent`, the
-/// same predicate the Humans / Agents chips use, so its two counts partition
-/// the list and sum to the All chip.
-#[test]
-fn the_members_subtitle_folds_the_rows_the_screen_lists() {
-    let member = |key: &str, role: &str| MemberRow {
-        key: key.into(),
-        label: key.into(),
-        is_agent: role == "agent",
-        role: role.into(),
-        is_this_node: false,
-        model: String::new(),
-        live: true,
-    };
-    let rows = vec![
-        member("aa", "validator"),
-        member("bb", "resident"),
-        member("triage", "agent"),
-    ];
-    assert_eq!(members_summary(true, &rows), "2 humans · 1 agent");
-    // singulars, and the count that used to be the whole subtitle.
-    assert_eq!(members_summary(true, &rows[..1]), "1 human · 0 agents");
-
-    // The invariant under the wording: every number in the subtitle is a slice
-    // of the list, so they add up to the row count. The valset fold never did.
-    let counted: usize = members_summary(true, &rows)
-        .split(" · ")
-        .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
-        .sum();
-    assert_eq!(
-        counted,
-        rows.len(),
-        "the Members subtitle must sum to the roster printed under it"
-    );
 }
 
 #[test]
@@ -338,321 +261,73 @@ fn huddle_recipient_nodes_keeps_the_readers_other_device() {
 }
 
 #[test]
-fn popover_uses_only_shared_design_roles() {
-    let tokens = ui_lang_components::ui::theme::LIGHT;
-    let raised = raised_style(&iced::Theme::Light);
-    // OPAQUE. iced has no backdrop blur, so a glass role over a menu is just
-    // transparency: the sentence behind an item and the item's own label draw
-    // through each other.
-    assert_eq!(
-        raised.background,
-        Some(iced::Background::Color(tokens.palette.popover))
-    );
-    assert_eq!(raised.background.map(alpha_of), Some(1.0));
-    assert_eq!(
-        raised_style(&iced::Theme::Dark).background.map(alpha_of),
-        Some(1.0)
-    );
-    assert_eq!(raised.border.radius, tokens.radius.card.into());
-    assert_eq!(raised.shadow, tokens.elevation.popover);
-}
-
-#[test]
-fn palette_keys_use_logical_escape_and_physical_shortcut() {
-    use iced::keyboard::{
-        Key, Modifiers,
-        key::{Code, Named, Physical},
+fn palette_keys_use_native_platform_shortcuts() {
+    let plain = gpui_kit::Modifiers::default();
+    let command = gpui_kit::Modifiers {
+        platform: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        ..Default::default()
     };
-
-    assert_eq!(
-        palette_key_action(
-            Key::Named(Named::Escape),
-            Physical::Code(Code::KeyA),
-            Modifiers::default(),
-            true,
-        ),
-        "close"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Named(Named::Escape),
-            Physical::Code(Code::KeyA),
-            Modifiers::default(),
-            false,
-        ),
-        "none"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Character("x".into()),
-            Physical::Code(Code::KeyK),
-            Modifiers::COMMAND,
-            false,
-        ),
-        "open"
-    );
-    assert_eq!(
-        palette_key_action(
-            Key::Character("x".into()),
-            Physical::Code(Code::KeyK),
-            Modifiers::COMMAND,
-            true,
-        ),
-        "close"
-    );
+    assert_eq!(palette_key_action("escape".into(), plain, true), "close");
+    assert_eq!(palette_key_action("escape".into(), plain, false), "none");
+    assert_eq!(palette_key_action("k".into(), command, false), "open");
+    assert_eq!(palette_key_action("K".into(), command, true), "close");
+    assert_eq!(palette_key_action("x".into(), command, false), "none");
+    assert_eq!(palette_key_action("k".into(), plain, false), "none");
 }
 
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
-    use iced::keyboard::{Key, key::Named};
-
-    let escape = Key::Named(Named::Escape);
-    let target = |tab: ShellTab,
-                  palette: bool,
-                  bell: bool,
-                  create: bool,
-                  thread_action: MessageAction,
-                  action: MessageAction,
-                  drawer: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            palette,
-            bell,
-            create,
-            thread_action,
-            action,
-            drawer,
-            false,
-        )
+    let escape = String::from("escape");
+    let target = |palette: bool, bell: bool, create: bool| {
+        escape_target(escape.clone(), palette, bell, create)
     };
 
-    // Not Escape → nothing, whatever is open.
-    assert_eq!(
-        escape_target(
-            Key::Character("x".into()),
-            ShellTab::Chat,
-            false,
-            true,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-            true,
-        ),
-        ""
-    );
+    // Not Escape -> nothing, whatever is open.
+    assert_eq!(escape_target(String::from("x"), false, true, true), "");
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            true,
-            true,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        ""
-    );
-    // The ladder order is the z-order: bell over the create modal, menus
-    // after both, thread menu over the stream's, popovers last.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            true,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        "bell"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        "channel_create"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::More,
-            MessageAction::More,
-            false,
-        ),
-        "thread_menu"
-    );
-    // AND THE DRAWER OUTRANKS THE THREAD MENU WHEN IT IS OPEN. The rail is not
-    // mounted while Channel details is up (`if active_thread_seq > 0 &&
-    // !channel_settings_open`, `screens/chat.ice`), so a ⋯ flag left set behind
-    // it names no layer on screen — this test used to pin the opposite verdict,
-    // where the first Escape wiped `thread_edit_draft` and left the drawer
-    // standing.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::More,
-            MessageAction::Toolbar,
-            true,
-        ),
-        "channel_settings"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Editing,
-            true,
-        ),
-        "message_menu"
-    );
-    // THE DRAWER SITS UNDER THE STREAM'S MENU, which floats over Channel
-    // details, so it wins.
-    // It had no rung at all — an `×` and no keyboard exit, while every other
-    // overlay answered Escape. Measured: Escape over an open drawer changed
-    // exactly zero pixels on the running app.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            true,
-        ),
-        "channel_settings"
-    );
-    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
-    // the Pages screen — so it is a rung, and it answers only from Pages.
-    let armed = |tab: ShellTab, page_delete: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            page_delete,
-        )
-    };
-    assert_eq!(armed(ShellTab::Pages, true), "page_delete");
-    assert_eq!(armed(ShellTab::Chat, true), "");
+    assert_eq!(target(true, true, true), "");
+    // The ladder order is the z-order: bell over the create modal.
+    assert_eq!(target(false, true, true), "bell");
+    assert_eq!(target(false, false, true), "channel_create");
 
-    // Nothing transient open → Escape is a no-op. The pages block menus are
-    // gone with the surfaces they dismissed.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-        ),
-        ""
-    );
+    // Nothing transient open -> Escape is a no-op. THE PER-TAB RUNGS ARE GONE
+    // WITH THEIR SCREENS: the chat menus and details drawer, the pages armed
+    // delete and comments card, are their views' own layers now, dismissed
+    // inside the guest that painted the scrim.
+    assert_eq!(target(false, false, false), "");
 }
 
-// A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
-// clears menu state (`select_shell_tab` leaves every menu flag set), so a
-// ⋯ menu opened on Chat is still SET while Pages is on screen —
-// unscoped, that stale flag ate the first Escape on every other tab. The
-// palette, bell and create modal are mounted OUTSIDE the tab
-// match in `components/shell.ice` and keep answering from every tab.
+// EVERY RUNG LEFT RIDES EVERY TAB, WHICH IS WHY NEITHER READER TAKES ONE. The
+// per-tab rungs went to the views that mount their surfaces; the palette, the
+// bell and the create modal are mounted outside the native tab content,
+// so they stay on screen across a switch and must keep
+// answering from wherever the reader lands. The two readers enumerate the SAME
+// layers in the same order, and differ on exactly one verdict.
 #[test]
-fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
-    use iced::keyboard::{Key, key::Named};
-
-    let escape = Key::Named(Named::Escape);
-    let none = String::new();
-
-    // One closure per reader, the sibling test's `target` shape: tab first,
-    // then one argument per layer.
-    let overlay =
-        |tab: ShellTab, thread_action: MessageAction, action: MessageAction, drawer: bool| {
-            topmost_overlay(
-                tab,
-                false,
-                false,
-                false,
-                thread_action,
-                action,
-                drawer,
-                false,
-            )
-        };
-    let target = |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            bell,
-            create,
-            thread_action,
-            MessageAction::Toolbar,
-            false,
-            false,
-        )
+fn the_two_ladder_readers_enumerate_the_same_layers() {
+    let escape = String::from("escape");
+    let target = |palette: bool, bell: bool, create: bool| {
+        escape_target(escape.clone(), palette, bell, create)
     };
 
-    // A stale chat menu names no layer from another tab — for BOTH readers.
-    let stale_thread_menu =
-        |tab: ShellTab| overlay(tab, MessageAction::More, MessageAction::Toolbar, false);
-    assert_eq!(stale_thread_menu(ShellTab::Chat), "thread_menu");
-    assert_eq!(stale_thread_menu(ShellTab::Pages), none);
-    assert_eq!(stale_thread_menu(ShellTab::Explorer), none);
+    for (palette, bell, create, layer) in [
+        (false, true, true, "bell"),
+        (false, false, true, "channel_create"),
+    ] {
+        assert_eq!(topmost_overlay(palette, bell, create), layer);
+        assert_eq!(target(palette, bell, create), layer);
+    }
 
-    // Same for the stream's menu and the details drawer.
-    assert_eq!(
-        overlay(
-            ShellTab::Files,
-            MessageAction::Toolbar,
-            MessageAction::Editing,
-            false,
-        ),
-        none
-    );
-    assert_eq!(
-        overlay(
-            ShellTab::Pages,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            true,
-        ),
-        none
-    );
+    // THE ONE VERDICT THEY DIFFER ON. The scroll reader has to know a palette
+    // is over the pane it would otherwise move; Escape must not close what
+    // `palette_key_action` already owns.
+    assert_eq!(topmost_overlay(true, true, true), "palette");
+    assert_eq!(target(true, true, true), String::new());
 
-    // Window-level layers ride every tab: mounted outside the tab match, they
-    // stay on screen across a switch and must keep answering.
-    assert_eq!(
-        target(ShellTab::Governance, true, false, MessageAction::Toolbar),
-        "bell"
-    );
-    assert_eq!(
-        target(ShellTab::Node, false, true, MessageAction::Toolbar),
-        "channel_create"
-    );
+    // Nothing transient open, nothing named — for both.
+    assert_eq!(topmost_overlay(false, false, false), String::new());
+    assert_eq!(target(false, false, false), String::new());
 }
 
 #[test]
@@ -684,53 +359,24 @@ fn files_base64_round_trips() {
     }
 }
 
-#[test]
-fn bell_severity_projects_the_kind_and_defaults_to_info() {
-    assert_eq!(bell_severity("run_failed"), "danger");
-    assert_eq!(bell_severity("review_requested"), "warning");
-    assert_eq!(bell_severity("mentioned"), "info");
-    // an unnamed kind is a notice, never an alarm.
-    assert_eq!(bell_severity("brand_new_kind"), "info");
-}
-
-#[test]
-fn bell_badge_takes_the_worst_unread_severity() {
-    let item = |seq: i64, kind: &str, read: bool| BellItem {
-        seq,
-        reason: kind.into(),
-        read,
-        ..BellItem::default()
-    };
-
-    assert_eq!(
-        bell_worst_severity(&[item(1, "mentioned", false), item(2, "run_failed", false)]),
-        "danger"
-    );
-    // a READ error does not keep the badge red.
-    assert_eq!(
-        bell_worst_severity(&[
-            item(1, "run_failed", true),
-            item(2, "review_requested", false)
-        ]),
-        "warning"
-    );
-    assert_eq!(bell_worst_severity(&[]), "info");
-}
-
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
 /// members, governance, agents, account — regardless of the destination, so a
 /// click into Files paid four `/v1/query` round trips for rows nothing on
 /// screen reads.
 #[test]
 fn a_tab_move_only_refetches_what_its_destination_draws() {
-    // EVERY tab, taken from the rail itself plus the footer's Settings, so a
-    // new seat lands in this sweep instead of quietly defaulting to "reads
-    // nothing" behind a hand-written negative list.
-    let mut tabs: Vec<ShellTab> = shell_nav(ShellTab::Chat, 0, false)
-        .into_iter()
-        .map(|seat| seat.id)
-        .collect();
-    tabs.push(ShellTab::Settings);
+    let tabs = [
+        ShellTab::Chat,
+        ShellTab::Pages,
+        ShellTab::Forge,
+        ShellTab::Agents,
+        ShellTab::Files,
+        ShellTab::Explorer,
+        ShellTab::Node,
+        ShellTab::Members,
+        ShellTab::Governance,
+        ShellTab::Settings,
+    ];
 
     // the roster is drawn by five panes: its own, the admin gate under
     // Approvals, the forge write gate, the Node permissions, and the Settings
@@ -824,22 +470,6 @@ checkpoint_blocks = 32
 }
 
 #[test]
-fn membership_removal_preserves_the_exact_stored_party() {
-    let key = "ab".repeat(32);
-    assert_eq!(member_party("acct:42").unwrap(), ::chat::Party::Account(42));
-    assert_eq!(
-        member_party(&key).unwrap(),
-        ::chat::Party::Key(vec![0xab; 32])
-    );
-    assert_eq!(
-        member_party(&format!("user:{key}")).unwrap(),
-        ::chat::Party::Key(vec![0xab; 32])
-    );
-    assert!(member_party("module:chat").is_err());
-    assert!(member_party("acct:invalid").is_err());
-}
-
-#[test]
 fn bell_renders_attribution_relation_and_change_actor() {
     let item = BellItem {
         seq: 1,
@@ -862,5 +492,4 @@ fn bell_renders_attribution_relation_and_change_actor() {
         bell_presentation(&item, std::slice::from_ref(&context)),
         context
     );
-    assert_eq!(bell_worst_severity(&[item]), "info");
 }

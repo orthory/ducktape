@@ -1,7 +1,6 @@
 use super::*;
 
-/// A selected loader call. Ice task-flow transforms may read only their input,
-/// so the optional carries every argument the chosen effect needs.
+/// A selected loader call with every argument the chosen effect needs.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LoadRequest {
     pub rpc: String,
@@ -28,71 +27,6 @@ pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
 
-pub fn merge_pending_blocks(
-    canonical: Vec<PageBlock>,
-    current: Vec<PageBlock>,
-    current_page: String,
-    next_page: String,
-    settled_id: String,
-) -> Vec<PageBlock> {
-    if current_page != next_page {
-        return canonical;
-    }
-    let canonical_ids = canonical
-        .iter()
-        .map(|block| block.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut pending_by_anchor = BTreeMap::<String, Vec<PageBlock>>::new();
-    let mut anchor = String::new();
-    for block in current {
-        if canonical_ids.contains(&block.id) {
-            anchor = block.id;
-        } else if block.pending && block.id != settled_id {
-            pending_by_anchor
-                .entry(anchor.clone())
-                .or_default()
-                .push(block);
-        }
-    }
-    if pending_by_anchor.is_empty() {
-        return canonical;
-    }
-    let mut merged = pending_by_anchor.remove("").unwrap_or_default();
-    for block in canonical {
-        let id = block.id.clone();
-        merged.push(block);
-        merged.extend(pending_by_anchor.remove(&id).unwrap_or_default());
-    }
-    merged.extend(pending_by_anchor.into_values().flatten());
-    merged
-}
-
-pub fn append_page_comment_threads(
-    threads: Vec<PageCommentThread>,
-    next: Vec<PageCommentThread>,
-) -> Vec<PageCommentThread> {
-    threads
-        .into_iter()
-        .chain(next)
-        .map(|thread| (thread.id.clone(), thread))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
-pub fn append_page_comments(
-    comments: Vec<PageComment>,
-    next: Vec<PageComment>,
-) -> Vec<PageComment> {
-    comments
-        .into_iter()
-        .chain(next)
-        .map(|comment| (comment.ordinal, comment))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
     if keep_pending {
         return current;
@@ -113,14 +47,6 @@ pub fn remember_failed_draft(
         return pending;
     }
     format!("{existing}\n{pending}")
-}
-
-pub fn retain_for_endpoint(value: String, current: String, next: String) -> String {
-    if current == next {
-        value
-    } else {
-        String::new()
-    }
 }
 
 pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
@@ -144,20 +70,12 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         return false;
     }
     match phase {
-        crate::MutationPhase::MessageDelete | crate::MutationPhase::MessageEdit => true,
+        crate::MutationPhase::MessageEdit => true,
         crate::MutationPhase::Idle
         | crate::MutationPhase::Recovering
-        | crate::MutationPhase::BlockComment
         | crate::MutationPhase::Channel
-        | crate::MutationPhase::ChannelArchive
-        | crate::MutationPhase::ChannelMember
-        | crate::MutationPhase::ChannelRename
-        | crate::MutationPhase::ChannelUnarchive
-        | crate::MutationPhase::CommentResolve
         | crate::MutationPhase::Huddle
-        | crate::MutationPhase::Onboarding
-        | crate::MutationPhase::Page
-        | crate::MutationPhase::PageDelete => false,
+        | crate::MutationPhase::Onboarding => false,
     }
 }
 
@@ -170,120 +88,6 @@ pub fn message_seq_after_failure(
         0
     } else {
         current
-    }
-}
-
-pub fn message_text_after_failure(
-    current: String,
-    phase: crate::MutationPhase,
-    committed: bool,
-) -> String {
-    if committed_message_change(phase, committed) {
-        String::new()
-    } else {
-        current
-    }
-}
-
-pub fn message_action_after_failure(
-    current: crate::MessageAction,
-    phase: crate::MutationPhase,
-    committed: bool,
-) -> crate::MessageAction {
-    if committed_message_change(phase, committed) {
-        crate::MessageAction::Toolbar
-    } else {
-        current
-    }
-}
-
-pub fn refreshed_required_message_seq(
-    messages: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-    value: i64,
-) -> i64 {
-    if current_channel != next_channel {
-        return 0;
-    }
-    if messages
-        .iter()
-        .any(|message| message.seq == value && !message.deleted)
-    {
-        value
-    } else {
-        0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MessageSelection {
-    pub seq: i64,
-    pub rev: i64,
-    pub action: crate::MessageAction,
-    pub draft: String,
-}
-
-pub(crate) fn message_selection_after_window_ref(
-    messages: &[ChatMessage],
-    seq: i64,
-    rev: i64,
-    action: crate::MessageAction,
-    draft: String,
-) -> MessageSelection {
-    let visible = seq > 0
-        && messages
-            .iter()
-            .any(|message| message.seq == seq && !message.deleted);
-    if visible {
-        MessageSelection {
-            seq,
-            rev,
-            action,
-            draft,
-        }
-    } else {
-        MessageSelection {
-            seq: 0,
-            rev: 0,
-            action: crate::MessageAction::Toolbar,
-            draft: String::new(),
-        }
-    }
-}
-
-pub fn message_selection_after_window(
-    messages: Vec<ChatMessage>,
-    seq: i64,
-    rev: i64,
-    action: crate::MessageAction,
-    draft: String,
-) -> MessageSelection {
-    message_selection_after_window_ref(&messages, seq, rev, action, draft)
-}
-
-pub fn refreshed_known_message_seq(
-    messages: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-    value: i64,
-) -> i64 {
-    if current_channel != next_channel
-        || messages
-            .iter()
-            .any(|message| message.seq == value && message.deleted)
-    {
-        0
-    } else {
-        value
-    }
-}
-
-pub fn refreshed_channel_value(current_channel: String, next_channel: String, value: i64) -> i64 {
-    if current_channel == next_channel {
-        value
-    } else {
-        0
     }
 }
 
@@ -396,26 +200,13 @@ pub fn channel_switch_facts(
     }
 }
 
-/// Is the reader inside the last tenth of the loaded scrollback?
-///
-/// The stream is bottom-anchored, so a scrollable reports its offset relative
-/// to the END — 1.0 is the TOP of the history in hand, which is where the next
-/// older page belongs.
-///
-/// A NaN offset (content that fits reports `0/0`) compares false against
-/// everything, which is the answer this wants anyway — iced does not publish a
-/// viewport at all in that case, so it is a belt, not the braces.
-pub fn near_scroll_top(relative_offset: f64) -> bool {
-    relative_offset >= 0.9
-}
-
 /// Is the reader AT the live tail — the other end of the same offset.
 ///
 /// 0.0 is the end the stream is anchored to, so a small band around it counts
 /// as "now": the last row is on screen and the next arrival scrolls itself into
 /// view.
 ///
-/// A NaN offset (content that fits, which iced reports as `0/0`) must read as AT
+/// An undefined relative offset (`0/0` when content fits) must read as AT
 /// THE TAIL — a conversation too short to scroll is entirely on screen — and NaN
 /// compares false against everything, so the band is written as the comparison
 /// that must SUCCEED to be at the tail, with NaN taken by the explicit arm.
@@ -485,16 +276,6 @@ pub fn submit_verdict(
     }
 }
 
-/// The operation-id prefix each composer mints under, so a pending message and
-/// a pending reply never share an id space.
-pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
-    match kind {
-        crate::ComposerKind::Message => "message".to_owned(),
-        crate::ComposerKind::Reply => "reply".to_owned(),
-        crate::ComposerKind::Edit | crate::ComposerKind::ThreadEdit => "edit".to_owned(),
-    }
-}
-
 /// The rail's key: a reply belongs to its THREAD, and the same seq under two
 /// rooms is two different threads.
 pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
@@ -503,6 +284,17 @@ pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String
 
 pub fn edit_scope(endpoint: &str, channel_id: &str, seq: i64) -> String {
     format!("{endpoint}\u{1f}{channel_id}#{seq}/edit")
+}
+
+/// The thread a reply composer's scope names — the `#<seq>` tail
+/// [`thread_scope`] appends — or 0 for a room's own box. The rail belongs to
+/// the view, so the thread a submitted reply is for is read back off the box
+/// it was written in rather than off any app state that may have moved.
+pub fn scope_thread_seq(scope: &str) -> i64 {
+    let Some((_, seq)) = scope.rsplit_once('#') else {
+        return 0;
+    };
+    seq.parse().unwrap_or_default()
 }
 
 /// The room a composer scope belongs to: a thread scope shorn of the
@@ -520,19 +312,6 @@ pub fn room_scope(scope: &str) -> String {
     }
     scope.to_owned()
 }
-
-/// The clicked page's title, from the index the sidebar is already drawn from
-/// — the header has to move with the click, not with the round trip. Falls
-/// back to the current title while the id is not in the list yet.
-pub fn page_display_title(pages: Vec<PageItem>, page: String, current: String) -> String {
-    pages
-        .iter()
-        .find(|row| row.id == page)
-        .map_or(current, |row| row.title.clone())
-}
-
-/// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id
-/// (no channel selected / disconnected) is inert.
 pub fn mark_channel_read(
     mut reads: Vec<ChannelRead>,
     channel: String,
@@ -549,8 +328,51 @@ pub fn mark_channel_read(
     reads
 }
 
-/// One channel row with the unread decision already attached. Ice externs take
-/// lists by value, so a view-time lookup cloned the unread list once per row.
+/// ONE SEND IN FLIGHT, as the screen must paint it before any block carries
+/// it. The room's timeline is the chat view's own reading of the index, which
+/// cannot know about an operation the node has not committed yet — so the app
+/// keeps the admitted sends here and the view paints them at the tail of the
+/// surface each was written in (`thread_seq` 0 is the room itself).
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct PendingSend {
+    pub id: String,
+    pub body: String,
+    pub thread_seq: i64,
+}
+
+/// A newly admitted send, at the end of the queue.
+pub fn send_pending(
+    mut sends: Vec<PendingSend>,
+    id: String,
+    body: String,
+    thread_seq: i64,
+) -> Vec<PendingSend> {
+    sends.push(PendingSend {
+        id,
+        body,
+        thread_seq,
+    });
+    sends
+}
+
+/// The queue without the send `id` names — it committed, or it failed and its
+/// words went back to the composer it was written in.
+pub fn send_settled(mut sends: Vec<PendingSend>, id: &str) -> Vec<PendingSend> {
+    sends.retain(|send| send.id != id);
+    sends
+}
+
+/// The queue after a send FAILED. A committed one stays: the block carrying it
+/// landed and only the read after it failed, so taking the row off now would
+/// blank the message she just sent until the recovery resync puts it back.
+pub fn send_failed(sends: Vec<PendingSend>, id: &str, committed: bool) -> Vec<PendingSend> {
+    match committed {
+        true => sends,
+        false => send_settled(sends, id),
+    }
+}
+
+/// One channel row with the unread decision already attached.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSidebarRow {
     pub channel: ChatChannel,
@@ -688,187 +510,6 @@ pub fn frozen_unread_boundary(
     if arrived_with_unread { last_read } else { 0 }
 }
 
-/// The `seq` of the first message past `boundary` (messages are seq-ascending),
-/// or 0 when the visit started caught up (`boundary <= 0`) or nothing is unread.
-/// Pending optimistic messages carry a negative seq, so they never anchor a divider.
-pub fn first_unread_seq(messages: Vec<ChatMessage>, boundary: i64) -> i64 {
-    if boundary <= 0 {
-        return 0;
-    }
-    messages
-        .iter()
-        .find(|message| message.seq > boundary)
-        .map_or(0, |message| message.seq)
-}
-
-pub fn thread_generation_after_refresh(
-    generation: i64,
-    current_channel: String,
-    next_channel: String,
-    previous_root: i64,
-    next_root: i64,
-) -> i64 {
-    let context_unchanged = current_channel == next_channel && previous_root == next_root;
-    if context_unchanged {
-        generation
-    } else {
-        generation + 1
-    }
-}
-
-pub fn thread_loading_after_refresh(
-    loading: bool,
-    current_channel: String,
-    next_channel: String,
-    previous_root: i64,
-    next_root: i64,
-) -> bool {
-    let same_channel = current_channel == next_channel;
-    let active_root_was_invalidated = previous_root > 0 && next_root <= 0;
-    loading && same_channel && !active_root_was_invalidated
-}
-
-pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
-    if root_seq > 0 { messages } else { Vec::new() }
-}
-
-/// The clicked message as the rail's first row, so a thread opens on the
-/// message it is ABOUT instead of a blank 330px plate for the whole round trip.
-/// `thread_loaded` replaces the vec wholesale on arrival, and a load that FAILS
-/// leaves the root standing rather than a permanently empty pane.
-///
-/// BOTH LISTS, because `open_thread_for` is emitted from inside the rail too: a
-/// re-root onto a reply names a seq that lives in `thread`, never in the
-/// timeline. Answers empty when neither holds it — the honest state, and the
-/// one the rail drew before.
-pub fn thread_root_seed(
-    messages: Vec<ChatMessage>,
-    thread: Vec<ChatMessage>,
-    seq: i64,
-) -> Vec<ChatMessage> {
-    messages
-        .into_iter()
-        .chain(thread)
-        .find(|message| message.seq == seq)
-        .into_iter()
-        .collect()
-}
-
-pub fn remember_orphaned_comment_drafts(
-    mut drafts: Vec<String>,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    current: String,
-) -> Vec<String> {
-    if selected_block_missing(&blocks, &selected_id) {
-        append_recovered_draft(&mut drafts, current);
-    }
-    drafts
-}
-
-/// The live-resync twin of [`remember_orphaned_comment_drafts`]: the rail's
-/// anchor is the PAGE, so the half-typed comment is orphaned only when that
-/// page itself vanished from the index — never merely because a resync ran.
-pub fn remember_orphaned_page_comment(
-    mut drafts: Vec<String>,
-    pages: Vec<PageItem>,
-    target: String,
-    draft: String,
-) -> Vec<String> {
-    let page_gone = !target.is_empty() && !pages.iter().any(|page| page.id == target);
-    if page_gone {
-        append_recovered_draft(&mut drafts, draft);
-    }
-    drafts
-}
-
-pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec<String> {
-    if let Some(index) = drafts.iter().position(|draft| draft == &recovered) {
-        drafts.remove(index);
-    }
-    drafts
-}
-
-/// The commented BLOCK ids in a thread list — the page's own id marks no line.
-pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) -> Vec<String> {
-    let mut targets: Vec<String> = threads
-        .into_iter()
-        .filter(|thread| !thread.resolved && thread.target != page_id)
-        .map(|thread| thread.target)
-        .collect();
-    // NOT deduplicated — see `load::commented_targets`. The repetition is the
-    // per-line thread count the margin chip spells.
-    targets.sort();
-    targets
-}
-
-/// The open thread's resolved flag, read off the rail's own list.
-pub fn thread_is_resolved(threads: &[PageCommentThread], id: &str) -> bool {
-    threads
-        .iter()
-        .find(|thread| thread.id == id)
-        .is_some_and(|thread| thread.resolved)
-}
-
-pub fn retain_selected_string(value: String, selected_id: String) -> String {
-    if selected_id.is_empty() {
-        String::new()
-    } else {
-        value
-    }
-}
-
-pub fn retain_selected_i64(value: i64, selected_id: String) -> i64 {
-    if selected_id.is_empty() { 0 } else { value }
-}
-
-pub fn retain_selected_comment_threads(
-    threads: Vec<PageCommentThread>,
-    selected_id: String,
-) -> Vec<PageCommentThread> {
-    if selected_id.is_empty() {
-        Vec::new()
-    } else {
-        threads
-    }
-}
-
-pub fn retain_selected_comments(
-    comments: Vec<PageComment>,
-    selected_id: String,
-) -> Vec<PageComment> {
-    if selected_id.is_empty() {
-        Vec::new()
-    } else {
-        comments
-    }
-}
-
-fn selected_block_missing(blocks: &[PageBlock], selected_id: &str) -> bool {
-    !selected_id.is_empty() && !blocks.iter().any(|block| block.id == selected_id)
-}
-
-fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
-    let should_append = !draft.is_empty() && !drafts.iter().any(|current| current == &draft);
-    if should_append {
-        drafts.push(draft);
-    }
-}
-
-pub fn scope_key(scope: &str, id: &str) -> String {
-    format!("{scope}\0{id}")
-}
-
-pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
-    let below = (pointer_y - 4.0).max(0.0);
-    let below_fits = below + 190.0 <= viewport_height;
-    if below_fits {
-        below
-    } else {
-        (pointer_y - 190.0).max(0.0)
-    }
-}
-
 pub(crate) struct Tip {
     pub(crate) height: i64,
     pub(crate) status: String,
@@ -931,155 +572,4 @@ fn operator_token_for(origin: &str) -> Option<String> {
     let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;
     let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)
-}
-
-// ============================================================================
-// THE COPY RANGE — a run of messages, addressed by the two seqs at its ends.
-//
-// This app had no way to copy a message's TEXT at all: the action menu offers
-// `Copy message link` and nothing else, so quoting a conversation anywhere
-// meant retyping it. There is no cross-widget text selection to reach for —
-// iced has none, and the timeline's hover is deliberately draw-time (see the
-// note on `MessageCard`), so a drag that tracked the cursor across rows would
-// cost a route and a full rebuild per row crossed, which is exactly the
-// per-hover round trip `DiffRow` refuses. The unit is therefore the message,
-// not the character, and the gesture is a click plus a shift-click.
-//
-// The ends are seqs, not indices: history PREPENDS, so an index is stale the
-// moment an older page merges in, while a seq names the same message forever.
-// Neither end is required to be the earlier one — the anchor is where the
-// reader started, which is as often the newest row as the oldest.
-//
-// A row's own reading is pure arithmetic on those two seqs, with no list at
-// all: the rows a `lazy` memo lends to a cached row do not include the
-// timeline, and asking for one there would unmemo the whole scrollback. The
-// list is needed only where the text is actually lifted.
-// ============================================================================
-
-/// Where a press left the copy range: the anchor it keeps, the head it moved,
-/// and the surface both address.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CopyRange {
-    pub anchor: i64,
-    pub head: i64,
-    pub surface: crate::CopySurface,
-}
-
-/// The range's ends in order, or `None` when there is no range.
-fn range_seqs(anchor: i64, head: i64) -> Option<(i64, i64)> {
-    (anchor > 0 && head > 0).then(|| (anchor.min(head), anchor.max(head)))
-}
-
-/// True for a row inside the copy range, which is what draws its tint. The
-/// surface is half the answer: a thread reply and a timeline row draw their
-/// seqs from the SAME channel sequence, so a reply can fall numerically inside
-/// a range the reader drew in the stream behind it. Without this it would
-/// light up in a range whose copy never included it.
-pub fn seq_in_copy_range(
-    seq: i64,
-    anchor: i64,
-    head: i64,
-    surface: crate::CopySurface,
-    mine: crate::CopySurface,
-) -> bool {
-    if surface != mine {
-        return false;
-    }
-    range_seqs(anchor, head).is_some_and(|(low, high)| seq >= low && seq <= high)
-}
-
-/// The rows of `messages` the range covers, oldest first.
-fn range_rows(messages: &[ChatMessage], anchor: i64, head: i64) -> Vec<&ChatMessage> {
-    let Some((low, high)) = range_seqs(anchor, head) else {
-        return Vec::new();
-    };
-    messages
-        .iter()
-        .filter(|message| message.seq >= low && message.seq <= high)
-        .collect()
-}
-
-/// How many messages the range covers in this surface's list. Zero is "no
-/// range here", which is what each copy bar is gated on — a bar has no empty
-/// reading, and only the surface the range was drawn in has a non-zero one.
-pub fn copy_range_count(messages: &[ChatMessage], anchor: i64, head: i64) -> i64 {
-    range_rows(messages, anchor, head).len() as i64
-}
-
-/// The range as plain text, oldest first: one `author: body` entry per
-/// message, blank-line separated so a multi-line body stays readable when it
-/// lands in an editor. A deleted or empty row contributes nothing — its body
-/// is gone, and a placeholder would be a line the reader never wrote.
-pub fn copy_range_text(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
-    range_rows(messages, anchor, head)
-        .into_iter()
-        .filter(|message| !message.deleted && !message.body.trim().is_empty())
-        .map(|message| format!("{}: {}", message.author, message.body.trim()))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// The toast the copy raises, counting what actually reached the clipboard.
-pub fn copy_range_toast(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
-    match copy_range_count(messages, anchor, head) {
-        1 => "Message copied".to_owned(),
-        count => format!("{count} messages copied"),
-    }
-}
-
-/// Whichever list the range was drawn in — the surface decides, so the chord
-/// lifts the same rows the bar is counting.
-pub fn copy_range_rows(
-    timeline: &[ChatMessage],
-    thread: &[ChatMessage],
-    surface: crate::CopySurface,
-) -> Vec<ChatMessage> {
-    match surface {
-        crate::CopySurface::Timeline => timeline.to_vec(),
-        crate::CopySurface::Thread => thread.to_vec(),
-        crate::CopySurface::Nowhere => Vec::new(),
-    }
-}
-
-/// Extend a shift-selected range within one surface, starting a new range if
-/// there is no anchor in that surface. The handler routes plain clicks separately.
-/// Pending rows have negative sequence numbers and clear the range so its copy
-/// shortcut cannot remain armed without a visible Clear button.
-pub fn copy_range_after_press(
-    anchor: i64,
-    surface: crate::CopySurface,
-    seq: i64,
-    pressed_in: crate::CopySurface,
-) -> CopyRange {
-    let settled = seq > 0;
-    if !settled {
-        return CopyRange {
-            anchor: 0,
-            head: 0,
-            surface: crate::CopySurface::Nowhere,
-        };
-    }
-    let anchored = anchor > 0 && surface == pressed_in;
-    CopyRange {
-        anchor: if anchored { anchor } else { seq },
-        head: seq,
-        surface: pressed_in,
-    }
-}
-
-/// The copy bar's own count line. It has no zero reading — the bar is gated on
-/// a non-zero count — so this never has to spell an empty range.
-pub fn copy_range_label(count: i64) -> String {
-    match count {
-        1 => "1 message selected".to_owned(),
-        count => format!("{count} messages selected"),
-    }
-}
-
-/// A forward page cursor is the last loaded reply, only when more exist.
-pub fn thread_page_cursor(messages: &[ChatMessage], has_more: bool) -> i64 {
-    match has_more {
-        true => messages.last().map_or(0, |message| message.seq),
-        false => 0,
-    }
 }

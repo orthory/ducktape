@@ -28,7 +28,13 @@ Two things are easy to get wrong:
 already materialized on disk — read and edit it with your ordinary file tools, \
 not with the files.* read operations. In a Forge checkout, use ordinary git \
 freely: commits you create are preserved, and any uncommitted tree left at the \
-end is captured with the commit message from your final response. The files.* \
+end is captured in one commit titled after the Forge item. Identity is the \
+node's: your environment already names you as author and the node as \
+committer. A commit of yours with another author or committer, or whose \
+message carries a `*-by:` trailer (Co-Authored-By, Signed-off-by) or an \
+author/committer/from line, costs your commit history but not your work: \
+every commit you made is dropped and the final tree is pushed as that one \
+item-titled commit. The files.* \
 operations read the SHARED filesystem, which is a different thing and mostly \
 outside your checkout.
 
@@ -73,9 +79,13 @@ the pack digest the upload returned.
 
 modules.update: build the module using its repository's toolchain and \
 dependencies. The standard Linux guest includes Rust, the wasm32-unknown-unknown \
-target and wasm-tools; it has no package-registry network, so dependencies must \
-be in the checkout. Package a component with `ducktape module pack \
-component.wasm --out module.artifact` (optionally `--index index.wasm`). This \
+target and wasm-tools, and reaches the internet through the HTTP proxy its \
+HTTP_PROXY/HTTPS_PROXY name, so cargo and git fetch what the build needs. \
+Package the deployment with `ducktape module pack component.wasm --out \
+module.artifact`, adding `--index index.wasm` for a mapper and `--view view.wasm \
+--assets <dir>` for a desktop view. The artifact is the WHOLE deployment: a part \
+the running one ships and yours omits is removed when yours activates, so a \
+view-only change still packs the module's current component and mapper. This \
 offline command prints the deployment SHA-256. Commit the artifact in your Forge \
 checkout and follow the output contract. Ducktape binds the artifact to the \
 host-pushed commit before your program requests deployment.

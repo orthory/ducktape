@@ -508,14 +508,19 @@ pub async fn load_appearance() -> crate::Appearance {
     }
 }
 
+/// `System` is the absence of an override: it clears the key rather than
+/// storing a third value, so `load_appearance` needs no "system" spelling.
 pub async fn save_appearance(mode: crate::Appearance) -> bool {
-    let mode = match mode {
-        crate::Appearance::System => return false,
-        crate::Appearance::Light => "light",
-        crate::Appearance::Dark => "dark",
-    };
     let mut prefs = read_prefs();
-    prefs["appearance"] = serde_json::json!(mode);
+    match mode {
+        crate::Appearance::System => {
+            if let Some(prefs) = prefs.as_object_mut() {
+                prefs.remove("appearance");
+            }
+        }
+        crate::Appearance::Light => prefs["appearance"] = serde_json::json!("light"),
+        crate::Appearance::Dark => prefs["appearance"] = serde_json::json!("dark"),
+    }
     write_prefs(&prefs)
 }
 
@@ -638,20 +643,6 @@ pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<S
         return Err(format!("{field} must be between 1 and {limit} bytes"));
     }
     Ok(value.to_string())
-}
-
-pub(crate) fn bounded_exact_text(
-    value: String,
-    field: &str,
-    limit: usize,
-) -> Result<String, String> {
-    let invalid = value.len() > limit || value.chars().any(|character| character == '\0');
-    if invalid {
-        return Err(format!(
-            "{field} must be at most {limit} bytes and contain no NUL"
-        ));
-    }
-    Ok(value)
 }
 
 pub(crate) fn required_id(value: String, subject: &str) -> Result<String, String> {

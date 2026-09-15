@@ -200,7 +200,7 @@ pub(super) async fn fetch_and_hydrate_genesis<
         client,
         blobs,
         &hash,
-        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::MAX_GENESIS_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )
     .await
@@ -891,7 +891,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "fb7249348f419f61af37816c4444cede7cf1f11720cfac3b110b5f2e1cbe291d";
+        "1f0e160475e0a5759c3c77645659cc887a412849d96c0bb92b472a507099a5fa";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -918,12 +918,14 @@ mod tests {
 
     /// the genesis code set the pins compose over: the founding set the build
     /// staged beside this test executable — the committed components (the
-    /// kernel fixtures pin the same bytes), read and hashed at test time,
-    /// never embedded.
+    /// kernel fixtures pin the same bytes) and the founding views
+    /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
+    /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
         let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
-            .expect("founding set");
+        let mut ids = topology::TOPOLOGY.wasm_ids(PRODUCTION);
+        ids.extend(topology::VIEWS);
+        let hashes = noded::bundle::hash_bundle(&dir, &ids).expect("founding set");
         GenesisModules {
             hashes,
             source: GenesisSource::FoundingSet(dir),
@@ -1020,6 +1022,7 @@ mod tests {
                 10,
                 ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
+                    kind: modules::Kind::Module,
                     code_hash: first.to_vec(),
                 },
             ),
@@ -1140,7 +1143,7 @@ mod tests {
         let genesis = Genesis {
             modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
+                bytes: module_artifact::Artifact::module(b"pages-bytes".to_vec()).encode(),
             }],
         };
         let bytes = genesis.encode();
@@ -1199,7 +1202,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
+            module_artifact::Artifact::module(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");

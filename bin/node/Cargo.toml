@@ -70,6 +70,8 @@ collaboration = { workspace = true }
 identity = { workspace = true }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
+# the desktop app's release manifest + signature: `ducktape release sign`.
+app-update = { workspace = true }
 authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
@@ -104,6 +106,8 @@ workspace-config = { workspace = true }
 blobstore = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
+run-envelope = { workspace = true }
+borsh = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability executor runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
 # `wireguard_listen` node.toml key; the wireguard crate supplies the
@@ -161,6 +165,12 @@ reqwest = { workspace = true }
 # WebSocket bridge to a route's loopback upstream (ws://127.0.0.1, no TLS).
 tokio-tungstenite = "0.24"
 sha2 = { workspace = true }
+# Validate standalone executor archives before extracting their runtime assets.
+tar = "0.4"
+# `release sign-bundle` unpacks the bundle it sends and the one it receives
+# into a scratch dir that goes away on every exit path.
+tempfile = "3"
+flate2 = "1"
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).
 rand = "0.8"

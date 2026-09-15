@@ -4,10 +4,20 @@
 //! valset plane, and a press leaves as `op.submit` carrying the module
 //! message — or, for the clipboard, as the one intent left.
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use members_view::host::{Copy, Session};
 use members_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ui_lang_guest::wire::{Frame, Request};
+
+fn node_ending(frame: &Frame, suffix: &str) -> Node {
+    fn find(node: &Node, suffix: &str) -> Option<Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node.clone());
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
 
 /// This node's key, as the node reports it and the valset lists it.
 const THIS_NODE: &str = "01020304";
@@ -117,14 +127,14 @@ fn a_connected_view_reads_its_own_roster() {
 
     let (frame, _live) = connected_roster(true);
     for expected in [
-        "2 humans · 1 agent",
+        "2 humans, 1 agent",
         THIS_NODE,
-        "this node",
+        "This node",
         RESIDENT,
-        "VALIDATOR",
-        "RESIDENT",
+        "Validator",
+        "Resident",
         "Reviewer Bot",
-        "AGENT",
+        "Agent",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -141,6 +151,36 @@ fn a_connected_view_reads_its_own_roster() {
     let frame = tick_native(press(&frame, "Show agents only"));
     assert!(has_text(&frame, "Reviewer Bot"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, THIS_NODE), "{:?}", texts(&frame));
+}
+
+#[test]
+fn the_member_record_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
+    use ducktape_view_guest::wire::{Length, mouse};
+
+    let frame = opened(true, "Reviewer Bot");
+    let width = |frame: &Frame| match node_ending(frame, "/member") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed member pane: {node:?}"),
+    };
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&frame, "/member-resize")
+    else {
+        panic!("member resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    assert_eq!(width(&frame), 312.0);
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: -48.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 360.0);
 }
 
 /// A valset block re-reads the roster through the live subscription.
@@ -198,12 +238,142 @@ fn a_pause_leaves_as_a_signed_runs_op() {
         })
     );
 
+    // while the kernel holds the answer the button says so and takes no
+    // second press; the refusal then reads as a sentence, verb first
+    assert!(has_text(&frame, "Sending…"), "{:?}", texts(&frame));
+    let Node::Button { on_press: None, .. } = node_ending(&frame, "/status-change") else {
+        panic!("the sending button is disabled: {:?}", texts(&frame));
+    };
     let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
     assert!(
-        has_text(&frame, "the local user key is locked"),
+        has_text(
+            &frame,
+            "The node refused the change: the local user key is locked"
+        ),
         "{:?}",
         texts(&frame)
     );
+    assert!(has_text(&frame, "Pause agent"), "{:?}", texts(&frame));
+}
+
+/// Connected but unanswered, the list says it is reading — never a blank,
+/// never "no members" before the node has spoken.
+#[test]
+fn the_list_says_it_is_reading_until_the_roster_answers() {
+    let frame = boot();
+    let session_id = request(&frame, "members.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    assert!(
+        has_text(&frame, "Reading the roster…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "No members yet"), "{:?}", texts(&frame));
+
+    let (frame, _) = connected_roster(false);
+    assert!(
+        !has_text(&frame, "Reading the roster…"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Show validators only"));
+    assert!(has_text(&frame, THIS_NODE), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, RESIDENT), "{:?}", texts(&frame));
+}
+
+/// A roster refusal reads as a sentence with the kernel's reason inside it.
+#[test]
+fn a_roster_refusal_reads_as_a_sentence() {
+    let frame = boot();
+    let session_id = request(&frame, "members.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    let status = request(&frame, "rpc.status").id;
+    let frame = tick_native(vec![refuse(status, "not connected to a node")]);
+    assert!(
+        has_text(&frame, "Couldn't read the roster: not connected to a node"),
+        "{:?}",
+        texts(&frame)
+    );
+    // a refusal is not an empty network: no "appear as they join" under it
+    assert!(!has_text(&frame, "No members yet"), "{:?}", texts(&frame));
+}
+
+/// This node's validator seat has no ballot to press: the record says why.
+#[test]
+fn this_nodes_own_seat_reads_why_it_has_no_ballot() {
+    let frame = opened(true, THIS_NODE);
+    assert!(
+        !has_text(&frame, "Remove from the validator set"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(
+            &frame,
+            "This node holds a validator seat. Another validator opens the ballot to remove it."
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// Every text under a fixed-height box keeps ONE line. A roster row is
+/// built at 32 px, a record header at 40 px and a filter tab at 28 px: a
+/// name, a role word, a capability tag or a presence word allowed to wrap
+/// breaks onto a second line and lands under the next row, so the rows
+/// overlap. The texts that MUST wrap — the error notice, the 64-hex key,
+/// an agent's capability line and the gate captions — sit in boxes with no
+/// fixed height, which is what lets this walk carry no allow-list: a
+/// wrapping text found under a fixed height is the defect itself.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    use ducktape_view_guest::wire::{Length, Wrapping};
+
+    fn fixed_height(node: &Node) -> bool {
+        matches!(
+            node,
+            Node::Container {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Linear {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Button {
+                height: Some(Length::Fixed(_)),
+                ..
+            }
+        )
+    }
+
+    fn walk(node: &Node, under_fixed: bool, wrapping: &mut Vec<String>) {
+        let under_fixed = under_fixed || fixed_height(node);
+        if let Node::Text { key, options, .. } = node {
+            let one_line = options.wrapping == Some(Wrapping::None);
+            if under_fixed && !one_line {
+                wrapping.push(key.clone());
+            }
+        }
+        for child in node.children() {
+            walk(child, under_fixed, wrapping);
+        }
+    }
+
+    // the whole roster is on screen behind each record: a validator (this
+    // node), a resident with a ballot, and the agent whose row carries a
+    // capability caption
+    for label in [THIS_NODE, RESIDENT, "Reviewer Bot"] {
+        let frame = opened(true, label);
+        let mut wrapping = Vec::new();
+        walk(
+            frame.root.as_ref().expect("a drawn page"),
+            false,
+            &mut wrapping,
+        );
+        assert!(
+            wrapping.is_empty(),
+            "cells that may wrap in a fixed-height box, with {label} open: {wrapping:?}"
+        );
+    }
 }
 
 /// An admin opens a ballot over a resident: `op.submit` carrying the

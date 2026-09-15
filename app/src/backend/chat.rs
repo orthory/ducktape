@@ -1,243 +1,6 @@
 use super::*;
 use ::chat;
 
-/// One reaction tap folded into the visible rows at CLICK time — the chip
-/// must not wait for the block. Rides the canonical reactor-set fold, so the
-/// settled delta replays over it without drifting the count. No cached
-/// identity (boot race) = no optimistic fold; the resync renders it instead.
-pub fn reaction_applied(
-    messages: Vec<ChatMessage>,
-    seq: i64,
-    emoji: String,
-    added: bool,
-) -> Vec<ChatMessage> {
-    let Some(key) = rpc::cached_user_key() else {
-        return messages;
-    };
-    let reactor = names().handle_of(&key);
-    chat::client::optimistic_reaction(messages, seq, emoji, added, reactor)
-}
-
-/// The row a send paints before the block lands. Same arrangement as the
-/// reaction fold above: the client mints the row, the shell supplies the
-/// identity it must be attributed to, so the pending row groups under the
-/// reader's previous message instead of breaking the run and re-grouping when
-/// the settle delta replaces it.
-pub fn optimistic_message(
-    messages: Vec<ChatMessage>,
-    body: String,
-    message_id: String,
-) -> Vec<ChatMessage> {
-    bounded_chat_window(chat::client::optimistic_message(
-        messages,
-        body,
-        message_id,
-        ReaderFacts::cached().reader(),
-    ))
-}
-
-/// The thread rail owns a root plus one sliding reply page. The server cursor
-/// remains authoritative for older/newer pages; mounted rich rows stay bounded
-/// while a hot thread keeps receiving replies.
-pub fn optimistic_thread_message(
-    messages: Vec<ChatMessage>,
-    body: String,
-    message_id: String,
-) -> Vec<ChatMessage> {
-    bounded_thread_window(chat::client::optimistic_message(
-        messages,
-        body,
-        message_id,
-        ReaderFacts::cached().reader(),
-    ))
-}
-
-/// [`chat::client::mark_message_groups`] as a value fold, for the reducer.
-///
-/// The timeline calls it on the vec it just pushed an optimistic row onto. The
-/// thread rail does NOT: its vec is `[root] ++ replies` and the root renders as
-/// its own divided block, so a whole-vec pass folds the first reply under the
-/// root and swallows its header. The rail's replies-only marking lives inside
-/// `bounded_thread_window`, which every rail writer already folds through.
-pub fn mark_author_runs(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    chat::client::mark_message_groups(&mut messages);
-    messages
-}
-
-pub async fn rename_channel(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    name: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let name = bounded_text(name, "channel name", 128)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::RenameChannel {
-                channel_id: channel_id.clone(),
-                name,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-pub async fn archive_channel(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::SetChannelArchived {
-                channel_id: channel_id.clone(),
-                archived: true,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-pub async fn unarchive_channel(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::SetChannelArchived {
-                channel_id: channel_id.clone(),
-                archived: false,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-/// A membership row retains its exact party; user-entered keys are resolved
-/// to their account only when adding a new seat.
-pub(crate) fn member_party(value: &str) -> Result<::chat::Party, String> {
-    let value = value.trim();
-    if let Some(number) = value.strip_prefix("acct:") {
-        let number = number
-            .parse::<u64>()
-            .map_err(|_| "member must name acct:<number> or a public key".to_string())?;
-        return Ok(::chat::Party::Account(number));
-    }
-    public_key(
-        value.strip_prefix("user:").unwrap_or(value),
-        "member public key",
-    )
-    .map(::chat::Party::Key)
-}
-
-async fn member_to_add(rpc: &RpcClient, value: &str) -> Result<::chat::Party, String> {
-    let party = member_party(value)?;
-    let ::chat::Party::Key(key) = party else {
-        return Ok(party);
-    };
-    let reply: identity::IdentityReply = rpc
-        .query(
-            "identity",
-            &identity::IdentityQuery::OfKey { key: key.clone() },
-        )
-        .await?;
-    let identity::IdentityReply::Account(account) = reply else {
-        return Err("the identity module returned the wrong reply".to_string());
-    };
-    Ok(match account {
-        Some(account) => ::chat::Party::Account(account.number),
-        None => ::chat::Party::Key(key),
-    })
-}
-
-pub async fn add_channel_member(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    member_key: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        let party = member_to_add(&rpc, &member_key).await?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::SetMembership {
-                channel_id: channel_id.clone(),
-                party,
-                member: true,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-pub async fn remove_channel_member(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    member_key: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let party = member_party(&member_key)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::SetMembership {
-                channel_id: channel_id.clone(),
-                party,
-                member: false,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-/// The reaction picker's emoji, in grid order — a frequently-used seed the
-/// view lays out 8 per row. Adding here is the whole "add an emoji" change.
-pub fn reaction_palette() -> Vec<String> {
-    [
-        "👍", "❤️", "😄", "😂", "😮", "😢", "🎉", "👀", //
-        "🙌", "🔥", "✅", "❌", "💯", "🚀", "🤔", "😅", //
-        "🙏", "👏", "💪", "✨", "⚡", "🐛", "📌", "❓", //
-        "🦆", "🤝", "😴", "🧠", "➕", "🎯", "🚧", "🏁",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
-
 /// One participant of a channel's live huddle — the roster is consensus state
 /// (`HuddleMember{user, node, joined_at}`), not a count.
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -254,6 +17,24 @@ pub struct HuddleParticipant {
 }
 
 /// Render canonical account or historical key seats from the huddle index.
+/// The roster of a room the reader is seated in but not looking at (a voice
+/// room), read off the room list's own seats: the seat carries the person
+/// and the node, which is all the huddle window and the beacon match need.
+pub(crate) fn roster_of_seats(seats: &[chat::client::HuddleSeat]) -> Vec<HuddleParticipant> {
+    seats
+        .iter()
+        .map(|seat| HuddleParticipant {
+            key: seat.node.clone(),
+            label: seat.label.clone(),
+            initials: seat.initials.clone(),
+            is_agent: false,
+            is_you: seat.is_you,
+            joined_at: 0,
+            node: seat.node.clone(),
+        })
+        .collect()
+}
+
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
     reader: ChatReader<'_>,
@@ -276,6 +57,58 @@ pub(crate) fn huddle_roster(
                 node: member.node.clone(),
                 label,
             }
+        })
+        .collect()
+}
+
+/// Who the huddle window offers to invite: the room's members not yet seated,
+/// the reader included among the seated. A member row's key is a bare user
+/// key or an `acct:` handle; a seat's is a party handle — `member_id` makes
+/// them comparable.
+// ponytail: a voice room's seats (`roster_of_seats`) carry the NODE key, not
+// the party, so those match by label — both come off the one name directory.
+// Carry the party on `HuddleSeat` when a same-named pair shows up (a module
+// byte change, so a pin move).
+pub(crate) fn huddle_invitees(
+    members: &[ChatMember],
+    roster: &[HuddleParticipant],
+) -> Vec<ChatMember> {
+    members
+        .iter()
+        .filter(|member| {
+            let seated = roster
+                .iter()
+                .any(|seat| member_id(&seat.key) == member.key || seat.label == member.label);
+            !seated
+        })
+        .cloned()
+        .collect()
+}
+
+/// The invite is a post in the room addressed to the person: the mention is
+/// what reaches them (the desktop banner names the room and the sender), and
+/// the room's own timeline shows who was asked. `key` is a member row's key.
+pub(crate) fn huddle_invite_text(key: &str, room: &str) -> String {
+    let mention = match key.strip_prefix("acct:") {
+        Some(account) => format!("<@{account}>"),
+        None => format!("<@key:{key}>"),
+    };
+    format!("{mention} come join the huddle in #{room}")
+}
+
+/// The roster as the room list shows it under the room: a name, its
+/// initials, and whether the seat is the reader's own.
+pub(crate) fn huddle_seats(
+    members: &[chat::index::HuddleEntry],
+    reader: ChatReader<'_>,
+) -> Vec<HuddleSeat> {
+    huddle_roster(members, reader)
+        .into_iter()
+        .map(|seat| HuddleSeat {
+            label: seat.label,
+            initials: seat.initials,
+            is_you: seat.is_you,
+            node: seat.node,
         })
         .collect()
 }
@@ -390,6 +223,23 @@ pub async fn join_huddle(
     .await
 }
 
+/// Enter a voice room from the list: leave the huddle the reader is in (if
+/// any) and join `channel_id`'s. Two ops, in order — the roster is consensus
+/// state, so a person is never seated in two rooms at once. Answers the room
+/// joined.
+pub async fn move_huddle(
+    rpc: String,
+    password: String,
+    leaving: String,
+    channel_id: String,
+) -> Result<String, AppError> {
+    if !leaving.is_empty() {
+        leave_huddle(rpc.clone(), password.clone(), leaving).await?;
+    }
+    join_huddle(rpc, password, channel_id.clone()).await?;
+    Ok(channel_id)
+}
+
 pub async fn leave_huddle(
     rpc: String,
     password: String,
@@ -458,101 +308,6 @@ pub async fn send_message(
             thread_seq: 0,
             body: operation_body,
         })
-}
-
-pub async fn load_thread(
-    rpc: String,
-    channel_id: String,
-    root_seq: i64,
-    target_seq: i64,
-    generation: i64,
-) -> Result<ThreadLoadData, HydrationError> {
-    let result = load_thread_window(rpc, channel_id, root_seq, target_seq).await;
-    result
-        .map(|thread| ThreadLoadData {
-            generation,
-            root_seq: thread.root_seq,
-            target_seq: thread.target_seq,
-            messages: thread.messages,
-            next_reply_seq: thread.next_reply_seq,
-            has_more: thread.has_more,
-        })
-        .map_err(|message| HydrationError {
-            generation,
-            message: user_error(message),
-        })
-}
-
-async fn load_thread_window(
-    rpc: String,
-    channel_id: String,
-    root_seq: i64,
-    target_seq: i64,
-) -> Result<ThreadData, String> {
-    let root_seq = positive_sequence(root_seq)?;
-    let target_seq = u64::try_from(target_seq).unwrap_or(0);
-    let rpc = rpc_client(&rpc)?;
-    if target_seq > 0 {
-        return load_target_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
-    }
-    load_thread_data(&rpc, &channel_id, root_seq).await
-}
-
-pub async fn load_thread_page(
-    rpc: String,
-    channel_id: String,
-    root_seq: i64,
-    after_reply_seq: i64,
-    generation: i64,
-) -> Result<ThreadPageData, HydrationError> {
-    let result = async {
-        let root_seq = positive_sequence(root_seq)?;
-        let after_reply_seq = u64::try_from(after_reply_seq).ok().filter(|seq| *seq > 0);
-        let rpc = rpc_client(&rpc)?;
-        let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
-        let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
-        let facts = ReaderFacts::current().await;
-        let messages = thread
-            .replies
-            .into_iter()
-            .map(|row| chat_message(row, facts.reader()))
-            .collect();
-        Ok(ThreadPageData {
-            generation,
-            messages,
-            next_reply_seq,
-            has_more: thread.has_more,
-        })
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-pub async fn refresh_live_thread(
-    rpc: String,
-    channel_id: String,
-    root_seq: i64,
-) -> Result<LiveThreadData, AppError> {
-    if channel_id.is_empty() || root_seq <= 0 {
-        return Ok(LiveThreadData {
-            channel_id,
-            root_seq: 0,
-            messages: Vec::new(),
-        });
-    }
-    let root_seq = positive_sequence(root_seq).map_err(app_error)?;
-    let rpc = rpc_client(&rpc).map_err(app_error)?;
-    load_thread_data(&rpc, &channel_id, root_seq)
-        .await
-        .map(|thread| LiveThreadData {
-            channel_id,
-            root_seq: thread.root_seq,
-            messages: thread.messages,
-        })
-        .map_err(app_error)
 }
 
 pub async fn send_reply(
@@ -633,84 +388,9 @@ pub async fn edit_message(
     .await
 }
 
-pub async fn delete_message(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    seq: i64,
-) -> Result<bool, AppError> {
-    async {
-        let seq = positive_sequence(seq)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::DeleteMessage {
-                channel_id: channel_id.clone(),
-                seq,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-pub async fn add_reaction(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    seq: i64,
-    emoji: String,
-) -> Result<bool, AppError> {
-    async {
-        let seq = positive_sequence(seq)?;
-        let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::AddReaction {
-                channel_id: channel_id.clone(),
-                seq,
-                emoji,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-pub async fn remove_reaction(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    seq: i64,
-    emoji: String,
-) -> Result<bool, AppError> {
-    async {
-        let seq = positive_sequence(seq)?;
-        let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::RemoveReaction {
-                channel_id: channel_id.clone(),
-                seq,
-                emoji,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
+/// THE COMMAND PALETTE'S CHAT SEARCH. The Chat tab searches the index for
+/// itself now; this is the workspace-wide search the palette runs across chat
+/// and pages at once, which is the app's own screen.
 pub async fn search_chat(
     rpc: String,
     channel_id: String,
@@ -771,159 +451,14 @@ pub async fn search_chat(
     result.map_err(app_error)
 }
 
-pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        load_pages_data(&rpc, Some(&page_id)).await
-    }
-    .await
-    .map_err(app_error)
-}
-
-/// Every comment thread on a PAGE, not on one block: the same
-/// `ThreadsForTargets` query, asked for the page and all of its blocks at once.
-/// `target` comes back as the page id — the rail is document-scoped.
-pub async fn load_page_threads(
-    rpc: String,
-    page_id: String,
-    generation: i64,
-) -> Result<BlockThreadListData, HydrationError> {
-    let result = async {
-        // "" is `page_edited`'s "not my turn" — its parallel always fires
-        // both runs; an empty target answers empty without touching the node
-        // (and no open rail matches an empty target, so the answer is inert).
-        if page_id.is_empty() {
-            return Ok(BlockThreadListData {
-                generation,
-                target: String::new(),
-                from: 0,
-                threads: Vec::new(),
-                total: 0,
-                next_from: 0,
-                has_more: false,
-            });
-        }
-        let page_id = required_id(page_id, "page")?;
-        let rpc = rpc_client(&rpc)?;
-        let blocks = load_page_blocks(&rpc, &page_id).await?;
-        let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
-        let names = names();
-        let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
-            .await?
-            .into_iter()
-            .map(|thread| page_comment_thread(thread, &names))
-            .collect();
-        let total = count_i64(threads.len());
-        Ok(BlockThreadListData {
-            generation,
-            target: page_id,
-            from: 0,
-            threads,
-            total,
-            next_from: 0,
-            has_more: false,
-        })
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-pub async fn load_block_comment_page(
-    rpc: String,
-    target: String,
-    thread_id: String,
-    from: i64,
-    generation: i64,
-) -> Result<BlockCommentData, HydrationError> {
-    let result = async {
-        let target = required_id(target, "block")?;
-        let thread_id = required_id(thread_id, "comment thread")?;
-        let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
-        let rpc = rpc_client(&rpc)?;
-        query_block_comment_page(&rpc, &target, &thread_id, from, generation)
-            .await?
-            .ok_or_else(|| "comment thread was not found".to_string())
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-pub async fn post_block_comment(
-    rpc: String,
-    password: String,
-    target: String,
-    thread_id: String,
-    text: String,
-    generation: i64,
-) -> Result<BlockCommentData, AppError> {
-    async {
-        let target = required_id(target, "block")?;
-        let text = bounded_text(text, "comment", 16 * 1024)?;
-        let thread_id = comment_thread_id(thread_id)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::AddComment {
-                thread_id: thread_id.clone(),
-                comment_id: fresh_id("comment"),
-                target: target.clone(),
-                text,
-                anchor: None,
-                mentions: Vec::new(),
-            }),
-            password,
-        )
-        .await?;
-        query_block_comment_page(&rpc, &target, &thread_id, 0, generation)
-            .await
-            .and_then(|page| page.ok_or_else(|| "comment thread was not found".to_string()))
-            .map_err(committed_error)
-    }
-    .await
-}
-
-/// Flip a thread's resolved flag. The node's own op; the caller reloads the
-/// rail to pick the new state up.
-pub async fn resolve_comment_thread(
-    rpc: String,
-    password: String,
-    thread_id: String,
-    resolved: bool,
-) -> Result<bool, AppError> {
-    async {
-        let thread_id = required_id(thread_id, "comment thread")?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::ResolveThread {
-                thread_id,
-                resolved,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-    .map_err(app_error)
-}
-
 /// Hand a WEB link to the OS opener — the `DuckKind::Web` arm of the open
 /// plane, and its only caller. Only http(s) leaves the app this way
 /// (this passes a string to a shell command, and the scheme gate is the trust
 /// boundary); every other scheme is the open plane's own to resolve.
 pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     async {
-        // "" is `page_edited`'s "not my turn" (see its parallel) — nothing
-        // was asked, nothing opens.
+        // "" is the open plane's "not my turn" — nothing was asked, nothing
+        // opens.
         if url.is_empty() {
             return Ok(false);
         }
@@ -944,153 +479,6 @@ pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     }
     .await
     .map_err(app_error)
-}
-
-pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {
-    if thread_id.is_empty() {
-        Ok(fresh_id("thread"))
-    } else {
-        required_id(thread_id, "comment thread")
-    }
-}
-
-/// The cheapest thing the pages view can be asked: zero targets, so the guest
-/// scans nothing and answers an empty group list. [`await_fold`] reads only
-/// the reply's watermark header, so the body should cost as little as the lane
-/// allows.
-pub(crate) fn empty_pages_probe() -> PagesViewQuery {
-    PagesViewQuery::ThreadsForTargets {
-        targets: Vec::new(),
-    }
-}
-
-pub async fn create_page(
-    rpc: String,
-    password: String,
-    title: String,
-) -> Result<PagesData, AppError> {
-    async {
-        let title = bounded_text(title, "page title", pages::MAX_PAGE_TITLE_LEN)?;
-        let page_id = fresh_id("page");
-        let rpc = rpc_client(&rpc)?;
-        let height = signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::CreatePage {
-                page_id: page_id.clone(),
-                title: title.clone(),
-                blocks: Vec::new(),
-            }),
-            password,
-        )
-        .await?;
-        // WAIT FOR THE FOLD, THEN RELOAD. `submit_frame` returns when the node
-        // ACCEPTS a transaction, not when it applies one, and the pages read
-        // model is folded behind the block loop — so a reload fired straight
-        // after the write reads an index that predates it. The view lane
-        // answers how far the fold has consumed the op feed, so this waits for
-        // it to reach the block that took the write.
-        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
-        // The wait above already covers this reload, so it passes None rather
-        // than paying a second probe for the same watermark.
-        let mut data = load_pages_data(&rpc, Some(&page_id))
-            .await
-            .map_err(committed_error)?;
-        // LAND ON THE PAGE THAT WAS JUST MADE. The wait above narrows the
-        // window; it does not close it (a boundary stamp leaves no watermark,
-        // a busy block can park the fold mid-batch, the budget is bounded on
-        // purpose), so the correction stays the guarantee — measured, not
-        // assumed: the reload asked for the new id, was handed the first page
-        // in the list instead, and reported the new id absent from that list.
-        // `load_pages_data` is right to drop an id it cannot see (a live
-        // refresh or a save can legitimately name a page that has since been
-        // deleted, and must follow the fallback). This is the one caller that
-        // KNOWS its id is good, so the correction belongs here: press Enter on
-        // a title and you are on that page, not on whichever one sorts first.
-        // It is a no-op whenever the fold did arrive.
-        if data.active_page != page_id {
-            data.active_page = page_id;
-            data.active_page_title = title;
-            data.active_page_parent = String::new();
-            data.blocks = Vec::new();
-            data.comment_thread_total = 0;
-            data.commented_block_hits = Vec::new();
-        }
-        Ok(data)
-    }
-    .await
-}
-
-pub async fn delete_page(
-    rpc: String,
-    password: String,
-    page_id: String,
-) -> Result<PagesData, AppError> {
-    async {
-        if page_id.is_empty() {
-            return Err("choose a page first".to_string().into());
-        }
-        let rpc = rpc_client(&rpc)?;
-        let height = signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::RemoveBlock {
-                block_id: page_id.clone(),
-            }),
-            password,
-        )
-        .await?;
-        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
-        // Same as `create_page`: the wait above covers this reload.
-        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
-        // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
-        // `create_page`, read the other way round and narrowed by the same
-        // wait: this reload can still see the removed page, so it stayed in
-        // the sidebar, stayed selectable, and re-installed its blocks into the
-        // editor when picked — a document the network no longer has. The
-        // correction below is idempotent, so it costs nothing once the fold
-        // has arrived and remains the guarantee when it has not.
-        // `RemoveBlock` deletes the whole SUBTREE
-        // (pages/src/store.rs walks children with no page-kind stop), so every
-        // descendant goes with it, not just the row that was asked for.
-        let doomed = descendants_of(&data.pages, &page_id);
-        data.pages.retain(|page| !doomed.contains(&page.id));
-        if doomed.contains(&data.active_page) {
-            // Re-resolve exactly as `load_pages_data` would have, had the index
-            // already caught up: the first surviving page, or nothing.
-            data.active_page = data
-                .pages
-                .first()
-                .map(|page| page.id.clone())
-                .unwrap_or_default();
-            data.active_page_title = String::new();
-            data.active_page_parent = String::new();
-            data.blocks = Vec::new();
-            data.comment_thread_total = 0;
-            data.commented_block_hits = Vec::new();
-        }
-        Ok(data)
-    }
-    .await
-}
-
-/// A page id and every page beneath it. `RemoveBlock` takes the subtree, so a
-/// caller correcting a stale read has to take the same set or it leaves orphans
-/// pointing at a parent that is gone.
-pub(crate) fn descendants_of(pages: &[PageItem], root: &str) -> BTreeSet<String> {
-    let mut doomed = BTreeSet::from([root.to_string()]);
-    // The index is not depth-ordered, so sweep until nothing new is added.
-    loop {
-        let before = doomed.len();
-        for page in pages {
-            if doomed.contains(&page.parent) {
-                doomed.insert(page.id.clone());
-            }
-        }
-        if doomed.len() == before {
-            return doomed;
-        }
-    }
 }
 
 /// Every hit joined to the TITLE of the page it lives in.
@@ -1172,4 +560,41 @@ pub async fn search_pages(
     }
     .await;
     result.map_err(app_error)
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::*;
+
+    #[test]
+    fn invitees_are_the_unseated_members_and_the_invite_mentions_them() {
+        let member = |key: &str| ChatMember {
+            key: key.into(),
+            label: key.into(),
+        };
+        let seat = |key: &str| HuddleParticipant {
+            key: key.into(),
+            label: String::new(),
+            initials: String::new(),
+            is_agent: false,
+            is_you: false,
+            joined_at: 0,
+            node: String::new(),
+        };
+        let members = [member("aa"), member("bb"), member("acct:7")];
+        let roster = [seat("user:aa"), seat("acct:7")];
+        let left: Vec<_> = huddle_invitees(&members, &roster)
+            .into_iter()
+            .map(|member| member.key)
+            .collect();
+        assert_eq!(left, vec!["bb"]);
+        assert_eq!(
+            huddle_invite_text("bb", "lounge"),
+            "<@key:bb> come join the huddle in #lounge"
+        );
+        assert_eq!(
+            huddle_invite_text("acct:7", "lounge"),
+            "<@7> come join the huddle in #lounge"
+        );
+    }
 }

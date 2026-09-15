@@ -87,6 +87,7 @@ pub(super) fn publish_boundary_status(
 ) {
     let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height,
@@ -168,7 +169,7 @@ pub(super) struct ValidatorLoopState<'a> {
 
 /// one finished pending-swap code fetch: the digest, and the error if the
 /// bytes did not land.
-type FetchOutcome = ([u8; 32], Option<crate::blob_fetch::BlobFetchError>);
+type FetchOutcome = super::code_announce::FetchOutcome;
 
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -275,6 +276,9 @@ struct ValidatorRuntime<'a> {
     /// nudge per view; every finalized block moves the estimate and re-arms.
     last_nudged_view: Option<u64>,
     last_crank: std::time::SystemTime,
+    /// Conversation timers are inspected once per committed block, including
+    /// the recovered block on process startup.
+    last_conversation_height: Option<u64>,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
@@ -593,6 +597,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         real_work_parked: false,
         last_nudged_view: None,
         last_crank,
+        last_conversation_height: None,
         last_nudge,
         workers,
         code_signaller,

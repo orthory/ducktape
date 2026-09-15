@@ -21,7 +21,7 @@
 //! blank the cards the current one just installed.
 
 use super::*;
-use iced::futures::SinkExt as _;
+use futures::SinkExt as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -83,6 +83,10 @@ pub struct LiveRunHint {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
+    /// What the run has done so far, as the message it draws as lists it.
+    pub activity: Vec<LiveActivity>,
+    /// The answer as it is being written, clipped.
+    pub answer_preview: String,
 }
 
 impl From<&LiveAgentRow> for LiveRunHint {
@@ -95,6 +99,8 @@ impl From<&LiveAgentRow> for LiveRunHint {
             dispatch_id: row.dispatch_id.clone(),
             agent: row.agent.clone(),
             status: row.status.clone(),
+            activity: row.activity.clone(),
+            answer_preview: row.answer_preview.clone(),
         }
     }
 }
@@ -128,7 +134,7 @@ pub struct LiveAgentNotice {
 /// node, what a reading was entitled to read is the SEATED KEY's
 /// (`Reach::Signed`) — and a Settings unlock or lock moves that seat with the
 /// endpoint, the chain and the connect attempt all unchanged
-/// (`handlers/node.ice` SettingsIntent.unlock/.lock bump no generation). Without
+/// (Settings unlock/lock does not bump the connect generation). Without
 /// this term, a reading taken under the previous key stays "current" across a
 /// key switch.
 pub fn live_agents_stale(
@@ -142,25 +148,6 @@ pub fn live_agents_stale(
         || notice.chain_id != chain_id
         || notice.generation != generation
         || notice.signer_key != signer_key
-}
-
-/// Test seam: Ice reads extern structs but cannot construct one, so a scenario
-/// that needs a run already on screen has no other way to seat one.
-pub fn live_agent_row(
-    channel_id: String,
-    anchor_seq: i64,
-    run_id: String,
-    agent: String,
-    status: String,
-) -> LiveAgentRow {
-    LiveAgentRow {
-        channel_id,
-        anchor_seq,
-        run_id,
-        agent,
-        status,
-        ..LiveAgentRow::default()
-    }
 }
 
 /// Fold one parsed output event into the row. Status lines replace the status;
@@ -189,7 +176,13 @@ pub(crate) fn live_row_apply(mut row: LiveAgentRow, event: &AgentChatEvent) -> L
             row.status = event.title.clone();
         }
         "preview" | "answer" => {
-            row.answer_preview = clip_text(&event.answer, MAX_LIVE_PREVIEW_BYTES);
+            // A provider's last item can be its structured payload (a JSON
+            // block list) before the words: not a preview anyone reads, and
+            // it flashed in the card for a poll before the reply landed.
+            let raw_payload = matches!(event.answer.trim_start().chars().next(), Some('{' | '['));
+            if !raw_payload {
+                row.answer_preview = clip_text(&event.answer, MAX_LIVE_PREVIEW_BYTES);
+            }
             row.status = if event.kind == "answer" {
                 "Done".into()
             } else {
@@ -373,8 +366,8 @@ pub fn chat_live_agents(
     chain_id: String,
     generation: i64,
     signer_key: String,
-) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
-    use iced::futures::StreamExt as _;
+) -> futures::stream::BoxStream<'static, LiveAgentNotice> {
+    use futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
         let Ok(client) = rpc_client(&rpc) else {
@@ -580,7 +573,7 @@ pub fn chat_live_agents(
             watcher.handle.abort();
         }
     });
-    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+    futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     })
     .boxed()
@@ -724,7 +717,7 @@ async fn watch_live_output(
     sender: tokio::sync::mpsc::Sender<LiveAgentNotice>,
 ) {
     let rpc = taken.rpc.clone();
-    use iced::futures::StreamExt as _;
+    use futures::StreamExt as _;
     let fold = |event: &AgentChatEvent| {
         let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(row) = rows.get_mut(&dispatch) {
@@ -749,11 +742,10 @@ async fn watch_live_output(
                 continue;
             };
             // A PENDING RUN DOES NOT NAME ITS PROVIDER (`PendingRun` carries
-            // the agent and the anchor, not the worker), and the parse only
-            // branches on the provider for Claude message/result events —
-            // Codex item events are read independently of that argument. So
-            // this reads one more line than a Codex run would emit and loses
-            // nothing; it is not a claim about which worker took the run.
+            // the agent and the anchor, not the worker). Passing Claude enables
+            // its message/result parsing; distinct Codex item and Pi message_end
+            // and tool_execution_start/end shapes are read independently of that
+            // argument. This is not a claim about which worker took the run.
             if let Some(event) = provider_output_event("claude", line, id) {
                 id += 1;
                 fold(&event);

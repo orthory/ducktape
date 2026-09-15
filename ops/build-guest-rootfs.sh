@@ -174,7 +174,11 @@ fi
 
 # ---- 3. the init -----------------------------------------------------------
 MUSL_TARGET="$ARCH-unknown-linux-musl"
-INIT="$HERE/target/$MUSL_TARGET/release/duck-guest-init"
+# cargo's own answer, not `$HERE/target`: a host whose cargo config names a
+# shared `build.target-dir` builds the init there.
+TARGET_DIR="$(cd "$HERE" && cargo metadata --no-deps --format-version 1 \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+INIT="$TARGET_DIR/$MUSL_TARGET/release/duck-guest-init"
 # ALWAYS, never "only if it is missing". cargo is already incremental, so this
 # costs nothing when the source has not moved — while skipping it on an
 # existing binary bakes a stale PID 1 into the image and the next boot silently

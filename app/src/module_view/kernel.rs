@@ -33,6 +33,11 @@
 //! - `op.submit` `{target, payload}` — one module op, signed with the
 //!   SEATED key and submitted; answered with the block height. The view
 //!   never carries a password, an endpoint or a key.
+//! - `rpc.admin` `{route, payload}` — one POST to a `/v1` route that
+//!   mutates THE NODE rather than module state, signed with the SEATED key
+//!   exactly as the `ducktape node` verbs sign theirs; answered with the
+//!   node's own reply text, or its refusal. The kernel names no route —
+//!   the node's operator gate decides what this key may ask for.
 //! - `git.merge` `{target, repo, ours, theirs, message}` — the merge commit
 //!   a git-backed module's wire demands the CLIENT compute, built with
 //!   libgit2 against a bare mirror of the node's `/<target>/<repo>` remote
@@ -50,10 +55,17 @@
 //!   `badge` event with `{"count": N}` in its detail; `host.roster`
 //!   `{scope, members}` — the mention vocabulary of the host composer a
 //!   view docked over `scope`.
+//! - `host.id` `<prefix>` — one id, unique on this device, for a module
+//!   whose records are addressed by ids its WRITER mints. A view has no
+//!   clock and no entropy of its own, so the app mints it.
+//! - `clock.ticks` `<period, i64 ms little-endian>` — a subscription that
+//!   gets one item per period. A wasm module has no clock, so the guest's
+//!   recurring tasks use this door; the window thread keeps the
+//!   deadline and the shell draws the frame it comes due on.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
-//! view's next redraw; the widget polls while any is in flight.
+//! view's next redraw; reply notifications wake the native presenter.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -64,32 +76,88 @@ use super::{Guest, ModuleViewEvent, Slot, wire};
 const MAX_BLOCKS: usize = 1_000;
 /// The most a `blob.get` may pull: a frame's worth, as the loader's own cap.
 const MAX_BLOB_BYTES: usize = 16 << 20;
+/// The longest `host.id` prefix: a word naming the kind of record, not a
+/// payload of its own.
+const MAX_ID_PREFIX: usize = 32;
 /// The most one `rpc.stream` frame may carry into a view. A node frame is a
 /// line of a run's output or the like; a frame past this is the node
 /// misbehaving, and the subscription ends rather than growing the guest.
 const MAX_STREAM_FRAME_BYTES: usize = 1 << 20;
+const MAX_IN_FLIGHT: usize = 256;
+const MAX_SUBSCRIPTIONS: usize = 256;
+const MAX_REPLY_EVENTS: usize = 1024;
+const MAX_REPLY_BYTES: usize = 32 << 20;
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
-#[derive(Default)]
 pub(super) struct Replies {
     events: Mutex<Vec<wire::Event>>,
     in_flight: AtomicUsize,
     /// Told on every answer delivered: a test waits here for the node
     /// calls in flight, never on a clock.
     landed: std::sync::Condvar,
+    changed: tokio::sync::watch::Sender<()>,
+    fault: Mutex<Option<String>>,
+}
+
+impl Default for Replies {
+    fn default() -> Self {
+        Self {
+            events: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            landed: std::sync::Condvar::new(),
+            changed: tokio::sync::watch::channel(()).0,
+            fault: Mutex::default(),
+        }
+    }
 }
 
 impl Replies {
-    pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) {
-        let mut events = self.events.lock().expect("kernel replies");
-        pending.append(&mut events);
+    /// Coalesced notifications wake each native presenter independently. The
+    /// answer remains in the queue, including when no window is presenting it.
+    pub(super) fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
-    /// Whether a query or a submit is still on its way: the widget keeps
-    /// polling until none is.
+    pub(super) fn drain_into(&self, pending: &mut Vec<wire::Event>) -> Result<(), String> {
+        let mut events = self.events.lock().expect("kernel replies");
+        if let Some(fault) = self.fault() { return Err(fault); }
+        pending.append(&mut events);
+        Ok(())
+    }
+
+    pub(super) fn fault(&self) -> Option<String> {
+        self.fault.lock().expect("kernel reply fault").clone()
+    }
+
+    fn admit(self: &std::sync::Arc<Self>) -> Option<InFlight> {
+        if self.fault().is_some() { return None; }
+        self.in_flight.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+            |count| (count < MAX_IN_FLIGHT).then_some(count + 1)).ok()?;
+        Some(InFlight(self.clone()))
+    }
+
+    /// Whether a query or a submit is still on its way.
+    #[cfg(test)]
     pub(super) fn any_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    /// WHETHER THE VIEW IS STILL OWED A FRAME, which is the in-flight count
+    /// AND the answers already lying here. The two are one fact to a caller
+    /// and reading only the count loses a race it loses often: a request is
+    /// spawned inside a redraw, and a node that answers before that redraw
+    /// returns has already given the count back — leaving an answer nobody
+    /// is coming back for. The widget then stops polling and the view sits
+    /// on "Loading…" until an unrelated event wakes it; a test's pump
+    /// returns and reads a screen that never got its rows.
+    ///
+    /// Under the events lock, because that is the lock [`Replies::settled`]
+    /// takes to give a count back: with it held, empty and zero together
+    /// mean nothing can arrive that no one is waiting for.
+    pub(super) fn answer_owed(&self) -> bool {
+        let events = self.events.lock().expect("kernel replies");
+        !events.is_empty() || self.in_flight.load(Ordering::SeqCst) > 0
     }
 
     /// Blocks until nothing is in flight.
@@ -106,8 +174,25 @@ impl Replies {
     /// a subscription's last item and its count are not the same moment.
     fn item(&self, id: u64, result: Result<Vec<u8>, String>, done: bool) {
         let mut events = self.events.lock().expect("kernel replies");
+        if self.fault().is_some() { return; }
+        let bytes = |result: &Result<Vec<u8>, String>| match result {
+            Ok(bytes) => bytes.len(), Err(error) => error.len(),
+        };
+        let queued: usize = events.iter().map(|event| match event {
+            wire::Event::Response { result, .. } => bytes(result),
+            _ => 0,
+        }).sum();
+        let exceeds_budget = events.len() >= MAX_REPLY_EVENTS
+            || bytes(&result) > MAX_REPLY_BYTES.saturating_sub(queued);
+        if exceeds_budget {
+            *self.fault.lock().expect("kernel reply fault") = Some("view reply backlog limit exceeded; view stopped".into());
+            self.landed.notify_all();
+            self.changed.send_replace(());
+            return;
+        }
         events.push(wire::Event::Response { id, result, done });
         self.landed.notify_all();
+        self.changed.send_replace(());
     }
 
     /// One request off the in-flight count, under the lock a waiter holds.
@@ -115,8 +200,10 @@ impl Replies {
         let _events = self.events.lock().expect("kernel replies");
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.landed.notify_all();
+        self.changed.send_replace(());
     }
 
+    #[cfg(test)]
     fn deliver(&self, id: u64, result: Result<Vec<u8>, String>) {
         self.item(id, result, true);
         self.settled();
@@ -135,9 +222,66 @@ impl Drop for InFlight {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn reply_notifications_wake_each_presenter_and_keep_the_answer() {
+    let replies = Replies::default();
+    let mut first = replies.changes();
+    let mut second = replies.changes();
+    replies.item(7, Ok(vec![1, 2]), true);
+    futures::executor::block_on(async {
+        first.changed().await.expect("first presenter notified");
+        second.changed().await.expect("second presenter notified");
+    });
+    let mut pending = Vec::new();
+    replies.drain_into(&mut pending).expect("reply budget");
+    assert!(matches!(pending.as_slice(), [wire::Event::Response { id: 7, result: Ok(bytes), done: true }] if bytes == &[1, 2]));
+    assert!(!replies.answer_owed());
+}
+
+#[cfg(test)]
+#[test]
+fn request_admission_is_bounded_and_drop_returns_capacity() {
+    let replies = std::sync::Arc::new(Replies::default());
+    let mut admitted: Vec<_> = (0..MAX_IN_FLIGHT)
+        .map(|_| replies.admit().expect("within budget")).collect();
+    assert!(replies.admit().is_none());
+    admitted.pop();
+    let replacement = replies.admit().expect("dropped request returns capacity");
+    drop(replacement);
+    drop(admitted);
+    assert!(!replies.any_in_flight());
+}
+
+#[cfg(test)]
+#[test]
+fn reply_overflow_stops_the_view_instead_of_losing_an_answer_silently() {
+    let replies = std::sync::Arc::new(Replies::default());
+    for id in 0..MAX_REPLY_EVENTS { replies.item(id as u64, Ok(Vec::new()), false); }
+    assert!(replies.fault().is_none());
+    replies.item(MAX_REPLY_EVENTS as u64, Ok(Vec::new()), true);
+    assert!(replies.fault().is_some());
+    assert!(replies.admit().is_none());
+    let mut pending = Vec::new();
+    assert!(replies.drain_into(&mut pending).is_err());
+    assert!(pending.is_empty());
+    assert_eq!(replies.events.lock().unwrap().len(), MAX_REPLY_EVENTS);
+}
+
+#[cfg(test)]
+#[test]
+fn queued_reply_bytes_are_bounded_across_individually_valid_items() {
+    let replies = Replies::default();
+    replies.item(1, Ok(vec![0; MAX_REPLY_BYTES]), false);
+    assert!(replies.fault().is_none());
+    replies.item(2, Ok(vec![1]), true);
+    assert!(replies.fault().is_some());
+    assert_eq!(replies.events.lock().unwrap().len(), 1);
+}
+
 /// The kernel's own runtime, on its own thread: the window thread never
 /// blocks on the node, and the app's executor is not this module's to use.
-fn runtime() -> tokio::runtime::Handle {
+pub(super) fn runtime() -> tokio::runtime::Handle {
     static HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     HANDLE
         .get_or_init(|| {
@@ -183,12 +327,15 @@ pub(super) fn answer(
         ("rpc", "live") => {
             let plane = std::str::from_utf8(payload).unwrap_or_default().trim();
             let named = plane == BLOCK_PLANE || workspace_config::validate_module_id(plane).is_ok();
+            let capacity = guest.live_subscriptions.len() < MAX_SUBSCRIPTIONS;
+            if !capacity { guest.refuse(id, "too many live subscriptions".into()); return true; }
             match named {
                 true => guest.live_subscriptions.push((id, plane.to_owned())),
                 false => guest.refuse(id, "`rpc.live` names no plane".into()),
             }
         }
         ("op", "submit") => spawn(guest, id, payload, submit),
+        ("rpc", "admin") => spawn(guest, id, payload, admin),
         ("git", "merge") => spawn(guest, id, payload, git_merge),
         ("picture", "put") => spawn_host(guest, id, payload, picture_put),
         ("picture", "inline") => spawn(guest, id, payload, picture_inline),
@@ -212,6 +359,32 @@ pub(super) fn answer(
                     guest.reply(id, Ok(Vec::new()));
                 }
                 None => guest.refuse(id, "`host.badge` carries no count".into()),
+            }
+        }
+        ("clock", "ticks") => {
+            let period = tick_period(payload);
+            let capacity = guest.clocks.len() < MAX_SUBSCRIPTIONS;
+            if !capacity { guest.refuse(id, "too many clock subscriptions".into()); return true; }
+            match period {
+                Some(period) => guest.clocks.push(Clock {
+                    id,
+                    period,
+                    due: std::time::Instant::now() + period,
+                }),
+                None => guest.refuse(id, "`clock.ticks` names no period".into()),
+            }
+        }
+        ("host", "id") => {
+            let prefix = std::str::from_utf8(payload).unwrap_or_default().trim();
+            let named = !prefix.is_empty()
+                && prefix.len() <= MAX_ID_PREFIX
+                && prefix.bytes().all(|byte| byte.is_ascii_alphanumeric());
+            match named {
+                true => guest.reply(
+                    id,
+                    Ok(crate::backend::fresh_id(prefix).into_bytes()),
+                ),
+                false => guest.refuse(id, "`host.id` names no prefix".into()),
             }
         }
         _ => return false,
@@ -244,10 +417,14 @@ fn spawn(guest: &mut Guest, id: u64, payload: &[u8], call: Call) {
         return;
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(client, ask).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
@@ -268,10 +445,14 @@ fn spawn_host(guest: &mut Guest, id: u64, payload: &[u8], call: HostCall) {
         }
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(ask).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
@@ -293,16 +474,70 @@ fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
     };
     let bytes = payload.to_vec();
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     runtime().spawn(async move {
+        let _counted = counted;
         let result = call(client, bytes).await;
-        replies.deliver(id, result);
+        replies.item(id, result, true);
     });
 }
 
 /// A node stream the kernel is running for one subscription. Dropped with
 /// the guest that asked, or with the cancel that retires it — and dropping
 /// it ends the socket, so a view that is replaced leaves nothing reading.
+/// One `clock.ticks` subscription: the period the view asked for, and when
+/// its next item is due.
+pub(super) struct Clock {
+    pub(super) id: u64,
+    period: std::time::Duration,
+    due: std::time::Instant,
+}
+
+/// The shortest and longest period a view may ask the clock for. Below the
+/// floor a tick is a spin the window thread pays for every frame; above the
+/// ceiling it is not a period but a date, which a view has no business
+/// keeping — it reads the node for that.
+const MIN_TICK_MS: i64 = 16;
+const MAX_TICK_MS: i64 = 60 * 60 * 1_000;
+
+/// A `clock.ticks` payload: the period in milliseconds, little-endian, as
+/// `ui_lang_guest::every` writes it.
+fn tick_period(payload: &[u8]) -> Option<std::time::Duration> {
+    let millis = i64::from_le_bytes(<[u8; 8]>::try_from(payload).ok()?);
+    let named = (MIN_TICK_MS..=MAX_TICK_MS).contains(&millis);
+    named.then(|| std::time::Duration::from_millis(millis as u64))
+}
+
+/// Every clock item due at `now`, and the deadline re-armed for each. The
+/// instant is an argument so the rule is decided, not timed: the widget
+/// hands it `Instant::now()`, a test hands it the deadline it chose.
+pub(super) fn ticked(clocks: &mut [Clock], now: std::time::Instant) -> Vec<wire::Event> {
+    let mut items = Vec::new();
+    for clock in clocks.iter_mut() {
+        if clock.due > now {
+            continue;
+        }
+        // ONE ITEM PER REDRAW, however far behind: a window that was not
+        // drawn for a minute owes the view one tick, not four thousand.
+        clock.due = now + clock.period;
+        items.push(wire::Event::Response {
+            id: clock.id,
+            result: Ok(Vec::new()),
+            done: false,
+        });
+    }
+    items
+}
+
+/// When the nearest clock item comes due, for the redraw the widget asks
+/// the shell to schedule.
+pub(super) fn next_tick(clocks: &[Clock]) -> Option<std::time::Instant> {
+    clocks.iter().map(|clock| clock.due).min()
+}
+
 pub(super) struct NodeStream(tokio::task::JoinHandle<()>);
 
 impl Drop for NodeStream {
@@ -348,6 +583,7 @@ fn stream_ask(ask: &serde_json::Value) -> Result<(String, String), String> {
 /// Opens one node topic for a view: the socket under the seated key, then
 /// every frame it sends, until it ends.
 fn stream_open(guest: &mut Guest, id: u64, payload: &[u8]) {
+    guest.streams.retain(|(_, stream)| !stream.0.is_finished());
     let ask: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(ask) => ask,
         Err(error) => {
@@ -372,8 +608,10 @@ fn stream_open(guest: &mut Guest, id: u64, payload: &[u8]) {
         return;
     };
     let replies = guest.replies.clone();
-    replies.in_flight.fetch_add(1, Ordering::SeqCst);
-    let counted = InFlight(replies.clone());
+    let Some(counted) = replies.admit() else {
+        guest.refuse(id, "too many in-flight view requests".into());
+        return;
+    };
     let handle = runtime().spawn(async move {
         let _counted = counted;
         match open_topic(client.origin(), &topic, &query).await {
@@ -397,7 +635,7 @@ async fn open_topic(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
-    use iced::futures::SinkExt as _;
+    use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -433,14 +671,14 @@ async fn open_topic(
 /// subscription.
 async fn forward<S>(replies: &Replies, id: u64, mut socket: S)
 where
-    S: iced::futures::Stream<
+    S: futures::Stream<
             Item = Result<
                 tokio_tungstenite::tungstenite::Message,
                 tokio_tungstenite::tungstenite::Error,
             >,
         > + Unpin,
 {
-    use iced::futures::StreamExt as _;
+    use futures::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
     while let Some(message) = socket.next().await {
         let frame = match message {
@@ -464,6 +702,7 @@ where
             return;
         }
         replies.item(id, Ok(frame), false);
+        if replies.fault().is_some() { return; }
     }
     replies.item(id, Ok(Vec::new()), true);
 }
@@ -535,10 +774,11 @@ fn files_get(
 /// of the two [`crate::backend::picture`] draws — the store never grows a
 /// slot nothing paints.
 fn picture_surface(ask: &serde_json::Value) -> Option<&'static str> {
-    use crate::backend::{FILES_SURFACE, FORGE_SURFACE};
+    use crate::backend::{CHAT_SURFACE, FILES_SURFACE, FORGE_SURFACE};
     match ask["surface"].as_str()? {
         FILES_SURFACE => Some(FILES_SURFACE),
         FORGE_SURFACE => Some(FORGE_SURFACE),
+        CHAT_SURFACE => Some(CHAT_SURFACE),
         _ => None,
     }
 }
@@ -634,12 +874,25 @@ fn query(
     })
 }
 
+/// One index-tier view read, AFTER the module's fold has caught up with
+/// everything this client knows it wrote.
+///
+/// A derived read model folds BEHIND the block loop, so a view read fired on
+/// the heels of this view's own `op.submit` answers a tier that predates it:
+/// the moved block back where it was, the deleted line still alive, the line
+/// just typed missing. A module whose records the view then plans against
+/// (the pages document save) turns that into a DUPLICATE write, so the wait
+/// belongs on the kernel's read rather than in each view that has to
+/// remember it. `crate::backend::await_seen_fold` waits for nothing when
+/// nothing is outstanding, which is every read a view makes that did not
+/// just write.
 fn view(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
     Box::pin(async move {
         let target = target_of(&ask)?;
+        crate::backend::await_seen_fold(&client, &target, &ask["query"]).await;
         let reply: serde_json::Value = client
             .view(&target, &ask["query"])
             .await
@@ -694,6 +947,70 @@ fn submit(
         let payload = serde_json::to_vec(&ask["payload"]).map_err(|error| error.to_string())?;
         let height = crate::backend::seated_write(&client, &target, payload).await?;
         Ok(height.to_string().into_bytes())
+    })
+}
+
+/// `{route, payload}` read once: the `/v1` route to POST and the bytes to
+/// sign with it. The route is an ABSOLUTE path in plain tokens and carries
+/// no query — the signature covers exactly the string the request sends, so
+/// anything that would have to be escaped is REFUSED rather than escaped,
+/// the way [`stream_ask`] refuses one. A string payload is the body
+/// verbatim (`/v1/log-filter` takes a bare filter); anything else is its
+/// JSON.
+fn admin_ask(ask: &serde_json::Value) -> Result<(String, Vec<u8>), String> {
+    let route = ask["route"].as_str().unwrap_or_default();
+    let plain_path = route.starts_with("/v1/")
+        && !route.contains("..")
+        && route
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:~".contains(&byte));
+    if !plain_path {
+        return Err("`rpc.admin` names no plain `/v1` route".into());
+    }
+    let body = match &ask["payload"] {
+        serde_json::Value::String(text) => text.clone().into_bytes(),
+        other => serde_json::to_vec(other).map_err(|error| error.to_string())?,
+    };
+    Ok((route.to_owned(), body))
+}
+
+/// One node-level POST under the SEATED key. The proof is the one
+/// `ducktape node log-filter` mints — `signed_req::request_headers` over the
+/// method, the path and the body, bound to this node's key — reached through
+/// the app's own [`crate::backend::seated_request_headers`], so nothing here
+/// signs anything itself. The node's operator gate is the decider: a key it
+/// does not admit gets the node's refusal, not the kernel's.
+fn admin(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let (route, body) = admin_ask(&ask)?;
+        let node_key = crate::backend::node_public_key(client.origin()).await?;
+        let signed = crate::backend::seated_request_headers("POST", &route, &node_key, &body)
+            .await
+            .ok_or_else(|| "`rpc.admin` needs the session key unlocked".to_owned())?;
+        let content_type = match &ask["payload"] {
+            serde_json::Value::String(_) => "text/plain; charset=utf-8",
+            _ => "application/json",
+        };
+        let mut request = reqwest::Client::new()
+            .post(format!("{}{route}", client.origin()))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
+        for (name, value) in signed {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("could not reach the node: {error}"))?;
+        let code = response.status();
+        let text = response.text().await.unwrap_or_default();
+        match code.is_success() {
+            true => Ok(text.into_bytes()),
+            false => Err(format!("{route} rejected ({code}): {text}")),
+        }
     })
 }
 
@@ -897,7 +1214,7 @@ mod tests {
     fn a_node_stream_forwards_every_frame_and_the_close_ends_it() {
         let replies = std::sync::Arc::new(Replies::default());
         replies.in_flight.fetch_add(1, Ordering::SeqCst);
-        let frames = iced::futures::stream::iter(vec![
+        let frames = futures::stream::iter(vec![
             Ok(Message::Text(r#"{"topic":"run-output:d4c3"}"#.to_owned())),
             Ok(Message::Ping(Vec::new())),
             Ok(Message::Binary(vec![7, 8])),
@@ -913,7 +1230,7 @@ mod tests {
 
         replies.wait_idle();
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         let items: Vec<(u64, Result<Vec<u8>, String>, bool)> = landed
             .into_iter()
             .map(|event| match event {
@@ -932,6 +1249,96 @@ mod tests {
         assert!(!replies.any_in_flight());
     }
 
+    /// The route and the body a `rpc.admin` ask becomes, and what it
+    /// refuses: the signature covers exactly the path string the POST
+    /// carries, so a route that is not a plain absolute `/v1` path is
+    /// refused instead of escaped. A string payload is the body verbatim —
+    /// `/v1/log-filter` takes a bare filter, not JSON.
+    #[test]
+    fn an_admin_ask_becomes_one_route_and_one_body_or_a_refusal() {
+        let ask = serde_json::json!({"route": "/v1/log-filter", "payload": "info,ducktape::join=debug"});
+        assert_eq!(
+            admin_ask(&ask).expect("a plain ask"),
+            (
+                "/v1/log-filter".to_owned(),
+                b"info,ducktape::join=debug".to_vec()
+            )
+        );
+        let structured = serde_json::json!({"route": "/v1/invite", "payload": {"ttl": 60}});
+        assert_eq!(
+            admin_ask(&structured).expect("a json ask"),
+            ("/v1/invite".to_owned(), br#"{"ttl":60}"#.to_vec())
+        );
+        assert!(admin_ask(&serde_json::json!({"payload": "info"})).is_err());
+        assert!(admin_ask(&serde_json::json!({"route": "v1/log-filter"})).is_err());
+        assert!(admin_ask(&serde_json::json!({"route": "/v1/../admin/keys"})).is_err());
+        let smuggled = serde_json::json!({"route": "/v1/log-filter?admin=1"});
+        assert!(
+            admin_ask(&smuggled).is_err(),
+            "a route that would need escaping is refused, never escaped"
+        );
+    }
+
+    /// A refused ask never reaches the node, and the answer lands in
+    /// [`Replies`] like every other: the test waits on the in-flight count,
+    /// never on a clock.
+    #[test]
+    fn a_refused_admin_ask_lands_as_one_answer_and_reaches_no_node() {
+        let replies = std::sync::Arc::new(Replies::default());
+        replies.in_flight.fetch_add(1, Ordering::SeqCst);
+        let running = replies.clone();
+        // port 1 is nothing's: a call that reached the network here would
+        // fail with a transport error instead of the refusal asserted below
+        let client = ducktape_rpc::Client::new("http://127.0.0.1:1").expect("a client");
+        runtime().spawn(async move {
+            let result = admin(client, serde_json::json!({"route": "/etc/passwd"})).await;
+            running.deliver(11, result);
+        });
+
+        replies.wait_idle();
+        let mut landed = Vec::new();
+        replies.drain_into(&mut landed).expect("reply budget");
+        assert_eq!(
+            landed,
+            vec![wire::Event::Response {
+                id: 11,
+                result: Err("`rpc.admin` names no plain `/v1` route".into()),
+                done: true,
+            }]
+        );
+        assert!(!replies.any_in_flight());
+    }
+
+    /// AN ANSWER THAT BEAT THE REDRAW THAT ASKED FOR IT IS STILL OWED A
+    /// FRAME. The in-flight count is given back the moment the answer is
+    /// written, so a node quick enough to answer inside the redraw leaves
+    /// the count at zero with the answer undrained — and a caller reading
+    /// only the count walks away from it, which is a view stuck on
+    /// "Loading…" until something unrelated wakes it.
+    #[test]
+    fn an_answer_already_written_is_owed_a_frame_with_nothing_in_flight() {
+        let replies = std::sync::Arc::new(Replies::default());
+        assert!(!replies.answer_owed(), "nothing asked, nothing owed");
+
+        replies.in_flight.fetch_add(1, Ordering::SeqCst);
+        let running = replies.clone();
+        // port 1 is nothing's: the refusal is composed without a node, which
+        // is what makes this answer land inside the caller's own redraw
+        let client = ducktape_rpc::Client::new("http://127.0.0.1:1").expect("a client");
+        runtime().spawn(async move {
+            let result = admin(client, serde_json::json!({"route": "/etc/passwd"})).await;
+            running.deliver(3, result);
+        });
+        replies.wait_idle();
+
+        assert!(!replies.any_in_flight(), "the count came back");
+        assert!(replies.answer_owed(), "and the answer is still here");
+        let mut landed = Vec::new();
+        replies.drain_into(&mut landed).expect("reply budget");
+        assert_eq!(landed.len(), 1);
+        assert!(!replies.answer_owed(), "drained, and nothing is owed");
+    }
+
     /// A subscription the view abandons is aborted mid-wait — a socket
     /// waiting on the node stops no other way — and the in-flight count it
     /// took comes back with it. It must, or the widget polls for a stream
@@ -947,7 +1354,7 @@ mod tests {
             forward(
                 &running,
                 7,
-                iced::futures::stream::pending::<
+                futures::stream::pending::<
                     Result<Message, tokio_tungstenite::tungstenite::Error>,
                 >(),
             )
@@ -958,7 +1365,7 @@ mod tests {
         drop(NodeStream(waiting));
         replies.wait_idle();
         let mut landed = Vec::new();
-        replies.drain_into(&mut landed);
+        replies.drain_into(&mut landed).expect("reply budget");
         assert!(landed.is_empty(), "an abort delivers nothing: {landed:?}");
     }
 }

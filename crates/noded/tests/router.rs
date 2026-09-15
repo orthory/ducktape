@@ -1148,6 +1148,26 @@ async fn the_open_query_lane_stays_open_and_anonymous() {
     );
 }
 
+/// The contract number is a fact about the binary, not the boundary: a node
+/// that has published nothing yet serves it too, so the app can refuse (or
+/// not) before the first block.
+#[tokio::test]
+async fn status_carries_the_contract_number_before_any_publish() {
+    let (handle, _cmd_rx, _events) = local_node();
+    let response = noded::router(handle)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["contract"], noded::NODE_CONTRACT);
+}
+
 #[tokio::test]
 async fn status_reports_root_hash_height_and_module_roots() {
     // deliberately NO actor: /v1/status serves the last-published snapshot
@@ -1156,6 +1176,7 @@ async fn status_reports_root_hash_height_and_module_roots() {
     // exists to prevent.
     let (handle, _cmd_rx, _events) = local_node();
     handle.status_cell().publish(NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: "9.9.9".into(),
         root_hash: "cd".repeat(32),
         height: 3,
@@ -1188,6 +1209,9 @@ async fn status_reports_root_hash_height_and_module_roots() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
+    // the app-facing surface's number rides beside the build version: the
+    // desktop app reads this one field to decide whether to open a console.
+    assert_eq!(body["contract"], noded::NODE_CONTRACT);
     assert_eq!(body["version"], "9.9.9");
     assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
@@ -1625,7 +1649,7 @@ async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
         .oneshot(stage(
-            module_artifact::ModuleArtifact::component(vec![7u8; 3 * 1024 * 1024]).encode(),
+            module_artifact::Artifact::module(vec![7u8; 3 * 1024 * 1024]).encode(),
         ))
         .await
         .unwrap();
@@ -2163,6 +2187,57 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+}
+
+/// The browser door reads each request body under the RESOLVED route's own
+/// `max_request_bytes` — the per-lane cap — not under one router-wide
+/// limit. Over it is a named 413 before the request reaches the lane; the
+/// route's queries (resolve + get) are the only work done.
+#[tokio::test]
+async fn gateway_browser_proxy_reads_the_body_under_the_routes_own_cap() {
+    let (handle, cmds, _events) = local_node();
+    // resolve + get, and nothing after: the over-cap body never reaches
+    // proxy_current's own resolution.
+    spawn_duck_actor(cmds, 2);
+    let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
+    let handle = handle
+        .with_gateway(lane)
+        .with_browser_gateway("127.0.0.1:49152".parse().unwrap());
+
+    let authority = "app.demo.duck";
+    let cap = gateway_route()
+        .statement
+        .route
+        .unwrap()
+        .policy
+        .max_request_bytes as usize;
+    let response = noded::gateway_browser_router(handle)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api")
+                .header("x-duck-authority", authority)
+                .header(header::ORIGIN, format!("duck://{authority}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(vec![7u8; cap + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let error = body_json(response).await["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.starts_with("gateway_body_exceeds_route_cap"),
+        "{error}"
+    );
+    assert!(error.contains(&cap.to_string()), "{error}");
+    assert!(
+        jobs.try_recv().is_err(),
+        "an over-cap body must never become a gateway job"
+    );
 }
 
 /// a GET carrying the RFC 6455 upgrade headers axum's `WebSocketUpgrade`
@@ -2712,6 +2787,7 @@ fn spawn_huddle_actor(mut cmds: mpsc::Receiver<NodeCommand>) {
                         post_policy: chat::PostPolicy::Open,
                         hooks: vec![],
                         pinned: vec![],
+                        voice: false,
                         huddle: vec![chat::HuddleMember {
                             party: chat::Party::Account(MEMBER_ACCOUNT),
                             node: huddle_node_signer().public_key().as_ref().to_vec(),

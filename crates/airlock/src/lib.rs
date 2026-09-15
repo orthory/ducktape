@@ -22,6 +22,8 @@ pub mod attest;
 pub mod bodyseal;
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "codesign")]
+pub mod codesign;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 #[cfg(feature = "verify")]
@@ -30,5 +32,7 @@ pub mod handshake;
 pub mod seal;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "codesign")]
+pub mod sign;
 pub mod token;
 pub mod wire;

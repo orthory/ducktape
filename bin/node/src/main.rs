@@ -52,6 +52,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod account_cli;
 mod agent;
 mod agent_cli;
+mod chief_cli;
 mod agent_plane;
 mod airlock;
 mod announce;
@@ -99,6 +100,7 @@ mod reachability_plane;
 mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
+mod release_cli;
 mod replica;
 mod resource_limits;
 mod rpc;
@@ -300,6 +302,9 @@ enum Family {
     /// live code swaps: update, register, status
     #[command(subcommand)]
     Module(module_cli::ModuleCmd),
+    /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
+    #[command(subcommand)]
+    Release(release_cli::ReleaseCmd),
     /// the stdio MCP server an agent runner spawns
     Mcp,
 }
@@ -333,6 +338,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),
+        Family::Release(cmd) => release_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -724,6 +730,7 @@ fn run_node(
             ));
         }
         status.publish(noded::NodeStatus {
+            contract: noded::NODE_CONTRACT,
             version: build_version(),
             public_key: status_public_key.clone(),
             ..Default::default()

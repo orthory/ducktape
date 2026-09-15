@@ -12,11 +12,10 @@ CARGO ?= cargo
 # bytes are pinned by GENESIS_ROOT_HASH, so a silent re-resolution between two
 # operators moves the genesis hash with no source change.
 LOCKED ?= --locked
-APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release release-app publish-app airlock-gateway-image rcodesign views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -33,14 +32,17 @@ prereqs:
 	  command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
 	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
+	  for library in x11-xcb xkbcommon xkbcommon-x11 fontconfig freetype2; do \
+	    pkg-config --exists "$$library" 2>/dev/null || missing="$$missing $$library"; \
+	  done; \
 	fi; \
 	[ -z "$$missing" ] || { \
 	  echo "missing build prerequisites:$$missing" >&2; \
 	  if [ "$(UNAME_S)" = Darwin ]; then \
 	    echo "  xcode-select --install" >&2; \
 	  else \
-	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
-	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
+	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev   # Debian/Ubuntu" >&2; \
+	    echo "  On other distributions, install development packages for the missing libraries above." >&2; \
 	  fi; \
 	  echo "  rustup: https://rustup.rs" >&2; \
 	  exit 1; }
@@ -57,7 +59,8 @@ all: prereqs
 ## foreground. Ctrl-C quits the app and leaves the node and services up for
 ## `cargo run -p ducktape-app`; the next `make dev` replaces them.
 ## `make dev-clear` stops that background runtime without deleting its state,
-## while `make demo-clear` removes the workspace entirely.
+## while `make demo-clear` removes the workspace entirely. `make dev YES=1`
+## installs every agent CLI the checklist would offer without asking.
 dev: views
 	@bash ops/dev.sh
 
@@ -112,6 +115,18 @@ labs-gate:
 node: prereqs
 	$(CARGO) build $(LOCKED) --release -p node-bin
 
+## stage the airlock enclave image root under target/airlock-gateway-image:
+## the release `airlock-gateway`, the pinned `rcodesign` it signs release
+## bundles with, and the entitlements it applies (ops/airlock-gateway/).
+airlock-gateway-image:
+	ops/airlock-gateway/stage-image.sh
+
+## the pinned `rcodesign` into $(BIN_DEST): what `cargo test -p airlock` signs
+## a fixture bundle with (the gateway's own `POST /sign/macos-bundle` path),
+## installed from the same pinned release the image carries.
+rcodesign:
+	ops/airlock-gateway/install-rcodesign.sh --prefix "$(patsubst %/,%,$(dir $(BIN_DEST)))"
+
 ## release build of the untrusted UDP coordinator
 coordinator:
 	$(CARGO) build $(LOCKED) --release -p coordinator-bin
@@ -120,48 +135,7 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test $(LOCKED) -p coordinator-bin
 
-# Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
-# can parse a different language than the compiler in app/Cargo.toml.
-#
-# Both the URL and the rev come from app/Cargo.toml, so the install source
-# cannot drift from the pin the app compiles against.
-#
-# This installs straight from the pinned rev. `cargo install --git` resolves the
-# package's whole workspace, so it also clones the one git dependency no part of
-# cargo-ice uses (pornin/ecgfp5, which the trading example wants). That clone is
-# the deliberate price: the alternative was a hand-maintained `ice-install/<rev>`
-# branch holding the same rev minus the example members, which had to be rebased
-# and pushed on every pin bump and broke `make app` with a bare git exit 128
-# every time someone forgot.
-ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' app/Cargo.toml | head -n1)
-ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
-ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
-ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
-ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
-
-# The build dir is keyed by rev too: cargo treats every checkout under its git
-# cache as immutable (no mtime check on its sources) and hashes a git package's
-# outputs without the revision, so a build dir shared across revs hands the
-# next rev the previous rev's binary as "fresh" — a cargo-ice that parses the
-# wrong language, filed under the right rev. An existing binary can predate the
-# isolated build dir. Only reuse an install completed by this recipe; --force
-# also replaces Cargo's stale registration.
-.PHONY: ice-tool
-ice-tool:
-	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
-	rm -f "$(ICE_INSTALL_STAMP)" && \
-	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
-		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
-	touch "$(ICE_INSTALL_STAMP)"
-
-# The `wasm-tools` CLI the view bundler drives (cargo-ice shells out to it to
-# wrap each view as a component), installed the same way cargo-ice is: under
-# target, keyed by version, so `make views` needs nothing on PATH and cannot
-# pick up a global copy at another version. It is the componentizer's own
-# release — `wasm-tools 1.x.y` and the `wit-component 0.x.y` guest-builder
-# links ship together and write the same bytes — so the version is read off
-# guest-builder's manifest, the one place the componentizer is pinned, and no
-# second number exists to drift.
+# Pin wasm-tools to the component encoder used by guest-builder.
 WASM_TOOLS_VERSION = 1.$(shell sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' bin/guest-builder/Cargo.toml | head -n1)
 WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
 WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
@@ -170,69 +144,80 @@ $(WASM_TOOLS_BIN):
 	CARGO_TARGET_DIR="$(WASM_TOOLS_ROOT)/build" $(CARGO) install wasm-tools \
 		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
 
-## build every desktop view (crates/views) as an `ice:view` component
-## and stage it under target/views, where a built desktop app loads it from
-## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-## binary). Installs the bundler's wasm-tools under target on first use and
-## puts it on the recipe's PATH, never the operator's. The views workspace pins
-## the same ducktape-ui rev as the app, and this refuses when they differ: a
-## view compiled by another language revision than the host that renders it is
-## a wire nobody tested.
+## Compile Rust-authored views and stage dynamically loaded WASM components.
 VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
 
-views: ice-tool $(WASM_TOOLS_BIN)
-	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
-	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
+views: $(WASM_TOOLS_BIN)
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" CARGO="$(CARGO)" bash ops/build-views.sh $(VIEW_PACKAGES)
 
-## rebuild the committed view sources in two isolated roots and compare bytes
-views-repro-check: ice-tool $(WASM_TOOLS_BIN)
-	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)" "$(ICE_ROOT)"
+## Rebuild committed view sources in two isolated roots and compare bytes.
+views-repro-check: $(WASM_TOOLS_BIN)
+	bash ops/views-repro-check.sh "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
-## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
-## unless the environment says otherwise — `cargo-ice bundle` reads these
-## itself, and this recipe inherits the environment, so nothing is forwarded
-## by hand:
-##   ICE_CODESIGN_IDENTITY  a "Developer ID Application: … (TEAMID)" identity
-##                          (`security find-identity -v -p codesigning`).
-##                          Signs the .app and the .dmg with --timestamp
-##                          --options runtime; without it both are signed
-##                          ad-hoc, which Gatekeeper refuses off this machine.
-##   ICE_NOTARY_KEY         path to the App Store Connect API key .p8
-##   ICE_NOTARY_KEY_ID      that key's id
-##   ICE_NOTARY_ISSUER      the issuer UUID
-##                          All three together add `xcrun notarytool submit
-##                          --wait` + `xcrun stapler staple` on the DMG. Set
-##                          without ICE_CODESIGN_IDENTITY, cargo-ice refuses
-##                          before the upload — Apple rejects an ad-hoc
-##                          signature.
-## The release recipe is app/README.md § "Release build".
-app: prereqs ice-tool views
-	"$(ICE_BIN)" bundle -p ducktape-app
+## Build native Ducktape.app and DMG using Apple's packaging tools.
+## DUCKTAPE_CODESIGN_IDENTITY selects Developer ID; default is ad-hoc.
+## DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID, DUCKTAPE_NOTARY_ISSUER
+## together submit and staple the signed image. See app/README.md.
+app: prereqs views
+	CARGO="$(CARGO)" bash ops/bundle-app-macos.sh
 
-## `make app-release` for a build that leaves this machine: refuses unless a
-## real Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
-## forgetting one variable. Notarization needs the three ICE_NOTARY_* vars on
-## top; without them the bundle is signed and stapleable but not stapled.
 app-release:
-	@if [ -z "$$ICE_CODESIGN_IDENTITY" ]; then \
-		echo "app-release needs ICE_CODESIGN_IDENTITY set to a Developer ID Application identity;" >&2; \
-		echo "list them with: security find-identity -v -p codesigning" >&2; \
-		echo "(and ICE_NOTARY_KEY, ICE_NOTARY_KEY_ID, ICE_NOTARY_ISSUER to notarize)" >&2; \
-		echo "see app/README.md § \"Release build\"; 'make app' builds the ad-hoc bundle" >&2; \
-		exit 1; \
-	fi
+	@test -n "$$DUCKTAPE_CODESIGN_IDENTITY" && test "$$DUCKTAPE_CODESIGN_IDENTITY" != "-" || \
+	  { echo "app-release requires DUCKTAPE_CODESIGN_IDENTITY (Developer ID Application)" >&2; exit 1; }
 	@$(MAKE) app
+
+## the archive a release offers: a Developer ID-signed, notarized bundle
+## (every offered release is), the ticket stapled to it, packed by
+## ops/release/archive.sh into
+## target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst — the script
+## refuses an ad-hoc or unnotarized bundle by name, so it is the host-side
+## verifier on both paths below. Publish it with `make publish-app`.
+##
+## ONE signing path per environment, chosen by DUCKTAPE_SIGN_VIA:
+##   unset    the local Developer ID: `app-release` with the three
+##            DUCKTAPE_NOTARY_* required (not optional as for `app`).
+##   airlock  the airlock gateway signs: `app` stages Ducktape.app UNSIGNED,
+##            `ducktape release sign-bundle` sends it to the enclave holding
+##            the apple-codesign credential DUCKTAPE_SIGN_CREDENTIAL through
+##            NODE (the local node's http base) and unpacks the signed,
+##            notarized, stapled bundle back in place. Set together with
+##            DUCKTAPE_CODESIGN_IDENTITY or any DUCKTAPE_NOTARY_* it refuses
+##            (`sign_path_conflict`): there is no fallback from one to the other.
+##     DUCKTAPE_SIGN_VIA=airlock DUCKTAPE_SIGN_CREDENTIAL=release-sign NODE=http://127.0.0.1:8844 make release-app
+ifeq ($(DUCKTAPE_SIGN_VIA),airlock)
+release-app:
+	@test -z "$$DUCKTAPE_CODESIGN_IDENTITY" -a -z "$$DUCKTAPE_NOTARY_KEY" -a -z "$$DUCKTAPE_NOTARY_KEY_ID" -a -z "$$DUCKTAPE_NOTARY_ISSUER" || \
+	  { echo "release-app: sign_path_conflict: DUCKTAPE_SIGN_VIA=airlock with DUCKTAPE_CODESIGN_IDENTITY or DUCKTAPE_NOTARY_* set; one signing path per environment" >&2; exit 2; }
+	@test -n "$(DUCKTAPE_SIGN_CREDENTIAL)" -a -n "$(NODE)" || \
+	  { echo "release-app: DUCKTAPE_SIGN_VIA=airlock needs DUCKTAPE_SIGN_CREDENTIAL=<apple-codesign credential name> and NODE=<the local node's http base>" >&2; exit 2; }
+	@DUCKTAPE_SIGN_VIA=airlock $(MAKE) app
+	"$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" release sign-bundle target/app-bundle/Ducktape.app \
+	  --credential "$(DUCKTAPE_SIGN_CREDENTIAL)" --node "$(NODE)" \
+	  --out target/app-bundle/Ducktape-signed.tar.zst --unpack-into target/app-bundle
+	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
+else ifeq ($(DUCKTAPE_SIGN_VIA),)
+release-app:
+	@test -n "$$DUCKTAPE_NOTARY_KEY" -a -n "$$DUCKTAPE_NOTARY_KEY_ID" -a -n "$$DUCKTAPE_NOTARY_ISSUER" || \
+	  { echo "release-app requires DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID and DUCKTAPE_NOTARY_ISSUER: a release is notarized" >&2; exit 1; }
+	@$(MAKE) app-release
+	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
+else
+release-app:
+	@echo "release-app: DUCKTAPE_SIGN_VIA=$(DUCKTAPE_SIGN_VIA) is not a signing path (unset = local Developer ID, airlock = the airlock gateway)" >&2; exit 2
+endif
 
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
 
+## put the built bundle under the launcher: `ducktape-launcher install` seeds
+## it as a release, swaps it into /Applications (DUCKTAPE_INSTALL_DIR
+## overrides; the directory must be writable by this user) and writes the
+## update state the app and the launcher share. The bundle ships its own
+## launcher (Contents/MacOS/ducktape-launcher is its CFBundleExecutable),
+## signed with the rest of it, so nothing is added or re-sealed here.
 install-app: app
-	mkdir -p "$(APP_DEST)"
-	rm -rf "$(APP_DEST)/Ducktape.app"
-	cp -R target/ice-bundle/Ducktape.app "$(APP_DEST)/"
-	@echo "installed $(APP_DEST)/Ducktape.app"
+	target/release/ducktape-launcher install --from target/app-bundle/Ducktape.app
 else
 ## where the Linux desktop entry and its icon land — the XDG per-user roots,
 ## so `make install-app` needs no root.
@@ -242,28 +227,66 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 ## install the ducktape operator CLI and the desktop app without requiring root
 install: install-node install-app
 
-## build the desktop app binary and the views it loads
+## build the desktop app binary, its launcher, and the views it loads, and
+## stage them whole as one release under target/app-release:
+## `{ducktape-launcher, ducktape-app, views/*.wasm}` — what `ducktape-launcher
+## install --from` takes and what ops/release/archive.sh packs.
 app: prereqs views
-	$(CARGO) build $(LOCKED) --release -p ducktape-app
+	$(CARGO) build $(LOCKED) --release -p ducktape-app -p app-launcher
+	rm -rf target/app-release
+	mkdir -p target/app-release/views
+	install -m 0755 target/release/ducktape-app target/release/ducktape-launcher target/app-release/
+	install -m 0644 target/views/*.wasm target/app-release/views/
 
-## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
-## The `.desktop` entry's `MimeType=x-scheme-handler/duck` is what makes
-## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app, and its
-## `%u` is what puts the URL in argv where the app reads it. `Exec=` is
-## rewritten to an absolute path: a desktop session inherits no shell PATH.
-## The entry is installed under the app id the window reports, so the running
-## window associates with it (icon, pinned-app identity).
+## the archive a release offers: the staged release packed by
+## ops/release/archive.sh into
+## target/release-archive/Ducktape-<sha7>-linux-<arch>.tar.zst. Publish it
+## with `make publish-app`.
+release-app: app
+	bash ops/release/archive.sh --from target/app-release --out-dir "$(RELEASE_ARCHIVE_DIR)"
+
+## install the desktop app under its launcher and REGISTER THE duck:// SCHEME
+## with the desktop. The release is staged whole (`ducktape-launcher`,
+## `ducktape-app`, `views/`) and `ducktape-launcher install` seeds it as
+## `$XDG_DATA_HOME/ducktape/releases/<sha>`, points `current` at it, writes
+## the update state, and installs the `.desktop` entry with `Exec=` at
+## `current/ducktape-launcher %u` — an absolute path, since a desktop
+## session inherits no shell PATH, and the launcher, since that is what
+## flips to a staged update and passes the URL on to the app. The entry's
+## `MimeType=x-scheme-handler/duck` is what makes
+## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app; its
+## `%u` puts the URL in argv where the app reads it; its name is the app id
+## the window reports, so the running window associates with it (icon,
+## pinned-app identity).
 install-app: app
-	mkdir -p "$(BIN_DEST)" "$(DESKTOP_DEST)" "$(ICON_DEST)"
-	install -m 0755 target/release/ducktape-app "$(BIN_DEST)/ducktape-app"
-	mkdir -p "$(BIN_DEST)/views"
-	install -m 0644 target/views/*.wasm "$(BIN_DEST)/views/"
+	mkdir -p "$(ICON_DEST)"
 	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
-	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/dev.ducktape.app.desktop \
-		> "$(DESKTOP_DEST)/dev.ducktape.app.desktop"
+	target/release/ducktape-launcher install --from target/app-release
 	-update-desktop-database "$(DESKTOP_DEST)"
-	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/dev.ducktape.app.desktop"
 endif
+
+## where `release-app` leaves its archives and `archives.txt` (one
+## `<os>-<arch>=<path>` line per platform; a rerun replaces its own line).
+RELEASE_ARCHIVE_DIR ?= target/release-archive
+
+## publish a built desktop-app release to a network's duckfs: compose +
+## seal the manifest, sign it with the release wallet, `fs put` the archives,
+## the manifest and its signature under /shared/releases. Runs
+## ops/release/publish.sh; every flag is a variable. ARCHIVES defaults to
+## what `make release-app` wrote to $(RELEASE_ARCHIVE_DIR)/archives.txt, so
+## after a `release-app` on this machine the archive list may be left out;
+## a release for several platforms names every archive explicitly:
+##   make publish-app NODE=http://127.0.0.1:8844 RELEASE_KEY=~/.ducktape/release/keys/release.key \
+##        SEQUENCE=18 DISPLAY="2026.09.2+9d71b254a" \
+##        ARCHIVES="macos-aarch64=target/Ducktape-macos-aarch64.tar.zst linux-x86_64=target/Ducktape-linux-x86_64.tar.zst"
+ARCHIVES ?= $(shell cat "$(RELEASE_ARCHIVE_DIR)/archives.txt" 2>/dev/null)
+publish-app:
+	@test -n "$(NODE)" -a -n "$(RELEASE_KEY)" -a -n "$(SEQUENCE)" -a -n "$(DISPLAY)" -a -n "$(ARCHIVES)" || \
+	  { echo "publish-app needs NODE, RELEASE_KEY, SEQUENCE, DISPLAY and ARCHIVES (see the comment above)" >&2; exit 2; }
+	DUCKTAPE_BIN="$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" bash ops/release/publish.sh \
+	  --node "$(NODE)" --key "$(RELEASE_KEY)" --sequence "$(SEQUENCE)" --display "$(DISPLAY)" \
+	  $(if $(NOTES_URL),--notes-url "$(NOTES_URL)") \
+	  $(foreach archive,$(ARCHIVES),--archive "$(archive)")
 
 # where `cargo install` puts the binary, and so where the installed binary
 # looks for its founding set: workspace_config::modules_dir() reads
@@ -368,7 +391,7 @@ BUILDER_MODULES := \
   crates/modules/apps/automations crates/modules/apps/collaboration \
   crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
-  crates/modules/apps/forge \
+  crates/modules/apps/forge crates/modules/apps/boards \
   crates/modules/system/attribution crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \
